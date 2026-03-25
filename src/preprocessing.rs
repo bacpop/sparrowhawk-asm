@@ -2,7 +2,7 @@
 
 use core::panic;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::{path::PathBuf, time::Instant};
 
 use nohash_hasher::NoHashHasher;
@@ -10,18 +10,18 @@ use std::{cmp::Ordering, collections::HashMap, hash::BuildHasherDefault};
 
 use rayon::prelude::*;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 use needletail::parse_fastx_file;
 
 // use std::process::exit;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 use plotters::prelude::*;
 
 use super::HashInfoSimple;
 use super::QualOpts;
 
-// #[cfg(not(feature = "wasm"))]
+// #[cfg(not(target_arch = "wasm32"))]
 // use super::bit_encoding::{encode_base, rc_base};
 
 use crate::bit_encoding::UInt;
@@ -33,21 +33,21 @@ use crate::spectrum_fitter::SpectrumFitter;
 /// Tuple for name and list of input files
 pub type InputFastx = (String, Vec<String>);
 
-// #[cfg(feature = "wasm")]
+// #[cfg(target_arch = "wasm32")]
 // use wasm_bindgen::prelude::*;
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 use crate::fastx_wasm::open_fastq;
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 use crate::post_state;
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 use seq_io::fastq::Record;
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen_file_reader::WebSysFile;
 
 // For the fitting, we'll use actually MAXSIZEHISTO - 1
 const MAXSIZEHISTO: usize = 500;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 use crate::gpu_filter;
 
 #[inline]
@@ -128,7 +128,7 @@ fn drain_countmap_into_themap<IntT>(
     });
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_kmers_from_files<F>(files: &[String], mut on_record: F)
 where
     F: FnMut(std::borrow::Cow<'_, [u8]>, usize, Option<&[u8]>),
@@ -147,7 +147,7 @@ where
     log::info!("Finished getting kmers from {} file(s)", files.len());
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
     let backend = BitMapBackend::new(out_path, (1280, 960));
     let root = backend.into_drawing_area();
@@ -188,7 +188,7 @@ fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
 // This might be useful again in the future, but now it was just meaning that we were wasting memory!
 // I'm disabling them for the moment
 //
-// #[cfg(not(feature = "wasm"))]
+// #[cfg(not(target_arch = "wasm32"))]
 // fn put_these_nts_into_an_efficient_vector(charseq : &[u8], compseq : &mut Vec<u64>, occ : u8) {
 //     let mut tmpu64 : u64 = 0;
 //     let mut tmpind : u8  = 0;
@@ -219,7 +219,7 @@ fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
 //     }
 // }
 
-// #[cfg(not(feature = "wasm"))]
+// #[cfg(not(target_arch = "wasm32"))]
 // fn put_these_nts_into_an_efficient_vector_rc(charseq : &[u8], compseq : &mut Vec<u64>, occ : u8) {
 //     let mut tmpu64 : u64 = 0;
 //     let mut tmpind : u8  = 0;
@@ -250,7 +250,7 @@ fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
 
 /// Read all FASTQ records from `files` into contiguous packed ASCII buffers suitable
 /// for the GPU extraction pipeline.  Returns (seq_data, qual_data, read_offsets, read_lengths).
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn collect_raw_reads_for_gpu(
     files: &[String],
 ) -> (Vec<u8>, Vec<u8>, Vec<u32>, Vec<u32>) {
@@ -283,7 +283,7 @@ fn collect_raw_reads_for_gpu(
 /// Read all FASTQ records from `file1` and `file2` into contiguous packed ASCII buffers
 /// suitable for the GPU extraction pipeline (WASM version using seq_io readers).
 /// Returns (seq_data, qual_data, read_offsets, read_lengths).
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 fn collect_raw_reads_for_gpu_wasm(
     file1: &mut WebSysFile,
     file2: &mut WebSysFile,
@@ -322,7 +322,7 @@ fn collect_raw_reads_for_gpu_wasm(
 }
 
 /// CPU bulk extraction: pushes all kmer occurrences into a flat `outvec` for CPU sort+count.
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn bulk_preprocessing_standalone_cpu<IntT>(
     files: &[String],
     k: usize,
@@ -359,7 +359,7 @@ where
     (theseq, outdict, minmaxdict)
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 fn get_kmers_from_both_files_wasm<IntT>(
     file1: &mut WebSysFile,
     file2: &mut WebSysFile,
@@ -468,7 +468,7 @@ where
     (outdict, minmaxdict)
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 fn chunked_processing_wasm<IntT>(
     file1: &mut WebSysFile,
     file2: &mut WebSysFile,
@@ -668,7 +668,7 @@ where
     (outdict, minmaxdict, themap, histovec, minc)
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 fn bloom_filter_preprocessing_wasm<IntT>(
     file1: &mut WebSysFile,
     file2: &mut WebSysFile,
@@ -817,7 +817,7 @@ where
     (outdict, minmaxdict, themap, histovec, minc)
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn bloom_filter_preprocessing_standalone<IntT>(
     files: &[String],
     k: usize,
@@ -895,7 +895,7 @@ where
     (outdict, minmaxdict, themap)
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn get_map_with_counts(
     invec: &[(u64, u64, u8)],
     min_count: u16,
@@ -1044,7 +1044,7 @@ fn get_map_with_counts(
     outdict
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn get_map_with_counts_and_fit(
     invec: &mut Vec<(u64, u64, u8)>,
     out_path: &mut Option<PathBuf>,
@@ -1154,7 +1154,7 @@ fn get_map_with_counts_and_fit(
     outdict
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 fn get_map_wasm(
     invec: &mut Vec<(u64, u64, u8)>,
     min_count: u16,
@@ -1340,7 +1340,7 @@ fn update_countmap(
     tmpref.0 = tmpref.0.saturating_add(c);
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 fn chunked_preprocessing_standalone<IntT>(
     files: &[String],
     k: usize,
@@ -1455,7 +1455,7 @@ where
 }
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn preprocessing_standalone<IntT>(
     input_files: &[InputFastx],
     k: usize,
@@ -1817,7 +1817,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_arch = "wasm32")]
 /// Main preprocessing function for wasm
 pub async fn preprocessing_wasm<IntT>(
     file1: &mut WebSysFile,
