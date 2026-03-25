@@ -9,21 +9,18 @@ edition = "2021"
 default = ["basic"]
 # wasm = ["dep:js-sys", "dep:wasm-bindgen", "dep:simple-error", "dep:console_error_panic_hook", "dep:wasm-bindgen-file-reader", "dep:seq_io", "dep:flate2", "dep:web-sys", "dep:getrandom"]
 wasm = ["js-sys", "wasm-bindgen", "simple-error", "console_error_panic_hook", "wasm-bindgen-file-reader", "seq_io", "flate2", "web-sys", "getrandom",
-        # "serde", "ahash", "num-traits", "log", "simple_logger", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
         "serde", "ahash", "num-traits", "log", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
-        # "stacker", "project-root", "petgraph", "bnum", "json", "argmin", "argmin-math", "libm"]
-        "stacker", "project-root", "petgraph", "bnum", "json", "argmin", "argmin-math", "argmin-observer-slog", "libm",
+        "stacker", "project-root", "bnum", "json", "argmin", "argmin-math", "argmin-observer-slog", "libm",
         "wasm-bindgen-futures"]
-# basic = ["needletail", "serde", "ahash", "num-traits", "log", "simple_logger", "indicatif", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
 basic = ["needletail", "serde", "ahash", "num-traits", "log", "indicatif", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
-         # "stacker", "plotters", "project-root", "petgraph", "bnum", "argmin", "argmin-math", "libm"]
-         # "stacker", "plotters", "project-root", "petgraph", "bnum", "argmin", "argmin-math", "argmin-observer-slog", "libm"]
-         "stacker", "plotters", "project-root", "petgraph", "bnum", "argmin", "argmin-math", "argmin-observer-slog", "libm", "fern", "humantime"]
+         "stacker", "plotters", "project-root", "bnum", "argmin", "argmin-math", "argmin-observer-slog", "libm", "fern", "humantime"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+sphk-graph = { path = "../sphk-graph" }
+
 # i/o
 needletail = { version = "0.6.3", default-features = false, features = ["flate2", "xz2", "zstd"], optional = true}
 serde = { version = "1.0.219", features = ["derive"], optional = true}
@@ -50,7 +47,8 @@ stacker = {version = "0.1.20", optional = true}
 
 plotters = {version = "0.3.7", optional = true}
 project-root = {version = "0.2.2", optional = true}
-petgraph = {version = "0.8.1", optional = true}
+# petgraph is used directly in algorithm files (inner_graph access, tarjan_scc, connected_components)
+petgraph = "0.8.1"
 
 bnum = {version = "0.13.0", features = ["serde", "numtraits"], optional = true}
 

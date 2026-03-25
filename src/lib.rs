@@ -1,8 +1,6 @@
 //! Efficient genome assembler for small genomes in Rust
 #![warn(missing_docs)]
 use std::{
-    cell::*,
-    // process::exit,
     collections::HashMap,
     fmt,
     hash::BuildHasherDefault,
@@ -31,9 +29,6 @@ pub mod nthash;
 /// Contains functions to store the output of the program
 pub mod save_functions;
 
-/// Contains the graph definitions
-pub mod graphs;
-
 /// Contains different traits that implement various algorithms
 pub mod algorithms;
 
@@ -46,11 +41,9 @@ pub mod spectrum_fitter;
 /// GPU-accelerated radix sort + count + filter for bulk kmer preprocessing
 pub mod gpu_filter;
 
-use crate::graphs::pt_graph::EdgeType;
 use nohash_hasher::NoHashHasher;
 
 use crate::graph_works::Assemble;
-use crate::graphs::pt_graph::PtGraph;
 use bit_encoding::{U256, U512};
 
 pub mod cli;
@@ -73,6 +66,9 @@ extern crate console_error_panic_hook;
 pub mod fastx_wasm;
 #[cfg(feature = "wasm")]
 use crate::graph_works::Contigs;
+
+// Re-export core graph types from sphk-graph so callers don't need to depend on it directly.
+pub use sphk_graph::{EdgeType, EdgeWeight, HashInfoSimple, Idx};
 
 /// Logging wrapper function for the WebAssembly version
 #[cfg(feature = "wasm")]
@@ -104,26 +100,6 @@ pub fn logw(text: &str, typ: Option<&str>) {
     } else {
         println!("{}", text);
     }
-}
-
-/// Index type for both nodes and edges in the graph/gir.
-pub type Idx = usize;
-
-/// Type for representing weight of the `Edge`.
-pub type EdgeWeight = u16;
-
-/// Struct that contains the basic information for one k-mer
-pub struct HashInfoSimple {
-    /// maximum hash
-    pub hnc: u64,
-    /// First and last bases
-    pub b: u8,
-    /// found neighbours, if any, previous to this kmer
-    pub pre: Vec<(u64, EdgeType)>,
-    /// found neighbours, if any, posterior to this kmer
-    pub post: Vec<(u64, EdgeType)>,
-    /// Counts associated to this kmer
-    pub counts: u16,
 }
 
 /// Quality filtering options for FASTQ files
@@ -171,7 +147,6 @@ pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
 pub async fn main() {
     let args = cli_args();
 
-    // log::info!("Starting program!");
     eprintln!("Sparrowhawk");
     let mut timevec = Vec::new();
     timevec.push(Instant::now());
@@ -193,12 +168,10 @@ pub async fn main() {
             no_bubble_collapse,
             no_dead_end_removal,
             gpu,
-            // no_conflictive_links_removal,
         } => {
             let outputlogfile: PathBuf =
                 PathBuf::from(output_dir).join(format!("{output_prefix}_log.txt"));
             if args.verbose {
-                // set_up_logging(log::LevelFilter::Trace, outputlogfile);
                 set_up_logging(log::LevelFilter::Info, outputlogfile);
             } else {
                 set_up_logging(log::LevelFilter::Warn, outputlogfile);
@@ -206,16 +179,11 @@ pub async fn main() {
 
             check_threads(*threads);
 
-            // Read input
             let input_files = get_input_list(file_list, seq_files);
-            // let input_files = get_input_list(file_list);
             let quality = QualOpts {
                 min_count: *min_count,
                 min_qual: *min_qual,
             };
-
-            // Build, merge
-            // let rc = !*single_strand;
 
             log::info!("Checking requested threads and creating pool if needed");
             rayon::ThreadPoolBuilder::new()
@@ -233,7 +201,7 @@ pub async fn main() {
 
             let mut preprocessed_data: HashMap<
                 u64,
-                RefCell<HashInfoSimple>,
+                HashInfoSimple,
                 BuildHasherDefault<NoHashHasher<u64>>,
             >;
             let theseq: Vec<u64>;
@@ -279,7 +247,7 @@ pub async fn main() {
                         *gpu,
                     ).await;
                 drop(theseq);
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -290,9 +258,7 @@ pub async fn main() {
                     false,
                 );
 
-                // Save as fasta
                 save_functions::save_as_fasta::<u64>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
             } else if *k <= 64 {
                 log::info!("k={}: using 128-bit representation", *k);
                 let thedict: HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>;
@@ -310,7 +276,7 @@ pub async fn main() {
                     ).await;
                 drop(theseq);
 
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -321,9 +287,7 @@ pub async fn main() {
                     false,
                 );
 
-                // Save as fasta
                 save_functions::save_as_fasta::<u128>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
             } else if *k <= 128 {
                 log::info!("k={}: using 256-bit representation", *k);
 
@@ -342,7 +306,7 @@ pub async fn main() {
                     ).await;
                 drop(theseq);
 
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -353,9 +317,7 @@ pub async fn main() {
                     false,
                 );
 
-                // Save as fasta
                 save_functions::save_as_fasta::<U256>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
             } else if *k <= 256 {
                 log::info!("k={}: using 512-bit representation", *k);
 
@@ -374,7 +336,7 @@ pub async fn main() {
                     ).await;
                 drop(theseq);
 
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -385,9 +347,7 @@ pub async fn main() {
                     false,
                 );
 
-                // Save as fasta
                 save_functions::save_as_fasta::<U512>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
             } else {
                 panic!("kmer length larger than 256 currently not supported.");
             }
@@ -459,7 +419,7 @@ pub struct AssemblyHelper {
     use_gpu: bool,
     gpu_power_pref: u32,
     preprocessed_data:
-        Option<HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>>,
+        Option<HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>>,
     maxmindict: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict64: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict128: Option<HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>>,
@@ -494,8 +454,6 @@ impl AssemblyHelper {
         if cfg!(debug_assertions) {
             init_panic_hook();
         }
-
-        // TODO: improve verbose with the creation of a logging class and object that carries the verbose level and affects the logw functions, or something similar.
 
         logw("Beginning processing", Some("info"));
         post_state("initialised");
@@ -535,7 +493,6 @@ impl AssemblyHelper {
         let mut wf1 = WebSysFile::new(file1);
         let mut wf2 = WebSysFile::new(file2);
 
-        // Read input
         let quality = QualOpts {
             min_count: self.min_count,
             min_qual: self.min_qual,
@@ -545,7 +502,7 @@ impl AssemblyHelper {
 
         let preprocessed_data: HashMap<
             u64,
-            RefCell<HashInfoSimple>,
+            HashInfoSimple,
             BuildHasherDefault<NoHashHasher<u64>>,
         >;
         let maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
@@ -682,7 +639,7 @@ impl AssemblyHelper {
     pub fn assemble(&mut self) {
         logw("Starting assembly...", Some("info"));
         let (mut outcontigs, outdot, outgfa, outgfav2) =
-            graph_works::BasicAsm::assemble_wasm::<PtGraph>(
+            graph_works::BasicAsm::assemble_wasm(
                 self.k,
                 self.preprocessed_data.as_mut().unwrap(),
                 self.maxmindict.as_mut().unwrap(),

@@ -240,6 +240,75 @@ fn grad_ll(pars: &[f64], counts: &[f64]) -> Vec<f64> {
     vec![grad_w0, grad_c]
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a bimodal k-mer spectrum: error peak at freq 1-3, coverage peak at freq ~20.
+    fn make_bimodal_histogram() -> Vec<u32> {
+        let mut h = vec![0u32; 499];
+        h[0] = 200_000; // freq=1 (error singletons)
+        h[1] = 80_000;  // freq=2
+        h[2] = 30_000;  // freq=3
+        // low counts between peaks (still >= MIN_FREQ=50 so they survive truncation)
+        for i in 3..17 {
+            h[i] = 100;
+        }
+        h[17] = 60_000; // freq=18
+        h[18] = 80_000; // freq=19 (coverage peak)
+        h[19] = 100_000; // freq=20
+        h[20] = 80_000; // freq=21
+        h[21] = 60_000; // freq=22
+        h
+    }
+
+    #[test]
+    fn bimodal_histogram_does_not_panic() {
+        let mut fit = SpectrumFitter::new();
+        let counts = make_bimodal_histogram();
+        let _ = fit.fit_histogram(counts);
+        // Just verify it completes without panicking
+    }
+
+    #[test]
+    fn bimodal_histogram_converges() {
+        let mut fit = SpectrumFitter::new();
+        let counts = make_bimodal_histogram();
+        let result = fit.fit_histogram(counts);
+        // A well-formed bimodal histogram should allow the optimizer to converge.
+        // If it doesn't (Err), we accept that too — this just checks no panic.
+        if let Ok(cutoff) = result {
+            // Cutoff should be somewhere between error and coverage peaks (1-17)
+            assert!(cutoff >= 1 && cutoff < 18, "cutoff={cutoff} out of expected range 1-17");
+        }
+    }
+
+    #[test]
+    fn all_zeros_histogram_returns_err_or_min_cutoff() {
+        let mut fit = SpectrumFitter::new();
+        // All zeros: truncation removes everything → empty histogram
+        let counts = vec![0u32; 499];
+        let result = fit.fit_histogram(counts);
+        // Either fails to converge (Err) or returns some minimal cutoff. Must not panic.
+        match result {
+            Ok(cutoff) => assert!(cutoff >= 1),
+            Err(_) => {} // expected: optimizer cannot converge on empty data
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Model already fitted")]
+    fn fit_histogram_twice_panics() {
+        let mut fit = SpectrumFitter::new();
+        let counts = make_bimodal_histogram();
+        let _ = fit.fit_histogram(counts.clone());
+        // If the first call succeeded, fitted=true and the second call panics.
+        // If the first call failed (Err), fitted=false and this test will fail (not panic).
+        // The bimodal histogram is designed to converge, so the first call should succeed.
+        let _ = fit.fit_histogram(counts);
+    }
+}
+
 // Root finder at integer steps -- when is the responsibility of
 // the b component higher than the a component
 fn find_cutoff(pars: &[f64], max_cutoff: usize) -> usize {

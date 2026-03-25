@@ -6,7 +6,7 @@ use core::panic;
 use std::{path::PathBuf, time::Instant};
 
 use nohash_hasher::NoHashHasher;
-use std::{cell::*, cmp::Ordering, collections::HashMap, hash::BuildHasherDefault};
+use std::{cmp::Ordering, collections::HashMap, hash::BuildHasherDefault};
 
 use rayon::prelude::*;
 
@@ -98,7 +98,7 @@ fn build_histogram_from_countmap(
 
 fn drain_countmap_into_themap<IntT>(
     countmap: &mut HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
-    themap: &mut HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    themap: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     outdict: &mut HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     minmaxdict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
     minc: u16,
@@ -109,13 +109,13 @@ fn drain_countmap_into_themap<IntT>(
     countmap.retain(|h, tup| {
         if tup.0 >= minc {
             themap.entry(*h).or_insert_with(|| {
-                RefCell::new(HashInfoSimple {
+                HashInfoSimple {
                     hnc: tup.1,
                     b: tup.2,
                     pre: Vec::new(),
                     post: Vec::new(),
                     counts: tup.0,
-                })
+                }
             });
         } else {
             outdict.remove(h);
@@ -248,43 +248,77 @@ fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
 //     }
 // }
 
+/// Read all FASTQ records from `files` into contiguous packed ASCII buffers suitable
+/// for the GPU extraction pipeline.  Returns (seq_data, qual_data, read_offsets, read_lengths).
 #[cfg(not(feature = "wasm"))]
-fn bulk_preprocessing_standalone<IntT>(
+fn collect_raw_reads_for_gpu(
     files: &[String],
-    k: usize,
-    qual: &QualOpts,
-    buckets: &mut [Vec<(u64, u64, u8)>; crate::gpu_filter::BUCKET_COUNT],
-) -> (
-    Vec<u64>,
-    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-)
-where
-    IntT: for<'a> UInt<'a>,
-{
-    let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
+) -> (Vec<u8>, Vec<u8>, Vec<u32>, Vec<u32>) {
+    let mut seq_data:     Vec<u8> = Vec::new();
+    let mut qual_data:    Vec<u8> = Vec::new();
+    let mut read_offsets: Vec<u32> = Vec::new();
+    let mut read_lengths: Vec<u32> = Vec::new();
 
-    let theseq: Vec<u64> = Vec::new();
-
-    extract_kmers_from_files(files, |seq, num_bases, qual_bytes| {
-        let kmer_opt = Kmer::<IntT>::new(seq, num_bases, qual_bytes, k, qual.min_qual, true);
-        if let Some(mut kmer_it) = kmer_opt {
-            let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer();
-            let bucket = ((hc >> 58) & 63) as usize;
-            buckets[bucket].push((hc, hnc, b));
-            outdict.entry(hc).or_insert(km);
-            minmaxdict.entry(hnc).or_insert(hc);
-            while let Some((hc, hnc, b, km)) = kmer_it.get_next_kmer_and_give_us_things() {
-                let bucket = ((hc >> 58) & 63) as usize;
-                buckets[bucket].push((hc, hnc, b));
-                outdict.entry(hc).or_insert(km);
-                minmaxdict.entry(hnc).or_insert(hc);
+    for file in files {
+        let mut reader = parse_fastx_file(file)
+            .unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+        while let Some(record) = reader.next() {
+            let seqrec = record.expect("Invalid FASTQ record");
+            let seq = seqrec.seq();
+            let len = seq.len() as u32;
+            if len == 0 { continue; }
+            read_offsets.push(seq_data.len() as u32);
+            read_lengths.push(len);
+            seq_data.extend_from_slice(&seq);
+            if let Some(q) = seqrec.qual() {
+                qual_data.extend_from_slice(q);
+            } else {
+                qual_data.extend(std::iter::repeat_n(b'~', len as usize));
             }
         }
-    });
+    }
+    (seq_data, qual_data, read_offsets, read_lengths)
+}
 
-    (theseq, outdict, minmaxdict)
+/// Read all FASTQ records from `file1` and `file2` into contiguous packed ASCII buffers
+/// suitable for the GPU extraction pipeline (WASM version using seq_io readers).
+/// Returns (seq_data, qual_data, read_offsets, read_lengths).
+#[cfg(feature = "wasm")]
+fn collect_raw_reads_for_gpu_wasm(
+    file1: &mut WebSysFile,
+    file2: &mut WebSysFile,
+) -> (Vec<u8>, Vec<u8>, Vec<u32>, Vec<u32>) {
+    let mut seq_data:     Vec<u8>  = Vec::new();
+    let mut qual_data:    Vec<u8>  = Vec::new();
+    let mut read_offsets: Vec<u32> = Vec::new();
+    let mut read_lengths: Vec<u32> = Vec::new();
+
+    let mut reader = open_fastq(file1);
+    while let Some(record) = reader.next() {
+        let seqrec = record.expect("Invalid FASTQ record");
+        let seq = seqrec.seq();
+        let len = seq.len() as u32;
+        if len == 0 { continue; }
+        read_offsets.push(seq_data.len() as u32);
+        read_lengths.push(len);
+        seq_data.extend_from_slice(seq);
+        qual_data.extend_from_slice(seqrec.qual());
+    }
+    drop(reader);
+
+    let mut reader = open_fastq(file2);
+    while let Some(record) = reader.next() {
+        let seqrec = record.expect("Invalid FASTQ record");
+        let seq = seqrec.seq();
+        let len = seq.len() as u32;
+        if len == 0 { continue; }
+        read_offsets.push(seq_data.len() as u32);
+        read_lengths.push(len);
+        seq_data.extend_from_slice(seq);
+        qual_data.extend_from_slice(seqrec.qual());
+    }
+
+    (seq_data, qual_data, read_offsets, read_lengths)
 }
 
 /// CPU bulk extraction: pushes all kmer occurrences into a flat `outvec` for CPU sort+count.
@@ -446,7 +480,7 @@ fn chunked_processing_wasm<IntT>(
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     Vec<u32>,
     u16,
 )
@@ -644,7 +678,7 @@ fn bloom_filter_preprocessing_wasm<IntT>(
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     Vec<u32>,
     u16,
 )
@@ -681,15 +715,14 @@ where
             true,
         );
         if let Some(mut kmer_it) = kmer_opt {
-            let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer(); // TODO: potential really small improvement, get only hash for the bloom filter, then get the rest.
+            let (hc, hnc, b) = kmer_it.get_curr_hash_and_bases();
             if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                outdict.entry(hc).or_insert(km);
+                outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
                 minmaxdict.entry(hnc).or_insert(hc);
             }
-            while let Some(tmptuple) = kmer_it.get_next_kmer_and_give_us_things() {
-                let (hc, hnc, b, km) = tmptuple;
+            while let Some((hc, hnc, b)) = kmer_it.get_next_hash_and_bases() {
                 if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                    outdict.entry(hc).or_insert(km);
+                    outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
                     minmaxdict.entry(hnc).or_insert(hc);
                 }
             }
@@ -722,15 +755,14 @@ where
             true,
         );
         if let Some(mut kmer_it) = kmer_opt {
-            let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer();
+            let (hc, hnc, b) = kmer_it.get_curr_hash_and_bases();
             if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                outdict.entry(hc).or_insert(km);
+                outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
                 minmaxdict.entry(hnc).or_insert(hc);
             }
-            while let Some(tmptuple) = kmer_it.get_next_kmer_and_give_us_things() {
-                let (hc, hnc, b, km) = tmptuple;
+            while let Some((hc, hnc, b)) = kmer_it.get_next_hash_and_bases() {
                 if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                    outdict.entry(hc).or_insert(km);
+                    outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
                     minmaxdict.entry(hnc).or_insert(hc);
                 }
             }
@@ -795,7 +827,7 @@ fn bloom_filter_preprocessing_standalone<IntT>(
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
 )
 where
     IntT: for<'a> UInt<'a>,
@@ -815,14 +847,14 @@ where
     extract_kmers_from_files(files, |seq, num_bases, qual_bytes| {
         let kmer_opt = Kmer::<IntT>::new(seq, num_bases, qual_bytes, k, qual.min_qual, true);
         if let Some(mut kmer_it) = kmer_opt {
-            let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer(); // TODO: potential really small improvement, get only hash for the bloom filter, then get the rest.
+            let (hc, hnc, b) = kmer_it.get_curr_hash_and_bases();
             if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                outdict.entry(hc).or_insert(km);
+                outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
                 minmaxdict.entry(hnc).or_insert(hc);
             }
-            while let Some((hc, hnc, b, km)) = kmer_it.get_next_kmer_and_give_us_things() {
+            while let Some((hc, hnc, b)) = kmer_it.get_next_hash_and_bases() {
                 if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                    outdict.entry(hc).or_insert(km);
+                    outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
                     minmaxdict.entry(hnc).or_insert(hc);
                 }
             }
@@ -868,7 +900,7 @@ fn get_map_with_counts(
     invec: &[(u64, u64, u8)],
     min_count: u16,
     out_path: &mut Option<PathBuf>,
-) -> HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>> {
+) -> HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> {
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
 
     let mut i = 0;
@@ -888,13 +920,13 @@ fn get_map_with_counts(
                     // tmpcounter += 1;
                     outdict
                         .entry(tmphash)
-                        .or_insert(RefCell::new(HashInfoSimple {
+                        .or_insert(HashInfoSimple {
                             hnc: invec[i - 1].1,
                             b: invec[i - 1].2,
                             pre: Vec::new(),
                             post: Vec::new(),
                             counts: c,
-                        }));
+                        });
                 } else {
                     plotvec.push(c);
                 }
@@ -910,13 +942,13 @@ fn get_map_with_counts(
             // tmpcounter += 1;
             outdict
                 .entry(tmphash)
-                .or_insert(RefCell::new(HashInfoSimple {
+                .or_insert(HashInfoSimple {
                     hnc: invec[i - 1].1,
                     b: invec[i - 1].2,
                     pre: Vec::new(),
                     post: Vec::new(),
                     counts: c,
-                }));
+                });
         } else {
             plotvec.push(c);
         }
@@ -961,7 +993,7 @@ fn get_map_with_counts(
                         plotvec
                             .iter()
                             .map(|x: &u16| (*x as u32, 1))
-                            .chain(outdict.values().map(|x| (x.borrow().counts as u32, 1))),
+                            .chain(outdict.values().map(|x| (x.counts as u32, 1))),
                     ),
             )
             .unwrap();
@@ -980,13 +1012,13 @@ fn get_map_with_counts(
                     // tmpcounter += 1;
                     outdict
                         .entry(tmphash)
-                        .or_insert(RefCell::new(HashInfoSimple {
+                        .or_insert(HashInfoSimple {
                             hnc: invec[i - 1].1,
                             b: invec[i - 1].2,
                             pre: Vec::new(),
                             post: Vec::new(),
                             counts: c,
-                        }));
+                        });
                 }
                 tmphash = invec[i].0;
                 c = 1;
@@ -1000,13 +1032,13 @@ fn get_map_with_counts(
             // tmpcounter += 1;
             outdict
                 .entry(tmphash)
-                .or_insert(RefCell::new(HashInfoSimple {
+                .or_insert(HashInfoSimple {
                     hnc: invec[i - 1].1,
                     b: invec[i - 1].2,
                     pre: Vec::new(),
                     post: Vec::new(),
                     counts: c,
-                }));
+                });
         }
     }
     outdict
@@ -1016,7 +1048,7 @@ fn get_map_with_counts(
 fn get_map_with_counts_and_fit(
     invec: &mut Vec<(u64, u64, u8)>,
     out_path: &mut Option<PathBuf>,
-) -> HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>> {
+) -> HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> {
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
 
     let mut i = 0;
@@ -1034,13 +1066,13 @@ fn get_map_with_counts_and_fit(
             // tmpcounter += 1;
             outdict
                 .entry(tmphash)
-                .or_insert(RefCell::new(HashInfoSimple {
+                .or_insert(HashInfoSimple {
                     hnc: invec[i - 1].1,
                     b: invec[i - 1].2,
                     pre: Vec::new(),
                     post: Vec::new(),
                     counts: c,
-                }));
+                });
 
             if c as usize > MAXSIZEHISTO {
                 plotvec[MAXSIZEHISTO - 1] = plotvec[MAXSIZEHISTO - 1].saturating_add(1);
@@ -1059,13 +1091,13 @@ fn get_map_with_counts_and_fit(
     // tmpcounter += 1;
     outdict
         .entry(tmphash)
-        .or_insert(RefCell::new(HashInfoSimple {
+        .or_insert(HashInfoSimple {
             hnc: invec[i - 1].1,
             b: invec[i - 1].2,
             pre: Vec::new(),
             post: Vec::new(),
             counts: c,
-        }));
+        });
 
     if c as usize > MAXSIZEHISTO {
         plotvec[MAXSIZEHISTO - 1] = plotvec[MAXSIZEHISTO - 1].saturating_add(1);
@@ -1109,7 +1141,7 @@ fn get_map_with_counts_and_fit(
         fitted_min_count
     );
 
-    outdict.retain(|_, rc| rc.borrow().counts >= fitted_min_count);
+    outdict.retain(|_, hi| hi.counts >= fitted_min_count);
     outdict.shrink_to_fit();
 
     if let Some(p) = out_path {
@@ -1128,7 +1160,7 @@ fn get_map_wasm(
     min_count: u16,
     do_fit: bool,
 ) -> (
-    HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     Vec<u32>,
     u16,
 ) {
@@ -1149,13 +1181,13 @@ fn get_map_wasm(
                 // tmpcounter += 1;
                 outdict
                     .entry(tmphash)
-                    .or_insert(RefCell::new(HashInfoSimple {
+                    .or_insert(HashInfoSimple {
                         hnc: invec[i - 1].1,
                         b: invec[i - 1].2,
                         pre: Vec::new(),
                         post: Vec::new(),
                         counts: c,
-                    }));
+                    });
 
                 if c as usize > MAXSIZEHISTO {
                     plotvec[MAXSIZEHISTO - 1] = plotvec[MAXSIZEHISTO - 1].saturating_add(1);
@@ -1174,13 +1206,13 @@ fn get_map_wasm(
         // tmpcounter += 1;
         outdict
             .entry(tmphash)
-            .or_insert(RefCell::new(HashInfoSimple {
+            .or_insert(HashInfoSimple {
                 hnc: invec[i - 1].1,
                 b: invec[i - 1].2,
                 pre: Vec::new(),
                 post: Vec::new(),
                 counts: c,
-            }));
+            });
 
         if c as usize > MAXSIZEHISTO {
             plotvec[MAXSIZEHISTO - 1] = plotvec[MAXSIZEHISTO - 1].saturating_add(1);
@@ -1222,7 +1254,7 @@ fn get_map_wasm(
         );
 
         post_state("preprocess:bulk:filtering");
-        outdict.retain(|_, rc| rc.borrow().counts >= minc);
+        outdict.retain(|_, hi| hi.counts >= minc);
         outdict.shrink_to_fit();
     } else {
         post_state("preprocess:bulk:filtering");
@@ -1232,13 +1264,13 @@ fn get_map_wasm(
                     // tmpcounter += 1;
                     outdict
                         .entry(tmphash)
-                        .or_insert(RefCell::new(HashInfoSimple {
+                        .or_insert(HashInfoSimple {
                             hnc: invec[i - 1].1,
                             b: invec[i - 1].2,
                             pre: Vec::new(),
                             post: Vec::new(),
                             counts: c,
-                        }));
+                        });
                 }
 
                 if c as usize > MAXSIZEHISTO {
@@ -1259,13 +1291,13 @@ fn get_map_wasm(
             // tmpcounter += 1;
             outdict
                 .entry(tmphash)
-                .or_insert(RefCell::new(HashInfoSimple {
+                .or_insert(HashInfoSimple {
                     hnc: invec[i - 1].1,
                     b: invec[i - 1].2,
                     pre: Vec::new(),
                     post: Vec::new(),
                     counts: c,
-                }));
+                });
         }
 
         if c as usize > MAXSIZEHISTO {
@@ -1320,7 +1352,7 @@ fn chunked_preprocessing_standalone<IntT>(
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
 )
 where
     IntT: for<'a> UInt<'a>,
@@ -1435,7 +1467,7 @@ pub async fn preprocessing_standalone<IntT>(
     do_fit: bool,
     use_gpu: bool,
 ) -> (
-    HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     Vec<u64>,
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -1469,19 +1501,16 @@ where
         let maxmindict;
 
         if use_gpu {
-            // Fill partitioned buckets (top 6 bits of canonical hash → 64 buckets)
-            log::info!("Using GPU radix sort + count + filter");
-            let mut buckets: [Vec<(u64, u64, u8)>; crate::gpu_filter::BUCKET_COUNT] =
-                std::array::from_fn(|_| Vec::new());
-            let (tseq, tdict, mmdict) =
-                bulk_preprocessing_standalone::<IntT>(&all_files, k, qual, &mut buckets);
-            theseq = tseq;
-            thedict = tdict;
-            maxmindict = mmdict;
+            // GPU k-mer extraction path: upload raw sequences, extract+count+filter on GPU,
+            // then do a single CPU pass to build outdict/maxmindict for surviving k-mers.
+            log::info!("Using GPU k-mer extraction + count + filter");
+
+            let (seq_data, qual_data, gpu_read_offsets, gpu_read_lengths) =
+                collect_raw_reads_for_gpu(&all_files);
 
             timevec.push(Instant::now());
             log::info!(
-                "k-mers extracted in {} s",
+                "Reads collected for GPU in {} s",
                 timevec
                     .last()
                     .unwrap()
@@ -1489,25 +1518,78 @@ where
                     .as_secs()
             );
 
-            themap = gpu_filter::gpu_sort_count_filter(
-                &buckets, qual.min_count, do_fit, out_path,
+            let gpu_themap = gpu_filter::gpu_extract_count_filter(
+                &seq_data,
+                &qual_data,
+                &gpu_read_offsets,
+                &gpu_read_lengths,
+                k as u32,
+                // CPU accepts (raw - 33) > min_qual_phred, i.e. raw >= phred + 34.
+                // GPU shader rejects raw < params.min_qual, so pass phred + 34.
+                qual.min_qual as u32 + 34,
+                qual.min_count,
                 wgpu::PowerPreference::HighPerformance,
             ).await;
-            drop(buckets);
+            drop(seq_data);
+            drop(qual_data);
 
             timevec.push(Instant::now());
             log::info!(
-                "GPU sort+count+filter done in {} s",
+                "GPU extraction+count+filter done in {} s",
                 timevec
                     .last()
                     .unwrap()
                     .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                     .as_secs()
             );
+
+            // Second CPU pass: build outdict + maxmindict only for k-mers that survived.
+            let mut od: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>> =
+                HashMap::with_hasher(BuildHasherDefault::default());
+            let mut mmd: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> =
+                HashMap::with_hasher(BuildHasherDefault::default());
+            extract_kmers_from_files(&all_files, |seq, num_bases, qual_bytes| {
+                let kmer_opt =
+                    Kmer::<IntT>::new(seq, num_bases, qual_bytes, k, qual.min_qual, true);
+                if let Some(mut kmer_it) = kmer_opt {
+                    let (hc, hnc, _b, km) =
+                        kmer_it.get_curr_kmerhash_and_bases_and_kmer();
+                    if gpu_themap.contains_key(&hc) {
+                        od.entry(hc).or_insert(km);
+                        mmd.entry(hnc).or_insert(hc);
+                    }
+                    while let Some((hc, hnc, _b, km)) =
+                        kmer_it.get_next_kmer_and_give_us_things()
+                    {
+                        if gpu_themap.contains_key(&hc) {
+                            od.entry(hc).or_insert(km);
+                            mmd.entry(hnc).or_insert(hc);
+                        }
+                    }
+                }
+            });
+
+            timevec.push(Instant::now());
+            log::info!(
+                "outdict+maxmindict built in {} s",
+                timevec
+                    .last()
+                    .unwrap()
+                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                    .as_secs()
+            );
+
+            themap = gpu_themap;
+            theseq = Vec::new();
+            thedict = od;
+            maxmindict = mmd;
         } else {
             // CPU path: flat vec → par_sort → count+filter
             log::info!("Using CPU sort + count + filter");
-            let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
+            let estimated_kmers = all_files.iter()
+                .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
+                .sum::<u64>() as usize / 5;
+            let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers);
             let (tseq, tdict, mmdict) =
                 bulk_preprocessing_standalone_cpu::<IntT>(&all_files, k, qual, &mut tmpvec);
             theseq = tseq;
@@ -1561,7 +1643,10 @@ where
     } else {
         log::info!("Processing in chunks of size {}", csize);
 
-        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
+        let estimated_kmers = all_files.iter()
+            .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
+            .sum::<u64>() as usize / 5;
+        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers);
         let (thedict, maxmindict, themap) = chunked_preprocessing_standalone::<IntT>(
             &all_files,
             k,
@@ -1586,6 +1671,152 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nohash_hasher::NoHashHasher;
+    use std::{collections::HashMap, hash::BuildHasherDefault};
+
+    fn empty_countmap() -> HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
+        HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    fn empty_themap(
+    ) -> HashMap<u64, crate::HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> {
+        HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    fn empty_dict() -> HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> {
+        HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    #[test]
+    fn update_countmap_single_entry() {
+        let input = vec![(100u64, 200u64, 1u8)];
+        let mut cmap = empty_countmap();
+        update_countmap(&input, &mut cmap);
+        assert_eq!(cmap[&100].0, 1);
+        assert_eq!(cmap[&100].1, 200u64);
+        assert_eq!(cmap[&100].2, 1u8);
+    }
+
+    #[test]
+    fn update_countmap_two_same_hash() {
+        let input = vec![(100u64, 200u64, 1u8), (100u64, 200u64, 1u8)];
+        let mut cmap = empty_countmap();
+        update_countmap(&input, &mut cmap);
+        assert_eq!(cmap[&100].0, 2);
+    }
+
+    #[test]
+    fn update_countmap_two_different_hashes() {
+        let input = vec![(100u64, 200u64, 1u8), (200u64, 100u64, 2u8)];
+        let mut cmap = empty_countmap();
+        update_countmap(&input, &mut cmap);
+        assert_eq!(cmap[&100].0, 1);
+        assert_eq!(cmap[&200].0, 1);
+    }
+
+    #[test]
+    fn update_countmap_accumulates_across_calls() {
+        // Two calls: first adds 2, second adds 1 → total 3
+        let input1 = vec![(42u64, 0u64, 0u8), (42u64, 0u64, 0u8)];
+        let input2 = vec![(42u64, 0u64, 0u8)];
+        let mut cmap = empty_countmap();
+        update_countmap(&input1, &mut cmap);
+        update_countmap(&input2, &mut cmap);
+        assert_eq!(cmap[&42].0, 3);
+    }
+
+    #[test]
+    fn update_countmap_run_of_five() {
+        let input: Vec<_> = (0..5).map(|_| (7u64, 8u64, 0u8)).collect();
+        let mut cmap = empty_countmap();
+        update_countmap(&input, &mut cmap);
+        assert_eq!(cmap[&7].0, 5);
+    }
+
+    #[test]
+    fn drain_countmap_above_threshold_included() {
+        let mut cmap = empty_countmap();
+        cmap.insert(1u64, (5u16, 2u64, 0u8)); // count=5 >= minc=3 → in themap
+        let mut themap = empty_themap();
+        let mut outdict = empty_dict();
+        let mut minmaxdict = empty_dict();
+        drain_countmap_into_themap::<u64>(
+            &mut cmap,
+            &mut themap,
+            &mut outdict,
+            &mut minmaxdict,
+            3,
+            None,
+        );
+        assert!(themap.contains_key(&1));
+    }
+
+    #[test]
+    fn drain_countmap_below_threshold_excluded() {
+        let mut cmap = empty_countmap();
+        cmap.insert(2u64, (2u16, 3u64, 0u8)); // count=2 < minc=3 → removed from outdict
+        let mut themap = empty_themap();
+        let mut outdict = empty_dict();
+        outdict.insert(2u64, 99u64); // should be removed
+        let mut minmaxdict = empty_dict();
+        minmaxdict.insert(3u64, 2u64); // hnc → hc, should be removed
+        drain_countmap_into_themap::<u64>(
+            &mut cmap,
+            &mut themap,
+            &mut outdict,
+            &mut minmaxdict,
+            3,
+            None,
+        );
+        assert!(!themap.contains_key(&2));
+        assert!(!outdict.contains_key(&2));
+        assert!(!minmaxdict.contains_key(&3));
+    }
+
+    #[test]
+    fn drain_countmap_boundary_equal_minc() {
+        // count == minc → included (>= check)
+        let mut cmap = empty_countmap();
+        cmap.insert(5u64, (3u16, 0u64, 0u8));
+        let mut themap = empty_themap();
+        let mut outdict = empty_dict();
+        let mut minmaxdict = empty_dict();
+        drain_countmap_into_themap::<u64>(
+            &mut cmap,
+            &mut themap,
+            &mut outdict,
+            &mut minmaxdict,
+            3,
+            None,
+        );
+        assert!(themap.contains_key(&5));
+    }
+
+    #[test]
+    fn drain_countmap_with_histogram() {
+        let mut cmap = empty_countmap();
+        cmap.insert(1u64, (5u16, 0u64, 0u8)); // count=5 → histovec[4]
+        cmap.insert(2u64, (10u16, 0u64, 0u8)); // count=10 → histovec[9]
+        let mut themap = empty_themap();
+        let mut outdict = empty_dict();
+        let mut minmaxdict = empty_dict();
+        let mut histovec = vec![0u32; MAXSIZEHISTO];
+        drain_countmap_into_themap::<u64>(
+            &mut cmap,
+            &mut themap,
+            &mut outdict,
+            &mut minmaxdict,
+            1,
+            Some(&mut histovec),
+        );
+        assert!(histovec[4] > 0, "count=5 should be at histovec[4]");
+        assert!(histovec[9] > 0, "count=10 should be at histovec[9]");
+    }
+}
+
 #[cfg(feature = "wasm")]
 /// Main preprocessing function for wasm
 pub async fn preprocessing_wasm<IntT>(
@@ -1599,7 +1830,7 @@ pub async fn preprocessing_wasm<IntT>(
     use_gpu: bool,
     gpu_power_pref: u32,
 ) -> (
-    HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     Option<HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
     Vec<u32>,
@@ -1617,9 +1848,106 @@ where
         (themap, Some(thedict), maxmindict, histovec, used_min_count)
     } else if csize == 0 {
         post_state("preprocess:bulk:start");
-        // Build indexes
         logw("Starting preprocessing with k = {k}", Some("info"));
 
+        if use_gpu {
+            // GPU k-mer extraction path: upload raw sequences, extract+count+filter on GPU,
+            // then do a second CPU pass to build outdict/maxmindict for surviving k-mers only.
+            logw("Using GPU k-mer extraction + count + filter", Some("info"));
+            post_state("preprocess:bulk:gpu:collect");
+
+            let (seq_data, qual_data, gpu_read_offsets, gpu_read_lengths) =
+                collect_raw_reads_for_gpu_wasm(file1, file2);
+
+            let pref = match gpu_power_pref {
+                1 => wgpu::PowerPreference::HighPerformance,
+                2 => wgpu::PowerPreference::LowPower,
+                _ => wgpu::PowerPreference::None,
+            };
+
+            post_state("preprocess:bulk:gpu:extract");
+            let gpu_themap = crate::gpu_filter::gpu_extract_count_filter(
+                &seq_data,
+                &qual_data,
+                &gpu_read_offsets,
+                &gpu_read_lengths,
+                k as u32,
+                // CPU accepts (raw - 33) > min_qual_phred, i.e. raw >= phred + 34.
+                // GPU shader rejects raw < params.min_qual, so pass phred + 34.
+                qual.min_qual as u32 + 34,
+                qual.min_count,
+                pref,
+            ).await;
+            drop(seq_data);
+            drop(qual_data);
+
+            // Second CPU pass: build outdict + maxmindict only for surviving k-mers.
+            post_state("preprocess:bulk:gpu:second_pass");
+            let mut od: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>> =
+                HashMap::with_hasher(BuildHasherDefault::default());
+            let mut mmd: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> =
+                HashMap::with_hasher(BuildHasherDefault::default());
+
+            let mut reader = open_fastq(file1);
+            while let Some(record) = reader.next() {
+                let seqrec = record.expect("Invalid FASTQ record");
+                let rl = seqrec.seq().len();
+                let kmer_opt = Kmer::<IntT>::new(
+                    std::borrow::Cow::Borrowed(seqrec.seq()),
+                    rl,
+                    Some(seqrec.qual()),
+                    k,
+                    qual.min_qual,
+                    true,
+                );
+                if let Some(mut kmer_it) = kmer_opt {
+                    let (hc, hnc, _b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer();
+                    if gpu_themap.contains_key(&hc) {
+                        od.entry(hc).or_insert(km);
+                        mmd.entry(hnc).or_insert(hc);
+                    }
+                    while let Some((hc, hnc, _b, km)) = kmer_it.get_next_kmer_and_give_us_things() {
+                        if gpu_themap.contains_key(&hc) {
+                            od.entry(hc).or_insert(km);
+                            mmd.entry(hnc).or_insert(hc);
+                        }
+                    }
+                }
+            }
+            drop(reader);
+
+            let mut reader = open_fastq(file2);
+            while let Some(record) = reader.next() {
+                let seqrec = record.expect("Invalid FASTQ record");
+                let rl = seqrec.seq().len();
+                let kmer_opt = Kmer::<IntT>::new(
+                    std::borrow::Cow::Borrowed(seqrec.seq()),
+                    rl,
+                    Some(seqrec.qual()),
+                    k,
+                    qual.min_qual,
+                    true,
+                );
+                if let Some(mut kmer_it) = kmer_opt {
+                    let (hc, hnc, _b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer();
+                    if gpu_themap.contains_key(&hc) {
+                        od.entry(hc).or_insert(km);
+                        mmd.entry(hnc).or_insert(hc);
+                    }
+                    while let Some((hc, hnc, _b, km)) = kmer_it.get_next_kmer_and_give_us_things() {
+                        if gpu_themap.contains_key(&hc) {
+                            od.entry(hc).or_insert(km);
+                            mmd.entry(hnc).or_insert(hc);
+                        }
+                    }
+                }
+            }
+
+            post_state("preprocess:bulk:gpu:done");
+            return (gpu_themap, Some(od), mmd, Vec::new(), qual.min_count);
+        }
+
+        // CPU path: flat vec → par_sort → count+filter
         // First, we want to fill our mega-vector with all k-mers from both paired-end reads
         logw("Filling vector", Some("info"));
 
@@ -1628,56 +1956,6 @@ where
             get_kmers_from_both_files_wasm::<IntT>(file1, file2, k, qual, &mut tmpvec);
 
         logw("k-mers extracted", Some("info"));
-
-        if use_gpu {
-            // Partition flat tmpvec into 64 buckets by top-6 bits of canonical hash
-            let mut buckets: [Vec<(u64, u64, u8)>; crate::gpu_filter::BUCKET_COUNT] =
-                std::array::from_fn(|_| Vec::new());
-            for &(hc, hnc, b) in &tmpvec {
-                buckets[((hc >> 58) & 63) as usize].push((hc, hnc, b));
-            }
-            drop(tmpvec);
-
-            let pref = match gpu_power_pref {
-                1 => wgpu::PowerPreference::HighPerformance,
-                2 => wgpu::PowerPreference::LowPower,
-                _ => wgpu::PowerPreference::None,   // includes idx=0 (default/None)
-            };
-
-            let mut no_path: Option<std::path::PathBuf> = None;
-            let mut themap = crate::gpu_filter::gpu_sort_count_filter(
-                &buckets, qual.min_count, do_fit, &mut no_path, pref,
-            ).await;
-
-            // Build histovec and optionally re-fit min_count from the GPU-filtered output
-            let (histovec, used_min_count) = if do_fit {
-                let mut hv: Vec<u32> = vec![0u32; MAXSIZEHISTO];
-                for e in themap.values() {
-                    let c = e.borrow().counts as usize;
-                    if c < MAXSIZEHISTO {
-                        hv[c] = hv[c].saturating_add(1);
-                    } else {
-                        hv[MAXSIZEHISTO - 1] = hv[MAXSIZEHISTO - 1].saturating_add(1);
-                    }
-                }
-                let mut fit = SpectrumFitter::new();
-                let result = fit.fit_histogram(hv[..(MAXSIZEHISTO - 1)].to_vec());
-                let minc = match result {
-                    Ok(theres) => {
-                        let v = theres as u16;
-                        if v == 0 || v <= 10 { 3u16 } else { v }
-                    }
-                    Err(_) => 3u16,
-                };
-                themap.retain(|_, rc| rc.borrow().counts >= minc);
-                themap.shrink_to_fit();
-                (hv, minc)
-            } else {
-                (Vec::new(), qual.min_count)
-            };
-
-            return (themap, Some(thedict), maxmindict, histovec, used_min_count);
-        }
 
         // Then, we want to sort it according to the hash
         // log::debug!("Number of kmers BEFORE cleaning: {:?}", tmpvec.len());

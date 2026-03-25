@@ -1,10 +1,8 @@
 use nohash_hasher::NoHashHasher;
-use std::{cell::*, collections::HashMap, hash::BuildHasherDefault};
+use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(feature = "wasm"))]
 use std::{io::Write, path::PathBuf, time::Instant};
-
-// use rayon::prelude::*;
 
 #[cfg(not(feature = "wasm"))]
 use super::io_utils::*;
@@ -12,19 +10,17 @@ use super::io_utils::*;
 #[cfg(not(feature = "wasm"))]
 use needletail::parser::write_fasta;
 
-// use std::process::exit;
-extern crate petgraph;
-use super::HashInfoSimple;
-
-use crate::algorithms::collapser::SerializedContigs;
-use crate::graphs::pt_graph::EdgeType;
-use crate::graphs::Graph;
+use crate::algorithms::collapser::Collapsable;
+use crate::algorithms::corrector::Correctable;
+use crate::algorithms::shrinker::Shrinkable;
 use crate::nthash;
 
 use crate::bit_encoding::rc_base;
 use crate::logw;
 #[cfg(feature = "wasm")]
 use crate::post_state;
+
+use sphk_graph::{DbgGraph, EdgeType, HashInfoSimple, SerializedContigs};
 
 /// Get backwards neighbours, i.e. incoming edges to either the canonical or non-canonical hashes
 pub fn check_bkg(
@@ -33,20 +29,13 @@ pub fn check_bkg(
     hnc: u64,
     k: usize,
     bases: u8,
-    thedict: &HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
 ) -> Vec<(u64, EdgeType)> {
     let mut outvec = Vec::new();
-    // Let's start first with the canonical one
     let thecbase = bases & 3;
     let thencbase = (bases >> 2) & 3;
     for i in 0..4 {
-        //ACTG, in that order
-        // let tmphashc = (nthash::swapbits033(hc ^ nthash::HASH_LOOKUP[thecbase as usize]
-        //                                        ^ (nthash::MS_TAB_31L[(i as usize * 31) + (k % 31)]
-        //                                         | nthash::MS_TAB_33R[(i as usize) * 33 + (k % 33)])
-        //                 )).rotate_right(1u32);
-
         let tmphashc = nthash::swapbits_18_31_42_51_58_63(
             (hc ^ nthash::HASH_LOOKUP[thecbase as usize]
                 ^ (nthash::MS_TAB_5LL[(i as usize * 5) + (k % 5)]
@@ -57,14 +46,6 @@ pub fn check_bkg(
                     | nthash::MS_TAB_19RR[(i as usize * 19) + (k % 19)]))
                 .rotate_right(1u32),
         );
-        // let tmphashc = (nthash::swapbits_0_19_32_43_52_59(hc ^ nthash::HASH_LOOKUP[thecbase as usize]
-        //                                        ^ (nthash::MS_TAB_5LL[( i as usize * 5)  + (k % 5)]
-        //                                         | nthash::MS_TAB_7L[(  i as usize * 7)  + (k % 7)]
-        //                                         | nthash::MS_TAB_9LC[( i as usize * 9)  + (k % 9)]
-        //                                         | nthash::MS_TAB_11CR[(i as usize * 11) + (k % 11)]
-        //                                         | nthash::MS_TAB_13R[( i as usize * 13) + (k % 13)]
-        //                                         | nthash::MS_TAB_19RR[(i as usize * 19) + (k % 19)])
-        // )).rotate_right(1u32);
 
         if thedict.contains_key(&tmphashc) {
             outvec.push((tmphashc, EdgeType::MinToMin));
@@ -75,12 +56,6 @@ pub fn check_bkg(
             }
         }
 
-        // let mut tmphashnc = hnc
-        //     ^ (nthash::MS_TAB_31L[(rc_base(i) as usize  * 31) + (k % 31)]
-        //     |  nthash::MS_TAB_33R[(rc_base(i) as usize) * 33  + (k % 33)]);
-        // tmphashnc ^= nthash::RC_HASH_LOOKUP[thencbase as usize];
-        // tmphashnc = tmphashnc.rotate_right(1_u32);
-        // tmphashnc = nthash::swapbits3263(tmphashnc);
         let mut tmphashnc = hnc
             ^ (nthash::MS_TAB_5LL[(rc_base(i) as usize * 5) + (k % 5)]
                 | nthash::MS_TAB_7L[(rc_base(i) as usize * 7) + (k % 7)]
@@ -107,26 +82,19 @@ pub fn check_bkg(
 
 /// Get forward neighbours, i.e. outgoing edges from either the canonical or non-canonical hashes
 pub fn check_fwd(
-    // Here FORWARD means OUTGOING
     hc: u64,
     hnc: u64,
     k: usize,
     bases: u8,
-    thedict: &HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+    thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
 ) -> Vec<(u64, EdgeType)> {
     let mut outvec = Vec::new();
 
-    // Let's start first with the canonical one
     let thecbase = (bases >> 2) & 3;
     let thencbase = bases & 3;
     for i in 0..4 {
-        //ACTG, in that order
         let mut tmphashc = hc.rotate_left(1);
-        // tmphashc =  nthash::swapbits033(tmphashc);
-        // tmphashc ^= nthash::HASH_LOOKUP[i as usize];
-        // tmphashc ^= nthash::MS_TAB_31L[(thecbase as usize * 31) + (k % 31)]
-        //           | nthash::MS_TAB_33R[(thecbase as usize) * 33 + (k % 33)];
         tmphashc = nthash::swapbits_0_19_32_43_52_59(tmphashc);
         tmphashc ^= nthash::HASH_LOOKUP[i as usize];
         tmphashc ^= nthash::MS_TAB_5LL[(thecbase as usize * 5) + (k % 5)]
@@ -145,10 +113,6 @@ pub fn check_fwd(
             }
         }
 
-        // let tmphashnc = (nthash::swapbits3263(hnc)).rotate_left(1u32)
-        //     ^ nthash::RC_HASH_LOOKUP[i as usize]
-        //     ^ (nthash::MS_TAB_31L[(rc_base(thencbase) as usize * 31) + (k % 31)]
-        //      | nthash::MS_TAB_33R[(rc_base(thencbase) as usize) * 33 + (k % 33)]);
         let tmphashnc = nthash::swapbits_0_19_32_43_52_59(hnc.rotate_left(1u32))
             ^ nthash::RC_HASH_LOOKUP[i as usize]
             ^ (nthash::MS_TAB_5LL[(rc_base(thencbase) as usize * 5) + (k % 5)]
@@ -157,14 +121,6 @@ pub fn check_fwd(
                 | nthash::MS_TAB_11CR[(rc_base(thencbase) as usize * 11) + (k % 11)]
                 | nthash::MS_TAB_13R[(rc_base(thencbase) as usize * 13) + (k % 13)]
                 | nthash::MS_TAB_19RR[(rc_base(thencbase) as usize * 19) + (k % 19)]);
-        // let tmphashnc = (nthash::swapbits_18_31_42_51_58_63(hnc)).rotate_left(1u32)
-        //     ^ nthash::RC_HASH_LOOKUP[i as usize]
-        //     ^ (  nthash::MS_TAB_5LL[( rc_base(thencbase) as usize * 5)  + (k % 5)]
-        //        | nthash::MS_TAB_7L[(  rc_base(thencbase) as usize * 7)  + (k % 7)]
-        //        | nthash::MS_TAB_9LC[( rc_base(thencbase) as usize * 9)  + (k % 9)]
-        //        | nthash::MS_TAB_11CR[(rc_base(thencbase) as usize * 11) + (k % 11)]
-        //        | nthash::MS_TAB_13R[( rc_base(thencbase) as usize * 13) + (k % 13)]
-        //        | nthash::MS_TAB_19RR[(rc_base(thencbase) as usize * 19) + (k % 19)]);
 
         if thedict.contains_key(&tmphashnc) {
             outvec.push((tmphashnc, EdgeType::MaxToMin));
@@ -201,8 +157,6 @@ impl Contigs {
 
     /// Temporal and historical function to simplify contigs. To be removed in the future
     pub fn shrink(&mut self) {
-        // log::warn!("Contigs are going to be shrunk!");
-
         for ic in 0..self.serialized_contigs.len() {
             let mut tmpv = self.serialized_contigs[ic][0].abs_ind.clone();
             let contiglen = self.serialized_contigs[ic].len();
@@ -217,7 +171,6 @@ impl Contigs {
     /// Save contigs in a file
     #[cfg(not(feature = "wasm"))]
     pub fn write_fasta<W: Write>(&self, f: &mut W) {
-        //         self.print_coverage_stats();
         for i in 0..self.contig_sequences.as_ref().unwrap().len() {
             let _ = write_fasta(
                 i.to_string().as_bytes(),
@@ -229,13 +182,94 @@ impl Contigs {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kmer::Kmer;
+    use nohash_hasher::NoHashHasher;
+    use std::{borrow::Cow, collections::HashMap, hash::BuildHasherDefault};
+
+    fn empty_thedict(
+    ) -> HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> {
+        HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    fn empty_maxmindict() -> HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> {
+        HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    #[test]
+    fn check_fwd_empty_dict_returns_empty() {
+        let dict = empty_thedict();
+        let maxmin = empty_maxmindict();
+        assert!(check_fwd(0xDEAD_BEEF, 0xCAFE_BABE, 3, 0b0101, &dict, &maxmin).is_empty());
+    }
+
+    #[test]
+    fn check_bkg_empty_dict_returns_empty() {
+        let dict = empty_thedict();
+        let maxmin = empty_maxmindict();
+        assert!(check_bkg(0xDEAD_BEEF, 0xCAFE_BABE, 3, 0b0101, &dict, &maxmin).is_empty());
+    }
+
+    #[test]
+    fn check_fwd_finds_consecutive_kmer() {
+        let seq = b"ACGTACGTACGT";
+        let k = 5;
+        let mut it =
+            Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, k, 0, true).unwrap();
+        let (hc1, hnc1, b1, _) = it.get_curr_kmerhash_and_bases_and_kmer();
+        let (hc2, hnc2, b2, _) = it.get_next_kmer_and_give_us_things().unwrap();
+
+        let mut dict = empty_thedict();
+        dict.insert(hc2, HashInfoSimple {
+            hnc: hnc2,
+            b: b2,
+            pre: vec![],
+            post: vec![],
+            counts: 1,
+        });
+        let mut maxmin = empty_maxmindict();
+        maxmin.insert(hnc2, hc2);
+
+        let result = check_fwd(hc1, hnc1, k, b1, &dict, &maxmin);
+        assert!(!result.is_empty(), "check_fwd should find the consecutive kmer");
+        assert!(result.iter().any(|(h, _)| *h == hc2));
+    }
+
+    #[test]
+    fn check_bkg_finds_preceding_kmer() {
+        let seq = b"ACGTACGTACGT";
+        let k = 5;
+        let mut it =
+            Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, k, 0, true).unwrap();
+        let (hc1, hnc1, b1, _) = it.get_curr_kmerhash_and_bases_and_kmer();
+        let (hc2, hnc2, b2, _) = it.get_next_kmer_and_give_us_things().unwrap();
+
+        let mut dict = empty_thedict();
+        dict.insert(hc1, HashInfoSimple {
+            hnc: hnc1,
+            b: b1,
+            pre: vec![],
+            post: vec![],
+            counts: 1,
+        });
+        let mut maxmin = empty_maxmindict();
+        maxmin.insert(hnc1, hc1);
+
+        let result = check_bkg(hc2, hnc2, k, b2, &dict, &maxmin);
+        assert!(!result.is_empty(), "check_bkg should find the preceding kmer");
+        assert!(result.iter().any(|(h, _)| *h == hc1));
+    }
+}
+
 /// Public API for assemblers.
 pub trait Assemble {
     #[cfg(not(feature = "wasm"))]
-    /// Assembles given data using specified `Graph` and writes results into the output file.
-    fn assemble<G: Graph>(
+    /// Assembles given data and writes results into the output file.
+    fn assemble(
         k: usize,
-        indict: &mut HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         timevec: &mut Vec<Instant>,
         path: &mut Option<PathBuf>,
@@ -245,10 +279,10 @@ pub trait Assemble {
     ) -> Contigs;
 
     #[cfg(feature = "wasm")]
-    /// Assembles given data using specified `Graph` and prepares all info for being later transferred to Javascript.
-    fn assemble_wasm<G: Graph>(
+    /// Assembles given data and prepares all info for being later transferred to Javascript.
+    fn assemble_wasm(
         k: usize,
-        indict: &mut HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
@@ -262,9 +296,9 @@ pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
     #[cfg(not(feature = "wasm"))]
-    fn assemble<G: Graph>(
+    fn assemble(
         k: usize,
-        indict: &mut HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         timevec: &mut Vec<Instant>,
         path: &mut Option<PathBuf>,
@@ -278,24 +312,19 @@ impl Assemble for BasicAsm {
         );
         timevec.push(Instant::now());
 
-        // FIRST: iterate over all k-mers, check the existance of forwards/backwards neighbours in the dictionary.
-        // let mut i = 0;
-        // let mut ialone = 0;
-        // let mut nedges = 0;
-        indict.iter().for_each(|(h, hi)| {
-            let mut himutref = hi.borrow_mut();
-
-            himutref.pre = check_bkg(*h, himutref.hnc, k, himutref.b, indict, maxmindict);
-            himutref.post = check_fwd(*h, himutref.hnc, k, himutref.b, indict, maxmindict);
-            // let tmpnedges = himutref.pre.len() + himutref.post.len();
-            // nedges += tmpnedges;
-            // i += 1;
-            // if tmpnedges == 0 { ialone += 1};
-        });
-
-        //         drop(maxmindict);
-        // logw(format!("Prop. of alone kmers: {:.1} %", (ialone as f64) / (i as f64) * 100.0).as_str(), Some("info"));
-        // logw(format!("Number of edges {}", (nedges as f64) / (2 as f64)).as_str(), Some("info"));
+        let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = indict
+            .iter()
+            .map(|(h, hi)| {
+                let pre = check_bkg(*h, hi.hnc, k, hi.b, indict, maxmindict);
+                let post = check_fwd(*h, hi.hnc, k, hi.b, indict, maxmindict);
+                (*h, pre, post)
+            })
+            .collect();
+        for (h, pre, post) in updates {
+            let entry = indict.get_mut(&h).unwrap();
+            entry.pre = pre;
+            entry.post = post;
+        }
 
         timevec.push(Instant::now());
         logw(
@@ -311,23 +340,7 @@ impl Assemble for BasicAsm {
             Some("info"),
         );
 
-        // indict.iter().for_each(|(h, hi)| {
-        //     let himutref = hi.borrow();
-        //
-        //     // Check first previous neighbours:
-        //     for ipre in himutref.pre.iter() {
-        //         if !indict.get(&ipre.0).unwrap().borrow().pre.contains(&(*h, ipre.1.rev())) || !indict.get(&ipre.0).unwrap().borrow().post.contains(&(*h, ipre.1)) {
-        //             println!("HEY1");
-        //         }
-        //     }
-        //     for ipost in himutref.post.iter() {
-        //         if !indict.get(&ipost.0).unwrap().borrow().post.contains(&(*h, ipost.1.rev())) || !indict.get(&ipost.0).unwrap().borrow().pre.contains(&(*h, ipost.1)) {
-        //             println!("HEY2");
-        //         }
-        //     }
-        // });
-
-        let mut ptgraph = G::create_from_map::<G>(k, indict);
+        let mut ptgraph = DbgGraph::from_kmer_map(k, indict);
 
         timevec.push(Instant::now());
         logw(
@@ -342,13 +355,6 @@ impl Assemble for BasicAsm {
             .as_str(),
             Some("info"),
         );
-
-        // log::info!("Saving graph (pre-shrink w/o one-node contigs) as DOT file...");
-        // if path_.is_some() {
-        //     let mut wbuf = set_ostream(&Some(path_.unwrap().clone().replace(".dot", "_preshrink.dot")));
-        //     ptgraph.write_to_dot(&mut wbuf);
-        // }
-        // log::info!("Done.");
 
         logw("Starting graph correction", Some("info"));
 
@@ -367,24 +373,17 @@ impl Assemble for BasicAsm {
         let mut bool4: bool = false;
         while didanyofusdoanything {
             bool1 = ptgraph.shrink();
-            // let bool1 = false;
 
             if do_dead_end_removal {
                 bool2 = ptgraph.remove_dead_paths();
-                // let bool2 = false;
-
                 bool3 = ptgraph.shrink();
-                // let bool3 = false;
             }
 
             if do_bubble_collapse {
                 bool4 = ptgraph.correct_bubbles();
-                // let bool4 = false;
             }
 
-            //             println!("{} {}", bools, boolr);
             didanyofusdoanything = bool1 || bool2 || bool3 || bool4;
-            // break;
         }
 
         timevec.push(Instant::now());
@@ -453,9 +452,9 @@ impl Assemble for BasicAsm {
     }
 
     #[cfg(feature = "wasm")]
-    fn assemble_wasm<G: Graph>(
+    fn assemble_wasm(
         k: usize,
-        indict: &mut HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>,
+        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
@@ -464,28 +463,30 @@ impl Assemble for BasicAsm {
         logw("Starting assembler!", Some("info"));
 
         post_state("assembly:starting");
-        // FIRST: iterate over all k-mers, check the existance of forwards/backwards neighbours in the dictionary.
         let mut i = 0;
         let mut ialone = 0;
         let mut nedges = 0;
 
-        // TODO: explore parallelisation?
-
         post_state("assembly:create_graph");
-        indict.iter().for_each(|(h, hi)| {
-            let mut himutref = hi.borrow_mut();
-
-            himutref.pre = check_bkg(*h, himutref.hnc, k, himutref.b, indict, maxmindict);
-            himutref.post = check_fwd(*h, himutref.hnc, k, himutref.b, indict, maxmindict);
-            let tmpnedges = himutref.pre.len() + himutref.post.len();
-            nedges += tmpnedges;
+        let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = indict
+            .iter()
+            .map(|(h, hi)| {
+                let pre = check_bkg(*h, hi.hnc, k, hi.b, indict, maxmindict);
+                let post = check_fwd(*h, hi.hnc, k, hi.b, indict, maxmindict);
+                (*h, pre, post)
+            })
+            .collect();
+        for (h, pre, post) in updates {
+            let entry = indict.get_mut(&h).unwrap();
+            nedges += entry.pre.len() + entry.post.len();
             i += 1;
-            if tmpnedges == 0 {
-                ialone += 1
-            };
-        });
+            if entry.pre.is_empty() && entry.post.is_empty() {
+                ialone += 1;
+            }
+            entry.pre = pre;
+            entry.post = post;
+        }
 
-        //         drop(maxmindict);
         logw(
             format!(
                 "Prop. of alone kmers: {:.1} %",
@@ -499,32 +500,7 @@ impl Assemble for BasicAsm {
             Some("trace"),
         );
 
-        // log::info!("Neighbours searched for in {} s", timevec.last().unwrap().duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap()).as_secs());
-
-        // indict.iter().for_each(|(h, hi)| {
-        //     let himutref = hi.borrow();
-        //
-        //     // Check first previous neighbours:
-        //     for ipre in himutref.pre.iter() {
-        //         if !indict.get(&ipre.0).unwrap().borrow().pre.contains(&(*h, ipre.1.rev())) || !indict.get(&ipre.0).unwrap().borrow().post.contains(&(*h, ipre.1)) {
-        //             println!("HEY");
-        //         }
-        //     }
-        //     for ipost in himutref.post.iter() {
-        //         if !indict.get(&ipost.0).unwrap().borrow().post.contains(&(*h, ipost.1.rev())) || !indict.get(&ipost.0).unwrap().borrow().pre.contains(&(*h, ipost.1)) {
-        //             println!("HEY");
-        //         }
-        //     }
-        // });
-
-        let mut ptgraph = G::create_from_map::<G>(k, indict);
-
-        // log::info!("Saving graph (pre-shrink w/o one-node contigs) as DOT file...");
-        // if path_.is_some() {
-        //     let mut wbuf = set_ostream(&Some(path_.unwrap().clone().replace(".dot", "_preshrink.dot")));
-        //     ptgraph.write_to_dot(&mut wbuf);
-        // }
-        // log::info!("Done.");
+        let mut ptgraph = DbgGraph::from_kmer_map(k, indict);
 
         post_state("assembly:correct_graph");
         logw("Starting graph correction", Some("info"));
@@ -544,24 +520,17 @@ impl Assemble for BasicAsm {
         let mut bool4: bool = false;
         while didanyofusdoanything {
             bool1 = ptgraph.shrink();
-            // let bool1 = false;
 
             if do_dead_end_removal {
                 bool2 = ptgraph.remove_dead_paths();
-                // let bool2 = false;
-
                 bool3 = ptgraph.shrink();
-                // let bool3 = false;
             }
 
             if do_bubble_collapse {
                 bool4 = ptgraph.correct_bubbles();
-                // let bool4 = false;
             }
 
-            //             println!("{} {}", bools, boolr);
             didanyofusdoanything = bool1 || bool2 || bool3 || bool4;
-            // break;
         }
 
         logw("Shrinkage and pruning finished", Some("info"));
