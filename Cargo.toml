@@ -19,7 +19,8 @@ basic = ["needletail", "serde", "ahash", "num-traits", "log", "indicatif", "clap
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-sphk-graph = { path = "../sphk-graph" }
+#sphk-graph = { path = "../sphk-graph" }
+sphk-graph = { git = "https://github.com/vrbouza/sphk-graph.git", branch = "master" }
 
 # i/o
 needletail = { version = "0.6.3", default-features = false, features = ["flate2", "xz2", "zstd"], optional = true}
