@@ -51,10 +51,10 @@ Current **main features**:
 Currently the only option is to compile from source.
 
 ## Compilation from source
-Development has been done only on x86_64 GNU/Linux-based systems, and most surely will probably stay that way (i.e. no other systems have been tested). To compile our project from source as we did, you will need the [rust toolchain](https://www.rust-lang.org/tools/install) installed in your system. To get an in principle working version (up to some degree), always clone a versioned tag. E.g. to get version v0.1.2, you could use:
+Development has been done only on x86_64 GNU/Linux-based systems, and most surely will probably stay that way (i.e. no other systems have been tested). To compile our project from source as we did, you will need the [rust toolchain](https://www.rust-lang.org/tools/install) installed in your system. To get an in principle working version (up to some degree), always clone a versioned tag. E.g. to get version vX.Y.Z, you could use:
 
 ```
-git clone --branch v0.1.2 https://github.com/bacpop/sparrowhawk.git
+git clone --branch vX.Y.Z https://github.com/bacpop/sparrowhawk.git
 ```
 
 sparrowhawk is designed to compile to run natively as a x86_64 binary, but you can also compile it to the WebAssembly target `wasm32-unknown-unknown`. You can see below how to do it manually (as we did for development). Check out [sparrowhawk-web](https://github.com/bacpop/sparrowhawk-web) for an integrated project with Javascript and [wasm-pack](https://github.com/rustwasm/wasm-pack).
