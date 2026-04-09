@@ -47,7 +47,7 @@ nohash-hasher = {version = "0.2.0", optional = true}
 stacker = {version = "0.1.20", optional = true}
 # statistical = "1.0.0"
 
-plotters = {version = "0.3.7", optional = true}
+plotters = {version = "0.3.7", optional = true, features = ["ab_glyph"]}
 project-root = {version = "0.2.2", optional = true}
 petgraph = {version = "0.8.1", optional = true}
 
