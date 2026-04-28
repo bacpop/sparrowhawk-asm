@@ -54,15 +54,15 @@ petgraph = {version = "0.8.1", optional = true}
 bnum = {version = "0.13.0", features = ["serde", "numtraits"], optional = true}
 
 # WebAssembly
-js-sys                   = {version = "0.3.51", optional = true}
-wasm-bindgen             = {version = "0.2"   , optional = true}
+js-sys                   = {version = "0.3.96", optional = true}
+wasm-bindgen             = {version = "0.2.119", optional = true}
 simple-error             = {version = "0.2"   , optional = true}
 console_error_panic_hook = {version = "0.1.7" , optional = true}
 wasm-bindgen-file-reader = {version = "1"     , optional = true}
 seq_io                   = {version = "0.3.2" , optional = true}
 flate2                   = {version = "1.0"   , optional = true}
 getrandom                = {version = "0.2"   , optional = true, features = ["js"]}
-web-sys                  = {version = "0.3.77", optional = true, features = ["Blob", "console", "Document", "Element", "HtmlCanvasElement", "HtmlImageElement", "Response", "Window"]}
+web-sys                  = {version = "0.3.96", optional = true, features = ["Blob", "console", "Document", "Element", "HtmlCanvasElement", "HtmlImageElement", "Response", "Window"]}
 json                     = {version = "0.12.4", optional = true}
 # argmin                   = {version = "0.10.0", optional = true, features = ["slog-logger", "wasm-bindgen"]}
 argmin                   = {version = "0.10.0", optional = true, features = ["wasm-bindgen"]}
