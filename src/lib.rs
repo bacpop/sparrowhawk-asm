@@ -67,8 +67,8 @@ pub mod fastx_wasm;
 #[cfg(target_arch = "wasm32")]
 use crate::graph_works::Contigs;
 
-// Re-export core graph types from sphk-graph so callers don't need to depend on it directly.
-pub use sphk_graph::{EdgeType, EdgeWeight, HashInfoSimple, Idx};
+// Re-export core graph types from sparrowhawk-graph so callers don't need to depend on it directly.
+pub use sparrowhawk_graph::{EdgeType, EdgeWeight, HashInfoSimple, Idx};
 
 /// Logging wrapper function for the WebAssembly version
 #[cfg(target_arch = "wasm32")]

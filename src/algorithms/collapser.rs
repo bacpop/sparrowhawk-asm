@@ -1,7 +1,7 @@
 //! Create string representation of contigs out of `DbgGraph`.
 
 use super::shrinker::Shrinkable;
-use sphk_graph::{CarryType, DbgGraph, NodeIndex, NodeStruct, SerializedContigs};
+use sparrowhawk_graph::{CarryType, DbgGraph, NodeIndex, NodeStruct, SerializedContigs};
 use std::cmp::max;
 
 use petgraph;
@@ -125,7 +125,7 @@ fn get_contig_length(vec: &[NodeStruct]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sphk_graph::NodeStruct;
+    use sparrowhawk_graph::NodeStruct;
 
     fn make_node(len: usize) -> NodeStruct {
         NodeStruct { counts: 1, abs_ind: vec![0u64; len], innerdir: None }

@@ -1,6 +1,6 @@
 //! Corrects parts of the provided graph, if needed
 use crate::logw;
-use sphk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex, NodeStruct};
+use sparrowhawk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex, NodeStruct};
 
 use crate::EdgeWeight;
 
@@ -444,7 +444,7 @@ fn check_dead_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sphk_graph::{DbgGraph, NodeStruct};
+    use sparrowhawk_graph::{DbgGraph, NodeStruct};
 
     fn make_node() -> NodeStruct {
         NodeStruct { counts: 10, abs_ind: vec![0u64], innerdir: None }

@@ -20,7 +20,7 @@ use crate::logw;
 #[cfg(target_arch = "wasm32")]
 use crate::post_state;
 
-use sphk_graph::{DbgGraph, EdgeType, HashInfoSimple, SerializedContigs};
+use sparrowhawk_graph::{DbgGraph, EdgeType, HashInfoSimple, SerializedContigs};
 
 /// Get backwards neighbours, i.e. incoming edges to either the canonical or non-canonical hashes
 pub fn check_bkg(

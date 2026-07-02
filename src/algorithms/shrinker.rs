@@ -1,6 +1,6 @@
 //! Shrink the given graph
 use crate::logw;
-use sphk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex};
+use sparrowhawk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex};
 
 use petgraph::visit::EdgeRef;
 use petgraph::Direction::{Incoming, Outgoing};
