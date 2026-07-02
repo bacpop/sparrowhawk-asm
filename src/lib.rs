@@ -2,7 +2,7 @@
 #![warn(missing_docs)]
 use std::{collections::HashMap, fmt, hash::BuildHasherDefault};
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use std::{path::PathBuf, time::Instant, time::SystemTime};
 
 extern crate num_cpus;
@@ -44,27 +44,27 @@ pub use sparrowhawk_graph::{EdgeType, EdgeWeight, HashInfoSimple, Idx};
 
 pub mod cli;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::cli::*;
 
 pub mod io_utils;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::io_utils::*;
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 use wasm_bindgen::prelude::*;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 use wasm_bindgen_file_reader::WebSysFile;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 extern crate console_error_panic_hook;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 pub mod fastx_wasm;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 use crate::graph_works::Contigs;
 
 /// Logging wrapper function for the WebAssembly version
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 pub fn logw(text: &str, typ: Option<&str>) {
     if let Some(thetyp) = typ {
         log((String::from("Sparrowhawk::") + thetyp + "::" + text).as_str());
@@ -74,7 +74,7 @@ pub fn logw(text: &str, typ: Option<&str>) {
 }
 
 /// Logging wrapper function for the standalone version
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn logw(text: &str, typ: Option<&str>) {
     if let Some(realtyp) = typ {
         if realtyp == "info" {
@@ -115,7 +115,7 @@ impl fmt::Display for QualOpts {
     }
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 /// Sets up logging
 pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
     fern::Dispatch::new()
@@ -136,7 +136,7 @@ pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
 }
 
 #[doc(hidden)]
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn main() {
     let args = cli_args();
 
@@ -379,13 +379,13 @@ pub fn main() {
 }
 
 // ===================================== WebAssembly stuff follows
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 /// Binary dummy function. In the future, we need to completely remove it whenever compilating with the feature "wasm"
 pub fn main() {
     panic!("You've compiled Sparrowhawk for WebAssembly support, you cannot use it as a normal binary anymore!");
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console)]
@@ -395,7 +395,7 @@ extern "C" {
     fn post_message(data: &JsValue);
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 /// Posts a state update message to the main thread via postMessage
 pub fn post_state(state: &str) {
     let obj = js_sys::Object::new();
@@ -407,14 +407,14 @@ pub fn post_state(state: &str) {
     post_message(&obj.into());
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 /// Function that allows to propagate panic error messages when compiling to wasm, see https://github.com/rustwasm/console_error_panic_hook
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 /// Main struct that acts as wrapper of the assembler when compiling to wasm
 pub struct AssemblyHelper {
@@ -442,7 +442,7 @@ pub struct AssemblyHelper {
     outgfav2: String,
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 impl AssemblyHelper {
     /// Constructor/initialiser of the wasm assembler. It also performs the preprocessing.

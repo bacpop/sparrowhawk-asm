@@ -1,13 +1,13 @@
 use nohash_hasher::NoHashHasher;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use std::{io::Write, path::PathBuf, time::Instant};
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use super::io_utils::*;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use needletail::parser::write_fasta;
 
 use crate::algorithms::collapser::Collapsable;
@@ -17,7 +17,7 @@ use crate::nthash;
 
 use crate::bit_encoding::rc_base;
 use crate::logw;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 use crate::post_state;
 
 use sparrowhawk_graph::{DbgGraph, EdgeType, HashInfoSimple, SerializedContigs};
@@ -169,7 +169,7 @@ impl Contigs {
     }
 
     /// Save contigs in a file
-    #[cfg(not(feature = "wasm"))]
+    #[cfg(not(target_family = "wasm"))]
     pub fn write_fasta<W: Write>(&self, f: &mut W) {
         for i in 0..self.contig_sequences.as_ref().unwrap().len() {
             let _ = write_fasta(
@@ -276,7 +276,7 @@ mod tests {
 
 /// Public API for assemblers.
 pub trait Assemble {
-    #[cfg(not(feature = "wasm"))]
+    #[cfg(not(target_family = "wasm"))]
     /// Assembles given data and writes results into the output file.
     fn assemble(
         k: usize,
@@ -289,7 +289,7 @@ pub trait Assemble {
         do_conflictive_links_removal: bool,
     ) -> Contigs;
 
-    #[cfg(feature = "wasm")]
+    #[cfg(target_family = "wasm")]
     /// Assembles given data and prepares all info for being later transferred to Javascript.
     fn assemble_wasm(
         k: usize,
@@ -306,7 +306,7 @@ pub trait Assemble {
 pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
-    #[cfg(not(feature = "wasm"))]
+    #[cfg(not(target_family = "wasm"))]
     fn assemble(
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -462,7 +462,7 @@ impl Assemble for BasicAsm {
         contigs
     }
 
-    #[cfg(feature = "wasm")]
+    #[cfg(target_family = "wasm")]
     fn assemble_wasm(
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,

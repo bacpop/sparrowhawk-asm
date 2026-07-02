@@ -4,10 +4,10 @@ use core::panic;
 use nohash_hasher::NoHashHasher;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use super::io_utils::*;
 // use std::process::exit;
 
@@ -132,7 +132,7 @@ pub fn write_sequences_and_coverages<IntT>(
 }
 
 /// Stores all the contigs as a fasta file
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn save_as_fasta<IntT>(
     ingraph: &mut Contigs,
     inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -155,7 +155,7 @@ pub fn save_as_fasta<IntT>(
 }
 
 /// Stores all the contigs in fasta format, but exports it as JSON for javascript
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 pub fn save_as_fasta_wasm<IntT>(
     ingraph: &mut Contigs,
     inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,

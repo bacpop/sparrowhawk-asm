@@ -5,71 +5,47 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[features]
-default = ["basic"]
-# wasm = ["dep:js-sys", "dep:wasm-bindgen", "dep:simple-error", "dep:console_error_panic_hook", "dep:wasm-bindgen-file-reader", "dep:seq_io", "dep:flate2", "dep:web-sys", "dep:getrandom"]
-wasm = ["js-sys", "wasm-bindgen", "simple-error", "console_error_panic_hook", "wasm-bindgen-file-reader", "seq_io", "flate2", "web-sys", "getrandom",
-        # "serde", "ahash", "num-traits", "log", "simple_logger", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
-        "serde", "ahash", "num-traits", "log", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
-        # "stacker", "project-root", "petgraph", "sparrowhawk-graph", "bnum", "json", "argmin", "argmin-math", "libm"]
-        "stacker", "project-root", "petgraph", "sparrowhawk-graph", "bnum", "json", "argmin", "argmin-math", "argmin-observer-slog", "libm"]
-# basic = ["needletail", "serde", "ahash", "num-traits", "log", "simple_logger", "indicatif", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
-basic = ["needletail", "serde", "ahash", "num-traits", "log", "indicatif", "clap", "regex", "rayon", "num_cpus", "nohash-hasher",
-         # "stacker", "plotters", "project-root", "petgraph", "sparrowhawk-graph", "bnum", "argmin", "argmin-math", "libm"]
-         # "stacker", "plotters", "project-root", "petgraph", "sparrowhawk-graph", "bnum", "argmin", "argmin-math", "argmin-observer-slog", "libm"]
-         "stacker", "plotters", "project-root", "petgraph", "sparrowhawk-graph", "bnum", "argmin", "argmin-math", "argmin-observer-slog", "libm", "fern", "humantime"]
-
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# i/o
-needletail = { version = "0.6.3", default-features = false, features = ["flate2", "xz2", "zstd"], optional = true}
-serde = { version = "1.0.219", features = ["derive"], optional = true}
-# data structures
-ahash = {version = "=0.8.11", optional = true}
-num-traits = {version = "0.2.19", optional = true}
-# logging
-log = {version = "0.4.27", optional = true}
-# simple_logger = { version = "5.0.0", features = ["stderr"], optional = true}
-fern = { version = "0.7.1", optional = true}
-humantime = { version = "2.2.0", optional = true}
-indicatif = { version = "0.17.11", features = ["rayon"], optional = true}
+serde = { version = "1.0.219", features = ["derive"] }
+ahash = { version = "=0.8.11" }
+num-traits = { version = "0.2.19" }
+log = { version = "0.4.27" }
+clap = { version = "4.5.35", features = ["derive"] }
+regex = { version = "1.11.1" }
+rayon = { version = "1.10.0" }
+num_cpus = { version = "1.16.0" }
+nohash-hasher = { version = "0.2.0" }
+stacker = { version = "0.1.20" }
+project-root = { version = "0.2.2" }
+petgraph = { version = "0.8.1" }
+sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", branch = "master" }
+bnum = { version = "0.13.0", features = ["serde", "numtraits"] }
+argmin = { version = "0.10.0", features = ["wasm-bindgen"] }
+argmin-math = { version = "0.4" }
+argmin-observer-slog = { version = "0.1.0" }
+libm = { version = "0.2" }
 
-# cli
-clap = { version = "4.5.35", features = ["derive"], optional = true}
-regex = {version = "1.11.1", optional = true}
-# parallelisation
-rayon = {version = "1.10.0", optional = true}
-num_cpus = {version = "1.16.0", optional = true}
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+needletail = { version = "0.6.3", default-features = false, features = ["flate2", "xz2", "zstd"] }
+indicatif = { version = "0.17.11", features = ["rayon"] }
+plotters = { version = "0.3.7", features = ["ab_glyph"] }
+fern = { version = "0.7.1" }
+humantime = { version = "2.2.0" }
 
-nohash-hasher = {version = "0.2.0", optional = true}
-stacker = {version = "0.1.20", optional = true}
-# statistical = "1.0.0"
-
-plotters = {version = "0.3.7", optional = true, features = ["ab_glyph"]}
-project-root = {version = "0.2.2", optional = true}
-petgraph = {version = "0.8.1", optional = true}
-sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", branch = "master", optional = true }
-
-bnum = {version = "0.13.0", features = ["serde", "numtraits"], optional = true}
-
-# WebAssembly
-js-sys                   = {version = "0.3.51", optional = true}
-wasm-bindgen             = {version = "0.2"   , optional = true}
-simple-error             = {version = "0.2"   , optional = true}
-console_error_panic_hook = {version = "0.1.7" , optional = true}
-wasm-bindgen-file-reader = {version = "1"     , optional = true}
-seq_io                   = {version = "0.3.2" , optional = true}
-flate2                   = {version = "1.0"   , optional = true}
-getrandom                = {version = "0.2"   , optional = true, features = ["js"]}
-web-sys                  = {version = "0.3.77", optional = true, features = ["Blob", "console", "Document", "Element", "HtmlCanvasElement", "HtmlImageElement", "Response", "Window"]}
-json                     = {version = "0.12.4", optional = true}
-# argmin                   = {version = "0.10.0", optional = true, features = ["slog-logger", "wasm-bindgen"]}
-argmin                   = {version = "0.10.0", optional = true, features = ["wasm-bindgen"]}
-argmin-math              = {version = "0.4",    optional = true}
-argmin-observer-slog     = {version = "0.1.0",  optional = true}
-libm                     = {version = "0.2",    optional = true}
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = { version = "0.3.51" }
+wasm-bindgen = { version = "0.2" }
+simple-error = { version = "0.2" }
+console_error_panic_hook = { version = "0.1.7" }
+wasm-bindgen-file-reader = { version = "1" }
+seq_io = { version = "0.3.2" }
+flate2 = { version = "1.0" }
+getrandom = { version = "0.2", features = ["js"] }
+web-sys = { version = "0.3.77", features = ["Blob", "console", "Document", "Element", "HtmlCanvasElement", "HtmlImageElement", "Response", "Window"] }
+json = { version = "0.12.4" }
 
 [dev-dependencies]
 # testing
