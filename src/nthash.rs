@@ -630,3 +630,97 @@ impl NtHashIterator {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bit_encoding::encode_base;
+
+    #[test]
+    fn swapbits033_known_value() {
+        // Bit 0 set, bit 33 unset → should swap → only bit 33 set
+        assert_eq!(swapbits033(1), 1u64 << 33);
+        // Bit 33 set, bit 0 unset → should swap → only bit 0 set
+        assert_eq!(swapbits033(1u64 << 33), 1);
+    }
+
+    #[test]
+    fn swapbits033_roundtrip() {
+        for v in [0u64, 1, 1u64 << 33, 0xDEADBEEF, u64::MAX] {
+            assert_eq!(swapbits033(swapbits033(v)), v);
+        }
+    }
+
+    #[test]
+    fn swapbits3263_known_value() {
+        // Bit 32 set, bit 63 unset → swap → only bit 63 set
+        assert_eq!(swapbits3263(1u64 << 32), 1u64 << 63);
+        assert_eq!(swapbits3263(1u64 << 63), 1u64 << 32);
+    }
+
+    #[test]
+    fn swapbits3263_roundtrip() {
+        for v in [0u64, 1u64 << 32, 1u64 << 63, 0xDEADBEEF_CAFEBABEu64] {
+            assert_eq!(swapbits3263(swapbits3263(v)), v);
+        }
+    }
+
+    #[test]
+    fn nthash_determinism() {
+        let seq = b"ACGTACGT";
+        let k = 4;
+        let h1 = NtHashIterator::new(&seq[0..k], k, true).curr_hash();
+        let h2 = NtHashIterator::new(&seq[0..k], k, true).curr_hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn rolling_equals_fresh() {
+        // Roll from seq[0..k] by one position; should equal fresh iterator on seq[1..k+1]
+        let seq = b"ACGTACGT";
+        let k = 4;
+        let mut it = NtHashIterator::new(&seq[0..k], k, true);
+        // roll_fwd takes encoded bases, not ASCII
+        it.roll_fwd(encode_base(seq[0]), encode_base(seq[k]));
+        let rolled = it.curr_hash();
+        let fresh = NtHashIterator::new(&seq[1..k + 1], k, true).curr_hash();
+        assert_eq!(rolled, fresh);
+    }
+
+    #[test]
+    fn rolling_all_windows() {
+        // All rolling windows must equal fresh iterators on the same window
+        let seq = b"ACGTACGT";
+        let k = 4;
+        let mut it = NtHashIterator::new(&seq[0..k], k, true);
+        for i in 1..=(seq.len() - k) {
+            it.roll_fwd(encode_base(seq[i - 1]), encode_base(seq[i + k - 1]));
+            let fresh = NtHashIterator::new(&seq[i..i + k], k, true).curr_hash();
+            assert_eq!(it.curr_hash(), fresh, "window {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn canonical_hash_is_minimum() {
+        let seq = b"ACGTACGT";
+        let k = 4;
+        let it = NtHashIterator::new(&seq[0..k], k, true);
+        let (canonical, nc, _is_rc) = it.curr_hash_and_whether_it_is_the_inverse();
+        assert!(canonical <= nc);
+        assert_eq!(it.curr_hash(), canonical);
+    }
+
+    #[test]
+    fn is_rc_flag_consistent() {
+        let seq = b"ACGTACGT";
+        let k = 4;
+        let it = NtHashIterator::new(&seq[0..k], k, true);
+        let (canonical, _nc, is_rc) = it.curr_hash_and_whether_it_is_the_inverse();
+        // is_rc == true means the rc hash is smaller (i.e. canonical == rc hash)
+        if is_rc {
+            assert_eq!(canonical, it.rh.unwrap());
+        } else {
+            assert_eq!(canonical, it.fh);
+        }
+    }
+}

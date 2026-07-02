@@ -1,12 +1,6 @@
 //! Efficient genome assembler for small genomes in Rust
 #![warn(missing_docs)]
-use std::{
-    cell::*,
-    // process::exit,
-    collections::HashMap,
-    fmt,
-    hash::BuildHasherDefault,
-};
+use std::{collections::HashMap, fmt, hash::BuildHasherDefault};
 
 #[cfg(not(feature = "wasm"))]
 use std::{path::PathBuf, time::Instant, time::SystemTime};
@@ -31,9 +25,6 @@ pub mod nthash;
 /// Contains functions to store the output of the program
 pub mod save_functions;
 
-/// Contains the graph definitions
-pub mod graphs;
-
 /// Contains different traits that implement various algorithms
 pub mod algorithms;
 
@@ -43,12 +34,13 @@ pub mod bloom_filter;
 /// Fits the k-mer spectrum to automatically get a min_count (taken from ska.rust!)
 pub mod spectrum_fitter;
 
-use crate::graphs::pt_graph::EdgeType;
 use nohash_hasher::NoHashHasher;
 
 use crate::graph_works::Assemble;
-use crate::graphs::pt_graph::PtGraph;
 use bit_encoding::{U256, U512};
+
+// Re-export core graph types so callers do not need to depend on sparrowhawk-graph directly.
+pub use sparrowhawk_graph::{EdgeType, EdgeWeight, HashInfoSimple, Idx};
 
 pub mod cli;
 
@@ -101,26 +93,6 @@ pub fn logw(text: &str, typ: Option<&str>) {
     } else {
         println!("{}", text);
     }
-}
-
-/// Index type for both nodes and edges in the graph/gir.
-pub type Idx = usize;
-
-/// Type for representing weight of the `Edge`.
-pub type EdgeWeight = u16;
-
-/// Struct that contains the basic information for one k-mer
-pub struct HashInfoSimple {
-    /// maximum hash
-    pub hnc: u64,
-    /// First and last bases
-    pub b: u8,
-    /// found neighbours, if any, previous to this kmer
-    pub pre: Vec<(u64, EdgeType)>,
-    /// found neighbours, if any, posterior to this kmer
-    pub post: Vec<(u64, EdgeType)>,
-    /// Counts associated to this kmer
-    pub counts: u16,
 }
 
 /// Quality filtering options for FASTQ files
@@ -230,7 +202,7 @@ pub fn main() {
 
             let mut preprocessed_data: HashMap<
                 u64,
-                RefCell<HashInfoSimple>,
+                HashInfoSimple,
                 BuildHasherDefault<NoHashHasher<u64>>,
             >;
             let theseq: Vec<u64>;
@@ -281,7 +253,7 @@ pub fn main() {
                         *auto_min_count,
                     );
                 drop(theseq);
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -311,7 +283,7 @@ pub fn main() {
                     );
                 drop(theseq);
 
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -342,7 +314,7 @@ pub fn main() {
                     );
                 drop(theseq);
 
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -373,7 +345,7 @@ pub fn main() {
                     );
                 drop(theseq);
 
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
+                let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
@@ -455,8 +427,7 @@ pub struct AssemblyHelper {
     do_fit: bool,
     no_bubble_collapse: bool,
     no_dead_end_removal: bool,
-    preprocessed_data:
-        Option<HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>>,
+    preprocessed_data: Option<HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>>,
     maxmindict: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict64: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict128: Option<HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>>,
@@ -536,11 +507,7 @@ impl AssemblyHelper {
 
         logw("Beginning processing", Some("info"));
 
-        let preprocessed_data: HashMap<
-            u64,
-            RefCell<HashInfoSimple>,
-            BuildHasherDefault<NoHashHasher<u64>>,
-        >;
+        let preprocessed_data: HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>;
         let maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
         let histovalues: Vec<u32>;
         let used_min_count: u16;
@@ -566,7 +533,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<u64>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -583,7 +556,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<u128>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -600,7 +579,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<U256>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -617,7 +602,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<U512>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -642,15 +633,14 @@ impl AssemblyHelper {
     /// Assemble method of the wasm version
     pub fn assemble(&mut self) {
         logw("Starting assembly...", Some("info"));
-        let (mut outcontigs, outdot, outgfa, outgfav2) =
-            graph_works::BasicAsm::assemble_wasm::<PtGraph>(
-                self.k,
-                self.preprocessed_data.as_mut().unwrap(),
-                self.maxmindict.as_mut().unwrap(),
-                !self.no_bubble_collapse,
-                !self.no_dead_end_removal,
-                false,
-            );
+        let (mut outcontigs, outdot, outgfa, outgfav2) = graph_works::BasicAsm::assemble_wasm(
+            self.k,
+            self.preprocessed_data.as_mut().unwrap(),
+            self.maxmindict.as_mut().unwrap(),
+            !self.no_bubble_collapse,
+            !self.no_dead_end_removal,
+            false,
+        );
 
         post_state("assembly:saving");
         logw("Assembly done!", Some("info"));

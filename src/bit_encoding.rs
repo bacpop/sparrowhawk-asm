@@ -765,7 +765,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use ska::ska_dict::bit_encoding::{encode_base, IUPAC};
+/// use sparrowhawk::bit_encoding::{encode_base, IUPAC};
 ///
 /// // A + Y -> H
 /// let new_base = encode_base(b'A');
@@ -940,5 +940,88 @@ mod tests {
         assert_eq!(overlap(&v, &n), 0.25);
 
         assert_eq!(overlap(&n, &empty), 0.0);
+    }
+
+    #[test]
+    fn test_encode_base() {
+        assert_eq!(encode_base(b'A'), 0);
+        assert_eq!(encode_base(b'C'), 1);
+        assert_eq!(encode_base(b'T'), 2);
+        assert_eq!(encode_base(b'G'), 3);
+        // Lowercase gives same encoding
+        assert_eq!(encode_base(b'a'), 0);
+        assert_eq!(encode_base(b'c'), 1);
+        assert_eq!(encode_base(b't'), 2);
+        assert_eq!(encode_base(b'g'), 3);
+    }
+
+    #[test]
+    fn test_decode_base() {
+        assert_eq!(decode_base(0), b'A');
+        assert_eq!(decode_base(1), b'C');
+        assert_eq!(decode_base(2), b'T');
+        assert_eq!(decode_base(3), b'G');
+    }
+
+    #[test]
+    fn test_decode_encode_roundtrip() {
+        for &base in &[b'A', b'C', b'T', b'G'] {
+            assert_eq!(decode_base(encode_base(base)), base);
+        }
+    }
+
+    #[test]
+    fn test_rc_base() {
+        // A (0) <-> T (2)
+        assert_eq!(rc_base(0), 2);
+        assert_eq!(rc_base(2), 0);
+        // C (1) <-> G (3)
+        assert_eq!(rc_base(1), 3);
+        assert_eq!(rc_base(3), 1);
+        // Double complement is identity
+        for base in 0u8..4 {
+            assert_eq!(rc_base(rc_base(base)), base);
+        }
+    }
+
+    #[test]
+    fn test_valid_base() {
+        assert!(valid_base(b'A'));
+        assert!(valid_base(b'C'));
+        assert!(valid_base(b'G'));
+        assert!(valid_base(b'T'));
+        assert!(!valid_base(b'N'));
+        assert!(!valid_base(b'n'));
+    }
+
+    #[test]
+    fn test_is_ambiguous() {
+        assert!(!is_ambiguous(b'A'));
+        assert!(!is_ambiguous(b'C'));
+        assert!(!is_ambiguous(b'G'));
+        assert!(!is_ambiguous(b'T'));
+        assert!(!is_ambiguous(b'U'));
+        assert!(!is_ambiguous(b'-'));
+        assert!(is_ambiguous(b'R'));
+        assert!(is_ambiguous(b'Y'));
+        assert!(is_ambiguous(b'N'));
+        assert!(is_ambiguous(b'B'));
+    }
+
+    #[test]
+    fn test_rev_comp_u64() {
+        // ACG encoded: A=0 at pos0, C=1<<2=4, G=3<<4=48  → 52
+        // CGT encoded: C=1 at pos0, G=3<<2=12, T=2<<4=32 → 45
+        let acg: u64 = (1 << 2) | (3 << 4); // 52
+        let cgt: u64 = 1 | (3 << 2) | (2 << 4); // 45
+        assert_eq!(acg.rev_comp(3), cgt);
+        assert_eq!(cgt.rev_comp(3), acg);
+
+        // Roundtrip: rev_comp(rev_comp(x, k), k) == x
+        assert_eq!(acg.rev_comp(3).rev_comp(3), acg);
+
+        // ACGT is its own reverse complement (palindrome)
+        let acgt: u64 = (1 << 2) | (3 << 4) | (2 << 6); // 180
+        assert_eq!(acgt.rev_comp(4), acgt);
     }
 }
