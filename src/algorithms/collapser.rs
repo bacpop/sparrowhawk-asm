@@ -1,11 +1,12 @@
 //! Create string representation of contigs out of `DbgGraph`.
 
 use super::shrinker::Shrinkable;
-use sparrowhawk_graph::{CarryType, DbgGraph, NodeIndex, NodeStruct, SerializedContigs};
+use sparrowhawk_graph::{
+    get_nodelist_kmer_length, CarryType, DbgGraph, NodeIndex, NodeStruct, SerializedContigs,
+};
 use std::cmp::max;
 
-use petgraph;
-use petgraph::algo::{connected_components, tarjan_scc};
+use petgraph::algo::tarjan_scc;
 use petgraph::visit::EdgeRef;
 use petgraph::EdgeDirection;
 
@@ -24,7 +25,7 @@ impl Collapsable for DbgGraph {
 
         log::info!(
             "Graph has {} weakly connected component(s), among which {} are single nodes.",
-            connected_components(&petgraph::graph::Graph::from(self.inner_graph().clone())),
+            self.connected_components(),
             self.node_indices()
                 .filter(|n| self
                     .inner_graph()
@@ -40,22 +41,26 @@ impl Collapsable for DbgGraph {
         );
 
         log::info!("Starting collapse loop.");
-        let minnts = 100;
+        let minnts = 100; // independent of this value, the minimum number of nts will be always k
         let limit = max(0, minnts - self.k() + 1);
 
         loop {
             loop {
+                // get all starting nodes, i.e. nodes with in_degree == 0
                 let externals = self.externals_bi();
                 log::debug!("\t- Loop over {} external nodes.", externals.len());
                 if externals.is_empty() {
                     break;
                 }
+                // create contigs from each starting node
                 for n in externals {
+                    // We need first to take care of perfect contigs, almost-already provided as such. These
+                    // are seen as nodes with no incoming/outcoming edges.
                     if self.contains_node(n) {
                         if self.get_good_connections_degree(n) == 0 {
                             log::debug!("\t\t# Isolated node.");
                             let thecont = vec![self.node_weight(n).unwrap().clone()];
-                            if get_contig_length(&thecont) > limit {
+                            if get_nodelist_kmer_length(&thecont) > limit {
                                 contigs.push(thecont);
                             }
                             self.remove_node(n);
@@ -65,7 +70,7 @@ impl Collapsable for DbgGraph {
                                 contigs.extend(
                                     contigs_
                                         .into_iter()
-                                        .filter(|c| get_contig_length(c) > limit)
+                                        .filter(|c| get_nodelist_kmer_length(c) > limit)
                                         .collect::<Vec<_>>(),
                                 );
                             });
@@ -77,11 +82,15 @@ impl Collapsable for DbgGraph {
 
             let tmpc = self.node_count();
             if tmpc != 0 {
+                // we guarantee that there's at least one node to unwrap here
                 log::debug!(
                     "\t\t# {} nodes remain. Starting to build from middle node.",
                     tmpc
                 );
 
+                // This call to stacker::grow here is needed because of the algorithm that is run to obtain the
+                // strongly-connected components. It is recursive, so in very entangled graphs (and/or when k is
+                // low, i.e. k ~< 15), it might lead to a stack overflow.
                 stacker::grow(100 * 1024 * 1024, || {
                     let sccvec: Vec<Vec<NodeIndex>> = tarjan_scc(self.inner_graph());
                     let node_in_cycle = sccvec[0].last().unwrap();
@@ -98,7 +107,7 @@ impl Collapsable for DbgGraph {
                     contigs.extend(
                         thecontigs
                             .into_iter()
-                            .filter(|c| get_contig_length(c) > limit)
+                            .filter(|c| get_nodelist_kmer_length(c) > limit)
                             .collect::<Vec<_>>(),
                     );
                 });
@@ -118,51 +127,7 @@ impl Collapsable for DbgGraph {
     }
 }
 
-fn get_contig_length(vec: &[NodeStruct]) -> usize {
-    vec.iter().map(|ns| ns.abs_ind.len()).sum()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sparrowhawk_graph::NodeStruct;
-
-    fn make_node(len: usize) -> NodeStruct {
-        NodeStruct {
-            counts: 1,
-            abs_ind: vec![0u64; len],
-            innerdir: None,
-        }
-    }
-
-    #[test]
-    fn get_contig_length_empty() {
-        assert_eq!(get_contig_length(&[]), 0);
-    }
-
-    #[test]
-    fn get_contig_length_single_node_no_kmers() {
-        assert_eq!(get_contig_length(&[make_node(0)]), 0);
-    }
-
-    #[test]
-    fn get_contig_length_single_node_five() {
-        assert_eq!(get_contig_length(&[make_node(5)]), 5);
-    }
-
-    #[test]
-    fn get_contig_length_multiple_nodes() {
-        let nodes = vec![make_node(3), make_node(0), make_node(7)];
-        assert_eq!(get_contig_length(&nodes), 10);
-    }
-
-    #[test]
-    fn get_contig_length_large() {
-        let nodes: Vec<_> = (0..100).map(|_| make_node(50)).collect();
-        assert_eq!(get_contig_length(&nodes), 5000);
-    }
-}
-
+// Main collapse function/method
 #[inline]
 fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContigs {
     let mut contigs: SerializedContigs = vec![];
@@ -203,10 +168,13 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContig
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
+            // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
             contigs.push(contig.clone());
             contig.clear();
 
+            // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
             if num_following == 0 {
+                // We cannot continue.
                 ptgraph.remove_node(current_vertex);
                 return contigs;
             }
@@ -215,6 +183,12 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContig
             return contigs;
         }
 
+        // If we arrived here, current_vertex is either considered good to be added to the current
+        // contig, or we have created a contig break and we are starting from this ambiguous node
+        // and also current_edge_index is the vertex through which we should continue our
+        // journey, or we have either a simple loop or a circumference to deal with
+
+        // We add the current_vertex to the contig
         let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
         if let Some(innvtx) = nwtocopy.innerdir {
             if current_type != innvtx.get_from_and_to().0 {
@@ -224,12 +198,14 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContig
 
         contig.push(nwtocopy);
 
+        // We get our next soon-to-be current_vertex (now named "target")
         target = outneighs[0].0;
 
         if current_vertex == target {
             panic!("FATAL: continuing to the same vertex!")
         };
 
+        // We update the variables and get ready to do another iteration!
         current_type = outneighs[0].1.get_from_and_to().1;
         ptgraph.remove_node(current_vertex);
         current_vertex = target;
@@ -246,6 +222,8 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> Ser
     let mut current_vertex = v;
     let mut target;
 
+    // We need to get the carrytype, the edges, and so on before we can begin. We'll try to set them to get a forward
+    // direction with only one neighbour, if possible.
     let outeds;
     let mut outmin = Vec::new();
     let mut outmax = Vec::new();
@@ -264,9 +242,10 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> Ser
     let outmaxlen = outmax.len();
     match (outminlen, outmaxlen) {
         (0, 0) | (0, 1) | (1, 0) => panic!("External node!!!"),
-        (1, 1) | (1, _) => outeds = outmin,
-        (_, 1) => outeds = outmax,
+        (1, 1) | (1, _) => outeds = outmin, // We select the minimum outgoing edges
+        (_, 1) => outeds = outmax,          // We select the maximum outgoing edges
         (_, _) => {
+            // We check whether they are the same and, if not, we select the first id from the minimum (this is clearly improvable)
             if outminlen <= outmaxlen {
                 outeds = outmin;
             } else {
@@ -284,11 +263,12 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> Ser
         .0;
     let mut outneighs = ptgraph.out_neighbours_bi(v, current_type);
     let mut num_following = outneighs.len();
-    let mut num_preceding = 0;
+    let mut num_preceding = 0; /////// This is strictly speaking always false here, but it is only for the first iteration.
+                               // Afterwards, we respect its true value to decide whether we stop or not the contig formation.
 
     loop {
         if num_following == 1 && num_preceding == 0 {
-            // Continue
+            // Ok, so we can continue, let's go!
         } else if num_following == 0 && num_preceding == 0 {
             let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
             if let Some(innvtx) = nwtocopy.innerdir {
@@ -303,14 +283,23 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> Ser
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
+            // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
             contigs.push(contig.clone());
             contig.clear();
 
+            // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
             if num_following == 0 {
+                // We cannot continue.
                 return contigs;
             }
         }
 
+        // If we arrived here, current_vertex is either considered good to be added to the current
+        // contig, or we have created a contig break and we are starting from this ambiguous node
+        // and also current_edge_index is the vertex through which we should continue our
+        // journey, or we have either a simple loop or a circumference to deal with
+
+        // We add the current_vertex to the contig
         let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
         if let Some(innvtx) = nwtocopy.innerdir {
             if current_type != innvtx.get_from_and_to().0 {
@@ -320,12 +309,14 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> Ser
 
         contig.push(nwtocopy);
 
+        // We get our next soon-to-be current_vertex (now named "target")
         target = outneighs[0].0;
 
         if current_vertex == target {
             panic!("FATAL: continuing to the same vertex!")
         };
 
+        // We update the variables and get ready to do another iteration!
         current_type = outneighs[0].1.get_from_and_to().1;
         ptgraph.remove_node(current_vertex);
         current_vertex = target;
