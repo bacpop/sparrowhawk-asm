@@ -2,7 +2,7 @@
 
 use super::shrinker::Shrinkable;
 use sparrowhawk_graph::{
-    get_nodelist_kmer_length, CarryType, DbgGraph, NodeIndex, NodeStruct, SerializedContigs,
+    get_nodelist_kmer_length, CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs,
 };
 use std::cmp::max;
 
@@ -77,7 +77,7 @@ impl Collapsable for DbgGraph {
                 // strongly-connected components. It is recursive, so in very entangled graphs (and/or when k is
                 // low, i.e. k ~< 15), it might lead to a stack overflow.
                 stacker::grow(100 * 1024 * 1024, || {
-                    let sccvec: Vec<Vec<NodeIndex>> = self.strongly_connected_components();
+                    let sccvec: Vec<Vec<NodeId>> = self.strongly_connected_components();
                     let node_in_cycle = sccvec[0].last().unwrap();
 
                     log::debug!(
@@ -114,7 +114,7 @@ impl Collapsable for DbgGraph {
 
 // Main collapse function/method
 #[inline]
-fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContigs {
+fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
     let mut contigs: SerializedContigs = vec![];
     let mut contig: Vec<NodeStruct> = vec![];
     let mut current_vertex = v;
@@ -194,7 +194,7 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContig
 }
 
 #[inline]
-fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContigs {
+fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
     let mut contigs: SerializedContigs = vec![];
     let mut contig: Vec<NodeStruct> = vec![];
     let mut current_vertex = v;

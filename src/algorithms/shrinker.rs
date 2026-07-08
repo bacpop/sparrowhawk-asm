@@ -1,6 +1,6 @@
 //! Shrink the given graph
 use crate::logw;
-use sparrowhawk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex};
+use sparrowhawk_graph::{CarryType, DbgGraph, EdgeId, EdgeType, NodeId};
 
 use std::collections::BTreeSet;
 
@@ -24,14 +24,14 @@ pub trait Shrinkable {
         &mut self,
         start_node: Self::NodeIdx,
         mid_node: Self::NodeIdx,
-        ambnodes: &BTreeSet<NodeIndex>,
+        ambnodes: &BTreeSet<NodeId>,
         currtype: EdgeType,
     );
 }
 
 impl Shrinkable for DbgGraph {
-    type EdgeIdx = EdgeIndex;
-    type NodeIdx = NodeIndex;
+    type EdgeIdx = EdgeId;
+    type NodeIdx = NodeId;
 
     fn shrink(&mut self) -> bool {
         // Shrinkage here means to only find consecutive nodes, w/o bifurcations
@@ -115,9 +115,9 @@ impl Shrinkable for DbgGraph {
     #[inline]
     fn shrink_single_path(
         &mut self,
-        base_node: NodeIndex,
-        mut next_node: NodeIndex,
-        ambnodes: &BTreeSet<NodeIndex>,
+        base_node: NodeId,
+        mut next_node: NodeId,
+        ambnodes: &BTreeSet<NodeId>,
         mut curredge: EdgeType,
     ) {
         let mut countsformean: Vec<u16> = vec![self.node_weight(base_node).unwrap().counts];
@@ -166,19 +166,8 @@ impl Shrinkable for DbgGraph {
                     .unwrap()
                     .set_internal_edge(EdgeType::MinToMin);
             } else {
-                let theedges = self.edges_between(ind[0].0, base_node);
-                if theedges.len() > 1 {
-                    panic!("More than one linking outgoing edge, this should not happen unless there are multiple connections to the same node.");
-                }
-
                 log::trace!("Modifying edges with a non-direct edge at the beginning.");
-                self.modify_edges_when_shrinking(
-                    base_node,
-                    ind[0].0,
-                    curredge,
-                    theedges[0],
-                    ind[0].1,
-                );
+                self.modify_edges_when_shrinking_between(base_node, ind[0].0, curredge, ind[0].1);
             }
             // ======================================= CHANGING INTERNAL EDGES IF NEEDED END
 
@@ -243,18 +232,9 @@ impl Shrinkable for DbgGraph {
                         .unwrap()
                         .set_internal_edge(EdgeType::MinToMin);
                 } else {
-                    let theedges = self.edges_between(ind[0].0, base_node);
-                    if theedges.len() > 1 {
-                        panic!("More than one linking outgoing edge, this should not happen unless there are multiple connections to the same node.");
-                    }
-
                     log::trace!("Modifying edges with a non-direct edge in the loop to an ambiguous node that is an external");
-                    self.modify_edges_when_shrinking(
-                        base_node,
-                        ind[0].0,
-                        curredge,
-                        theedges[0],
-                        ind[0].1,
+                    self.modify_edges_when_shrinking_between(
+                        base_node, ind[0].0, curredge, ind[0].1,
                     );
                 }
                 // ======================================= CHANGING INTERNAL EDGES IF NEEDED END
@@ -316,18 +296,9 @@ impl Shrinkable for DbgGraph {
                     }
                 } else {
                     newoutedge = prospective_node.1;
-                    let theedges = self.edges_between(ind[0].0, base_node);
-                    if theedges.len() > 1 {
-                        panic!("More than one linking outgoing edge, this should not happen unless there are multiple connections to the same node.");
-                    }
-
                     log::trace!("Modifying edges with a non-direct edge in the loop when reaching another ambiguous node that is not an external.");
-                    self.modify_edges_when_shrinking(
-                        base_node,
-                        ind[0].0,
-                        curredge,
-                        theedges[0],
-                        ind[0].1,
+                    self.modify_edges_when_shrinking_between(
+                        base_node, ind[0].0, curredge, ind[0].1,
                     );
                 }
 

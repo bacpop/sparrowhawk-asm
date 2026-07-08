@@ -1,6 +1,8 @@
 //! Corrects parts of the provided graph, if needed
 use crate::logw;
-use sparrowhawk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex, NodeStruct};
+use sparrowhawk_graph::{
+    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId, NodeStruct,
+};
 
 use crate::EdgeWeight;
 
@@ -35,9 +37,9 @@ pub trait Correctable {
 }
 
 impl Correctable for DbgGraph {
-    type EdgeIdx = EdgeIndex;
+    type EdgeIdx = EdgeId;
 
-    type NodeIdx = NodeIndex;
+    type NodeIdx = NodeId;
 
     fn remove_weak_nodes(&mut self, threshold: EdgeWeight) {
         self.retain_nodes_by_count(threshold);
@@ -55,22 +57,18 @@ impl Correctable for DbgGraph {
             .node_indices()
             .filter(|n| self.out_degree(*n) == 3)
             .filter(|n| {
-                let vmin = self.outgoing_edges_by_carry(*n, CarryType::Min);
+                let vmin = self.bubble_start_edges_by_carry(*n, CarryType::Min);
                 if vmin.len() > 2 {
                     return false;
                 }
 
                 if vmin.len() == 2 {
-                    check_bubble_structure(
-                        self,
-                        *n,
-                        vmin.into_iter().map(|(edge, _, _)| edge).collect(),
-                    )
+                    check_bubble_structure(self, *n, vmin)
                 } else {
                     false
                 }
             })
-            .collect::<BTreeSet<NodeIndex>>();
+            .collect::<BTreeSet<NodeId>>();
 
         if bubbles.is_empty() {
             return false;
@@ -122,7 +120,7 @@ impl Correctable for DbgGraph {
             self.externals_bi().len(),
             self.node_indices().filter(|n| self.out_degree(*n) == 0 && self.in_degree(*n) == 0).count()).as_str(), Some("info"));
 
-        let mut to_remove: Vec<NodeIndex> = vec![];
+        let mut to_remove: Vec<NodeId> = vec![];
         loop {
             let mut path_check_vec = vec![];
             let externals: Vec<_> = self
@@ -165,13 +163,13 @@ impl Correctable for DbgGraph {
 }
 
 /// Checks whether the candidate area can be a good bubble for error correction.
-fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeIndex, invec: Vec<EdgeIndex>) -> bool {
+fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleStartEdge>) -> bool {
     let mut midnodes = Vec::with_capacity(2);
     let mut midcts = Vec::with_capacity(2);
 
     for e in invec {
-        midnodes.push(ptgraph.edge_endpoints(e).unwrap().1);
-        midcts.push(ptgraph.edge_weight(e).unwrap().t.get_from_and_to().1);
+        midnodes.push(e.target);
+        midcts.push(e.edge_type.get_from_and_to().1);
     }
 
     // We need to check that the two intermediate nodes are different
@@ -208,7 +206,7 @@ fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeIndex, invec: Vec<Edge
 }
 
 /// This function collapses standard bubbles depending on the number of counts (very naive)
-fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeIndex) -> bool {
+fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
     let midconns = ptgraph.out_neighbours_min(startn);
     if midconns.len() != 2
         || ptgraph
@@ -321,7 +319,7 @@ fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeIndex) -> bool {
 
 /// Remove dead input path.
 #[inline]
-fn remove_paths(ptgraph: &mut DbgGraph, to_remove: Drain<NodeIndex>) {
+fn remove_paths(ptgraph: &mut DbgGraph, to_remove: Drain<NodeId>) {
     log::trace!("Removing {} dead paths", to_remove.len());
     for n in to_remove {
         ptgraph.remove_node(n);
@@ -332,8 +330,8 @@ fn remove_paths(ptgraph: &mut DbgGraph, to_remove: Drain<NodeIndex>) {
 #[inline]
 fn check_dead_path(
     ptgraph: &DbgGraph,
-    vertex: NodeIndex,
-    output_vec: &mut Vec<NodeIndex>,
+    vertex: NodeId,
+    output_vec: &mut Vec<NodeId>,
     k: usize,
     carryedge: EdgeType,
 ) {
@@ -374,13 +372,13 @@ fn check_dead_path(
         if nbkgn_c == 0 {
             panic!("Not expected! 2");
         } else if nbkgn_c != 1 {
-            let mut altpath: Vec<Vec<NodeIndex>> = Vec::with_capacity(nbkgn_c - 1);
+            let mut altpath: Vec<Vec<NodeId>> = Vec::with_capacity(nbkgn_c - 1);
             let mut maxlen = 0;
             for n in bkgneigh_c.iter() {
                 if n.0 == *output_vec.last().unwrap() {
                     continue;
                 } else {
-                    let mut tmppath: Vec<NodeIndex> = Vec::new();
+                    let mut tmppath: Vec<NodeId> = Vec::new();
                     check_backwards_path(
                         ptgraph,
                         n.0,
@@ -467,7 +465,7 @@ mod tests {
 
     /// Build a valid 5-node diamond: S → M1 → E → F
     ///                                S → M2 → E
-    fn make_valid_bubble() -> (DbgGraph, NodeIndex, EdgeIndex, EdgeIndex) {
+    fn make_valid_bubble() -> (DbgGraph, NodeId, Vec<BubbleStartEdge>) {
         let mut g = DbgGraph::new(3);
         let s = g.add_node(make_node());
         let m1 = g.add_node(make_node());
@@ -479,15 +477,14 @@ mod tests {
         g.add_bi_edge(m1, e, EdgeType::MinToMin);
         g.add_bi_edge(m2, e, EdgeType::MinToMin);
         g.add_bi_edge(e, f, EdgeType::MinToMin);
-        let e_s_m1 = g.edges_between(s, m1)[0];
-        let e_s_m2 = g.edges_between(s, m2)[0];
-        (g, s, e_s_m1, e_s_m2)
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
+        (g, s, edges)
     }
 
     #[test]
     fn valid_bubble_returns_true() {
-        let (g, s, e1, e2) = make_valid_bubble();
-        assert!(check_bubble_structure(&g, s, vec![e1, e2]));
+        let (g, s, edges) = make_valid_bubble();
+        assert!(check_bubble_structure(&g, s, edges));
     }
 
     #[test]
@@ -498,9 +495,9 @@ mod tests {
         let m1 = g.add_node(make_node());
         g.add_bi_edge(s, m1, EdgeType::MinToMin);
         g.add_edge(s, m1, EdgeType::MinToMax); // second edge to same node
-        let edges = g.edges_between(s, m1);
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         assert_eq!(edges.len(), 2);
-        assert!(!check_bubble_structure(&g, s, vec![edges[0], edges[1]]));
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 
     #[test]
@@ -511,21 +508,20 @@ mod tests {
         let m1 = g.add_node(make_node());
         g.add_edge(s, s, EdgeType::MinToMin); // self-loop
         g.add_bi_edge(s, m1, EdgeType::MinToMin);
-        let e_self = g.edges_between(s, s)[0];
-        let e_s_m1 = g.edges_between(s, m1)[0];
-        assert!(!check_bubble_structure(&g, s, vec![e_self, e_s_m1]));
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
+        assert_eq!(edges.len(), 2);
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 
     #[test]
     fn invalid_wrong_in_degree_of_middle() {
         // Add an extra incoming Min edge to M1 → in_degree check fails
-        let (mut g, s, e1, e2) = make_valid_bubble();
+        let (mut g, s, edges) = make_valid_bubble();
         let extra = g.add_node(make_node());
-        // Find M1 (target of e1)
-        let m1 = g.edge_endpoints(e1).unwrap().1;
+        let m1 = edges[0].target;
         g.add_bi_edge(extra, m1, EdgeType::MinToMin);
-        // Now in_neighbours_bi(M1, Min).len() == 2 ≠ 1 → false
-        assert!(!check_bubble_structure(&g, s, vec![e1, e2]));
+        // Now in_neighbours_bi(M1, Min).len() == 2 != 1, so the structure is invalid.
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 
     #[test]
@@ -543,17 +539,16 @@ mod tests {
         g.add_bi_edge(m1, e1, EdgeType::MinToMin);
         g.add_bi_edge(m2, e2, EdgeType::MinToMin); // different end
         g.add_bi_edge(e1, f, EdgeType::MinToMin);
-        let es_m1 = g.edges_between(s, m1)[0];
-        let es_m2 = g.edges_between(s, m2)[0];
-        assert!(!check_bubble_structure(&g, s, vec![es_m1, es_m2]));
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 }
 
 fn check_backwards_path(
     ptgraph: &DbgGraph,
-    vertex: NodeIndex,
+    vertex: NodeId,
     mut ty: CarryType,
-    output_vec: &mut Vec<NodeIndex>,
+    output_vec: &mut Vec<NodeId>,
     kmerlimit: usize,
 ) {
     let mut current_vertex = vertex;
