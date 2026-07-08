@@ -135,6 +135,39 @@ pub fn check_fwd(
     outvec
 }
 
+fn populate_neighbours(
+    k: usize,
+    indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+    maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+) -> (usize, usize, usize) {
+    let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = indict
+        .iter()
+        .map(|(h, hi)| {
+            let pre = check_bkg(*h, hi.hnc, k, hi.b, indict, maxmindict);
+            let post = check_fwd(*h, hi.hnc, k, hi.b, indict, maxmindict);
+            (*h, pre, post)
+        })
+        .collect();
+
+    let mut nkmers = 0;
+    let mut nalone = 0;
+    let mut directed_edge_refs = 0;
+
+    for (h, pre, post) in updates {
+        nkmers += 1;
+        directed_edge_refs += pre.len() + post.len();
+        if pre.is_empty() && post.is_empty() {
+            nalone += 1;
+        }
+
+        let entry = indict.get_mut(&h).unwrap();
+        entry.pre = pre;
+        entry.post = post;
+    }
+
+    (nkmers, nalone, directed_edge_refs)
+}
+
 ////////////////////////////////////////////////////////////////////////
 /// Output from the assembler.
 #[derive(Default)]
@@ -272,6 +305,54 @@ mod tests {
         );
         assert!(result.iter().any(|(h, _)| *h == hc1));
     }
+
+    #[test]
+    fn populate_neighbours_counts_new_edges() {
+        let seq = b"ACGTACGTACGT";
+        let k = 5;
+        let mut it =
+            Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, k, 0, true).unwrap();
+        let (hc1, hnc1, b1, _) = it.get_curr_kmerhash_and_bases_and_kmer();
+        let (hc2, hnc2, b2, _) = it.get_next_kmer_and_give_us_things().unwrap();
+
+        let mut dict = empty_thedict();
+        dict.insert(
+            hc1,
+            HashInfoSimple {
+                hnc: hnc1,
+                b: b1,
+                pre: vec![],
+                post: vec![],
+                counts: 1,
+            },
+        );
+        dict.insert(
+            hc2,
+            HashInfoSimple {
+                hnc: hnc2,
+                b: b2,
+                pre: vec![],
+                post: vec![],
+                counts: 1,
+            },
+        );
+
+        let mut maxmin = empty_maxmindict();
+        maxmin.insert(hnc1, hc1);
+        maxmin.insert(hnc2, hc2);
+
+        let (nkmers, nalone, directed_edge_refs) = populate_neighbours(k, &mut dict, &maxmin);
+
+        assert_eq!(nkmers, 2);
+        assert!(
+            nalone < nkmers,
+            "at least one kmer should have newly computed neighbours"
+        );
+        assert!(directed_edge_refs > 0);
+        assert!(dict
+            .values()
+            .any(|hi| !hi.pre.is_empty() || !hi.post.is_empty()));
+    }
 }
 
 /// Public API for assemblers.
@@ -323,19 +404,7 @@ impl Assemble for BasicAsm {
         );
         timevec.push(Instant::now());
 
-        let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = indict
-            .iter()
-            .map(|(h, hi)| {
-                let pre = check_bkg(*h, hi.hnc, k, hi.b, indict, maxmindict);
-                let post = check_fwd(*h, hi.hnc, k, hi.b, indict, maxmindict);
-                (*h, pre, post)
-            })
-            .collect();
-        for (h, pre, post) in updates {
-            let entry = indict.get_mut(&h).unwrap();
-            entry.pre = pre;
-            entry.post = post;
-        }
+        populate_neighbours(k, indict, maxmindict);
 
         timevec.push(Instant::now());
         logw(
@@ -474,40 +543,20 @@ impl Assemble for BasicAsm {
         logw("Starting assembler!", Some("info"));
 
         post_state("assembly:starting");
-        let mut i = 0;
-        let mut ialone = 0;
-        let mut nedges = 0;
-
         post_state("assembly:create_graph");
-        let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = indict
-            .iter()
-            .map(|(h, hi)| {
-                let pre = check_bkg(*h, hi.hnc, k, hi.b, indict, maxmindict);
-                let post = check_fwd(*h, hi.hnc, k, hi.b, indict, maxmindict);
-                (*h, pre, post)
-            })
-            .collect();
-        for (h, pre, post) in updates {
-            let entry = indict.get_mut(&h).unwrap();
-            nedges += entry.pre.len() + entry.post.len();
-            i += 1;
-            if entry.pre.is_empty() && entry.post.is_empty() {
-                ialone += 1;
-            }
-            entry.pre = pre;
-            entry.post = post;
-        }
+        let (nkmers, nalone, directed_edge_refs) = populate_neighbours(k, indict, maxmindict);
+        let alone_pct = if nkmers == 0 {
+            0.0
+        } else {
+            (nalone as f64) / (nkmers as f64) * 100.0
+        };
 
         logw(
-            format!(
-                "Prop. of alone kmers: {:.1} %",
-                (ialone as f64) / (i as f64) * 100.0
-            )
-            .as_str(),
+            format!("Prop. of alone kmers: {:.1} %", alone_pct).as_str(),
             Some("trace"),
         );
         logw(
-            format!("Number of edges {}", (nedges as f64) / (2_f64)).as_str(),
+            format!("Number of edges {}", (directed_edge_refs as f64) / 2_f64).as_str(),
             Some("trace"),
         );
 
