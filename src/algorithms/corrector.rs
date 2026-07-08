@@ -4,8 +4,6 @@ use sparrowhawk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex, Nod
 
 use crate::EdgeWeight;
 
-use petgraph::visit::EdgeRef;
-use petgraph::Direction::Outgoing;
 use std::{
     cmp::{max, min},
     collections::BTreeSet,
@@ -46,10 +44,7 @@ impl Correctable for DbgGraph {
     }
 
     fn remove_self_loops(&mut self) {
-        self.inner_graph_mut().retain_edges(|g, e| {
-            let (n1, n2) = g.edge_endpoints(e).unwrap();
-            n1 != n2
-        });
+        DbgGraph::remove_self_loops(self);
     }
 
     fn correct_bubbles(&mut self) -> bool {
@@ -60,20 +55,17 @@ impl Correctable for DbgGraph {
             .node_indices()
             .filter(|n| self.out_degree(*n) == 3)
             .filter(|n| {
-                let mut vmin = Vec::with_capacity(2);
-
-                for e in self.inner_graph().edges_directed(*n, Outgoing) {
-                    if e.weight().t.get_from_and_to().0 == CarryType::Min {
-                        if vmin.len() == 2 {
-                            return false;
-                        } else {
-                            vmin.push(e.id());
-                        }
-                    }
+                let vmin = self.outgoing_edges_by_carry(*n, CarryType::Min);
+                if vmin.len() > 2 {
+                    return false;
                 }
 
                 if vmin.len() == 2 {
-                    check_bubble_structure(self, *n, vmin)
+                    check_bubble_structure(
+                        self,
+                        *n,
+                        vmin.into_iter().map(|(edge, _, _)| edge).collect(),
+                    )
                 } else {
                     false
                 }
@@ -145,13 +137,7 @@ impl Correctable for DbgGraph {
             );
 
             for v in externals {
-                let carryedge = self
-                    .inner_graph()
-                    .edges_directed(v, petgraph::EdgeDirection::Outgoing)
-                    .next()
-                    .unwrap()
-                    .weight()
-                    .t;
+                let carryedge = self.first_outgoing_edge_type(v).unwrap();
                 check_dead_path(self, v, &mut path_check_vec, self.k(), carryedge);
                 if !path_check_vec.is_empty() {
                     dididoanything = true;

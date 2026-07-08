@@ -6,10 +6,6 @@ use sparrowhawk_graph::{
 };
 use std::cmp::max;
 
-use petgraph::algo::tarjan_scc;
-use petgraph::visit::EdgeRef;
-use petgraph::EdgeDirection;
-
 /// Collapse `DbgGraph` into `SerializedContigs`.
 pub trait Collapsable: Shrinkable {
     /// Collapses into `SerializedContigs`.
@@ -26,18 +22,7 @@ impl Collapsable for DbgGraph {
         log::info!(
             "Graph has {} weakly connected component(s), among which {} are single nodes.",
             self.connected_components(),
-            self.node_indices()
-                .filter(|n| self
-                    .inner_graph()
-                    .neighbors_directed(*n, EdgeDirection::Outgoing)
-                    .count()
-                    == 0
-                    && self
-                        .inner_graph()
-                        .neighbors_directed(*n, EdgeDirection::Incoming)
-                        .count()
-                        == 0)
-                .count()
+            self.isolated_node_count()
         );
 
         log::info!("Starting collapse loop.");
@@ -92,7 +77,7 @@ impl Collapsable for DbgGraph {
                 // strongly-connected components. It is recursive, so in very entangled graphs (and/or when k is
                 // low, i.e. k ~< 15), it might lead to a stack overflow.
                 stacker::grow(100 * 1024 * 1024, || {
-                    let sccvec: Vec<Vec<NodeIndex>> = tarjan_scc(self.inner_graph());
+                    let sccvec: Vec<Vec<NodeIndex>> = self.strongly_connected_components();
                     let node_in_cycle = sccvec[0].last().unwrap();
 
                     log::debug!(
@@ -134,16 +119,9 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> SerializedContig
     let mut contig: Vec<NodeStruct> = vec![];
     let mut current_vertex = v;
     let mut target;
-    let outeds: Vec<_> = ptgraph
-        .inner_graph()
-        .edges_directed(v, EdgeDirection::Outgoing)
-        .map(|e| e.id())
-        .collect();
     let mut current_type = ptgraph
-        .inner_graph()
-        .edge_weight(outeds[0])
+        .first_outgoing_edge_type(v)
         .unwrap()
-        .t
         .get_from_and_to()
         .0;
     let mut outneighs = ptgraph.out_neighbours_bi(v, current_type);
@@ -225,19 +203,8 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> Ser
     // We need to get the carrytype, the edges, and so on before we can begin. We'll try to set them to get a forward
     // direction with only one neighbour, if possible.
     let outeds;
-    let mut outmin = Vec::new();
-    let mut outmax = Vec::new();
-
-    for e in ptgraph
-        .inner_graph()
-        .edges_directed(v, EdgeDirection::Outgoing)
-    {
-        if e.weight().t.get_from_and_to().0 == CarryType::Min {
-            outmin.push(e.id());
-        } else {
-            outmax.push(e.id());
-        }
-    }
+    let outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
+    let outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
     let outminlen = outmin.len();
     let outmaxlen = outmax.len();
     match (outminlen, outmaxlen) {
@@ -254,13 +221,7 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeIndex) -> Ser
         }
     }
 
-    let mut current_type = ptgraph
-        .inner_graph()
-        .edge_weight(outeds[0])
-        .unwrap()
-        .t
-        .get_from_and_to()
-        .0;
+    let mut current_type = outeds[0].2.get_from_and_to().0;
     let mut outneighs = ptgraph.out_neighbours_bi(v, current_type);
     let mut num_following = outneighs.len();
     let mut num_preceding = 0; /////// This is strictly speaking always false here, but it is only for the first iteration.

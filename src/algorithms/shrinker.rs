@@ -2,9 +2,6 @@
 use crate::logw;
 use sparrowhawk_graph::{CarryType, DbgGraph, EdgeIndex, EdgeType, NodeIndex};
 
-use petgraph::visit::EdgeRef;
-use petgraph::Direction::{Incoming, Outgoing};
-
 use std::collections::BTreeSet;
 
 /// Mark graph as shrinkable.
@@ -29,17 +26,6 @@ pub trait Shrinkable {
         mid_node: Self::NodeIdx,
         ambnodes: &BTreeSet<NodeIndex>,
         currtype: EdgeType,
-    );
-
-    /// This helper function modifies the edges accordingly to have shrunken nodes with
-    /// internal edges.
-    fn modify_edges_when_shrinking(
-        &mut self,
-        base_node: NodeIndex,
-        prev_node: NodeIndex,
-        internal_edge_ty: EdgeType,
-        in_edge_ind: EdgeIndex,
-        in_edge_ty: EdgeType,
     );
 }
 
@@ -124,96 +110,6 @@ impl Shrinkable for DbgGraph {
         );
 
         dididoanything
-    }
-
-    #[inline]
-    fn modify_edges_when_shrinking(
-        &mut self,
-        base_node: NodeIndex,
-        prev_node: NodeIndex,
-        internal_edge_ty: EdgeType,
-        in_edge_ind: EdgeIndex,
-        in_edge_ty: EdgeType,
-    ) {
-        log::trace!("base_node: {:?} prev_node: {:?} internal_edge_ty: {:?} in_edge_ind: {:?} in_edge_ty: {:?}",
-            base_node, prev_node, internal_edge_ty, in_edge_ind, in_edge_ty,
-        );
-        log::trace!(
-            "edges coming to the prev_node from the base_node: {:?}",
-            self.edges_between(base_node, prev_node)
-        );
-        log::trace!(
-            "edges coming to the base_node from the prev_node: {:?}",
-            self.edges_between(prev_node, base_node)
-        );
-
-        match internal_edge_ty {
-            EdgeType::MinToMax => {
-                match in_edge_ty {
-                    EdgeType::MinToMin => {
-                        self.edge_weight_mut(in_edge_ind).unwrap().t = EdgeType::MinToMax;
-                        self.edge_weight_mut(
-                            self.inner_graph()
-                                .edges_connecting(base_node, prev_node)
-                                .next()
-                                .unwrap()
-                                .id(),
-                        )
-                        .unwrap()
-                        .t = EdgeType::MinToMax;
-                    }
-                    EdgeType::MaxToMin => {
-                        self.edge_weight_mut(in_edge_ind).unwrap().t = EdgeType::MaxToMax;
-                        self.edge_weight_mut(
-                            self.inner_graph()
-                                .edges_connecting(base_node, prev_node)
-                                .next()
-                                .unwrap()
-                                .id(),
-                        )
-                        .unwrap()
-                        .t = EdgeType::MinToMin;
-                    }
-                    _ => panic!("Not expected edge type"),
-                }
-                self.node_weight_mut(base_node)
-                    .unwrap()
-                    .set_internal_edge(EdgeType::MaxToMax);
-            }
-            EdgeType::MaxToMin => {
-                match in_edge_ty {
-                    EdgeType::MaxToMax => {
-                        self.edge_weight_mut(in_edge_ind).unwrap().t = EdgeType::MaxToMin;
-                        self.edge_weight_mut(
-                            self.inner_graph()
-                                .edges_connecting(base_node, prev_node)
-                                .next()
-                                .unwrap()
-                                .id(),
-                        )
-                        .unwrap()
-                        .t = EdgeType::MaxToMin;
-                    }
-                    EdgeType::MinToMax => {
-                        self.edge_weight_mut(in_edge_ind).unwrap().t = EdgeType::MinToMin;
-                        self.edge_weight_mut(
-                            self.inner_graph()
-                                .edges_connecting(base_node, prev_node)
-                                .next()
-                                .unwrap()
-                                .id(),
-                        )
-                        .unwrap()
-                        .t = EdgeType::MaxToMax;
-                    }
-                    _ => panic!("Not expected edge type"),
-                }
-                self.node_weight_mut(base_node)
-                    .unwrap()
-                    .set_internal_edge(EdgeType::MinToMin);
-            }
-            _ => panic!("Value not expected"),
-        }
     }
 
     #[inline]
@@ -452,12 +348,12 @@ impl Shrinkable for DbgGraph {
                         ind[0].0, prospective_node.0
                     );
                     println!("OUTGOING");
-                    for e in self.inner_graph().edges_directed(base_node, Outgoing) {
-                        println!("- Target: {:?} Type: {:?}", e.target(), e.weight().t);
+                    for (target, edge_type) in self.outgoing_edges(base_node) {
+                        println!("- Target: {:?} Type: {:?}", target, edge_type);
                     }
                     println!("INCOMING");
-                    for e in self.inner_graph().edges_directed(base_node, Incoming) {
-                        println!("- Source: {:?} Type: {:?}", e.source(), e.weight().t);
+                    for (source, edge_type) in self.incoming_edges(base_node) {
+                        println!("- Source: {:?} Type: {:?}", source, edge_type);
                     }
 
                     panic!("EY1!");
