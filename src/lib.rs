@@ -447,16 +447,19 @@ pub struct AssemblyHelper {
 impl AssemblyHelper {
     /// Constructor/initialiser of the wasm assembler. It also performs the preprocessing.
     pub fn new(
-        k: usize,
+        k: u32,
         verbose: bool,
         min_count: u16,
         min_qual: u8,
-        chunk_size: usize,
+        chunk_size: u32,
         do_bloom: bool,
         do_fit: bool,
         no_bubble_collapse: bool,
         no_dead_end_removal: bool,
     ) -> Self {
+        let k = k as usize;
+        let chunk_size = chunk_size as usize;
+
         if cfg!(debug_assertions) {
             init_panic_hook();
         }
