@@ -884,15 +884,25 @@ type CountMap<IntT> = HashMap<u64, KmerInfo<IntT>, BuildHasherDefault<NoHashHash
 #[cfg(not(target_family = "wasm"))]
 const COUNTMAP_SHARDS: usize = 16;
 
-/// Pick a shard from the **high** bits of the canonical hash.
+/// Pick a shard for a canonical hash, mixing first.
 ///
-/// This matters: `NoHashHasher` passes the hash through unchanged and hashbrown indexes its buckets
-/// with the *low* bits, so sharding on the low bits would give every key in a shard the same bucket
-/// index and turn each shard into one long probe chain.
+/// Neither end of `hc` can be used raw:
+///
+/// - **Not the high bits.** ntHash itself is uniform, but `hc = min(fwd, rc)` is not — the minimum of
+///   two uniform values has a triangular density. Measured on real reads (k=31), the top 4 bits of `hc`
+///   run from 12.2% in bin 0 down to 0.37% in bin 15, a 33x spread. Sharding on them put ~2x the ideal
+///   load on shard 0 and left shard 15 all but empty, so 16 shards behaved like 8.
+/// - **Not the low bits.** `NoHashHasher` passes the hash straight through and hashbrown indexes its
+///   buckets with the low bits, so every key in a shard would land in the same buckets.
+///
+/// One multiply gives bits that are uniform and independent of both. Note an xor-fold does *not* work
+/// here: it shuffles bits without removing the magnitude bias, and leaves the 33x spread intact.
 #[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn shard_of(hc: u64) -> usize {
-    ((hc >> (64 - COUNTMAP_SHARDS.trailing_zeros())) as usize) & (COUNTMAP_SHARDS - 1)
+    const MIX: u64 = 0x9E37_79B9_7F4A_7C15; // odd, golden-ratio derived
+    ((hc.wrapping_mul(MIX) >> (64 - COUNTMAP_SHARDS.trailing_zeros())) as usize)
+        & (COUNTMAP_SHARDS - 1)
 }
 
 /// Split the count-map into the two artefacts the assembler needs, keeping only k-mers seen at least
@@ -1198,10 +1208,25 @@ where
                 log::info!("EXPERIMENTAL: counting k-mers into a hash map (no sort)");
 
                 let shards = bulk_preprocessing_standalone_cpu::<IntT>(&all_files, k, qual);
-                log::debug!(
-                    "Number of distinct kmers BEFORE cleaning: {:?}",
-                    shards.iter().map(|s| s.len()).sum::<usize>()
-                );
+
+                // The slowest shard sets the pace of the parallel counting, so report the balance rather
+                // than assume it: an imbalanced `shard_of` silently costs parallelism, which is exactly
+                // what a naive high-bit shard selector did here (see `shard_of`).
+                let sizes: Vec<usize> = shards.iter().map(|s| s.len()).collect();
+                let total: usize = sizes.iter().sum();
+                log::debug!("Number of distinct kmers BEFORE cleaning: {total:?}");
+                if total > 0 {
+                    let ideal = total as f64 / sizes.len() as f64;
+                    let worst = *sizes.iter().max().unwrap() as f64 / ideal;
+                    log::info!("Count-map shard balance: busiest shard {worst:.2}x ideal");
+                    log::debug!("Count-map shard sizes: {sizes:?}");
+                    if worst > 1.5 {
+                        log::warn!(
+                            "Count-map shards are badly imbalanced (busiest {worst:.2}x ideal). \
+                             Parallel counting is limited by the busiest shard, so this costs speed."
+                        );
+                    }
+                }
 
                 // The count-map holds every distinct k-mer with its exact count, singletons included,
                 // so the spectrum is the same one the sort counter produces: count everything, then
