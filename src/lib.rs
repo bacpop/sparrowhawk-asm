@@ -157,6 +157,7 @@ pub fn main() {
             auto_min_count,
             do_bloom,
             chunk_size,
+            counter,
             no_histo,
             no_graphs,
             no_bubble_collapse,
@@ -205,7 +206,6 @@ pub fn main() {
                 HashInfoSimple,
                 BuildHasherDefault<NoHashHasher<u64>>,
             >;
-            let theseq: Vec<u64>;
             let mut maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
 
             let mut out_path_histo: Option<PathBuf>;
@@ -241,7 +241,7 @@ pub fn main() {
             } else if *k <= 32 {
                 log::info!("k={}: using 64-bit representation", *k);
                 let thedict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
+                (preprocessed_data, thedict, maxmindict, _, _) =
                     preprocessing::preprocessing_standalone::<u64>(
                         &input_files,
                         *k,
@@ -249,10 +249,10 @@ pub fn main() {
                         &mut timevec,
                         &mut out_path_histo,
                         *chunk_size,
+                        *counter,
                         *do_bloom,
                         *auto_min_count,
                     );
-                drop(theseq);
                 let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
                     &mut preprocessed_data,
@@ -270,7 +270,7 @@ pub fn main() {
             } else if *k <= 64 {
                 log::info!("k={}: using 128-bit representation", *k);
                 let thedict: HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
+                (preprocessed_data, thedict, maxmindict, _, _) =
                     preprocessing::preprocessing_standalone::<u128>(
                         &input_files,
                         *k,
@@ -278,10 +278,10 @@ pub fn main() {
                         &mut timevec,
                         &mut out_path_histo,
                         *chunk_size,
+                        *counter,
                         *do_bloom,
                         *auto_min_count,
                     );
-                drop(theseq);
 
                 let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
@@ -301,7 +301,7 @@ pub fn main() {
                 log::info!("k={}: using 256-bit representation", *k);
 
                 let thedict: HashMap<u64, U256, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
+                (preprocessed_data, thedict, maxmindict, _, _) =
                     preprocessing::preprocessing_standalone::<U256>(
                         &input_files,
                         *k,
@@ -309,10 +309,10 @@ pub fn main() {
                         &mut timevec,
                         &mut out_path_histo,
                         *chunk_size,
+                        *counter,
                         *do_bloom,
                         *auto_min_count,
                     );
-                drop(theseq);
 
                 let mut contigs = graph_works::BasicAsm::assemble(
                     *k,
@@ -332,7 +332,7 @@ pub fn main() {
                 log::info!("k={}: using 512-bit representation", *k);
 
                 let thedict: HashMap<u64, U512, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
+                (preprocessed_data, thedict, maxmindict, _, _) =
                     preprocessing::preprocessing_standalone::<U512>(
                         &input_files,
                         *k,
@@ -340,10 +340,10 @@ pub fn main() {
                         &mut timevec,
                         &mut out_path_histo,
                         *chunk_size,
+                        *counter,
                         *do_bloom,
                         *auto_min_count,
                     );
-                drop(theseq);
 
                 let mut contigs = graph_works::BasicAsm::assemble(
                     *k,

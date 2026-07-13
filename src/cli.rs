@@ -14,6 +14,32 @@ pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 
+/// How k-mer occurrences are turned into k-mer counts.
+///
+/// Both counters are exact and must produce identical results. They differ only in what their cost
+/// scales with, which is why both are kept: the choice is data-dependent.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum Counter {
+    /// Sort the k-mer occurrences and run-length count them. Cost scales with the number of k-mer
+    /// *occurrences*, which is predictable on any data, and memory is bounded by `--chunk-size`.
+    Sort,
+    /// EXPERIMENTAL. Count into a hash map keyed by the canonical hash: no sort, and no buffer of
+    /// occurrences, so memory scales with the number of *distinct* k-mers instead. Much faster on
+    /// low-diversity data, but unproven on real reads, where a high error rate inflates the distinct
+    /// k-mer count and the map can outgrow the cache. `--chunk-size` does not apply. Benchmark it
+    /// against `sort` on your own data before relying on it.
+    Map,
+}
+
+impl fmt::Display for Counter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Sort => write!(f, "sort"),
+            Self::Map => write!(f, "map"),
+        }
+    }
+}
+
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
     let k: usize = s
@@ -148,8 +174,15 @@ pub enum Commands {
         /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
         /// Nonzero values enable it, allowing for potential peak memory reduction. There is a tradeoff with computing time:
         /// very low values will make the whole execution slower.
+        /// Only applies to `--counter sort`; it is ignored by `--counter map`, which does not buffer occurrences.
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
+
+        /// How to count k-mers. `sort` (default) buffers occurrences and sorts them; `map` is an
+        /// EXPERIMENTAL hash-map counter whose memory scales with distinct k-mers instead of
+        /// occurrences. Both are exact and must agree; see `--help` for the trade-off.
+        #[arg(long, value_enum, default_value_t = Counter::Sort)]
+        counter: Counter,
 
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this

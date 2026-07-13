@@ -1,4 +1,6 @@
 use nohash_hasher::NoHashHasher;
+#[cfg(not(target_family = "wasm"))]
+use rayon::prelude::*;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
@@ -140,14 +142,29 @@ fn populate_neighbours(
     indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
 ) -> (usize, usize, usize) {
-    let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = indict
-        .iter()
-        .map(|(h, hi)| {
-            let pre = check_bkg(*h, hi.hnc, k, hi.b, indict, maxmindict);
-            let post = check_fwd(*h, hi.hnc, k, hi.b, indict, maxmindict);
+    // check_bkg/check_fwd are pure in (hc, hnc, k, bases) and only read the two dicts, so the whole
+    // neighbour search is parallel over the map. The mutation stays in the serial loop below.
+    //
+    // Serial on wasm: rayon there falls back to a single-threaded registry, so `par_iter` buys nothing,
+    // and its unindexed `collect` builds an intermediate linked list of `Vec`s — allocation we cannot
+    // afford under the 4 GiB linear-memory cap.
+    let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = {
+        let dict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> = indict;
+        let search = |(h, hi): (&u64, &HashInfoSimple)| {
+            let pre = check_bkg(*h, hi.hnc, k, hi.b, dict, maxmindict);
+            let post = check_fwd(*h, hi.hnc, k, hi.b, dict, maxmindict);
             (*h, pre, post)
-        })
-        .collect();
+        };
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            dict.par_iter().map(search).collect()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            dict.iter().map(search).collect()
+        }
+    };
 
     let mut nkmers = 0;
     let mut nalone = 0;

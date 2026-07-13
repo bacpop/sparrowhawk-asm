@@ -60,7 +60,8 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         // rec_ind: &'a u32,
     ) -> Option<(IntT, NtHashIterator)> {
         // log::info!("Building kmer");
-        if *idx + k >= seq_len {
+        // A k-mer starting at `idx` spans [idx, idx + k - 1], so it exists iff idx + k <= seq_len.
+        if *idx + k > seq_len {
             return None;
         }
         let mut kmer = IntT::zero_init();
@@ -77,7 +78,7 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
                 // Start again, skipping over N
                 // println!("Bad base found, restarting!");
                 *idx += i + 1;
-                if *idx + k >= seq_len {
+                if *idx + k > seq_len {
                     return None;
                 }
                 kmer = IntT::zero_init();
@@ -341,9 +342,16 @@ mod tests {
     }
 
     #[test]
-    fn kmer_exact_length_returns_none() {
-        // seq_len == k: idx=0, 0+k >= seq_len → None
-        assert!(Kmer::<u64>::new(Cow::Borrowed(b"ACG"), 3, None, 3, 0, true).is_none());
+    fn kmer_exact_length_yields_one() {
+        // seq_len == k: the whole sequence is the single k-mer (seq_len - k + 1 = 1)
+        assert_eq!(count_kmers(b"ACG", 3), 1);
+    }
+
+    #[test]
+    fn kmer_exact_length_suffix_after_n() {
+        // "ANACG" k=3: the N restarts the window at idx=2, leaving a suffix of exactly k.
+        // That suffix is a valid k-mer ("ACG") and must not be dropped.
+        assert_eq!(count_kmers(b"ANACG", 3), 1);
     }
 
     #[test]
@@ -354,7 +362,7 @@ mod tests {
 
     #[test]
     fn kmer_n_invalidates_window() {
-        // "ACNGT" k=3: N at pos 2, restart skips to idx=3, 3+3=6 >= 5 → None
+        // "ACNGT" k=3: N at pos 2, restart skips to idx=3, leaving only "GT" (< k) → None
         assert_eq!(count_kmers(b"ACNGT", 3), 0);
     }
 
