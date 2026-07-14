@@ -1,13 +1,13 @@
 //! Corrects parts of the provided graph, if needed
 use crate::logw;
 use sparrowhawk_graph::{
-    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId, NodeStruct,
+    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId,
 };
 
 use crate::EdgeWeight;
 
 use std::{
-    cmp::{max, min},
+    cmp::max,
     collections::BTreeSet,
     vec::Drain,
 };
@@ -50,58 +50,7 @@ impl Correctable for DbgGraph {
     }
 
     fn correct_bubbles(&mut self) -> bool {
-        let mut dididoanything = false;
-
-        logw("Starting resolution of standard bubbles", Some("info"));
-        let bubbles = self
-            .node_indices()
-            .filter(|n| self.out_degree(*n) == 3)
-            .filter(|n| {
-                let vmin = self.bubble_start_edges_by_carry(*n, CarryType::Min);
-                if vmin.len() > 2 {
-                    return false;
-                }
-
-                if vmin.len() == 2 {
-                    check_bubble_structure(self, *n, vmin)
-                } else {
-                    false
-                }
-            })
-            .collect::<BTreeSet<NodeId>>();
-
-        if bubbles.is_empty() {
-            return false;
-        } else {
-            logw(
-                format!(
-                    "Found {:?} potential bubbles (they might be less). Starting to collapse them ",
-                    bubbles.len()
-                )
-                .as_str(),
-                Some("trace"),
-            );
-            for n in bubbles {
-                if self.contains_node(n) {
-                    let tmpb = collapse_bubble(self, n);
-                    if tmpb {
-                        dididoanything = true;
-                    }
-                }
-            }
-        }
-
-        logw(
-            format!(
-                "Bubble correction ended. Corrected graph has {} nodes and {} edges",
-                self.node_count(),
-                self.edge_count()
-            )
-            .as_str(),
-            Some("info"),
-        );
-
-        dididoanything
+        correct_bubbles_skipping(self, &BTreeSet::new())
     }
 
     fn remove_dead_paths(&mut self) -> bool {
@@ -162,25 +111,131 @@ impl Correctable for DbgGraph {
     }
 }
 
-/// Checks whether the candidate area can be a good bubble for error correction.
-fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleStartEdge>) -> bool {
+/// Collapse every bubble in the graph, except those in `protected`.
+///
+/// `protected` is how the multi-k evidence path vetoes the coverage heuristic: a bubble whose branches
+/// are *both* corroborated by the reads at the larger k has no wrong branch to pop, so whichever the
+/// heuristic chose it would be deleting real sequence.
+pub fn correct_bubbles_skipping(g: &mut DbgGraph, protected: &BTreeSet<NodeId>) -> bool {
+    let mut dididoanything = false;
+
+    logw("Starting resolution of standard bubbles", Some("info"));
+    let bubbles = g
+        .node_indices()
+        .filter(|n| g.out_degree(*n) == 3)
+        .filter(|n| !protected.contains(n))
+        .filter(|n| {
+            let vmin = g.bubble_start_edges_by_carry(*n, CarryType::Min);
+            if vmin.len() > 2 {
+                return false;
+            }
+
+            if vmin.len() == 2 {
+                check_bubble_structure(g, *n, vmin).is_some()
+            } else {
+                false
+            }
+        })
+        .collect::<BTreeSet<NodeId>>();
+
+    if bubbles.is_empty() {
+        return false;
+    } else {
+        logw(
+            format!(
+                "Found {:?} potential bubbles (they might be less). Starting to collapse them ",
+                bubbles.len()
+            )
+            .as_str(),
+            Some("info"),
+        );
+        if !protected.is_empty() {
+            logw(
+                format!(
+                    "Multi-k vetoed {} bubble(s): both branches are corroborated at the evidence k, \
+                     so there is no wrong branch to pop.",
+                    protected.len()
+                )
+                .as_str(),
+                Some("info"),
+            );
+        }
+        for n in bubbles {
+            if g.contains_node(n) {
+                let tmpb = collapse_bubble(g, n);
+                if tmpb {
+                    dididoanything = true;
+                }
+            }
+        }
+    }
+
+    logw(
+        format!(
+            "Bubble correction ended. Corrected graph has {} nodes and {} edges",
+            g.node_count(),
+            g.edge_count()
+        )
+        .as_str(),
+        Some("info"),
+    );
+
+    dididoanything
+}
+
+/// Every part of a bubble, as `check_bubble_structure` derives it.
+///
+/// It used to compute all of this and then throw it away to return a `bool`, leaving `collapse_bubble`
+/// to rebuild it from scratch. The multi-k oracle needs the same parts — plus the two flanking unitigs,
+/// which are what supply the context a larger k needs to judge the branches — so hand them back.
+#[derive(Debug, Clone)]
+pub struct BubbleParts {
+    /// The fork. Exactly one k-mer, traversed on `CarryType::Min`.
+    pub start: NodeId,
+    /// The two branches, with the edge that reaches each from `start`.
+    pub mid: [(NodeId, EdgeType); 2],
+    /// Traversal carry of each branch.
+    pub midct: [CarryType; 2],
+    /// The join. Exactly one k-mer.
+    pub end: NodeId,
+    /// Traversal carry of `end`.
+    pub endct: CarryType,
+    /// Downstream flanking unitig, and the edge reaching it from `end`.
+    pub right: (NodeId, EdgeType),
+    /// Upstream flanking unitig, and the edge reaching `start` from it.
+    ///
+    /// `out_degree(start) == 3` decomposes as two outgoing `Min` branches plus one outgoing `Max`
+    /// back-link — the mate `add_bi_edge` installs for the incoming flank edge — so a well-formed
+    /// bubble start has exactly one of these. `None` if it does not, which the oracle treats as
+    /// "no context" rather than trusting it.
+    pub left: Option<(NodeId, EdgeType)>,
+}
+
+/// Checks whether the candidate area can be a good bubble for error correction, returning its parts.
+fn check_bubble_structure(
+    ptgraph: &DbgGraph,
+    startn: NodeId,
+    invec: Vec<BubbleStartEdge>,
+) -> Option<BubbleParts> {
     let mut midnodes = Vec::with_capacity(2);
     let mut midcts = Vec::with_capacity(2);
+    let mut midedges = Vec::with_capacity(2);
 
     for e in invec {
         midnodes.push(e.target);
         midcts.push(e.edge_type.get_from_and_to().1);
+        midedges.push(e.edge_type);
     }
 
     // We need to check that the two intermediate nodes are different
     if midnodes[0] == midnodes[1] || midnodes[0] == startn || midnodes[1] == startn {
-        return false;
+        return None;
     }
 
     // Now, how many neighbours do we have from the middle nodes?
     let tmpv0 = ptgraph.out_neighbours_bi(midnodes[0], midcts[0]);
     if tmpv0.len() != 1 || ptgraph.in_neighbours_bi(midnodes[0], midcts[0]).len() != 1 {
-        return false;
+        return None;
     }
     let outnode = tmpv0[0].0;
     let tmpv1 = ptgraph.out_neighbours_bi(midnodes[1], midcts[1]);
@@ -191,7 +246,7 @@ fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleS
         || (outct != tmpv1[0].1.get_from_and_to().1)
         || (ptgraph.in_neighbours_bi(midnodes[1], midcts[1]).len() != 1)
     {
-        return false;
+        return None;
     }
 
     let tmpv3 = ptgraph.out_neighbours_bi(outnode, outct);
@@ -199,91 +254,140 @@ fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleS
         || tmpv3[0].0 == startn
         || ptgraph.in_neighbours_bi(outnode, outct).len() != 2
     {
-        return false;
+        return None;
     }
 
-    true
+    // The upstream flank. Not part of the structural test — a bubble is still a bubble without one —
+    // so it is optional, and only the oracle cares.
+    let inmin = ptgraph.in_neighbours_bi(startn, CarryType::Min);
+    let left = if inmin.len() == 1 { Some(inmin[0]) } else { None };
+
+    Some(BubbleParts {
+        start: startn,
+        mid: [(midnodes[0], midedges[0]), (midnodes[1], midedges[1])],
+        midct: [midcts[0], midcts[1]],
+        end: outnode,
+        endct: outct,
+        right: tmpv3[0],
+        left,
+    })
 }
 
-/// This function collapses standard bubbles depending on the number of counts (very naive)
-fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
-    let midconns = ptgraph.out_neighbours_min(startn);
-    if midconns.len() != 2
-        || ptgraph
-            .out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)
-            .len()
-            != 1
-    {
-        return false;
+/// Derive a bubble's parts from its start node alone. The multi-k oracle's entry point.
+pub fn bubble_parts(ptgraph: &DbgGraph, startn: NodeId) -> Option<BubbleParts> {
+    if ptgraph.out_degree(startn) != 3 {
+        return None;
     }
-    let chosennode: usize;
+    let vmin = ptgraph.bubble_start_edges_by_carry(startn, CarryType::Min);
+    if vmin.len() != 2 {
+        return None;
+    }
+    check_bubble_structure(ptgraph, startn, vmin)
+}
+
+/// What the coverage heuristic decided to do with a bubble.
+///
+/// Split out of `collapse_bubble` so the multi-k path can substitute its own decision and still reuse
+/// the surgery verbatim — the bidirected bookkeeping in `apply_bubble_collapse` is the hardest code
+/// here and must not be reimplemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BubbleChoice {
+    /// Collapse the bubble onto this branch, discarding the other.
+    Keep(usize),
+    /// Cut this branch loose. Leaves a contig break rather than guessing.
+    SeverOne(usize),
+    /// Cut both branches loose: the evidence does not favour either. Deliberate — an ambiguous bubble
+    /// becomes a contig break, as SKESA does, rather than a coin flip.
+    SeverBoth,
+}
+
+/// The coverage heuristic. Pure: it inspects the graph and decides, but changes nothing.
+fn choose_branch_by_counts(
+    ptgraph: &DbgGraph,
+    startn: NodeId,
+    midconns: &[(NodeId, EdgeType)],
+) -> BubbleChoice {
     let node0w = ptgraph.node_weight(midconns[0].0).unwrap();
     let node1w = ptgraph.node_weight(midconns[1].0).unwrap();
-    let savedmidw: NodeStruct;
 
-    let count_threshold = min(
+    // Inspired by Skesa: a branch carrying less than 10% of the stronger branch's coverage is noise.
+    // The floor of 1 is there so a `counts == 0` branch is always dropped; it must be a floor, not a
+    // ceiling. This was `min`, which clamped the threshold to at most 1 — and since every surviving
+    // k-mer has `counts >= min_count`, the two arms below could then never fire, so the whole filter
+    // was dead code.
+    let count_threshold = max(
         (0.1_f32 * max(node0w.counts, node1w.counts) as f32).round() as u16,
         1,
-    ); // Inspired by Skesa
+    );
 
     if node0w.counts < count_threshold {
-        chosennode = 1;
-        savedmidw = node1w.clone();
-    } else if node1w.counts < count_threshold {
-        chosennode = 0;
-        savedmidw = node0w.clone();
-    } else {
-        if ((node0w.abs_ind.len() - node1w.abs_ind.len()) as i32).abs() as f32
-            / (max(node0w.abs_ind.len(), node1w.abs_ind.len()) as f32)
-            > 0.025
-        {
-            let startn_counts = ptgraph.node_weight(startn).unwrap().counts;
-
-            let endn_counts = ptgraph
-                .node_weight(
-                    ptgraph.out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)[0]
-                        .0,
-                )
-                .unwrap()
-                .counts;
-            let average_surrounding_counts =
-                ((startn_counts + endn_counts) as f32 / 2.0).round() as u16;
-
-            let rel_diff_0 = ((node0w.counts as i32) - (average_surrounding_counts as i32)).abs()
-                as f32
-                / (average_surrounding_counts as f32);
-            let rel_diff_1 = ((node1w.counts as i32) - (average_surrounding_counts as i32)).abs()
-                as f32
-                / (average_surrounding_counts as f32);
-
-            if rel_diff_0 > 0.2 && rel_diff_1 <= 0.2 {
-                ptgraph.remove_all_edges_of(midconns[0].0);
-            } else if rel_diff_0 <= 0.2 && rel_diff_1 > 0.2 {
-                ptgraph.remove_all_edges_of(midconns[1].0);
-            } else {
-                ptgraph.remove_all_edges_of(midconns[0].0);
-                ptgraph.remove_all_edges_of(midconns[1].0);
-            }
-            return true;
-        } else {
-            if node0w.counts > node1w.counts {
-                chosennode = 0;
-                savedmidw = node0w.clone();
-            } else if node0w.counts < node1w.counts {
-                chosennode = 1;
-                savedmidw = node1w.clone();
-            } else if node0w.abs_ind.len() > node1w.abs_ind.len() {
-                chosennode = 0;
-                savedmidw = node0w.clone();
-            } else {
-                chosennode = 1;
-                savedmidw = node1w.clone();
-            }
-        }
+        return BubbleChoice::Keep(1);
+    }
+    if node1w.counts < count_threshold {
+        return BubbleChoice::Keep(0);
     }
 
-    let midnodect = midconns[chosennode].1.get_from_and_to().1;
-    let midconn2 = ptgraph.out_neighbours_bi(midconns[chosennode].0, midnodect)[0];
+    // Cast before subtracting: these are usizes, so `a - b` underflows whenever branch 0 is the shorter
+    // one. Release wrapped and the `as i32` truncation recovered the right negative value by accident;
+    // debug panicked with "attempt to subtract with overflow".
+    let lendiff = (node0w.abs_ind.len() as i32 - node1w.abs_ind.len() as i32).abs() as f32
+        / (max(node0w.abs_ind.len(), node1w.abs_ind.len()) as f32);
+
+    if lendiff > 0.025 {
+        // The branches differ in length, so coverage alone cannot say which is right. Compare each
+        // against the coverage of the sequence flanking the bubble instead, and cut loose whichever
+        // deviates. If both deviate, or neither does, cut both: an ambiguous bubble becomes a contig
+        // break rather than a guess.
+        let startn_counts = ptgraph.node_weight(startn).unwrap().counts;
+        let endn_counts = ptgraph
+            .node_weight(
+                ptgraph.out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)[0].0,
+            )
+            .unwrap()
+            .counts;
+        let average_surrounding_counts = ((startn_counts + endn_counts) as f32 / 2.0).round() as u16;
+
+        let rel_diff = |c: u16| {
+            ((c as i32) - (average_surrounding_counts as i32)).abs() as f32
+                / (average_surrounding_counts as f32)
+        };
+        let (rel_diff_0, rel_diff_1) = (rel_diff(node0w.counts), rel_diff(node1w.counts));
+
+        if rel_diff_0 > 0.2 && rel_diff_1 <= 0.2 {
+            BubbleChoice::SeverOne(0)
+        } else if rel_diff_0 <= 0.2 && rel_diff_1 > 0.2 {
+            BubbleChoice::SeverOne(1)
+        } else {
+            BubbleChoice::SeverBoth
+        }
+    } else if node0w.counts > node1w.counts {
+        BubbleChoice::Keep(0)
+    } else if node0w.counts < node1w.counts {
+        BubbleChoice::Keep(1)
+    } else if node0w.abs_ind.len() > node1w.abs_ind.len() {
+        BubbleChoice::Keep(0)
+    } else {
+        BubbleChoice::Keep(1)
+    }
+}
+
+/// The surgery: fuse the bubble onto `winner`, discarding the other branch.
+///
+/// Removes both branches and the end node, merges the winner into `start`, appends the end node's
+/// single k-mer, and reattaches to the downstream flank. The precondition — `start` and `end` each hold
+/// exactly one k-mer — is what makes the hardcoded `set_internal_edge(MinToMin)` sound: `start` was
+/// reached on the `Min` strand and its lone k-mer sits at index 0, so the fused `abs_ind` reads
+/// front-to-back in `Min`. `shrink` never merges a junction node, so it holds in practice.
+pub fn apply_bubble_collapse(
+    ptgraph: &mut DbgGraph,
+    startn: NodeId,
+    midconns: &[(NodeId, EdgeType)],
+    winner: usize,
+) -> bool {
+    let savedmidw = ptgraph.node_weight(midconns[winner].0).unwrap().clone();
+
+    let midnodect = midconns[winner].1.get_from_and_to().1;
+    let midconn2 = ptgraph.out_neighbours_bi(midconns[winner].0, midnodect)[0];
     let outct = midconn2.1.get_from_and_to().1;
     let outconn = ptgraph.out_neighbours_bi(midconn2.0, outct)[0];
     let savedoutw = ptgraph.node_weight(midconn2.0).unwrap().clone();
@@ -300,7 +404,7 @@ fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
 
     let mutrefw = ptgraph.node_weight_mut(startn).unwrap();
 
-    mutrefw.merge(&savedmidw, midconns[chosennode].1);
+    mutrefw.merge(&savedmidw, midconns[winner].1);
     mutrefw.set_internal_edge(EdgeType::MinToMin);
     mutrefw.abs_ind.push(savedoutw.abs_ind[0]);
     mutrefw.set_mean_counts(&[mutrefw.counts, savedmidw.counts, savedoutw.counts]);
@@ -315,6 +419,35 @@ fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
         }
     }
     true
+}
+
+/// This function collapses standard bubbles depending on the number of counts (very naive)
+fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
+    // Deliberately weaker than `check_bubble_structure`: earlier collapses in the same pass may have
+    // reshaped the graph, and this is the guard the heuristic has always used. Tightening it here would
+    // change which bubbles get collapsed.
+    let midconns = ptgraph.out_neighbours_min(startn);
+    if midconns.len() != 2
+        || ptgraph
+            .out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)
+            .len()
+            != 1
+    {
+        return false;
+    }
+
+    match choose_branch_by_counts(ptgraph, startn, &midconns) {
+        BubbleChoice::Keep(w) => apply_bubble_collapse(ptgraph, startn, &midconns, w),
+        BubbleChoice::SeverOne(b) => {
+            ptgraph.remove_all_edges_of(midconns[b].0);
+            true
+        }
+        BubbleChoice::SeverBoth => {
+            ptgraph.remove_all_edges_of(midconns[0].0);
+            ptgraph.remove_all_edges_of(midconns[1].0);
+            true
+        }
+    }
 }
 
 /// Remove dead input path.
@@ -484,7 +617,7 @@ mod tests {
     #[test]
     fn valid_bubble_returns_true() {
         let (g, s, edges) = make_valid_bubble();
-        assert!(check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_some());
     }
 
     #[test]
@@ -497,7 +630,7 @@ mod tests {
         g.add_edge(s, m1, EdgeType::MinToMax); // second edge to same node
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         assert_eq!(edges.len(), 2);
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 
     #[test]
@@ -510,7 +643,7 @@ mod tests {
         g.add_bi_edge(s, m1, EdgeType::MinToMin);
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         assert_eq!(edges.len(), 2);
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 
     #[test]
@@ -521,7 +654,7 @@ mod tests {
         let m1 = edges[0].target;
         g.add_bi_edge(extra, m1, EdgeType::MinToMin);
         // Now in_neighbours_bi(M1, Min).len() == 2 != 1, so the structure is invalid.
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 
     #[test]
@@ -540,7 +673,7 @@ mod tests {
         g.add_bi_edge(m2, e2, EdgeType::MinToMin); // different end
         g.add_bi_edge(e1, f, EdgeType::MinToMin);
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 }
 

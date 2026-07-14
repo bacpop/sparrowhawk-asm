@@ -43,7 +43,7 @@ impl Shrinkable for DbgGraph {
             logw(format!("Starting shrinking the graph with {} nodes and {} edges, beginning from {} ambiguous nodes",
                   self.node_count(),
                   self.edge_count(),
-                  ambnodes.len()).as_str(), Some("trace"));
+                  ambnodes.len()).as_str(), Some("info"));
             for an in ambnodes.iter() {
                 if !self.contains_node(*an) {
                     continue;

@@ -13,9 +13,15 @@ use super::io_utils::*;
 
 use crate::bit_encoding::UInt;
 use crate::graph_works::Contigs;
+#[cfg(target_family = "wasm")]
 use crate::logw;
+use crate::spelling::spell_path;
 
 /// Writes the contig sequences and hopefully their average counts/coverage in the future
+///
+/// Each contig is trimmed by `k-1` bases at **both** ends. Only the interior of a contig is flanked by
+/// a k-mer on either side, so those are the only bases two independent k-mers agree on; the ends are
+/// spelled by a single k-mer each and are dropped, as SKESA also does.
 pub fn write_sequences_and_coverages<IntT>(
     invec: &mut Contigs,
     inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -25,111 +31,32 @@ pub fn write_sequences_and_coverages<IntT>(
 {
     // TODO: implement coverages somehow...
     invec.contig_sequences = Some(Vec::with_capacity(invec.serialized_contigs.len()));
-    let mut counter = 0;
-    for ipc in 0..invec.serialized_contigs.len() {
-        //         log::debug!("\nIteration");
-        //         let mut outseq : VecDeque<u8>  = VecDeque::new();
-        let mut outseq: Vec<u8> = Vec::new();
 
-        //         log::debug!("Initial index: {}", initind);
-        // First of all, we decode and set the cov. for the first k nucleotides
-        if invec.serialized_contigs[ipc].len() > 1 {
+    for (ipc, contig) in invec.serialized_contigs.iter().enumerate() {
+        if contig.len() > 1 {
             panic!("MORE THAN ONE ENTRY!!")
         };
-        let initkmer = inmap
-            .get(&invec.serialized_contigs[ipc][0].abs_ind[0])
-            .unwrap();
-        let nbitstomove = initkmer.n_bits() as usize - 2 * (k - 1);
-        //         log::debug!("nbits: {nbitstomove}");
 
-        let mut prevkmer = *initkmer;
-        if invec.serialized_contigs[ipc][0].abs_ind.len() > 1 {
-            let tmpkmermoved = *inmap
-                .get(&invec.serialized_contigs[ipc][0].abs_ind[1])
-                .unwrap()
-                >> 2;
-            let tmpkmerrevmoved = inmap
-                .get(&invec.serialized_contigs[ipc][0].abs_ind[1])
-                .unwrap()
-                .rev_comp(k)
-                >> 2;
-            let prevkmermoved = (prevkmer << nbitstomove) >> nbitstomove;
-            //             log::debug!("Prev.              {:#066b}", prevkmer            );
-            //             log::debug!("Prev. (rev.-comp.) {:#066b}", prevkmer.rev_comp(k));
-            //             log::debug!("Post.              {:#066b}", tmpkmermoved);
-            //             log::debug!("Post. (rev.-comp.) {:#066b}", tmpkmerrevmoved);
-            //             log::debug!("Prev.              {:#066b}", prevkmermoved);
+        // A contig is a walk through the graph, so it always spells. Anything else is a bug in the
+        // orientation bookkeeping upstream, and we would rather hear about it than emit a wrong base:
+        // this used to count the failures and push a base from the failing orientation regardless.
+        let full = spell_path(&contig[0].abs_ind, inmap, k)
+            .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"));
 
-            if tmpkmermoved != prevkmermoved && tmpkmerrevmoved != prevkmermoved {
-                // We need to add the first nucleotides from the rev. comp.
-                prevkmer = prevkmer.rev_comp(k);
-                //                 log::debug!("CHANGED");
-            }
-
-            if tmpkmermoved == prevkmermoved && tmpkmerrevmoved == prevkmermoved {
-                panic!("HOLI");
-            }
-        }
-
-        // for inc in 0..k {
-        //     outseq.push( prevkmer.get_one_nucleotide(k - 1 - inc));
-        // }
-
-        outseq.push(prevkmer.get_one_nucleotide(0));
-
-        // And now, we start the hard work with the remaining nucleotides
-        let mut currkmer: IntT;
-        let thelen = invec.serialized_contigs[ipc][0].abs_ind.len();
-        for i in 1..thelen {
-            //             log::debug!("Entry {}/{}", i + 1, thelen);
-            currkmer = *inmap
-                .get(&invec.serialized_contigs[ipc][0].abs_ind[i])
-                .unwrap();
-
-            if ((prevkmer << nbitstomove) >> nbitstomove) == (currkmer >> 2)
-                && ((prevkmer << nbitstomove) >> nbitstomove) == (currkmer.rev_comp(k) >> 2)
-            {
-                panic!("HOLI");
-            }
-
-            //             if ((prevkmer.rev_comp(k) << nbitstomove) >> nbitstomove) == (currkmer >> 2) || ((prevkmer.rev_comp(k) << nbitstomove) >> nbitstomove) == currkmer.rev_comp(k) {
-            //                 panic!("TEST2");
-            //             }
-
-            if ((prevkmer << nbitstomove) >> nbitstomove) != (currkmer >> 2) {
-                //                 log::debug!("CAMBIANDO!");
-                currkmer = currkmer.rev_comp(k);
-                if ((prevkmer << (nbitstomove)) >> nbitstomove) != (currkmer >> 2) {
-                    //                     log::debug!("BAD THING");
-                    //                     log::debug!("Prev.:              {:#066b}", (prevkmer << (nbitstomove)) >> nbitstomove);
-                    //                     log::debug!("Prev. (rev.-comp.): {:#066b}", (prevkmer.rev_comp(k) << (nbitstomove)) >> nbitstomove);
-                    //                     log::debug!("Post:               {:#066b}", currkmer.rev_comp(k) >> 2);
-                    //                     log::debug!("Post. (rev.-comp.): {:#066b}", currkmer >> 2);
-                    //                     log::debug!("Prev. hash: {}",   invec.serialized_contigs[ipc][0].abs_ind[i - 1]);
-                    //                     log::debug!("Post. hash: {}\n", invec.serialized_contigs[ipc][0].abs_ind[i]);
-                    counter += 1;
-                }
-            }
-
-            outseq.push(currkmer.get_one_nucleotide(0));
-            prevkmer = currkmer;
-        }
-
-        // We spell one nucleotide per k-mer, taking the last base of each, so the leading k-1 bases of
-        // the contig are already absent. Trim the same k-1 from the tail, so that every base we emit is
-        // flanked by a k-mer on both sides. Trimming k here (as we used to) is one base too many.
-        if outseq.len() >= k {
-            outseq.truncate(outseq.len() - (k - 1));
-            if outseq.len() > 100 {
-                invec.contig_sequences.as_mut().unwrap().push(outseq);
+        // `full` is the whole walk: n + k - 1 bases, for n k-mers. Keep only the bases with a k-mer on
+        // each side, i.e. drop k-1 from each end, leaving n - k + 1. The guard is the old
+        // `outseq.len() >= k` (which was in units of k-mers, so n >= k) written in bases.
+        if full.len() >= 2 * k - 1 {
+            let body = &full[k - 1..full.len() - (k - 1)];
+            if body.len() > 100 {
+                invec
+                    .contig_sequences
+                    .as_mut()
+                    .unwrap()
+                    .push(body.to_vec());
             }
         }
     }
-
-    logw(
-        format!("\nNUMBER OF BAD THINGS: {}\n", counter).as_str(),
-        Some("debug"),
-    );
 }
 
 /// Stores all the contigs as a fasta file

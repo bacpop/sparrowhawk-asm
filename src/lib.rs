@@ -1,6 +1,11 @@
 //! Efficient genome assembler for small genomes in Rust
 #![warn(missing_docs)]
-use std::{collections::HashMap, fmt, hash::BuildHasherDefault};
+use std::fmt;
+
+// Only the wasm `AssemblyHelper` still names these types directly; on native the k-mer maps now live
+// behind `preprocessing::PreprocessedK`.
+#[cfg(target_family = "wasm")]
+use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
 use std::{path::PathBuf, time::Instant, time::SystemTime};
@@ -22,6 +27,9 @@ pub mod kmer;
 /// An implementation of ntHash, based on ntHash 2
 pub mod nthash;
 
+/// Turning a walk of canonical k-mer hashes back into nucleotides
+pub mod spelling;
+
 /// Contains functions to store the output of the program
 pub mod save_functions;
 
@@ -34,10 +42,16 @@ pub mod bloom_filter;
 /// Fits the k-mer spectrum to automatically get a min_count (taken from ska.rust!)
 pub mod spectrum_fitter;
 
+#[cfg(target_family = "wasm")]
 use nohash_hasher::NoHashHasher;
 
 use crate::graph_works::Assemble;
 use bit_encoding::{U256, U512};
+
+#[cfg(not(target_family = "wasm"))]
+use crate::bit_encoding::UInt;
+#[cfg(not(target_family = "wasm"))]
+use crate::preprocessing::InputFastx;
 
 // Re-export core graph types so callers do not need to depend on sparrowhawk-graph directly.
 pub use sparrowhawk_graph::{EdgeType, EdgeWeight, HashInfoSimple, Idx};
@@ -135,6 +149,106 @@ pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
         .unwrap();
 }
 
+/// Everything the `build` pipeline needs, once `IntT` has been chosen.
+///
+/// The four k-width branches used to be four verbatim copies of the same fifteen-line body, differing
+/// only in the integer type. Collapsing them into one generic function means a change to the pipeline
+/// is made once instead of four times — which is what makes adding a second k a local edit.
+#[cfg(not(target_family = "wasm"))]
+struct BuildOpts<'a> {
+    input_files: &'a [InputFastx],
+    /// `[k1]` for a single-k assembly, or `[k1, k2]` with `k2 > k1` for multi-k. `k1` is the assembly
+    /// k, whose graph is output; `k2` is the evidence k, used only to correct it.
+    ks: &'a [usize],
+    quality: &'a QualOpts,
+    chunk_size: usize,
+    counter: Counter,
+    do_bloom: bool,
+    auto_min_count: bool,
+    do_bubble_collapse: bool,
+    do_dead_end_removal: bool,
+    extraction: MultiKExtraction,
+    /// Multi-k oracle: k-mers of each flanking unitig to use as context around a bubble.
+    flank_context: usize,
+    /// Multi-k oracle: minimum discriminating evidence-k k-mers before a branch can be judged.
+    min_evidence: usize,
+    /// Multi-k oracle: maximum evidence nodes a supported branch's discriminating window may span.
+    max_nodes: usize,
+    /// Multi-k: veto the coverage heuristic on bubbles whose branches are both real.
+    protect: bool,
+    /// Multi-k: duplicate collapsed repeats the evidence k can resolve.
+    resolve: bool,
+    /// Multi-k: maximum evidence-driven correction rounds.
+    max_rounds: usize,
+    /// Multi-k: where to write the machine-readable verdict table.
+    stats_path: Option<PathBuf>,
+    output: PathBuf,
+}
+
+/// Run the whole `build` pipeline, monomorphised on the packed-k-mer width.
+#[cfg(not(target_family = "wasm"))]
+fn run_build<IntT>(
+    opts: BuildOpts,
+    timevec: &mut Vec<Instant>,
+    out_paths_histo: &mut [Option<PathBuf>],
+    out_path_graph: &mut Option<PathBuf>,
+) where
+    IntT: for<'a> UInt<'a>,
+{
+    let k1 = opts.ks[0];
+
+    let mut pre = preprocessing::preprocessing_standalone_multik::<IntT>(
+        opts.input_files,
+        opts.ks,
+        opts.quality,
+        timevec,
+        out_paths_histo,
+        opts.chunk_size,
+        opts.counter,
+        opts.do_bloom,
+        opts.auto_min_count,
+        opts.extraction,
+    );
+
+    // Build the evidence graph first and drop the evidence k's preprocessing with it: the evidence side
+    // never spells sequence, so its `thedict` is dead weight, and this is what keeps the second k from
+    // simply doubling peak memory.
+    let evidence = if pre.len() > 1 {
+        let ev_pre = pre.pop().unwrap();
+        Some(algorithms::multik::build_evidence::<IntT>(ev_pre))
+    } else {
+        None
+    };
+
+    let assembly = &mut pre[0];
+
+    let multik = evidence.as_ref().map(|ev| graph_works::MultiKCtx {
+        ev,
+        dict: &assembly.thedict,
+        flank_budget: opts.flank_context,
+        min_evidence: opts.min_evidence,
+        max_nodes: opts.max_nodes,
+        protect: opts.protect,
+        resolve: opts.resolve,
+        max_rounds: opts.max_rounds,
+        stats_path: opts.stats_path.clone(),
+    });
+
+    let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
+        k1,
+        &mut assembly.themap,
+        &mut assembly.maxmindict,
+        timevec,
+        out_path_graph,
+        opts.do_bubble_collapse,
+        opts.do_dead_end_removal,
+        false,
+        multik,
+    );
+
+    save_functions::save_as_fasta::<IntT>(&mut contigs, &assembly.thedict, k1, opts.output);
+}
+
 #[doc(hidden)]
 #[cfg(not(target_family = "wasm"))]
 pub fn main() {
@@ -158,6 +272,13 @@ pub fn main() {
             do_bloom,
             chunk_size,
             counter,
+            multik_extraction,
+            multik_min_evidence,
+            multik_max_nodes,
+            multik_flank_context,
+            multik_max_rounds,
+            multik_protect,
+            no_multik_resolve,
             no_histo,
             no_graphs,
             no_bubble_collapse,
@@ -201,24 +322,27 @@ pub fn main() {
                 log::info!("Minimum count per k-mer to be considered is {}", min_count);
             }
 
-            let mut preprocessed_data: HashMap<
-                u64,
-                HashInfoSimple,
-                BuildHasherDefault<NoHashHasher<u64>>,
-            >;
-            let mut maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
+            // One spectrum PNG per k, so the two fits can be compared. The evidence k has materially
+            // lower k-mer coverage (fewer k-mers per read, and (1-e)^k error-free probability), so its
+            // min_count must be fitted on its own spectrum, never inherited from the assembly k.
+            let mut out_paths_histo: Vec<Option<PathBuf>> = k
+                .iter()
+                .map(|ki| {
+                    if *no_histo {
+                        return None;
+                    }
+                    let mut p: PathBuf = output_dir.into();
+                    let suffix = if k.len() > 1 {
+                        format!("_kmerspectrum_k{ki}")
+                    } else {
+                        "_kmerspectrum".to_string()
+                    };
+                    p.set_file_name(output_prefix.to_owned() + &suffix);
+                    p.set_extension("png");
+                    Some(p)
+                })
+                .collect();
 
-            let mut out_path_histo: Option<PathBuf>;
-            if *no_histo {
-                out_path_histo = None;
-            } else {
-                out_path_histo = Some(output_dir.into());
-                out_path_histo
-                    .as_mut()
-                    .unwrap()
-                    .set_file_name(output_prefix.to_owned() + "_kmerspectrum");
-                out_path_histo.as_mut().unwrap().set_extension("png");
-            }
             let mut out_path_graph: Option<PathBuf>;
             if *no_graphs {
                 out_path_graph = None;
@@ -234,133 +358,84 @@ pub fn main() {
             output.set_file_name(output_prefix.to_string() + "_contigs");
             output.set_extension("fasta");
 
-            if *k % 2 == 0 {
+            // `valid_kmer` already rejects even k and anything outside 3..=256 per value; what it
+            // cannot see is the relationship between them.
+            match k.len() {
+                1 => {}
+                2 if k[1] > k[0] => log::info!(
+                    "Multi-k: assembling at k={}, using k={} as evidence",
+                    k[0],
+                    k[1]
+                ),
+                2 => {
+                    eprintln!(
+                        "error: the evidence k must be larger than the assembly k (got -k {},{}). \
+                         The point of the second k is longer-range read evidence.",
+                        k[0], k[1]
+                    );
+                    std::process::exit(2);
+                }
+                n => {
+                    eprintln!("error: at most two k values are supported for now (got {n})");
+                    std::process::exit(2);
+                }
+            }
+
+            let opts = BuildOpts {
+                input_files: &input_files,
+                ks: k,
+                quality: &quality,
+                chunk_size: *chunk_size,
+                counter: *counter,
+                do_bloom: *do_bloom,
+                auto_min_count: *auto_min_count,
+                do_bubble_collapse: !no_bubble_collapse,
+                do_dead_end_removal: !no_dead_end_removal,
+                extraction: *multik_extraction,
+                flank_context: *multik_flank_context,
+                min_evidence: *multik_min_evidence,
+                max_nodes: *multik_max_nodes,
+                protect: *multik_protect,
+                resolve: !no_multik_resolve,
+                max_rounds: *multik_max_rounds,
+                stats_path: if k.len() > 1 {
+                    let mut p: PathBuf = output_dir.into();
+                    p.set_file_name(output_prefix.to_owned() + "_multik_stats");
+                    p.set_extension("tsv");
+                    Some(p)
+                } else {
+                    None
+                },
+                output,
+            };
+
+            // The packed k-mer must fit in 2*k bits, so k picks the integer width. Both graphs share
+            // one width, taken from the LARGER k: it costs a little memory on the assembly k's
+            // `thedict` (post-filter, so roughly genome-sized) and saves monomorphising the whole
+            // pipeline twice.
+            let max_k = *k.iter().max().unwrap();
+            if max_k % 2 == 0 {
                 panic!("Support for even k-mer lengths not implemented");
-            } else if *k < 3 {
-                panic!("kmer length too small (min. 3)");
-            } else if *k <= 32 {
-                log::info!("k={}: using 64-bit representation", *k);
-                let thedict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, thedict, maxmindict, _, _) =
-                    preprocessing::preprocessing_standalone::<u64>(
-                        &input_files,
-                        *k,
-                        &quality,
-                        &mut timevec,
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *counter,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-                let mut contigs = graph_works::BasicAsm::assemble(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut timevec,
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<u64>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
-            } else if *k <= 64 {
-                log::info!("k={}: using 128-bit representation", *k);
-                let thedict: HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, thedict, maxmindict, _, _) =
-                    preprocessing::preprocessing_standalone::<u128>(
-                        &input_files,
-                        *k,
-                        &quality,
-                        &mut timevec,
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *counter,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-
-                let mut contigs = graph_works::BasicAsm::assemble(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut timevec,
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<u128>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
-            } else if *k <= 128 {
-                log::info!("k={}: using 256-bit representation", *k);
-
-                let thedict: HashMap<u64, U256, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, thedict, maxmindict, _, _) =
-                    preprocessing::preprocessing_standalone::<U256>(
-                        &input_files,
-                        *k,
-                        &quality,
-                        &mut timevec,
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *counter,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-
-                let mut contigs = graph_works::BasicAsm::assemble(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut timevec,
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<U256>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
-            } else if *k <= 256 {
-                log::info!("k={}: using 512-bit representation", *k);
-
-                let thedict: HashMap<u64, U512, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, thedict, maxmindict, _, _) =
-                    preprocessing::preprocessing_standalone::<U512>(
-                        &input_files,
-                        *k,
-                        &quality,
-                        &mut timevec,
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *counter,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-
-                let mut contigs = graph_works::BasicAsm::assemble(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut timevec,
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<U512>(&mut contigs, &thedict, *k, output);
-            // FASTA file(s)
-            } else {
-                panic!("kmer length larger than 256 currently not supported.");
+            }
+            match max_k {
+                0..=2 => panic!("kmer length too small (min. 3)"),
+                3..=32 => {
+                    log::info!("max k={max_k}: using 64-bit representation");
+                    run_build::<u64>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                33..=64 => {
+                    log::info!("max k={max_k}: using 128-bit representation");
+                    run_build::<u128>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                65..=128 => {
+                    log::info!("max k={max_k}: using 256-bit representation");
+                    run_build::<U256>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                129..=256 => {
+                    log::info!("max k={max_k}: using 512-bit representation");
+                    run_build::<U512>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                _ => panic!("kmer length larger than 256 currently not supported."),
             }
         }
     }

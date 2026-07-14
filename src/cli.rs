@@ -40,6 +40,37 @@ impl fmt::Display for Counter {
     }
 }
 
+/// How k-mers are extracted when more than one k is requested.
+///
+/// Both produce byte-for-byte identical results; they differ only in when the reads are touched.
+///
+/// Measured on the 1M-read simulation (12 threads, k=31,63), joint is a **wash**: 3.4% *slower* than
+/// sequential with the default sort counter, 1.8% faster with the map counter. Reading the files once
+/// instead of twice sounds like it should pay, but the I/O and record decode are a small share of the
+/// work next to the hashing — which is inherently once per k, because ntHash's rolling state depends
+/// on k. Sequential is therefore the default: never slower on the default counter, and much leaner on
+/// memory (at `--chunk-size 0`, joint held two unbounded occurrence buffers: 4.7 GB against 3.6 GB).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum MultiKExtraction {
+    /// One pass over the reads per k. The default: at least as fast as `joint` on the default counter,
+    /// and it lets each k's count structures be released before the next k is counted.
+    Sequential,
+    /// Read the files once, hashing every k from each batch of records. Saves the file read, the record
+    /// decode and the per-record owned copy — but not the hashing. Worth trying if your reads are on
+    /// slow or remote storage, where one fewer full pass over the files may actually matter; the
+    /// benchmark above ran from page cache, so it understates that case.
+    Joint,
+}
+
+impl fmt::Display for MultiKExtraction {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Joint => write!(f, "joint"),
+            Self::Sequential => write!(f, "sequential"),
+        }
+    }
+}
+
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
     let k: usize = s
@@ -146,9 +177,16 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_OUTPUT_PREFIX.to_string())]
         output_prefix: String,
 
-        /// K-mer size
-        #[arg(short, value_parser = valid_kmer, default_value_t = DEFAULT_KMER)]
-        k: usize,
+        /// K-mer size(s), comma-separated. One value gives a standard single-k assembly. Two give a
+        /// multi-k assembly: the first is the *assembly* k, whose graph is corrected and output; the
+        /// second is a larger *evidence* k, used only to decide which branches of the first are real.
+        /// For example `-k 31,63`.
+        ///
+        /// Note the values are comma-separated, not space-separated: a space-separated list would be
+        /// ambiguous against the positional list of input FASTQ files.
+        #[arg(short, value_parser = valid_kmer, value_delimiter = ',', num_args = 1..=2,
+              default_values_t = vec![DEFAULT_KMER])]
+        k: Vec<usize>,
 
         /// Minimum k-mer count (with reads)
         #[arg(long, default_value_t = DEFAULT_MINCOUNT)]
@@ -183,6 +221,59 @@ pub enum Commands {
         /// occurrences. Both are exact and must agree; see `--help` for the trade-off.
         #[arg(long, value_enum, default_value_t = Counter::Sort)]
         counter: Counter,
+
+        /// How to extract k-mers when two k values are given. `sequential` (default) makes one pass
+        /// over the reads per k. `joint` reads the files once and hashes every k from each batch;
+        /// measured, it is a wash (~3% either way), because the hashing — not the I/O — dominates.
+        /// Both produce identical results. Ignored when only one k is given.
+        #[arg(long, value_enum, default_value_t = MultiKExtraction::Sequential)]
+        multik_extraction: MultiKExtraction,
+
+        /// Multi-k: minimum number of reconstructed evidence-k k-mers that must all be present before
+        /// a bubble branch is accepted as supported by the reads.
+        #[arg(long, default_value_t = 5)]
+        multik_min_evidence: usize,
+
+        /// Multi-k: maximum number of distinct evidence-graph nodes a supported branch may span. A
+        /// branch confined to one evidence unitig is unambiguous at the larger k; allowing a few more
+        /// tolerates the boundaries where the branch meets its flanks.
+        #[arg(long, default_value_t = 3)]
+        multik_max_nodes: usize,
+
+        /// Multi-k: how many k-mers of each flanking unitig to use as context around a bubble. Must
+        /// exceed (k2 - 1 - k1), the minimum needed to span the bubble at all. Larger values buy more
+        /// evidence and are what make repeat diagnosis possible, at a cost linear in this value.
+        #[arg(long, default_value_t = 200)]
+        multik_flank_context: usize,
+
+        /// Multi-k: maximum number of evidence-driven correction rounds.
+        #[arg(long, default_value_t = 10)]
+        multik_max_rounds: usize,
+
+        /// Multi-k: do NOT resolve collapsed repeats.
+        ///
+        /// By default, when two k are given, a repeat that the evidence k can span — and whose flanks
+        /// the reads pair unambiguously with one branch — is duplicated, so that both genomic copies
+        /// survive and contigs run straight through it. It is the only correction here that throws
+        /// nothing away, and it measures strictly better: +2.7 kb of real genome recovered, zero
+        /// misassemblies, duplication ratio unchanged at 1.000.
+        ///
+        /// This flag disables it, leaving such bubbles to the coverage heuristic — which, since the two
+        /// branches of a collapsed repeat have identical coverage, then picks between them by coin flip
+        /// and deletes one real copy.
+        #[arg(long, default_value_t = false)]
+        no_multik_resolve: bool,
+
+        /// Multi-k: refuse to pop a bubble whose branches are BOTH corroborated at the evidence k.
+        ///
+        /// A MEASURED REGRESSION, kept only so the comparison can be reproduced. Do not turn it on. It
+        /// sounds right — there is no wrong branch to remove, so popping must be deleting real sequence —
+        /// but an unpopped branch is left unattached to anything, and at a median 61 bp it falls below
+        /// the 100 bp contig filter. So it drops BOTH copies where popping loses one: measured, it costs
+        /// 1,224 bp of genome to fix ~2 mismatches. Resolving the repeat (the default) is what actually
+        /// keeps both.
+        #[arg(long, default_value_t = false)]
+        multik_protect: bool,
 
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this

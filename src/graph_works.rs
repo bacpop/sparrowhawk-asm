@@ -14,7 +14,13 @@ use needletail::parser::write_fasta;
 
 use crate::algorithms::collapser::Collapsable;
 use crate::algorithms::corrector::Correctable;
+#[cfg(not(target_family = "wasm"))]
+use crate::algorithms::corrector::correct_bubbles_skipping;
+#[cfg(not(target_family = "wasm"))]
+use crate::algorithms::multik::{correct_with_evidence, EvidenceGraph, MultiKStats};
 use crate::algorithms::shrinker::Shrinkable;
+#[cfg(not(target_family = "wasm"))]
+use crate::bit_encoding::UInt;
 use crate::nthash;
 
 use crate::bit_encoding::rc_base;
@@ -23,6 +29,10 @@ use crate::logw;
 use crate::post_state;
 
 use sparrowhawk_graph::{DbgGraph, EdgeType, HashInfoSimple, SerializedContigs};
+#[cfg(not(target_family = "wasm"))]
+use sparrowhawk_graph::NodeId;
+#[cfg(not(target_family = "wasm"))]
+use std::collections::BTreeSet;
 
 /// Get backwards neighbours, i.e. incoming edges to either the canonical or non-canonical hashes
 pub fn check_bkg(
@@ -137,7 +147,7 @@ pub fn check_fwd(
     outvec
 }
 
-fn populate_neighbours(
+pub(crate) fn populate_neighbours(
     k: usize,
     indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -372,11 +382,35 @@ mod tests {
     }
 }
 
+/// Everything the multi-k oracle needs, handed to `assemble` when a second k was requested.
+#[cfg(not(target_family = "wasm"))]
+pub struct MultiKCtx<'a, IntT> {
+    /// The larger-k graph, used purely as evidence about the reads.
+    pub ev: &'a EvidenceGraph,
+    /// The assembly k's hash -> packed k-mer dictionary, for spelling candidate paths.
+    pub dict: &'a HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    /// How many k-mers of each flanking unitig to use as context.
+    pub flank_budget: usize,
+    /// Minimum discriminating k2-mers before a branch can be judged.
+    pub min_evidence: usize,
+    /// Maximum evidence nodes a supported branch's discriminating window may span.
+    pub max_nodes: usize,
+    /// Veto the coverage heuristic on bubbles whose branches are both corroborated at the evidence k.
+    pub protect: bool,
+    /// Duplicate the collapsed repeat where the evidence k resolves it, so both genomic copies survive
+    /// and contigs run through.
+    pub resolve: bool,
+    /// Maximum evidence-driven correction rounds.
+    pub max_rounds: usize,
+    /// Where to write the machine-readable verdict table, if anywhere.
+    pub stats_path: Option<PathBuf>,
+}
+
 /// Public API for assemblers.
 pub trait Assemble {
     #[cfg(not(target_family = "wasm"))]
     /// Assembles given data and writes results into the output file.
-    fn assemble(
+    fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -385,6 +419,7 @@ pub trait Assemble {
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
         do_conflictive_links_removal: bool,
+        multik: Option<MultiKCtx<'_, IntT>>,
     ) -> Contigs;
 
     #[cfg(target_family = "wasm")]
@@ -405,7 +440,7 @@ pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
     #[cfg(not(target_family = "wasm"))]
-    fn assemble(
+    fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -414,6 +449,7 @@ impl Assemble for BasicAsm {
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
         do_conflictive_links_removal: bool,
+        multik: Option<MultiKCtx<'_, IntT>>,
     ) -> Contigs {
         logw(
             "Constructing graph. Searching for neighbours...",
@@ -468,8 +504,52 @@ impl Assemble for BasicAsm {
         let mut bool2: bool = false;
         let mut bool3: bool = false;
         let mut bool4: bool = false;
+        // Splits interact: resolving one repeat reshapes its neighbourhood, so a split queued in the
+        // same pass can find the graph moved under it. Re-judging on the freshly-shrunk graph picks
+        // those up. Stop as soon as a round splits nothing.
+        let mut ev_rounds = 0usize;
+        let mut ev_stats = MultiKStats::default();
+        let mut protected: BTreeSet<NodeId> = BTreeSet::new();
         while didanyofusdoanything {
             bool1 = ptgraph.shrink();
+
+            // Ask the evidence graph about every bubble, on the freshly-shrunk graph — the flanks must
+            // be unitigs before there is any context to gather. Read-only: it changes nothing, so the
+            // assembly is bit-for-bit what a single-k run would produce. That is the point. It lets the
+            // whole oracle be validated on real data before it is trusted to act.
+            if let Some(ctx) = &multik {
+                if ev_rounds < ctx.max_rounds {
+                    let mut round = MultiKStats::default();
+                    protected = correct_with_evidence::<IntT>(
+                        ctx.ev,
+                        &mut ptgraph,
+                        ctx.dict,
+                        k,
+                        ctx.flank_budget,
+                        ctx.min_evidence,
+                        ctx.max_nodes,
+                        ctx.resolve,
+                        ctx.protect,
+                        &mut round,
+                    );
+                    ev_rounds += 1;
+                    let split = round.split_applied;
+                    ev_stats.accumulate(round);
+                    ev_stats.rounds = ev_rounds;
+                    // A split changed the graph: shrink and re-judge, which recovers the ones an
+                    // earlier split in the same pass had invalidated.
+                    if split > 0 {
+                        bool1 = true;
+                    } else {
+                        // Converged: nothing more can be split, so release whatever we were holding
+                        // back and let the coverage heuristic deal with the remainder.
+                        ev_rounds = ctx.max_rounds;
+                        if !ctx.protect {
+                            protected.clear();
+                        }
+                    }
+                }
+            }
 
             if do_dead_end_removal {
                 bool2 = ptgraph.remove_dead_paths();
@@ -477,10 +557,23 @@ impl Assemble for BasicAsm {
             }
 
             if do_bubble_collapse {
-                bool4 = ptgraph.correct_bubbles();
+                bool4 = correct_bubbles_skipping(&mut ptgraph, &protected);
             }
 
             didanyofusdoanything = bool1 || bool2 || bool3 || bool4;
+        }
+
+        if let Some(ctx) = &multik {
+            ev_stats.report(k, ctx.ev.k);
+            if let Some(path) = &ctx.stats_path {
+                let mut f = std::fs::File::create(path).expect("cannot write multi-k stats");
+                let _ = writeln!(f, "{}", MultiKStats::tsv_header());
+                let _ = writeln!(f, "{}", ev_stats.tsv_row("TOTAL"));
+                logw(
+                    format!("Multi-k stats written to {}", path.display()).as_str(),
+                    Some("info"),
+                );
+            }
         }
 
         timevec.push(Instant::now());
