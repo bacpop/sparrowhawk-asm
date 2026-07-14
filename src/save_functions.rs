@@ -115,10 +115,11 @@ pub fn write_sequences_and_coverages<IntT>(
             prevkmer = currkmer;
         }
 
-        if outseq.len() > k {
-            for _ in 0..k {
-                outseq.remove(outseq.len() - 1);
-            }
+        // We spell one nucleotide per k-mer, taking the last base of each, so the leading k-1 bases of
+        // the contig are already absent. Trim the same k-1 from the tail, so that every base we emit is
+        // flanked by a k-mer on both sides. Trimming k here (as we used to) is one base too many.
+        if outseq.len() >= k {
+            outseq.truncate(outseq.len() - (k - 1));
             if outseq.len() > 100 {
                 invec.contig_sequences.as_mut().unwrap().push(outseq);
             }
@@ -196,4 +197,102 @@ where
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph_works::Contigs;
+    use crate::kmer::Kmer;
+    use sparrowhawk_graph::NodeStruct;
+    use std::borrow::Cow;
+
+    /// A deterministic ACGT sequence. An LCG keeps it reproducible without pulling in a rng crate.
+    fn pseudo_seq(len: usize) -> Vec<u8> {
+        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                BASES[((state >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    /// Turn a sequence into the (thedict, abs_ind) pair that `write_sequences_and_coverages` consumes,
+    /// exactly as preprocessing would: `thedict` maps canonical hash -> canonical packed k-mer, and
+    /// `abs_ind` is the ordered list of canonical hashes along the walk.
+    fn dict_and_path(
+        seq: &[u8],
+        k: usize,
+    ) -> (
+        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        Vec<u64>,
+    ) {
+        let mut dict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> = HashMap::default();
+        let mut path: Vec<u64> = Vec::new();
+
+        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
+        let (hc, _, _, km) = it.get_curr_kmerhash_and_bases_and_kmer();
+        dict.insert(hc, km);
+        path.push(hc);
+        while let Some((hc, _, _, km)) = it.get_next_kmer_and_give_us_things() {
+            dict.insert(hc, km);
+            path.push(hc);
+        }
+        (dict, path)
+    }
+
+    /// A contig is spelled one nucleotide per k-mer (the *last* base of each), so it starts at S[k-1].
+    /// We then trim k-1 from the tail, so the emitted contig must be exactly `S[k-1 .. n]`, where
+    /// `n = |S| - k + 1` is the number of k-mers. Equivalently: k-1 bases dropped from each end.
+    #[test]
+    fn contig_is_trimmed_by_k_minus_one_at_each_end() {
+        let k = 31;
+        let seq = pseudo_seq(300);
+        let n = seq.len() - k + 1; // number of k-mers
+        let (dict, path) = dict_and_path(&seq, k);
+        assert_eq!(path.len(), n);
+
+        let mut contigs = Contigs::new(vec![vec![NodeStruct {
+            counts: 1,
+            abs_ind: path,
+            innerdir: None,
+        }]]);
+        write_sequences_and_coverages(&mut contigs, &dict, k);
+
+        let got = &contigs.contig_sequences.as_ref().unwrap()[0];
+        let want = &seq[k - 1..n];
+        assert_eq!(got.len(), want.len(), "contig length");
+        assert_eq!(got, want, "contig sequence");
+
+        // The trim is symmetric: k-1 gone from the front, k-1 gone from the back.
+        assert_eq!(got.len(), seq.len() - 2 * (k - 1));
+    }
+
+    /// The old code trimmed k from the tail instead of k-1, making every contig one base short.
+    /// Pin that down so it cannot regress.
+    #[test]
+    fn contig_keeps_the_final_confirmed_base() {
+        let k = 31;
+        let seq = pseudo_seq(300);
+        let n = seq.len() - k + 1;
+        let (dict, path) = dict_and_path(&seq, k);
+
+        let mut contigs = Contigs::new(vec![vec![NodeStruct {
+            counts: 1,
+            abs_ind: path,
+            innerdir: None,
+        }]]);
+        write_sequences_and_coverages(&mut contigs, &dict, k);
+
+        let got = &contigs.contig_sequences.as_ref().unwrap()[0];
+        assert_eq!(
+            *got.last().unwrap(),
+            seq[n - 1],
+            "the last base must be S[n-1]; trimming k rather than k-1 would leave S[n-2]"
+        );
+    }
 }
