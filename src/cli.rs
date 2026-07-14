@@ -177,14 +177,22 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_OUTPUT_PREFIX.to_string())]
         output_prefix: String,
 
-        /// K-mer size(s), comma-separated. One value gives a standard single-k assembly. Two give a
-        /// multi-k assembly: the first is the *assembly* k, whose graph is corrected and output; the
-        /// second is a larger *evidence* k, used only to decide which branches of the first are real.
-        /// For example `-k 31,63`.
+        /// K-mer size(s), comma-separated and strictly ascending.
+        ///
+        /// One value gives a standard single-k assembly. Two or more give a multi-k assembly: the FIRST
+        /// is the *assembly* k, whose graph is corrected and output, and the rest are larger *evidence*
+        /// k, used only to decide which branches of the assembly graph the reads actually support.
+        ///
+        /// A ladder is not redundant even though the largest evidence k resolves a superset of what the
+        /// smaller ones do. Evidence k needs (k-1) bases of *unambiguous* flank to be usable at all, and
+        /// in a tangled small-k graph that is often available for a small evidence k and not a large
+        /// one — and each resolution lengthens the unitigs that the next k up then needs.
+        ///
+        /// For example `-k 31,63`, or `-k 19,31,45,63`.
         ///
         /// Note the values are comma-separated, not space-separated: a space-separated list would be
         /// ambiguous against the positional list of input FASTQ files.
-        #[arg(short, value_parser = valid_kmer, value_delimiter = ',', num_args = 1..=2,
+        #[arg(short, value_parser = valid_kmer, value_delimiter = ',', num_args = 1..,
               default_values_t = vec![DEFAULT_KMER])]
         k: Vec<usize>,
 

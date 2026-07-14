@@ -197,42 +197,88 @@ fn run_build<IntT>(
 {
     let k1 = opts.ks[0];
 
-    let mut pre = preprocessing::preprocessing_standalone_multik::<IntT>(
-        opts.input_files,
-        opts.ks,
-        opts.quality,
-        timevec,
-        out_paths_histo,
-        opts.chunk_size,
-        opts.counter,
-        opts.do_bloom,
-        opts.auto_min_count,
-        opts.extraction,
-    );
+    // Build each evidence graph and drop that k's preprocessing with it, one k at a time.
+    //
+    // This matters much more with a ladder than it did with two k. The evidence side never spells
+    // sequence, so its `thedict` is dead weight, and once the graph is built `themap`'s neighbour lists
+    // live inside it — so an evidence k's count structures (the big ones) need never coexist with
+    // another's. Peak becomes `one k's preprocessing + the evidence graphs built so far`, rather than
+    // the sum over every k.
+    //
+    // `joint` extraction cannot do this: by construction it counts every k in one pass, so all N sets of
+    // count structures are live at once. It was already measured to buy nothing (+-3%), so with a ladder
+    // it is simply a worse deal, and we say so.
+    let mut evidence: Vec<algorithms::multik::EvidenceGraph> = Vec::new();
+    let mut assembly;
 
-    // Build the evidence graph first and drop the evidence k's preprocessing with it: the evidence side
-    // never spells sequence, so its `thedict` is dead weight, and this is what keeps the second k from
-    // simply doubling peak memory.
-    let evidence = if pre.len() > 1 {
-        let ev_pre = pre.pop().unwrap();
-        Some(algorithms::multik::build_evidence::<IntT>(ev_pre))
+    if opts.ks.len() > 1 && opts.extraction == MultiKExtraction::Joint {
+        log::warn!(
+            "--multik-extraction joint counts all {} k in one pass, so every k's count structures are \
+             live at once. It saves no time (measured: within 3% of sequential, and slower on the \
+             default counter), so with a ladder it only costs memory. Consider `sequential`.",
+            opts.ks.len()
+        );
+        let mut pre = preprocessing::preprocessing_standalone_multik::<IntT>(
+            opts.input_files,
+            opts.ks,
+            opts.quality,
+            timevec,
+            out_paths_histo,
+            opts.chunk_size,
+            opts.counter,
+            opts.do_bloom,
+            opts.auto_min_count,
+            opts.extraction,
+        );
+        // Drain the evidence k from the back, so the assembly k is what is left.
+        let mut evs: Vec<_> = pre.split_off(1);
+        for ev_pre in evs.drain(..) {
+            evidence.push(algorithms::multik::build_evidence::<IntT>(ev_pre));
+        }
+        assembly = pre.pop().unwrap();
     } else {
+        for (i, &k_ev) in opts.ks.iter().enumerate().skip(1) {
+            let ev_pre = preprocessing::preprocessing_standalone::<IntT>(
+                opts.input_files,
+                k_ev,
+                opts.quality,
+                timevec,
+                &mut out_paths_histo[i],
+                opts.chunk_size,
+                opts.counter,
+                opts.do_bloom,
+                opts.auto_min_count,
+            );
+            evidence.push(algorithms::multik::build_evidence::<IntT>(ev_pre));
+        }
+        assembly = preprocessing::preprocessing_standalone::<IntT>(
+            opts.input_files,
+            k1,
+            opts.quality,
+            timevec,
+            &mut out_paths_histo[0],
+            opts.chunk_size,
+            opts.counter,
+            opts.do_bloom,
+            opts.auto_min_count,
+        );
+    }
+
+    let multik = if evidence.is_empty() {
         None
+    } else {
+        Some(graph_works::MultiKCtx {
+            evidence: &evidence,
+            dict: &assembly.thedict,
+            flank_budget: opts.flank_context,
+            min_evidence: opts.min_evidence,
+            max_nodes: opts.max_nodes,
+            protect: opts.protect,
+            resolve: opts.resolve,
+            max_rounds: opts.max_rounds,
+            stats_path: opts.stats_path.clone(),
+        })
     };
-
-    let assembly = &mut pre[0];
-
-    let multik = evidence.as_ref().map(|ev| graph_works::MultiKCtx {
-        ev,
-        dict: &assembly.thedict,
-        flank_budget: opts.flank_context,
-        min_evidence: opts.min_evidence,
-        max_nodes: opts.max_nodes,
-        protect: opts.protect,
-        resolve: opts.resolve,
-        max_rounds: opts.max_rounds,
-        stats_path: opts.stats_path.clone(),
-    });
 
     let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
         k1,
@@ -360,25 +406,23 @@ pub fn main() {
 
             // `valid_kmer` already rejects even k and anything outside 3..=256 per value; what it
             // cannot see is the relationship between them.
-            match k.len() {
-                1 => {}
-                2 if k[1] > k[0] => log::info!(
-                    "Multi-k: assembling at k={}, using k={} as evidence",
+            // Strictly ascending: the first k is the assembly k, the rest are evidence, and the
+            // ladder climbs. Equal or descending values are always a mistake, and silently sorting them
+            // would hide it.
+            if k.windows(2).any(|w| w[1] <= w[0]) {
+                eprintln!(
+                    "error: -k values must be strictly ascending (got {k:?}). The first is the assembly \
+                     k; every later one is a larger evidence k, whose whole purpose is longer-range read \
+                     evidence than the k before it."
+                );
+                std::process::exit(2);
+            }
+            if k.len() > 1 {
+                log::info!(
+                    "Multi-k: assembling at k={}, with evidence ladder k={:?}",
                     k[0],
-                    k[1]
-                ),
-                2 => {
-                    eprintln!(
-                        "error: the evidence k must be larger than the assembly k (got -k {},{}). \
-                         The point of the second k is longer-range read evidence.",
-                        k[0], k[1]
-                    );
-                    std::process::exit(2);
-                }
-                n => {
-                    eprintln!("error: at most two k values are supported for now (got {n})");
-                    std::process::exit(2);
-                }
+                    &k[1..]
+                );
             }
 
             let opts = BuildOpts {

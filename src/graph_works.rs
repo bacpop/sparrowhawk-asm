@@ -385,8 +385,10 @@ mod tests {
 /// Everything the multi-k oracle needs, handed to `assemble` when a second k was requested.
 #[cfg(not(target_family = "wasm"))]
 pub struct MultiKCtx<'a, IntT> {
-    /// The larger-k graph, used purely as evidence about the reads.
-    pub ev: &'a EvidenceGraph,
+    /// The evidence graphs, in **ascending** k. Each is used in turn, run to its own fixed point before
+    /// the next: resolving with a smaller evidence k lengthens the unitigs that a larger one then needs
+    /// for flank context, which is the whole reason a ladder beats jumping straight to the largest k.
+    pub evidence: &'a [EvidenceGraph],
     /// The assembly k's hash -> packed k-mer dictionary, for spelling candidate paths.
     pub dict: &'a HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     /// How many k-mers of each flanking unitig to use as context.
@@ -504,11 +506,9 @@ impl Assemble for BasicAsm {
         let mut bool2: bool = false;
         let mut bool3: bool = false;
         let mut bool4: bool = false;
-        // Splits interact: resolving one repeat reshapes its neighbourhood, so a split queued in the
-        // same pass can find the graph moved under it. Re-judging on the freshly-shrunk graph picks
-        // those up. Stop as soon as a round splits nothing.
-        let mut ev_rounds = 0usize;
-        let mut ev_stats = MultiKStats::default();
+        // One stats block per evidence k, so the ladder can be read rung by rung.
+        let mut ladder_done = false;
+        let mut ev_stats: Vec<(usize, MultiKStats)> = Vec::new();
         let mut protected: BTreeSet<NodeId> = BTreeSet::new();
         while didanyofusdoanything {
             bool1 = ptgraph.shrink();
@@ -517,37 +517,49 @@ impl Assemble for BasicAsm {
             // be unitigs before there is any context to gather. Read-only: it changes nothing, so the
             // assembly is bit-for-bit what a single-k run would produce. That is the point. It lets the
             // whole oracle be validated on real data before it is trusted to act.
-            if let Some(ctx) = &multik {
-                if ev_rounds < ctx.max_rounds {
-                    let mut round = MultiKStats::default();
-                    protected = correct_with_evidence::<IntT>(
-                        ctx.ev,
-                        &mut ptgraph,
-                        ctx.dict,
-                        k,
-                        ctx.flank_budget,
-                        ctx.min_evidence,
-                        ctx.max_nodes,
-                        ctx.resolve,
-                        ctx.protect,
-                        &mut round,
-                    );
-                    ev_rounds += 1;
-                    let split = round.split_applied;
-                    ev_stats.accumulate(round);
-                    ev_stats.rounds = ev_rounds;
-                    // A split changed the graph: shrink and re-judge, which recovers the ones an
-                    // earlier split in the same pass had invalidated.
-                    if split > 0 {
-                        bool1 = true;
-                    } else {
-                        // Converged: nothing more can be split, so release whatever we were holding
-                        // back and let the coverage heuristic deal with the remainder.
-                        ev_rounds = ctx.max_rounds;
-                        if !ctx.protect {
-                            protected.clear();
+            if let (Some(ctx), false) = (&multik, ladder_done) {
+                ladder_done = true;
+
+                // The ladder. Ascending evidence k, each run to its own fixed point before the next,
+                // because every resolution merges nodes and lengthens unitigs — which is precisely the
+                // flank context the next k up needs, and often does not have until then.
+                for ev in ctx.evidence {
+                    let mut stats = MultiKStats::default();
+                    for round in 0..ctx.max_rounds {
+                        let mut r = MultiKStats::default();
+                        protected = correct_with_evidence::<IntT>(
+                            ev,
+                            &mut ptgraph,
+                            ctx.dict,
+                            k,
+                            ctx.flank_budget,
+                            ctx.min_evidence,
+                            ctx.max_nodes,
+                            ctx.resolve,
+                            ctx.protect,
+                            &mut r,
+                        );
+                        let split = r.split_applied;
+                        stats.accumulate(r);
+                        stats.rounds = round + 1;
+
+                        if split == 0 {
+                            break; // converged for this evidence k
                         }
+                        // A split reshaped the graph: re-compact, then re-judge. That recovers the
+                        // candidates an earlier split in the same pass had invalidated, and it lengthens
+                        // the unitigs the next rung of the ladder will need.
+                        ptgraph.shrink();
+                        bool1 = true;
                     }
+                    stats.report(k, ev.k);
+                    ev_stats.push((ev.k, stats));
+                }
+
+                // The ladder is done. Release anything we were holding back and let the coverage
+                // heuristic deal with whatever it could not resolve.
+                if !ctx.protect {
+                    protected.clear();
                 }
             }
 
@@ -564,11 +576,15 @@ impl Assemble for BasicAsm {
         }
 
         if let Some(ctx) = &multik {
-            ev_stats.report(k, ctx.ev.k);
             if let Some(path) = &ctx.stats_path {
                 let mut f = std::fs::File::create(path).expect("cannot write multi-k stats");
                 let _ = writeln!(f, "{}", MultiKStats::tsv_header());
-                let _ = writeln!(f, "{}", ev_stats.tsv_row("TOTAL"));
+                let mut total = MultiKStats::default();
+                for (kev, st) in &ev_stats {
+                    let _ = writeln!(f, "{}", st.tsv_row(&kev.to_string()));
+                    total.accumulate(st.clone());
+                }
+                let _ = writeln!(f, "{}", total.tsv_row("TOTAL"));
                 logw(
                     format!("Multi-k stats written to {}", path.display()).as_str(),
                     Some("info"),

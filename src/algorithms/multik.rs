@@ -993,16 +993,17 @@ impl MultiKStats {
 
     /// One TSV row of counters, so parameter sweeps are scriptable without scraping the log.
     pub fn tsv_header() -> &'static str {
-        "round\tbubbles_seen\tresolved_error\tresolvable_repeat\tprotected_repeat\t\
+        "k\trounds\tbubbles_seen\tresolved_error\tresolvable_repeat\tprotected_repeat\t\
          inconclusive_context\tinconclusive_absent\tinconclusive_partial\tinconclusive_spell\t\
          pairing_ok\tpairing_ambiguous\tsplit_applied\tsplit_skipped_stale\tflanks_truncated"
     }
 
-    /// `label` is the round number, or `TOTAL`.
+    /// `label` is the evidence k, or `TOTAL`.
     pub fn tsv_row(&self, label: &str) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             label,
+            self.rounds,
             self.bubbles_seen,
             self.resolved_error,
             self.resolvable_repeat,
