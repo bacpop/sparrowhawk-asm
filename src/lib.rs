@@ -168,7 +168,8 @@ struct BuildOpts<'a> {
     chunk_size: usize,
     counter: Counter,
     do_bloom: bool,
-    auto_min_count: bool,
+    /// Fit `min_count` from the k-mer spectrum, per k, rather than using `quality.min_count`.
+    do_fit: bool,
     do_bubble_collapse: bool,
     do_dead_end_removal: bool,
     extraction: MultiKExtraction,
@@ -231,7 +232,7 @@ fn run_build<IntT>(
             opts.chunk_size,
             opts.counter,
             opts.do_bloom,
-            opts.auto_min_count,
+            opts.do_fit,
             opts.extraction,
         );
         // Drain the evidence k from the back, so the assembly k is what is left.
@@ -251,7 +252,7 @@ fn run_build<IntT>(
                 opts.chunk_size,
                 opts.counter,
                 opts.do_bloom,
-                opts.auto_min_count,
+                opts.do_fit,
             );
             evidence.push(algorithms::multik::build_evidence::<IntT>(ev_pre));
         }
@@ -264,7 +265,7 @@ fn run_build<IntT>(
             opts.chunk_size,
             opts.counter,
             opts.do_bloom,
-            opts.auto_min_count,
+            opts.do_fit,
         );
     }
 
@@ -318,7 +319,6 @@ pub fn main() {
             min_count,
             min_qual,
             threads,
-            auto_min_count,
             do_bloom,
             chunk_size,
             counter,
@@ -359,14 +359,7 @@ pub fn main() {
             let input_files = get_input_list(file_list, seq_files);
             // let input_files = get_input_list(file_list);
 
-            // Fit the min_count from the spectrum unless an explicit value was given. `--auto-min-count`
-            // is deprecated (fitting is now the default) but still honoured, so old scripts do not break.
-            if *auto_min_count {
-                log::warn!(
-                    "--auto-min-count is deprecated and now a no-op: fitting is the default. Omit \
-                     --min-count to fit, or give it a value to override."
-                );
-            }
+            // Fit the min_count from the spectrum unless an explicit value was given.
             let do_fit = min_count.is_none();
             let quality = QualOpts {
                 // Only used when do_fit is false; the fit ignores it.
@@ -450,7 +443,7 @@ pub fn main() {
                 chunk_size: *chunk_size,
                 counter: *counter,
                 do_bloom: *do_bloom,
-                auto_min_count: do_fit,
+                do_fit,
                 do_bubble_collapse: !no_bubble_collapse,
                 do_dead_end_removal: !no_dead_end_removal,
                 extraction: *multik_extraction,

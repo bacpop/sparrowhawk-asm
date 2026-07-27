@@ -120,7 +120,7 @@ impl Shrinkable for DbgGraph {
         ambnodes: &BTreeSet<NodeId>,
         mut curredge: EdgeType,
     ) {
-        let mut countsformean: Vec<u16> = vec![self.node_weight(base_node).unwrap().counts];
+        let mut countsformean: Vec<u32> = vec![self.node_weight(base_node).unwrap().counts];
 
         let (initty, mut currtype) = curredge.get_from_and_to();
 

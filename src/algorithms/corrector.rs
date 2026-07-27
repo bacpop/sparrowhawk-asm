@@ -316,7 +316,7 @@ fn choose_branch_by_counts(
     // k-mer has `counts >= min_count`, the two arms below could then never fire, so the whole filter
     // was dead code.
     let count_threshold = max(
-        (0.1_f32 * max(node0w.counts, node1w.counts) as f32).round() as u16,
+        (0.1_f32 * max(node0w.counts, node1w.counts) as f32).round() as u32,
         1,
     );
 
@@ -345,10 +345,11 @@ fn choose_branch_by_counts(
             )
             .unwrap()
             .counts;
-        let average_surrounding_counts = ((startn_counts + endn_counts) as f32 / 2.0).round() as u16;
+        let average_surrounding_counts = ((startn_counts + endn_counts) as f32 / 2.0).round() as u32;
 
-        let rel_diff = |c: u16| {
-            ((c as i32) - (average_surrounding_counts as i32)).abs() as f32
+        // i64, not i32: with u32 counts the difference no longer fits in an i32.
+        let rel_diff = |c: u32| {
+            ((c as i64) - (average_surrounding_counts as i64)).abs() as f32
                 / (average_surrounding_counts as f32)
         };
         let (rel_diff_0, rel_diff_1) = (rel_diff(node0w.counts), rel_diff(node1w.counts));

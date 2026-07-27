@@ -73,7 +73,7 @@ use wasm_bindgen_file_reader::WebSysFile;
 const MAXSIZEHISTO: usize = 500;
 
 #[inline]
-fn add_to_histogram(histovec: &mut [u32], count: u16) {
+fn add_to_histogram(histovec: &mut [u32], count: u32) {
     let idx = if (count as usize) >= MAXSIZEHISTO {
         MAXSIZEHISTO - 1
     } else {
@@ -110,7 +110,7 @@ fn apply_spectrum_fit(histovec: &[u32]) -> u16 {
 }
 
 fn build_histogram_from_countmap(
-    countmap: &HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    countmap: &HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     histovec: &mut [u32],
 ) {
     for (_, tup) in countmap.iter() {
@@ -119,7 +119,7 @@ fn build_histogram_from_countmap(
 }
 
 fn drain_countmap_into_themap<IntT>(
-    countmap: &mut HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    countmap: &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     themap: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     outdict: &mut HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     minmaxdict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -129,7 +129,7 @@ fn drain_countmap_into_themap<IntT>(
     IntT: for<'a> UInt<'a>,
 {
     countmap.retain(|h, tup| {
-        if tup.0 >= minc {
+        if tup.0 >= minc as u32 {
             themap.entry(*h).or_insert_with(|| HashInfoSimple {
                 hnc: tup.1,
                 b: tup.2,
@@ -414,7 +414,7 @@ where
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
     let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
     let mut themap = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut countmap: HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> =
+    let mut countmap: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> =
         HashMap::with_hasher(BuildHasherDefault::default());
 
     let mut reader = open_fastq(file1);
@@ -885,7 +885,9 @@ where
 /// once, on first sight, rather than once per occurrence as the old sorting vector did.
 #[cfg(not(target_family = "wasm"))]
 struct KmerInfo<IntT> {
-    count: u16,
+    /// `u32`, not `u16`: real high-coverage libraries exceed 65,535 sightings for short high-copy
+    /// elements, which used to clip silently. Free — struct padding absorbs the widening.
+    count: u32,
     hnc: u64,
     b: u8,
     km: IntT,
@@ -943,7 +945,7 @@ where
     // Shards are drained in order, so the result is independent of how many threads did the counting.
     for shard in shards {
         for (hc, info) in shard {
-            if info.count >= minc {
+            if info.count >= minc as u32 {
                 themap.insert(
                     hc,
                     HashInfoSimple {
@@ -964,10 +966,10 @@ where
 
 fn update_countmap(
     invec: &[(u64, u64, u8)],
-    countmap: &mut HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    countmap: &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
 ) {
     let mut i = 0;
-    let mut c: u16 = 0;
+    let mut c: u32 = 0;
     let mut tmphash = invec[i].0;
     // let mut tmpcounter = 0;
 
@@ -1088,7 +1090,7 @@ where
 
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
     let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut countmap: HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> =
+    let mut countmap: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> =
         HashMap::with_hasher(BuildHasherDefault::default());
 
     let histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
@@ -1150,7 +1152,7 @@ where
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::type_complexity)]
 fn finish_sort_counter<IntT>(
-    mut countmap: HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    mut countmap: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     mut outdict: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     mut minmaxdict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
     mut histovec: Vec<u32>,
@@ -1368,7 +1370,7 @@ where
             let csize = if csize == 0 { usize::MAX } else { csize };
 
             let mut outvecs: Vec<Vec<(u64, u64, u8)>> = (0..nk).map(|_| Vec::new()).collect();
-            let mut countmaps: Vec<HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>> =
+            let mut countmaps: Vec<HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>> =
                 (0..nk)
                     .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
                     .collect();
@@ -1591,7 +1593,7 @@ mod tests {
     use nohash_hasher::NoHashHasher;
     use std::{collections::HashMap, hash::BuildHasherDefault};
 
-    fn empty_countmap() -> HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
+    fn empty_countmap() -> HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
         HashMap::with_hasher(BuildHasherDefault::default())
     }
 
@@ -1653,7 +1655,7 @@ mod tests {
     #[test]
     fn drain_countmap_above_threshold_included() {
         let mut cmap = empty_countmap();
-        cmap.insert(1u64, (5u16, 2u64, 0u8)); // count=5 >= minc=3 → in themap
+        cmap.insert(1u64, (5u32, 2u64, 0u8)); // count=5 >= minc=3 → in themap
         let mut themap = empty_themap();
         let mut outdict = empty_dict();
         let mut minmaxdict = empty_dict();
@@ -1671,7 +1673,7 @@ mod tests {
     #[test]
     fn drain_countmap_below_threshold_excluded() {
         let mut cmap = empty_countmap();
-        cmap.insert(2u64, (2u16, 3u64, 0u8)); // count=2 < minc=3 → removed from outdict
+        cmap.insert(2u64, (2u32, 3u64, 0u8)); // count=2 < minc=3 → removed from outdict
         let mut themap = empty_themap();
         let mut outdict = empty_dict();
         outdict.insert(2u64, 99u64); // should be removed
@@ -1694,7 +1696,7 @@ mod tests {
     fn drain_countmap_boundary_equal_minc() {
         // count == minc → included (>= check)
         let mut cmap = empty_countmap();
-        cmap.insert(5u64, (3u16, 0u64, 0u8));
+        cmap.insert(5u64, (3u32, 0u64, 0u8));
         let mut themap = empty_themap();
         let mut outdict = empty_dict();
         let mut minmaxdict = empty_dict();
@@ -1712,8 +1714,8 @@ mod tests {
     #[test]
     fn drain_countmap_with_histogram() {
         let mut cmap = empty_countmap();
-        cmap.insert(1u64, (5u16, 0u64, 0u8)); // count=5 → histovec[4]
-        cmap.insert(2u64, (10u16, 0u64, 0u8)); // count=10 → histovec[9]
+        cmap.insert(1u64, (5u32, 0u64, 0u8)); // count=5 → histovec[4]
+        cmap.insert(2u64, (10u32, 0u64, 0u8)); // count=10 → histovec[9]
         let mut themap = empty_themap();
         let mut outdict = empty_dict();
         let mut minmaxdict = empty_dict();

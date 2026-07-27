@@ -213,11 +213,6 @@ pub enum Commands {
         #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
         threads: usize,
 
-        /// DEPRECATED, and now a no-op: fitting is the default. Omit `--min-count` to fit, or give it a
-        /// value to override. Kept, hidden, for one release so existing scripts do not break.
-        #[arg(long, default_value_t = false, hide = true)]
-        auto_min_count: bool,
-
         /// Use, instead of the default filtering, a Bloom filter. This will use less memory and be faster, but will add
         /// false positive matches to the counting, making possible that a k-mer is counted more times that it should be.
         #[arg(long, default_value_t = false)]
