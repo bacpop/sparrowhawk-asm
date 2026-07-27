@@ -21,7 +21,7 @@ nohash-hasher = { version = "0.2.0" }
 stacker = { version = "0.1.20" }
 project-root = { version = "0.2.2" }
 petgraph = { version = "0.8.1" }
-sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", branch = "master" }
+sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", branch = "multik-dev" }
 bnum = { version = "0.13.0", features = ["serde", "numtraits"] }
 argmin = { version = "0.10.0", features = ["wasm-bindgen"] }
 argmin-math = { version = "0.4" }
