@@ -6,3 +6,8 @@ pub mod corrector;
 #[cfg(not(target_family = "wasm"))]
 pub mod multik;
 pub mod shrinker;
+/// Finding superbubbles — forks with three or more branches, multi-unitig branches, or nesting — and
+/// asking the multi-k oracle about them. Native only, for the same reason as `multik`: it needs the
+/// evidence graph.
+#[cfg(not(target_family = "wasm"))]
+pub mod superbubble;

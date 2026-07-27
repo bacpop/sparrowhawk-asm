@@ -31,9 +31,6 @@ pub trait Correctable {
 
     /// Remove all input and output dead paths
     fn remove_dead_paths(&mut self) -> bool;
-
-    /// Find and remove all links that are impossible in bi-directed de Bruijn graphs derived from DNA sequences.
-    fn remove_conflictive_links(&mut self) -> bool;
 }
 
 impl Correctable for DbgGraph {
@@ -104,10 +101,6 @@ impl Correctable for DbgGraph {
             // to_remove.sort_by(|a, b| b.cmp(a));
             remove_paths(self, to_remove.drain(..));
         }
-    }
-
-    fn remove_conflictive_links(&mut self) -> bool {
-        false
     }
 }
 

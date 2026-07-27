@@ -219,7 +219,7 @@ impl EvidenceGraph {
 /// means the stored list runs backwards relative to us, so reverse it. This is the rule
 /// `collapser.rs:137-141` already uses, and the clone matters: the reversal must never be written back
 /// into the graph.
-fn oriented(g: &DbgGraph, n: NodeId, carry: CarryType) -> Vec<u64> {
+pub(crate) fn oriented(g: &DbgGraph, n: NodeId, carry: CarryType) -> Vec<u64> {
     let w: &NodeStruct = g.node_weight(n).unwrap();
     let mut hashes = w.abs_ind.clone();
     if let Some(inn) = w.innerdir {
@@ -239,7 +239,7 @@ fn oriented(g: &DbgGraph, n: NodeId, carry: CarryType) -> Vec<u64> {
 /// Walking **backwards** from a node on carry `c`, the previous node's carry is the *source* carry of
 /// the edge, `get_from_and_to().0`. (Forwards it is the *target* carry, `.1`.) Getting this the wrong
 /// way round is the single easiest mistake here.
-fn gather_left(
+pub(crate) fn gather_left(
     g: &DbgGraph,
     from: (NodeId, EdgeType),
     budget: usize,
@@ -282,7 +282,7 @@ fn gather_left(
 /// Walk forwards from `end` along a unique path, collecting up to `budget` k-mers, in walk order.
 ///
 /// Forwards from a node on carry `c`, the next node's carry is the *target* carry, `get_from_and_to().1`.
-fn gather_right(
+pub(crate) fn gather_right(
     g: &DbgGraph,
     from: (NodeId, EdgeType),
     budget: usize,
@@ -505,7 +505,7 @@ where
 /// Measured on the bench data the shared chain is 2-3 nodes (~44 bases) — short, which is precisely why
 /// k2=63 can span it. A long chain would mean a long repeat, which k2 could not have resolved in the
 /// first place. So this is a sanity bound, not a tuning knob.
-const MAX_SHARED_CHAIN: usize = 8;
+pub(crate) const MAX_SHARED_CHAIN: usize = 8;
 
 /// The shared repeat between the fork point and the bubble, in walk order, each with its traversal carry.
 ///
@@ -564,6 +564,29 @@ fn shared_chain(g: &DbgGraph, p: &BubbleParts) -> Option<SharedChain> {
     Some(SharedChain { left, right })
 }
 
+/// Why a planned split did not happen.
+///
+/// This used to be a bare `bool` folded into a single `split_skipped_stale` counter, which made the
+/// number uninterpretable: it conflated *staleness* (the neighbourhood moved between judging and
+/// splitting) with *surgery failure* (the neighbourhood was intact but an expected edge was missing).
+/// Those have different causes and different fixes, so they are counted apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitOutcome {
+    /// The split was applied.
+    Applied,
+    /// `bubble_parts` no longer recognises a bubble at this start. Usually `shrink` absorbed the
+    /// junction into a longer unitig after an earlier split in the same pass.
+    StaleNoBubble,
+    /// Still a bubble, but with different mid nodes than the ones that were judged.
+    StaleMidsChanged,
+    /// Intact, but an expected edge in the left shared chain was absent.
+    SurgeryFailedLeft,
+    /// Intact, but an expected edge in the right shared chain was absent.
+    SurgeryFailedRight,
+    /// Intact, but the branch's edge to the bubble end was absent.
+    SurgeryFailedMid,
+}
+
 /// Duplicate the shared repeat so each branch gets its own copy of it, and rewire.
 ///
 /// Before, the genome's two loci are forced through one shared chain, so no contig can walk through and
@@ -595,7 +618,7 @@ fn split_repeat(
     chain: &SharedChain,
     pred_for: [(NodeId, EdgeType); 2],
     succ_for: [(NodeId, EdgeType); 2],
-) -> bool {
+) -> SplitOutcome {
     // Branch 1 moves onto the clones; branch 0 keeps the originals.
     let b = 1usize;
 
@@ -614,19 +637,19 @@ fn split_repeat(
     for w in chain.left.windows(2) {
         match edge_between(g, w[0], w[1].0) {
             Some(t) => left_edges.push(t),
-            None => return false,
+            None => return SplitOutcome::SurgeryFailedLeft,
         }
     }
     let mut right_edges = Vec::new();
     for w in chain.right.windows(2) {
         match edge_between(g, w[0], w[1].0) {
             Some(t) => right_edges.push(t),
-            None => return false,
+            None => return SplitOutcome::SurgeryFailedRight,
         }
     }
     let mid_to_end = match edge_between(g, (p.mid[b].0, p.midct[b]), p.end) {
         Some(t) => t,
-        None => return false,
+        None => return SplitOutcome::SurgeryFailedMid,
     };
 
     // --- clone the shared nodes ------------------------------------------------------------------
@@ -678,11 +701,11 @@ fn split_repeat(
     cut(g, exit, succ_for[b].0);
     g.add_bi_edge(*right_clones.last().unwrap(), succ_for[b].0, succ_for[b].1);
 
-    true
+    SplitOutcome::Applied
 }
 
 /// The fraction of flank k2-mers that must be present before we trust the context at all.
-const FLANK_SUPPORT: f64 = 0.9;
+pub(crate) const FLANK_SUPPORT: f64 = 0.9;
 
 /// What the evidence says about a bubble. Every candidate lands in exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +824,8 @@ pub fn correct_with_evidence<IntT>(
     do_resolve: bool,
     do_protect: bool,
     stats: &mut MultiKStats,
+    prev_skipped: &BTreeSet<NodeId>,
+    skipped_out: &mut BTreeSet<NodeId>,
 ) -> BTreeSet<NodeId>
 where
     IntT: for<'a> UInt<'a>,
@@ -818,11 +843,21 @@ where
     let mut to_split: Vec<(BubbleParts, SharedChain, Pairing)> = Vec::new();
 
     for p in candidates {
+        // Fate of anything the previous round could not split. The retry loop already re-offers these;
+        // what we did not know was what happens when it does.
+        let revisited = prev_skipped.contains(&p.start);
+        if revisited {
+            stats.revisit_seen += 1;
+        }
+
         let (v, truncated) =
             judge_bubble::<IntT>(ev, g, &p, dict, k1, flank_budget, min_evidence, max_nodes);
         stats.record(v, truncated);
 
         if v == Verdict::ResolvableRepeat {
+            if revisited {
+                stats.revisit_resolvable += 1;
+            }
             // k2 spans the repeat, so the reads know which predecessor belongs with which branch.
             // Whether they say so *unambiguously* is what decides if we may split.
             let paired = shared_chain(g, &p).and_then(|c| {
@@ -831,6 +866,9 @@ where
             match paired {
                 Some((c, pr)) => {
                     stats.pairing_ok += 1;
+                    if revisited {
+                        stats.revisit_paired += 1;
+                    }
                     to_split.push((p.clone(), c, pr));
                 }
                 None => stats.pairing_ambiguous += 1,
@@ -842,6 +880,10 @@ where
         }
     }
 
+    // Anything skipped last round that did not even come back as a candidate. `revisit_seen` counts
+    // reappearances, so the remainder vanished — absorbed by `shrink`, or popped.
+    stats.revisit_absent = prev_skipped.len().saturating_sub(stats.revisit_seen);
+
     if !do_protect {
         // Judged and reported, but the heuristic still gets every bubble it would have had.
         protected.clear();
@@ -850,18 +892,52 @@ where
     if do_resolve {
         for (p, c, pr) in &to_split {
             // Re-derive: an earlier split in this same pass may have reshaped this neighbourhood.
-            let stale = match crate::algorithms::corrector::bubble_parts(g, p.start) {
-                Some(fresh) => fresh.mid[0].0 != p.mid[0].0 || fresh.mid[1].0 != p.mid[1].0,
-                None => true,
+            let outcome = match crate::algorithms::corrector::bubble_parts(g, p.start) {
+                None => SplitOutcome::StaleNoBubble,
+                Some(fresh) if fresh.mid[0].0 != p.mid[0].0 || fresh.mid[1].0 != p.mid[1].0 => {
+                    SplitOutcome::StaleMidsChanged
+                }
+                Some(_) => split_repeat(g, p, c, pr.pred_for, pr.succ_for),
             };
-            if !stale && split_repeat(g, p, c, pr.pred_for, pr.succ_for) {
-                stats.split_applied += 1;
-            } else {
+            stats.record_split(outcome);
+
+            if outcome != SplitOutcome::Applied {
                 // We *intend* to split this one, we just could not on this pass. Veto the coverage
                 // heuristic on it so it survives to the next round — otherwise the heuristic pops it
                 // and the sequence we were about to recover is gone before we get a second chance.
-                stats.split_skipped_stale += 1;
                 protected.insert(p.start);
+                skipped_out.insert(p.start);
+
+                // One line per locus — there are only ~12-25 of these per dataset, so they are worth
+                // reading individually rather than inferring from totals. At `info` because `-v` maps
+                // to Info and never Debug (`lib.rs`), and this is the whole point of the counter.
+                //
+                // `still_present` and the degrees are what distinguish the two things a
+                // `StaleNoBubble` can mean: the start node destroyed, versus the node alive but no
+                // longer a fork because a neighbouring split already separated this locus too. Only
+                // the first would be a loss.
+                let still_present = g.contains_node(p.start);
+                let (od, idg) = if still_present {
+                    (g.out_degree(p.start), g.in_degree(p.start))
+                } else {
+                    (0, 0)
+                };
+                log::info!(
+                    "    split skipped ({outcome:?}): start={:?} present={} out_deg={} in_deg={} \
+                     mids={:?}/{:?} chain={}L+{}R preds={:?}/{:?} succs={:?}/{:?}",
+                    p.start,
+                    still_present,
+                    od,
+                    idg,
+                    p.mid[0].0,
+                    p.mid[1].0,
+                    c.left.len(),
+                    c.right.len(),
+                    pr.pred_for[0].0,
+                    pr.pred_for[1].0,
+                    pr.succ_for[0].0,
+                    pr.succ_for[1].0,
+                );
             }
         }
     }
@@ -936,8 +1012,60 @@ pub struct MultiKStats {
     pub pairing_ambiguous: usize,
     /// Splits actually performed.
     pub split_applied: usize,
-    /// Splits skipped because an earlier split had already reshaped the neighbourhood.
-    pub split_skipped_stale: usize,
+
+    // ── why a planned split did not happen ───────────────────────────────────
+    //
+    // These five replace a single `split_skipped_stale` counter, which conflated two different
+    // failures and so could not be acted on. `stale_*` mean the neighbourhood moved between judging
+    // and splitting; `surgery_failed_*` mean it did not, but an expected edge was missing.
+    /// `bubble_parts` no longer sees a bubble here — usually `shrink` absorbed the junction.
+    pub stale_no_bubble: usize,
+    /// Still a bubble, but with different mid nodes than were judged.
+    pub stale_mids_changed: usize,
+    /// An expected edge in the left shared chain was absent.
+    pub surgery_failed_left: usize,
+    /// An expected edge in the right shared chain was absent.
+    pub surgery_failed_right: usize,
+    /// The branch's edge to the bubble end was absent.
+    pub surgery_failed_mid: usize,
+
+    // ── fate of the previous round's skipped loci ────────────────────────────
+    //
+    // The retry loop in `graph_works` re-judges everything after each round with splits, so the
+    // question is not "were they retried" (they were) but "what happened when they were". Without
+    // this, a locus that silently stops being a candidate is indistinguishable from one that is
+    // retried and rejected.
+    /// Previously-skipped starts that reappeared as bubble candidates this round.
+    pub revisit_seen: usize,
+    /// …of those, how many still judged `ResolvableRepeat`.
+    pub revisit_resolvable: usize,
+    /// …of those, how many also paired unambiguously, i.e. were genuinely splittable this round.
+    pub revisit_paired: usize,
+    /// Previously-skipped starts that did not reappear as candidates at all.
+    pub revisit_absent: usize,
+}
+
+impl MultiKStats {
+    /// Total planned splits that did not happen, however they failed.
+    pub fn split_skipped(&self) -> usize {
+        self.stale_no_bubble
+            + self.stale_mids_changed
+            + self.surgery_failed_left
+            + self.surgery_failed_right
+            + self.surgery_failed_mid
+    }
+
+    /// Record one failed split against its reason.
+    pub fn record_split(&mut self, o: SplitOutcome) {
+        match o {
+            SplitOutcome::Applied => self.split_applied += 1,
+            SplitOutcome::StaleNoBubble => self.stale_no_bubble += 1,
+            SplitOutcome::StaleMidsChanged => self.stale_mids_changed += 1,
+            SplitOutcome::SurgeryFailedLeft => self.surgery_failed_left += 1,
+            SplitOutcome::SurgeryFailedRight => self.surgery_failed_right += 1,
+            SplitOutcome::SurgeryFailedMid => self.surgery_failed_mid += 1,
+        }
+    }
 }
 
 impl MultiKStats {
@@ -955,7 +1083,15 @@ impl MultiKStats {
         self.pairing_ok += r.pairing_ok;
         self.pairing_ambiguous += r.pairing_ambiguous;
         self.split_applied += r.split_applied;
-        self.split_skipped_stale += r.split_skipped_stale;
+        self.stale_no_bubble += r.stale_no_bubble;
+        self.stale_mids_changed += r.stale_mids_changed;
+        self.surgery_failed_left += r.surgery_failed_left;
+        self.surgery_failed_right += r.surgery_failed_right;
+        self.surgery_failed_mid += r.surgery_failed_mid;
+        self.revisit_seen += r.revisit_seen;
+        self.revisit_resolvable += r.revisit_resolvable;
+        self.revisit_paired += r.revisit_paired;
+        self.revisit_absent += r.revisit_absent;
     }
 
     /// Record one verdict.
@@ -995,13 +1131,16 @@ impl MultiKStats {
     pub fn tsv_header() -> &'static str {
         "k\trounds\tbubbles_seen\tresolved_error\tresolvable_repeat\tprotected_repeat\t\
          inconclusive_context\tinconclusive_absent\tinconclusive_partial\tinconclusive_spell\t\
-         pairing_ok\tpairing_ambiguous\tsplit_applied\tsplit_skipped_stale\tflanks_truncated"
+         pairing_ok\tpairing_ambiguous\tsplit_applied\tsplit_skipped\t\
+         stale_no_bubble\tstale_mids_changed\tsurgery_failed_left\tsurgery_failed_right\t\
+         surgery_failed_mid\trevisit_seen\trevisit_resolvable\trevisit_paired\trevisit_absent\t\
+         flanks_truncated"
     }
 
     /// `label` is the evidence k, or `TOTAL`.
     pub fn tsv_row(&self, label: &str) -> String {
         format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             label,
             self.rounds,
             self.bubbles_seen,
@@ -1015,7 +1154,16 @@ impl MultiKStats {
             self.pairing_ok,
             self.pairing_ambiguous,
             self.split_applied,
-            self.split_skipped_stale,
+            self.split_skipped(),
+            self.stale_no_bubble,
+            self.stale_mids_changed,
+            self.surgery_failed_left,
+            self.surgery_failed_right,
+            self.surgery_failed_mid,
+            self.revisit_seen,
+            self.revisit_resolvable,
+            self.revisit_paired,
+            self.revisit_absent,
             self.flanks_truncated,
         )
     }
@@ -1040,8 +1188,23 @@ impl MultiKStats {
         log::info!("    UNAMBIGUOUS (can be split)       {:5}", self.pairing_ok);
         log::info!("    ambiguous (will not guess)       {:5}", self.pairing_ambiguous);
         log::info!("  repeats SPLIT (contigs run through) {:5}", self.split_applied);
-        if self.split_skipped_stale > 0 {
-            log::info!("    skipped (graph moved under us)   {:5}", self.split_skipped_stale);
+        if self.split_skipped() > 0 {
+            // Broken out by cause: `stale_*` means the neighbourhood moved between judging and
+            // splitting, `surgery_*` means it did not but an expected edge was missing. The single
+            // counter these replaced could not distinguish the two, which is why it was never actionable.
+            log::info!("    NOT split, by cause              {:5}", self.split_skipped());
+            log::info!("      stale: no bubble any more      {:5}", self.stale_no_bubble);
+            log::info!("      stale: mid nodes changed       {:5}", self.stale_mids_changed);
+            log::info!("      surgery: left chain edge gone  {:5}", self.surgery_failed_left);
+            log::info!("      surgery: right chain edge gone {:5}", self.surgery_failed_right);
+            log::info!("      surgery: mid->end edge gone    {:5}", self.surgery_failed_mid);
+        }
+        if self.revisit_seen + self.revisit_absent > 0 {
+            log::info!("  fate of previously-skipped loci:");
+            log::info!("    came back as a candidate         {:5}", self.revisit_seen);
+            log::info!("      still RESOLVABLE               {:5}", self.revisit_resolvable);
+            log::info!("      and paired (splittable again)  {:5}", self.revisit_paired);
+            log::info!("    never came back                  {:5}", self.revisit_absent);
         }
         log::info!("  flanks truncated at budget         {:5}", self.flanks_truncated);
 

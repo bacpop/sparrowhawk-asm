@@ -286,6 +286,35 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         multik_protect: bool,
 
+        /// Multi-k: also split SUPERBUBBLES — forks with three or more branches, or branches more than
+        /// one unitig long — and not just simple bubbles.
+        ///
+        /// The same surgery repeat resolution already performs, generalised: the shared repeat around
+        /// the fork is duplicated once per path, so every genomic copy survives and contigs run
+        /// straight through. Measured read-only, these are 38-97% again as many resolvable loci as the
+        /// simple bubbles the assembler acts on today.
+        ///
+        /// OFF BY DEFAULT while the effect is being measured. The surgery duplicates nodes, so the
+        /// number to watch is QUAST's duplication ratio, which simple-bubble resolution holds at 1.000.
+        /// `--multik-survey-only` reports how many loci would be split, without splitting any.
+        #[arg(long, default_value_t = false)]
+        multik_resolve_superbubbles: bool,
+
+        /// Multi-k: survey bubbles and superbubbles against the evidence k, correct nothing, and
+        /// leave the multi-k stage.
+        ///
+        /// Read-only by construction. The contigs of `-k 31,89 --multik-survey-only` are
+        /// byte-identical to those of `-k 31`, and that identity is the check that the survey really
+        /// does not touch the graph. So a run answers "what is here?" and not "what would correcting
+        /// it give?" — to get both the numbers and a corrected assembly, run twice.
+        ///
+        /// What it adds over the existing per-bubble counters is superbubbles: forks with three or
+        /// more branches, branches more than one unitig long, and nested bubbles. None of those are
+        /// recognised by the bubble detector the assembler corrects with, so today they simply break
+        /// the contig.
+        #[arg(long, default_value_t = false)]
+        multik_survey_only: bool,
+
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this
         #[arg(long, default_value_t = false)]

@@ -18,6 +18,10 @@ use crate::algorithms::corrector::Correctable;
 use crate::algorithms::corrector::correct_bubbles_skipping;
 #[cfg(not(target_family = "wasm"))]
 use crate::algorithms::multik::{correct_with_evidence, EvidenceGraph, MultiKStats};
+#[cfg(not(target_family = "wasm"))]
+use crate::algorithms::superbubble::{
+    correct_superbubbles_with_evidence, survey_superbubbles, SuperbubbleStats,
+};
 use crate::algorithms::shrinker::Shrinkable;
 #[cfg(not(target_family = "wasm"))]
 use crate::bit_encoding::UInt;
@@ -380,6 +384,152 @@ mod tests {
             .values()
             .any(|hi| !hi.pre.is_empty() || !hi.post.is_empty()));
     }
+
+    // ── the edge invariant ───────────────────────────────────────────────────
+    //
+    // "An edge exists iff the k-1 overlap holds" (see `spelling.rs`). This used to be guarded by a
+    // `remove_conflictive_links` pass that was a stub returning `false` and was never enabled; these
+    // tests are what replaced it. If neighbour construction ever starts inventing links, the junction
+    // walk stops spelling and these fail.
+
+    /// A deterministic ACGT sequence, with a repeat planted twice so the graph actually branches
+    /// rather than being one long chain.
+    fn seq_with_repeat(k: usize) -> Vec<u8> {
+        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    BASES[((state >> 33) & 3) as usize]
+                })
+                .collect()
+        };
+        let repeat = next(3 * k);
+        let mut s = next(200);
+        s.extend_from_slice(&repeat);
+        s.extend(next(200));
+        s.extend_from_slice(&repeat);
+        s.extend(next(200));
+        s
+    }
+
+    /// Build (packed-k-mer dict, thedict, maxmindict) for a sequence, as preprocessing would.
+    #[allow(clippy::type_complexity)]
+    fn build_dicts(
+        seq: &[u8],
+        k: usize,
+    ) -> (
+        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+    ) {
+        let mut packed: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> =
+            HashMap::with_hasher(BuildHasherDefault::default());
+        let mut dict = empty_thedict();
+        let mut maxmin = empty_maxmindict();
+
+        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
+        let mut cur = Some(it.get_curr_kmerhash_and_bases_and_kmer());
+        while let Some((hc, hnc, b, km)) = cur {
+            packed.insert(hc, km);
+            maxmin.insert(hnc, hc);
+            dict.entry(hc)
+                .and_modify(|hi: &mut HashInfoSimple| hi.counts += 1)
+                .or_insert(HashInfoSimple {
+                    hnc,
+                    b,
+                    pre: vec![],
+                    post: vec![],
+                    counts: 1,
+                });
+            cur = it.get_next_kmer_and_give_us_things();
+        }
+        (packed, dict, maxmin)
+    }
+
+    /// A node's k-mers in the order a walk on `carry` traverses them. Same rule as
+    /// `multik::oriented` and `collapser`: `abs_ind` is stored in `innerdir`'s strand, so reverse it
+    /// when we walk the other way.
+    fn oriented(g: &DbgGraph, n: NodeId, carry: sparrowhawk_graph::CarryType) -> Vec<u64> {
+        let w = g.node_weight(n).unwrap();
+        let mut h = w.abs_ind.clone();
+        if let Some(inn) = w.innerdir {
+            if carry != inn.get_from_and_to().0 {
+                h.reverse();
+            }
+        }
+        h
+    }
+
+    /// Every edge in a real graph joins two k-mers that genuinely overlap by `k-1`.
+    #[test]
+    fn every_edge_is_a_valid_k_minus_one_junction() {
+        use crate::algorithms::shrinker::Shrinkable;
+        use crate::spelling::spell_path;
+
+        let k = 15;
+        let seq = seq_with_repeat(k);
+        let (packed, mut dict, maxmin) = build_dicts(&seq, k);
+        populate_neighbours(k, &mut dict, &maxmin);
+
+        let mut g = DbgGraph::from_kmer_map(k, &dict);
+        g.remove_self_loops();
+        g.shrink();
+
+        let mut checked = 0usize;
+        for n in g.node_indices().collect::<Vec<_>>() {
+            // The node's own k-mers must be a walk.
+            for carry in [
+                sparrowhawk_graph::CarryType::Min,
+                sparrowhawk_graph::CarryType::Max,
+            ] {
+                let h = oriented(&g, n, carry);
+                if h.len() > 1 {
+                    spell_path(&h, &packed, k)
+                        .unwrap_or_else(|e| panic!("node {n:?} on {carry:?} is not a walk: {e}"));
+                }
+            }
+            // And each outgoing edge must join two overlapping k-mers.
+            for (m, et) in g.outgoing_edges(n) {
+                let (sc, tc) = et.get_from_and_to();
+                let from = *oriented(&g, n, sc).last().unwrap();
+                let to = oriented(&g, m, tc)[0];
+                spell_path(&[from, to], &packed, k).unwrap_or_else(|e| {
+                    panic!("edge {n:?} -{et:?}-> {m:?} is not a k-1 junction: {e}")
+                });
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the test graph has no edges to check");
+    }
+
+    /// The companion to the above: a link that is *not* a valid junction is detected. Without this,
+    /// the test above could pass vacuously if `spell_path` accepted anything.
+    #[test]
+    fn a_fabricated_link_fails_the_junction_check() {
+        use crate::spelling::{spell_path, SpellError};
+
+        let k = 15;
+        let seq = seq_with_repeat(k);
+        let (packed, mut dict, maxmin) = build_dicts(&seq, k);
+        populate_neighbours(k, &mut dict, &maxmin);
+        let g = DbgGraph::from_kmer_map(k, &dict);
+
+        // Two k-mers from far-apart positions cannot overlap by k-1.
+        let all: Vec<u64> = g
+            .node_indices()
+            .map(|n| g.node_weight(n).unwrap().abs_ind[0])
+            .collect();
+        assert!(all.len() > 100);
+        assert_eq!(
+            spell_path(&[all[0], all[all.len() - 1]], &packed, k),
+            Err(SpellError::NotAWalk { index: 1 }),
+            "an invented junction must be rejected"
+        );
+    }
 }
 
 /// Everything the multi-k oracle needs, handed to `assemble` when a second k was requested.
@@ -402,10 +552,19 @@ pub struct MultiKCtx<'a, IntT> {
     /// Duplicate the collapsed repeat where the evidence k resolves it, so both genomic copies survive
     /// and contigs run through.
     pub resolve: bool,
+    /// Do the same for complex superbubbles — three-way forks and multi-unitig branches — which the
+    /// simple-bubble detector cannot represent at all. Independent of `resolve`: they act on disjoint
+    /// populations, and the superbubble pass skips anything the simple pass already handles.
+    pub resolve_superbubbles: bool,
     /// Maximum evidence-driven correction rounds.
     pub max_rounds: usize,
     /// Where to write the machine-readable verdict table, if anywhere.
     pub stats_path: Option<PathBuf>,
+    /// Survey bubbles and superbubbles and correct nothing. The graph is left exactly as a single-k
+    /// run would leave it, which is what makes the survey's read-only claim checkable.
+    pub survey_only: bool,
+    /// Where to write the superbubble survey table, if anywhere.
+    pub sb_stats_path: Option<PathBuf>,
 }
 
 /// Public API for assemblers.
@@ -420,7 +579,6 @@ pub trait Assemble {
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
         multik: Option<MultiKCtx<'_, IntT>>,
     ) -> Contigs;
 
@@ -432,7 +590,6 @@ pub trait Assemble {
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
     ) -> (Contigs, String, String, String);
 }
 
@@ -450,7 +607,6 @@ impl Assemble for BasicAsm {
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
         multik: Option<MultiKCtx<'_, IntT>>,
     ) -> Contigs {
         logw(
@@ -496,11 +652,6 @@ impl Assemble for BasicAsm {
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
 
-        if do_conflictive_links_removal {
-            logw("Removing conflictive links", Some("info"));
-            ptgraph.remove_conflictive_links();
-        }
-
         let mut didanyofusdoanything = true;
         let mut bool1: bool;
         let mut bool2: bool = false;
@@ -509,6 +660,7 @@ impl Assemble for BasicAsm {
         // One stats block per evidence k, so the ladder can be read rung by rung.
         let mut ladder_done = false;
         let mut ev_stats: Vec<(usize, MultiKStats)> = Vec::new();
+        let mut sb_stats: Vec<(usize, SuperbubbleStats)> = Vec::new();
         let mut protected: BTreeSet<NodeId> = BTreeSet::new();
         while didanyofusdoanything {
             bool1 = ptgraph.shrink();
@@ -520,13 +672,58 @@ impl Assemble for BasicAsm {
             if let (Some(ctx), false) = (&multik, ladder_done) {
                 ladder_done = true;
 
+                // Survey mode: judge everything, act on nothing, and leave the ladder. `protected`
+                // stays empty, so the coverage heuristic below sees exactly the graph a single-k run
+                // would hand it — which is what makes the contigs byte-identical to `-k <k1>` and so
+                // makes "read-only" a claim that can be checked rather than asserted.
+                if ctx.survey_only {
+                    for ev in ctx.evidence {
+                        // The simple bubbles the assembler already corrects, so the superbubble
+                        // numbers can be read as "what this adds" rather than "what exists".
+                        let mut base = MultiKStats::default();
+                        crate::algorithms::multik::survey_bubbles::<IntT>(
+                            ev,
+                            &ptgraph,
+                            ctx.dict,
+                            k,
+                            ctx.flank_budget,
+                            ctx.min_evidence,
+                            ctx.max_nodes,
+                            &mut base,
+                        );
+                        base.rounds = 1;
+                        base.report(k, ev.k);
+                        ev_stats.push((ev.k, base));
+
+                        let mut sb = SuperbubbleStats::default();
+                        survey_superbubbles::<IntT>(
+                            ev,
+                            &ptgraph,
+                            ctx.dict,
+                            k,
+                            ctx.flank_budget,
+                            ctx.min_evidence,
+                            ctx.max_nodes,
+                            &mut sb,
+                        );
+                        sb.report(k, ev.k);
+                        sb_stats.push((ev.k, sb));
+                    }
+                }
+
                 // The ladder. Ascending evidence k, each run to its own fixed point before the next,
                 // because every resolution merges nodes and lengthens unitigs — which is precisely the
                 // flank context the next k up needs, and often does not have until then.
-                for ev in ctx.evidence {
+                for ev in ctx.evidence.iter().filter(|_| !ctx.survey_only) {
                     let mut stats = MultiKStats::default();
+                    let mut sbstats = SuperbubbleStats::default();
+                    // Carried between rounds so each round can report what became of the loci the
+                    // previous one could not split. Reset per evidence k: the ladder changes the graph
+                    // enough that node ids from a lower rung mean nothing here.
+                    let mut prev_skipped: BTreeSet<NodeId> = BTreeSet::new();
                     for round in 0..ctx.max_rounds {
                         let mut r = MultiKStats::default();
+                        let mut skipped: BTreeSet<NodeId> = BTreeSet::new();
                         protected = correct_with_evidence::<IntT>(
                             ev,
                             &mut ptgraph,
@@ -538,8 +735,76 @@ impl Assemble for BasicAsm {
                             ctx.resolve,
                             ctx.protect,
                             &mut r,
+                            &prev_skipped,
+                            &mut skipped,
                         );
-                        let split = r.split_applied;
+
+                        // Per round, because `accumulate` sums them and the round structure — which is
+                        // what says whether the retry loop is doing anything — is lost in the total.
+                        log::info!(
+                            "  multi-k k2={} round {}: {} bubbles examined, {} resolvable, \
+                             {} paired; {} split, {} not ({} stale-no-bubble, \
+                             {} stale-mids, {} surgery); of {} carried in, {} returned, {} splittable",
+                            ev.k,
+                            round + 1,
+                            r.bubbles_seen,
+                            r.resolvable_repeat,
+                            r.pairing_ok,
+                            r.split_applied,
+                            r.split_skipped(),
+                            r.stale_no_bubble,
+                            r.stale_mids_changed,
+                            r.surgery_failed_left + r.surgery_failed_right + r.surgery_failed_mid,
+                            prev_skipped.len(),
+                            r.revisit_seen,
+                            r.revisit_paired,
+                        );
+
+                        // Superbubbles after simple bubbles, in the same round and on the same graph.
+                        // The simple pass gets first refusal — it is the established path — and this
+                        // one then re-runs detection, so it sees the graph as the simple pass left it
+                        // rather than as it was.
+                        //
+                        // Deliberately **not** re-compacted in between, though a split does leave the
+                        // clone chain in pieces and re-compacting first looks obviously right. Measured
+                        // on staph it costs splits (11 down to 7): `shrink` merges interiors, and a
+                        // superbubble whose interior has merged is either a simple bubble this pass
+                        // skips or a different structure than the one the evidence corroborated.
+                        let mut sb_split = 0usize;
+                        if ctx.resolve_superbubbles {
+                            let mut rsb = SuperbubbleStats::default();
+                            let deferred = correct_superbubbles_with_evidence::<IntT>(
+                                ev,
+                                &mut ptgraph,
+                                ctx.dict,
+                                k,
+                                ctx.flank_budget,
+                                ctx.min_evidence,
+                                ctx.max_nodes,
+                                &mut rsb,
+                            );
+                            sb_split = rsb.split_applied;
+                            log::info!(
+                                "  superbubbles k2={} round {}: {} found ({} complex), \
+                                 {} complex resolvable, {} bundles paired; {} split, {} not",
+                                ev.k,
+                                round + 1,
+                                rsb.found,
+                                rsb.complex,
+                                rsb.complex_resolvable_repeat,
+                                rsb.pairing_ok,
+                                rsb.split_applied,
+                                rsb.split_skipped(),
+                            );
+                            sbstats.accumulate(&rsb);
+                            sbstats.rounds = round + 1;
+                            // A superbubble we meant to split but could not must survive to the next
+                            // round, exactly as a simple bubble in the same position does.
+                            protected.extend(deferred);
+                        }
+
+                        let split = r.split_applied + sb_split;
+                        prev_skipped = skipped;
                         stats.accumulate(r);
                         stats.rounds = round + 1;
 
@@ -554,6 +819,10 @@ impl Assemble for BasicAsm {
                     }
                     stats.report(k, ev.k);
                     ev_stats.push((ev.k, stats));
+                    if ctx.resolve_superbubbles {
+                        sbstats.report(k, ev.k);
+                        sb_stats.push((ev.k, sbstats));
+                    }
                 }
 
                 // The ladder is done. Release anything we were holding back and let the coverage
@@ -587,6 +856,17 @@ impl Assemble for BasicAsm {
                 let _ = writeln!(f, "{}", total.tsv_row("TOTAL"));
                 logw(
                     format!("Multi-k stats written to {}", path.display()).as_str(),
+                    Some("info"),
+                );
+            }
+            if let Some(path) = &ctx.sb_stats_path {
+                let mut f = std::fs::File::create(path).expect("cannot write superbubble stats");
+                let _ = writeln!(f, "{}", SuperbubbleStats::tsv_header());
+                for (kev, st) in &sb_stats {
+                    let _ = writeln!(f, "{}", st.tsv_row(&kev.to_string()));
+                }
+                logw(
+                    format!("Superbubble survey written to {}", path.display()).as_str(),
                     Some("info"),
                 );
             }
@@ -664,7 +944,6 @@ impl Assemble for BasicAsm {
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
     ) -> (Contigs, String, String, String) {
         logw("Starting assembler!", Some("info"));
 
@@ -693,11 +972,6 @@ impl Assemble for BasicAsm {
 
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
-
-        if do_conflictive_links_removal {
-            logw("Removing conflictive links", Some("info"));
-            ptgraph.remove_conflictive_links();
-        }
 
         let mut didanyofusdoanything = true;
         let mut bool1: bool;

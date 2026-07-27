@@ -1,7 +1,5 @@
 //! Some docs should be here
 
-use core::panic;
-
 #[cfg(not(target_family = "wasm"))]
 use std::{path::PathBuf, time::Instant};
 
@@ -82,29 +80,115 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
     histovec[idx] = histovec[idx].saturating_add(1);
 }
 
-fn apply_spectrum_fit(histovec: &[u32]) -> u16 {
+/// Single-copy coverage estimate straight from the spectrum: the tallest bin above the error peak.
+///
+/// Independent of the fit, so it is available when the fit does *not* converge — which is exactly when
+/// it is needed, and where `SpectrumFitter`'s own `c` must not be trusted, since that field is assigned
+/// only on convergence and otherwise still holds its initial guess of 20.
+///
+/// `add_to_histogram` stores at `count - 1`, so `histovec[i]` counts k-mers seen exactly `i+1` times.
+/// This scans counts 3..=499 and returns a **count, not an index**: counts 1 and 2 are the error peak,
+/// and the final bin saturates (it absorbs every count >= `MAXSIZEHISTO`), so it is excluded for the
+/// same reason `fit_histogram` excludes it.
+///
+/// Consequence of that exclusion: above ~500x the true peak is inside the saturating bin and cannot be
+/// seen here. That does not matter for the fallback, which only runs on *thin* spectra — at those
+/// depths the fit converges — but it does bound any other use of this function.
+fn coverage_peak(histovec: &[u32]) -> usize {
+    let mut best_count = 2usize; // nothing above the error peak; the caller's floor of 2 then applies
+    let mut best_n = 0u32;
+    for (i, &n) in histovec[2..(MAXSIZEHISTO - 1)].iter().enumerate() {
+        if n > best_n {
+            // Strict, so ties keep the lowest count and the result is deterministic.
+            best_n = n;
+            best_count = i + 3; // slice index 0 is count 3
+        }
+    }
+    best_count
+}
+
+/// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
+///
+/// Not arbitrary: on a coverage ladder over the simulation and neiss the fitted cutoffs separate
+/// cleanly into a trustworthy group (14, 20, 23, 35, 36, 38, 52 — every reference assembly) and an
+/// untrustworthy one (2, 3, 5, 6, 7, 8), with nothing in between. This sits in that gap.
+const TRUST_FIT_ABOVE: usize = 10;
+
+/// What a k-mer set is *for*, which decides how cautious the fallback floor should be.
+///
+/// The two roles fail in opposite directions, so one floor cannot serve both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FitFloor {
+    /// The graph that becomes contigs. Too high a `min_count` deletes genuine single-copy k-mers and
+    /// fragments the assembly, which is the expensive failure — measured on a coverage ladder over the
+    /// simulation and neiss, `peak/8` was best or tied-best at every rung, and the next step up cost
+    /// 400 kb of assembly and half the N50.
+    Assembly,
+    /// A larger-k graph consulted only for whether a branch is corroborated. Here a *surviving error
+    /// k-mer* is the expensive failure: it corroborates a branch that is not real, and the correction
+    /// acts on that. Fragmenting this graph merely makes it answer "no evidence", which is safe. So it
+    /// is floored where trusted fits actually land, `peak/4`, rather than at the assembly's `peak/8`.
+    Evidence,
+}
+
+impl FitFloor {
+    /// Divisor applied to the histogram peak when the fit is not trusted.
+    fn peak_divisor(self) -> f64 {
+        match self {
+            Self::Assembly => 8.0,
+            Self::Evidence => 4.0,
+        }
+    }
+}
+
+/// In a k ladder the **first** k is the assembly k and every later one is evidence.
+///
+/// Single-k runs pass index 0 and so get [`FitFloor::Assembly`], which is right: there is no evidence
+/// graph, and the one graph built is the one that becomes contigs.
+pub fn role_for_k_index(i: usize) -> FitFloor {
+    if i == 0 {
+        FitFloor::Assembly
+    } else {
+        FitFloor::Evidence
+    }
+}
+
+/// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
+/// both filter sites keep k-mers with `count >= min_count`.
+fn apply_spectrum_fit(histovec: &[u32], role: FitFloor) -> u16 {
+    // Used whenever the fit is not trusted. Scaling off the peak (rather than a constant) means a fit
+    // that fails on a *deep* library does not collapse to a near-useless 2 or 3.
+    let peak = coverage_peak(histovec);
+    let floor = ((peak as f64 / role.peak_divisor()).round() as u16).max(2);
+
     let mut fit = SpectrumFitter::new();
     match fit.fit_histogram(histovec[..(MAXSIZEHISTO - 1)].to_vec()) {
-        Ok(minc) => {
-            let minc = minc as u16;
-            if minc == 0 {
-                panic!("Fitted min_count is zero or negative!");
-            } else if minc <= 10 {
-                logw(
-                    "Fit has converged to a value smaller than 10. A value of 3 will be used as minimum, as usually this happens when the remaining k-mers go to low values, where the fit might give bad results. You should check whether this value is appropiated or not by looking at the k-mer spectrum histogram.",
-                    Some("warn"),
-                );
-                3
-            } else {
-                minc
-            }
-        }
-        Err(_) => {
+        // A large cutoff means the fit found a well-separated true-k-mer component, and it should be
+        // trusted: every one of the fourteen reference assemblies lands here (fitted 14-52), and at
+        // 862x an erroneous k-mer needs only a handful of sightings to survive, so a small constant
+        // would be badly wrong.
+        Ok(minc) if minc > TRUST_FIT_ABOVE => minc as u16,
+        // Below that the cutoff is not trustworthy — measured on a coverage ladder over both the
+        // simulation and neiss, a fitted 5/6/7/8 loses up to 400 kb of assembly and halves N50
+        // against a small constant. What replaced it used to be a hardcoded 3, which is itself too
+        // aggressive at the bottom of the range: at 10x, min_count 3 discards every k-mer seen twice
+        // and with it most of the genome (neiss 1.01 Mb at 3 vs 1.49 Mb at 2). Scaling off the
+        // histogram gets both ends right.
+        outcome => {
+            let why = match &outcome {
+                Ok(minc) => format!("returned {minc}, too small to be reliable"),
+                Err(e) => format!("did not converge ({e})"),
+            };
             logw(
-                "Fit has not converged. A value of 3 will be used as minimum, as usually this happens when the remaining k-mers go to low values. You should check whether this value is appropiated or not by looking at the k-mer spectrum histogram.",
+                &format!(
+                    "The k-mer spectrum fit {why}. Falling back to the histogram: its peak is at count \
+                     {peak}, so a minimum count of {floor} will be used ({role:?} graph). This usually \
+                     means the spectrum is thin — low coverage, or a large k. Check the k-mer spectrum \
+                     histogram to confirm the value is appropriate."
+                ),
                 Some("warn"),
             );
-            3
+            floor
         }
     }
 }
@@ -395,6 +479,7 @@ fn chunked_processing_wasm<IntT>(
     outvec: &mut Vec<(u64, u64, u8)>,
     csize: usize,
     do_fit: bool,
+    role: FitFloor,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -568,7 +653,7 @@ where
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
         logw("Counting finished. Starting fit...", Some("info"));
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         logw(
             format!(
                 "Fit done! Fitted min_count value: {}. Starting filtering...",
@@ -614,6 +699,7 @@ fn bloom_filter_preprocessing_wasm<IntT>(
     k: usize,
     qual: &QualOpts,
     do_fit: bool,
+    role: FitFloor,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -738,7 +824,7 @@ where
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
         logw("Counting finished. Starting fit...", Some("info"));
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         logw(
             format!(
                 "Fit done! Fitted min_count value: {}. Starting filtering...",
@@ -787,6 +873,7 @@ fn bloom_filter_preprocessing_standalone<IntT>(
     k: usize,
     qual: &QualOpts,
     do_fit: bool,
+    role: FitFloor,
     out_path: &mut Option<PathBuf>,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -841,7 +928,7 @@ where
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
         log::info!("Starting fit...");
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         log::info!(
             "Fit done! Minimum count value to be used: {}. Filtering k-mers...",
             minc
@@ -1068,6 +1155,7 @@ where
 /// is therefore the memory knob. `usize::MAX` means "one unbounded chunk", which is what the old bulk
 /// path was — the two are the same algorithm, so there is only this one implementation.
 #[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
 fn chunked_preprocessing_standalone<IntT>(
     files: &[String],
     k: usize,
@@ -1075,6 +1163,7 @@ fn chunked_preprocessing_standalone<IntT>(
     outvec: &mut Vec<(u64, u64, u8)>,
     csize: usize,
     do_fit: bool,
+    role: FitFloor,
     out_path: &mut Option<PathBuf>,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -1141,7 +1230,9 @@ where
         outvec.clear();
     }
 
-    finish_sort_counter(countmap, outdict, minmaxdict, histovec, qual, do_fit, out_path)
+    finish_sort_counter(
+        countmap, outdict, minmaxdict, histovec, qual, do_fit, role, out_path,
+    )
 }
 
 /// Fit, filter and plot a finished sort-counter, whatever drove it.
@@ -1151,6 +1242,7 @@ where
 /// and the cheapest way to guarantee that is to have one implementation.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn finish_sort_counter<IntT>(
     mut countmap: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     mut outdict: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -1158,6 +1250,7 @@ fn finish_sort_counter<IntT>(
     mut histovec: Vec<u32>,
     qual: &QualOpts,
     do_fit: bool,
+    role: FitFloor,
     out_path: &mut Option<PathBuf>,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -1183,7 +1276,7 @@ where
         build_histogram_from_countmap(&countmap, &mut histovec);
 
         log::info!("Counting finished. Starting fit...");
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         log::info!(
             "Fit done! Fitted min_count value: {}. Starting filtering...",
             minc
@@ -1231,6 +1324,7 @@ fn finish_map_counter<IntT>(
     shards: Vec<CountMap<IntT>>,
     qual: &QualOpts,
     do_fit: bool,
+    role: FitFloor,
     out_path: &mut Option<PathBuf>,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -1273,7 +1367,7 @@ where
 
     let minc = if do_fit {
         log::info!("Counting finished. Starting fit...");
-        let minc = apply_spectrum_fit(&histovec);
+        let minc = apply_spectrum_fit(&histovec, role);
         log::info!("Fit done! Fitted min_count value: {minc}. Starting filtering...");
         minc
     } else {
@@ -1337,7 +1431,8 @@ where
         return ks
             .iter()
             .zip(out_paths.iter_mut())
-            .map(|(&k, out_path)| {
+            .enumerate()
+            .map(|(i, (&k, out_path))| {
                 preprocessing_standalone::<IntT>(
                     input_files,
                     k,
@@ -1348,6 +1443,7 @@ where
                     counter,
                     do_bloom,
                     do_fit,
+                    role_for_k_index(i),
                 )
             })
             .collect();
@@ -1424,7 +1520,8 @@ where
                 .zip(outdicts)
                 .zip(minmaxdicts)
                 .zip(out_paths.iter_mut())
-                .map(|(((countmap, outdict), minmaxdict), out_path)| {
+                .enumerate()
+                .map(|(i, (((countmap, outdict), minmaxdict), out_path))| {
                     finish_sort_counter::<IntT>(
                         countmap,
                         outdict,
@@ -1432,6 +1529,7 @@ where
                         vec![0; MAXSIZEHISTO],
                         qual,
                         do_fit,
+                        role_for_k_index(i),
                         out_path,
                     )
                 })
@@ -1465,7 +1563,10 @@ where
             all_shards
                 .into_iter()
                 .zip(out_paths.iter_mut())
-                .map(|(shards, out_path)| finish_map_counter::<IntT>(shards, qual, do_fit, out_path))
+                .enumerate()
+                .map(|(i, (shards, out_path))| {
+                    finish_map_counter::<IntT>(shards, qual, do_fit, role_for_k_index(i), out_path)
+                })
                 .collect::<Vec<_>>()
         }
     };
@@ -1509,6 +1610,7 @@ pub fn preprocessing_standalone<IntT>(
     counter: Counter,
     do_bloom: bool,
     do_fit: bool,
+    role: FitFloor,
 ) -> PreprocessedK<IntT>
 where
     IntT: for<'a> UInt<'a>,
@@ -1525,7 +1627,7 @@ where
 
     let (thedict, maxmindict, themap, histovec, used_min_count) = if do_bloom {
         log::info!("Processing using a Bloom filter");
-        bloom_filter_preprocessing_standalone::<IntT>(&all_files, k, qual, do_fit, out_path)
+        bloom_filter_preprocessing_standalone::<IntT>(&all_files, k, qual, do_fit, role, out_path)
     } else {
         match counter {
             Counter::Sort => {
@@ -1546,7 +1648,7 @@ where
                     / 5;
                 let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers);
                 let out = chunked_preprocessing_standalone::<IntT>(
-                    &all_files, k, qual, &mut tmpvec, csize, do_fit, out_path,
+                    &all_files, k, qual, &mut tmpvec, csize, do_fit, role, out_path,
                 );
                 drop(tmpvec);
                 out
@@ -1561,7 +1663,7 @@ where
                 log::info!("EXPERIMENTAL: counting k-mers into a hash map (no sort)");
 
                 let shards = bulk_preprocessing_standalone_cpu::<IntT>(&all_files, k, qual);
-                finish_map_counter::<IntT>(shards, qual, do_fit, out_path)
+                finish_map_counter::<IntT>(shards, qual, do_fit, role, out_path)
             }
         }
     };
@@ -1731,6 +1833,65 @@ mod tests {
         assert!(histovec[4] > 0, "count=5 should be at histovec[4]");
         assert!(histovec[9] > 0, "count=10 should be at histovec[9]");
     }
+
+    /// A bimodal spectrum: a tall error peak at count 1-2 and the real single-copy peak further out.
+    /// `coverage_peak` must return the *count* of the second peak, ignoring the first.
+    #[test]
+    fn coverage_peak_finds_the_mode_above_the_error_peak() {
+        for expected in [3usize, 10, 30, 113, 498] {
+            let mut h = vec![0u32; MAXSIZEHISTO];
+            h[0] = 1_000_000; // count 1: errors, must be ignored
+            h[1] = 200_000; // count 2: still errors
+            h[expected - 1] = 50_000; // the genuine single-copy peak
+            assert_eq!(
+                coverage_peak(&h),
+                expected,
+                "peak planted at count {expected}"
+            );
+        }
+    }
+
+    /// Ties keep the lowest count, and a spectrum with nothing above the error peak falls back to 2 —
+    /// so `apply_spectrum_fit`'s floor is well defined even for a degenerate histogram.
+    #[test]
+    fn coverage_peak_is_deterministic_and_has_a_floor() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        h[9] = 42;
+        h[19] = 42; // equal height: the lower count wins
+        assert_eq!(coverage_peak(&h), 10);
+
+        let mut only_errors = vec![0u32; MAXSIZEHISTO];
+        only_errors[0] = 99;
+        only_errors[1] = 7;
+        assert_eq!(coverage_peak(&only_errors), 2);
+    }
+
+    /// The evidence graph is floored twice as high as the assembly graph, and the first k of a ladder
+    /// is the assembly k. A single-k run passes index 0 and so is treated as an assembly graph.
+    #[test]
+    fn evidence_graphs_are_floored_higher_than_the_assembly_graph() {
+        assert_eq!(role_for_k_index(0), FitFloor::Assembly);
+        assert_eq!(role_for_k_index(1), FitFloor::Evidence);
+        assert_eq!(role_for_k_index(2), FitFloor::Evidence);
+
+        // A spectrum whose fit cannot be trusted, so both roles fall back to the histogram floor.
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        h[0] = 1_000_000;
+        h[23] = 5_000; // peak at count 24 -> assembly 24/8 = 3, evidence 24/4 = 6
+        assert_eq!(coverage_peak(&h), 24);
+        assert_eq!(apply_spectrum_fit(&h, FitFloor::Assembly), 3);
+        assert_eq!(apply_spectrum_fit(&h, FitFloor::Evidence), 6);
+    }
+
+    /// The last bin saturates (it absorbs every count >= MAXSIZEHISTO), so it must not be mistaken for
+    /// a peak — `fit_histogram` excludes it for the same reason.
+    #[test]
+    fn coverage_peak_ignores_the_saturating_bin() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        h[MAXSIZEHISTO - 1] = 1_000_000; // everything >= 500 piled up here
+        h[29] = 10;
+        assert_eq!(coverage_peak(&h), 30);
+    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -1758,7 +1919,7 @@ where
         logw("Processing using a Bloom filter", Some("info"));
 
         let (thedict, maxmindict, themap, histovec, used_min_count) =
-            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit);
+            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit, FitFloor::Assembly);
         (themap, Some(thedict), maxmindict, histovec, used_min_count)
     } else {
         // Chunking only ever bounded the occurrence buffer, so "no chunking" is one unbounded chunk.
@@ -1780,7 +1941,16 @@ where
 
         let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
         let (thedict, maxmindict, themap, mut histovec, used_min_count) =
-            chunked_processing_wasm::<IntT>(file1, file2, k, qual, &mut tmpvec, csize, do_fit);
+            chunked_processing_wasm::<IntT>(
+                file1,
+                file2,
+                k,
+                qual,
+                &mut tmpvec,
+                csize,
+                do_fit,
+                FitFloor::Assembly,
+            );
         drop(tmpvec);
         histovec.shrink_to_fit();
         (themap, Some(thedict), maxmindict, histovec, used_min_count)

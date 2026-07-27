@@ -18,7 +18,7 @@ use crate::bit_encoding::UInt;
 ///
 /// Every variant is an invariant violation that should be impossible for a walk taken from the graph:
 /// an edge exists *iff* the `k-1` overlap holds, so a genuine walk always overlaps. Reporting rather
-/// than papering over them is the point — the previous code counted the second case and emitted a base
+/// than papering over them is the point — earlier code counted a non-overlap and then emitted a base
 /// from the failing orientation anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpellError {
@@ -36,13 +36,6 @@ pub enum SpellError {
         /// Position of the k-mer that failed to follow its predecessor.
         index: usize,
     },
-    /// Both orientations of a k-mer overlap its predecessor, so the strand is ambiguous. This needs the
-    /// `k-1` junction to be a reverse-complement palindrome; `k-1` is even, so it is not impossible a
-    /// priori, but it has never been observed.
-    AmbiguousOverlap {
-        /// Position of the ambiguous k-mer.
-        index: usize,
-    },
 }
 
 impl fmt::Display for SpellError {
@@ -55,10 +48,6 @@ impl fmt::Display for SpellError {
             Self::NotAWalk { index } => write!(
                 f,
                 "k-mer {index} does not overlap its predecessor in either orientation"
-            ),
-            Self::AmbiguousOverlap { index } => write!(
-                f,
-                "k-mer {index} overlaps its predecessor in both orientations"
             ),
         }
     }
@@ -132,9 +121,9 @@ where
         let mut curr = get(i)?;
         let psuf = suffix(prev);
 
-        if psuf == prefix(curr) && psuf == prefix(curr.rev_comp(k)) {
-            return Err(SpellError::AmbiguousOverlap { index: i });
-        }
+        // If both orientations overlapped we would have to guess; that needs the whole k-mer to be a
+        // reverse-complement palindrome, which needs even k, which the CLI rejects (`valid_kmer`).
+        // So the forward orientation below is unambiguous whenever it matches.
         if psuf != prefix(curr) {
             curr = curr.rev_comp(k);
             if psuf != prefix(curr) {
@@ -313,4 +302,5 @@ mod tests {
             Err(SpellError::NotAWalk { index: 10 })
         );
     }
+
 }

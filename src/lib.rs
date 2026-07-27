@@ -183,10 +183,17 @@ struct BuildOpts<'a> {
     protect: bool,
     /// Multi-k: duplicate collapsed repeats the evidence k can resolve.
     resolve: bool,
+    /// Multi-k: do the same for complex superbubbles, not just simple bubbles.
+    resolve_superbubbles: bool,
     /// Multi-k: maximum evidence-driven correction rounds.
     max_rounds: usize,
     /// Multi-k: where to write the machine-readable verdict table.
     stats_path: Option<PathBuf>,
+    /// Multi-k: survey only — judge bubbles and superbubbles, correct nothing.
+    survey_only: bool,
+    /// Multi-k: where to write the superbubble survey table. Separate from `stats_path`: the two
+    /// tables share no columns.
+    sb_stats_path: Option<PathBuf>,
     output: PathBuf,
 }
 
@@ -253,6 +260,9 @@ fn run_build<IntT>(
                 opts.counter,
                 opts.do_bloom,
                 opts.do_fit,
+                // Only ever asked whether a branch is corroborated, so a surviving error k-mer here
+                // is a false corroboration rather than a fragmented contig — floored accordingly.
+                preprocessing::FitFloor::Evidence,
             );
             evidence.push(algorithms::multik::build_evidence::<IntT>(ev_pre));
         }
@@ -266,6 +276,7 @@ fn run_build<IntT>(
             opts.counter,
             opts.do_bloom,
             opts.do_fit,
+            preprocessing::FitFloor::Assembly,
         );
     }
 
@@ -280,8 +291,11 @@ fn run_build<IntT>(
             max_nodes: opts.max_nodes,
             protect: opts.protect,
             resolve: opts.resolve,
+            resolve_superbubbles: opts.resolve_superbubbles,
             max_rounds: opts.max_rounds,
             stats_path: opts.stats_path.clone(),
+            survey_only: opts.survey_only,
+            sb_stats_path: opts.sb_stats_path.clone(),
         })
     };
 
@@ -293,7 +307,6 @@ fn run_build<IntT>(
         out_path_graph,
         opts.do_bubble_collapse,
         opts.do_dead_end_removal,
-        false,
         multik,
     );
 
@@ -328,12 +341,13 @@ pub fn main() {
             multik_flank_context,
             multik_max_rounds,
             multik_protect,
+            multik_resolve_superbubbles,
+            multik_survey_only,
             no_multik_resolve,
             no_histo,
             no_graphs,
             no_bubble_collapse,
             no_dead_end_removal,
-            // no_conflictive_links_removal,
         } => {
             // Create the output directory if it does not exist, so every write below can assume it is
             // there.
@@ -452,9 +466,21 @@ pub fn main() {
                 max_nodes: *multik_max_nodes,
                 protect: *multik_protect,
                 resolve: !no_multik_resolve,
+                resolve_superbubbles: *multik_resolve_superbubbles,
                 max_rounds: *multik_max_rounds,
                 stats_path: if k.len() > 1 {
                     Some(Path::new(output_dir).join(format!("{output_prefix}_multik_stats.tsv")))
+                } else {
+                    None
+                },
+                survey_only: *multik_survey_only,
+                // Written whenever the superbubble machinery ran at all, surveying or correcting:
+                // the attrition columns are the point of the table, and they are populated either way.
+                sb_stats_path: if k.len() > 1
+                    && (*multik_survey_only || *multik_resolve_superbubbles)
+                {
+                    Some(Path::new(output_dir)
+                        .join(format!("{output_prefix}_superbubble_stats.tsv")))
                 } else {
                     None
                 },
@@ -769,7 +795,6 @@ impl AssemblyHelper {
             self.maxmindict.as_mut().unwrap(),
             !self.no_bubble_collapse,
             !self.no_dead_end_removal,
-            false,
         );
 
         post_state("assembly:saving");
