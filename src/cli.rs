@@ -20,14 +20,14 @@ pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 /// scales with, which is why both are kept: the choice is data-dependent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Counter {
-    /// Sort the k-mer occurrences and run-length count them. Cost scales with the number of k-mer
-    /// *occurrences*, which is predictable on any data, and memory is bounded by `--chunk-size`.
+    /// DEPRECATED, slated for removal. Buffer every k-mer occurrence, sort it, and run-length count.
+    /// This is strictly more work than `Map`: it builds the *same* distinct-k-mer map, and on top of it
+    /// keeps an occurrence buffer (bounded by `--chunk-size`) that it then sorts. Measured 2.2-2.5x
+    /// slower than `Map` at equal or higher memory. Kept only to reproduce the old behaviour.
     Sort,
-    /// EXPERIMENTAL. Count into a hash map keyed by the canonical hash: no sort, and no buffer of
-    /// occurrences, so memory scales with the number of *distinct* k-mers instead. Much faster on
-    /// low-diversity data, but unproven on real reads, where a high error rate inflates the distinct
-    /// k-mer count and the map can outgrow the cache. `--chunk-size` does not apply. Benchmark it
-    /// against `sort` on your own data before relying on it.
+    /// Count into a hash map keyed by the canonical hash: no occurrence buffer, no sort, so memory
+    /// scales with the number of *distinct* k-mers. Validated on six real datasets (172x-862x): faster
+    /// and leaner than `Sort`, with byte-identical results. The default.
     Map,
 }
 
@@ -196,9 +196,14 @@ pub enum Commands {
               default_values_t = vec![DEFAULT_KMER])]
         k: Vec<usize>,
 
-        /// Minimum k-mer count (with reads)
-        #[arg(long, default_value_t = DEFAULT_MINCOUNT)]
-        min_count: u16,
+        /// Minimum k-mer count. If omitted, it is FITTED from the k-mer spectrum, separately for each k.
+        ///
+        /// The old fixed default of 5 is far too low for real data: fitted values on six real datasets
+        /// (172x-862x coverage) ranged from 20 to 52. At 862x an erroneous k-mer needs only 5 sightings
+        /// to survive, so a fixed 5 floods the graph with error k-mers. Give an explicit number to
+        /// override the fit.
+        #[arg(long)]
+        min_count: Option<u16>,
 
         /// Minimum k-mer quality (with reads)
         #[arg(long, default_value_t = DEFAULT_MINQUAL)]
@@ -208,8 +213,9 @@ pub enum Commands {
         #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
         threads: usize,
 
-        /// Do the automatic fit to the k-mer spectrum to get the min_count or not
-        #[arg(long, default_value_t = false)]
+        /// DEPRECATED, and now a no-op: fitting is the default. Omit `--min-count` to fit, or give it a
+        /// value to override. Kept, hidden, for one release so existing scripts do not break.
+        #[arg(long, default_value_t = false, hide = true)]
         auto_min_count: bool,
 
         /// Use, instead of the default filtering, a Bloom filter. This will use less memory and be faster, but will add
@@ -217,17 +223,19 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         do_bloom: bool,
 
-        /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
-        /// Nonzero values enable it, allowing for potential peak memory reduction. There is a tradeoff with computing time:
-        /// very low values will make the whole execution slower.
-        /// Only applies to `--counter sort`; it is ignored by `--counter map`, which does not buffer occurrences.
+        /// DEPRECATED. Bounds the occurrence buffer of the `sort` counter only; the default counter is
+        /// now `map`, which buffers nothing, so this has no effect there. Slated for removal with `sort`.
+        /// A value of zero disables chunking (`sort` only).
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
 
-        /// How to count k-mers. `sort` (default) buffers occurrences and sorts them; `map` is an
-        /// EXPERIMENTAL hash-map counter whose memory scales with distinct k-mers instead of
-        /// occurrences. Both are exact and must agree; see `--help` for the trade-off.
-        #[arg(long, value_enum, default_value_t = Counter::Sort)]
+        /// How to count k-mers. `map` (default) counts into a hash map keyed by canonical hash. `sort`
+        /// is the DEPRECATED older path: it buffers every occurrence, sorts it, and run-length counts —
+        /// which is strictly more work and more memory than `map` (it keeps the same distinct-k-mer map
+        /// *plus* the occurrence buffer), and is slated for removal. Measured on real reads, `map` is
+        /// 2.2-2.5x faster at equal or lower memory, and both produce identical results. Use `sort` only
+        /// to reproduce the old behaviour.
+        #[arg(long, value_enum, default_value_t = Counter::Map)]
         counter: Counter,
 
         /// How to extract k-mers when two k values are given. `sequential` (default) makes one pass

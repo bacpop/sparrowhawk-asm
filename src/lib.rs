@@ -8,7 +8,11 @@ use std::fmt;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
-use std::{path::PathBuf, time::Instant, time::SystemTime};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+    time::SystemTime,
+};
 
 extern crate num_cpus;
 
@@ -331,9 +335,17 @@ pub fn main() {
             no_dead_end_removal,
             // no_conflictive_links_removal,
         } => {
-            let mut outputlogfile: PathBuf = output_dir.into();
-            outputlogfile.set_file_name(output_prefix.to_string() + "_log");
-            outputlogfile.set_extension("txt");
+            // Create the output directory if it does not exist, so every write below can assume it is
+            // there.
+            std::fs::create_dir_all(output_dir)
+                .unwrap_or_else(|e| panic!("cannot create output directory {output_dir:?}: {e}"));
+
+            // NB: build every output path with `join`, NOT `set_file_name`. `set_file_name` *replaces*
+            // the last path component, so `--output-dir /tmp/` + `set_file_name("sphk_log")` yields
+            // `/sphk_log` (filesystem root -> permission denied), and `--output-dir reports` silently
+            // drops the directory. `join` appends into the directory, which is what is meant.
+            let outputlogfile: PathBuf =
+                Path::new(output_dir).join(format!("{output_prefix}_log.txt"));
             if args.verbose {
                 // set_up_logging(log::LevelFilter::Trace, outputlogfile);
                 set_up_logging(log::LevelFilter::Info, outputlogfile);
@@ -346,8 +358,19 @@ pub fn main() {
             // Read input
             let input_files = get_input_list(file_list, seq_files);
             // let input_files = get_input_list(file_list);
+
+            // Fit the min_count from the spectrum unless an explicit value was given. `--auto-min-count`
+            // is deprecated (fitting is now the default) but still honoured, so old scripts do not break.
+            if *auto_min_count {
+                log::warn!(
+                    "--auto-min-count is deprecated and now a no-op: fitting is the default. Omit \
+                     --min-count to fit, or give it a value to override."
+                );
+            }
+            let do_fit = min_count.is_none();
             let quality = QualOpts {
-                min_count: *min_count,
+                // Only used when do_fit is false; the fit ignores it.
+                min_count: min_count.unwrap_or(DEFAULT_MINCOUNT),
                 min_qual: *min_qual,
             };
 
@@ -362,10 +385,13 @@ pub fn main() {
             log::info!("Beginning processing");
             timevec.push(Instant::now());
 
-            if *auto_min_count {
-                log::info!("Automatic fitting to extract minimum counts per k-mer will be done.");
+            if do_fit {
+                log::info!("Minimum count per k-mer will be fitted from the spectrum, per k.");
             } else {
-                log::info!("Minimum count per k-mer to be considered is {}", min_count);
+                log::info!(
+                    "Minimum count per k-mer to be considered is {}",
+                    quality.min_count
+                );
             }
 
             // One spectrum PNG per k, so the two fits can be compared. The evidence k has materially
@@ -377,32 +403,24 @@ pub fn main() {
                     if *no_histo {
                         return None;
                     }
-                    let mut p: PathBuf = output_dir.into();
                     let suffix = if k.len() > 1 {
                         format!("_kmerspectrum_k{ki}")
                     } else {
                         "_kmerspectrum".to_string()
                     };
-                    p.set_file_name(output_prefix.to_owned() + &suffix);
-                    p.set_extension("png");
-                    Some(p)
+                    Some(Path::new(output_dir).join(format!("{output_prefix}{suffix}.png")))
                 })
                 .collect();
 
-            let mut out_path_graph: Option<PathBuf>;
-            if *no_graphs {
-                out_path_graph = None;
+            // No extension here: `assemble` sets .dot/.gfa/.gfa2 on this base path later (hence `mut`).
+            let mut out_path_graph: Option<PathBuf> = if *no_graphs {
+                None
             } else {
-                out_path_graph = Some(output_dir.into());
-                out_path_graph
-                    .as_mut()
-                    .unwrap()
-                    .set_file_name(output_prefix.to_owned() + "_graph");
-            }
+                Some(Path::new(output_dir).join(format!("{output_prefix}_graph")))
+            };
 
-            let mut output: PathBuf = output_dir.into();
-            output.set_file_name(output_prefix.to_string() + "_contigs");
-            output.set_extension("fasta");
+            let output: PathBuf =
+                Path::new(output_dir).join(format!("{output_prefix}_contigs.fasta"));
 
             // `valid_kmer` already rejects even k and anything outside 3..=256 per value; what it
             // cannot see is the relationship between them.
@@ -432,7 +450,7 @@ pub fn main() {
                 chunk_size: *chunk_size,
                 counter: *counter,
                 do_bloom: *do_bloom,
-                auto_min_count: *auto_min_count,
+                auto_min_count: do_fit,
                 do_bubble_collapse: !no_bubble_collapse,
                 do_dead_end_removal: !no_dead_end_removal,
                 extraction: *multik_extraction,
@@ -443,10 +461,7 @@ pub fn main() {
                 resolve: !no_multik_resolve,
                 max_rounds: *multik_max_rounds,
                 stats_path: if k.len() > 1 {
-                    let mut p: PathBuf = output_dir.into();
-                    p.set_file_name(output_prefix.to_owned() + "_multik_stats");
-                    p.set_extension("tsv");
-                    Some(p)
+                    Some(Path::new(output_dir).join(format!("{output_prefix}_multik_stats.tsv")))
                 } else {
                     None
                 },
