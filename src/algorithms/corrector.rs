@@ -7,10 +7,31 @@ use sparrowhawk_graph::{
 use crate::EdgeWeight;
 
 use std::{
-    cmp::max,
+    cmp::{max, min},
     collections::BTreeSet,
     vec::Drain,
 };
+
+/// Minimum number of k-mers a path must **exceed** to be worth keeping.
+///
+/// A run of `n` k-mers spans `n + k - 1` bases, so "longer than `minnts` bases" is `n > minnts + 1 - k`.
+///
+/// Saturating, because these are `usize`. Written as `minnts - k + 1` it underflows for every k above
+/// `minnts` and wraps to ~1.8e19 in release, whereupon `collapser` drops every contig and
+/// `check_dead_path` judges every path dead — a k = 139 assembly comes out completely empty. Above
+/// `minnts` a single k-mer already spans more than `minnts` bases, so 0 is the right limit there.
+///
+/// Shared by `check_dead_path` and `Collapsable::collapse` so both agree, and so the tests exercise
+/// this rather than a copy of it — the copies are what let the underflow survive.
+pub(crate) fn short_path_limit(minnts: usize, k: usize) -> usize {
+    (minnts + 1).saturating_sub(k)
+}
+
+/// A branch carrying less than this fraction of the stronger branch's coverage is noise.
+///
+/// Default for `--bubble-pop-ratio`, and the SKESA-inspired rule that was already the first arm of the
+/// old heuristic. It is now the *only* thing that licenses popping a bubble.
+pub const DEFAULT_POP_RATIO: f32 = 0.1;
 
 /// Mark graph as correctable.
 pub trait Correctable {
@@ -26,8 +47,8 @@ pub trait Correctable {
     /// Remove edges that are self-loops, i.e. those whose source and destination nodes are the same.
     fn remove_self_loops(&mut self);
 
-    /// Solve bubbles from the graph
-    fn correct_bubbles(&mut self) -> bool;
+    /// Solve bubbles from the graph, popping only where the coverage difference is stark.
+    fn correct_bubbles(&mut self, pop_ratio: f32) -> bool;
 
     /// Remove all input and output dead paths
     fn remove_dead_paths(&mut self) -> bool;
@@ -46,8 +67,8 @@ impl Correctable for DbgGraph {
         DbgGraph::remove_self_loops(self);
     }
 
-    fn correct_bubbles(&mut self) -> bool {
-        correct_bubbles_skipping(self, &BTreeSet::new())
+    fn correct_bubbles(&mut self, pop_ratio: f32) -> bool {
+        pop_bubbles_by_coverage(self, pop_ratio)
     }
 
     fn remove_dead_paths(&mut self) -> bool {
@@ -104,19 +125,19 @@ impl Correctable for DbgGraph {
     }
 }
 
-/// Collapse every bubble in the graph, except those in `protected`.
+/// Collapse every bubble whose two branches differ starkly enough in coverage; leave the rest alone.
 ///
-/// `protected` is how the multi-k evidence path vetoes the coverage heuristic: a bubble whose branches
-/// are *both* corroborated by the reads at the larger k has no wrong branch to pop, so whichever the
-/// heuristic chose it would be deleting real sequence.
-pub fn correct_bubbles_skipping(g: &mut DbgGraph, protected: &BTreeSet<NodeId>) -> bool {
+/// There used to be a `protected` set here, by which the multi-k evidence path vetoed the heuristic on
+/// bubbles it had corroborated. It is gone, and nothing replaced it: `choose_branch_by_counts` now
+/// refuses to touch a bubble whose branches have comparable coverage, which is exactly the case the
+/// veto existed for. A rule that cannot destroy a collapsed repeat needs no exemption list.
+pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32) -> bool {
     let mut dididoanything = false;
 
     logw("Starting resolution of standard bubbles", Some("info"));
     let bubbles = g
         .node_indices()
         .filter(|n| g.out_degree(*n) == 3)
-        .filter(|n| !protected.contains(n))
         .filter(|n| {
             let vmin = g.bubble_start_edges_by_carry(*n, CarryType::Min);
             if vmin.len() > 2 {
@@ -142,20 +163,9 @@ pub fn correct_bubbles_skipping(g: &mut DbgGraph, protected: &BTreeSet<NodeId>) 
             .as_str(),
             Some("info"),
         );
-        if !protected.is_empty() {
-            logw(
-                format!(
-                    "Multi-k vetoed {} bubble(s): both branches are corroborated at the evidence k, \
-                     so there is no wrong branch to pop.",
-                    protected.len()
-                )
-                .as_str(),
-                Some("info"),
-            );
-        }
         for n in bubbles {
             if g.contains_node(n) {
-                let tmpb = collapse_bubble(g, n);
+                let tmpb = collapse_bubble(g, n, pop_ratio);
                 if tmpb {
                     dididoanything = true;
                 }
@@ -287,81 +297,45 @@ pub fn bubble_parts(ptgraph: &DbgGraph, startn: NodeId) -> Option<BubbleParts> {
 pub enum BubbleChoice {
     /// Collapse the bubble onto this branch, discarding the other.
     Keep(usize),
-    /// Cut this branch loose. Leaves a contig break rather than guessing.
-    SeverOne(usize),
-    /// Cut both branches loose: the evidence does not favour either. Deliberate — an ambiguous bubble
-    /// becomes a contig break, as SKESA does, rather than a coin flip.
-    SeverBoth,
+    /// Do nothing at all. The bubble stays exactly as it is, contig break and all.
+    ///
+    /// Replaces the old `SeverOne`/`SeverBoth`. Severing *detached* a branch rather than deleting it,
+    /// and an isolated node under 100 nt is then dropped at collapse (`collapser.rs:45-51`) — so
+    /// "sever" meant "delete, one stage later", and on the bubbles it fired for (median 61 bp) it lost
+    /// *both* copies where popping loses one. Leaving the fork in place costs the same contig break
+    /// and keeps the sequence.
+    Leave,
 }
 
 /// The coverage heuristic. Pure: it inspects the graph and decides, but changes nothing.
+///
+/// Pops only when the weaker branch is noise beside the stronger one — the SKESA-inspired ratio that
+/// was already the first arm of this function. The two rules it replaces are gone on purpose:
+///
+/// - comparing branches of *unequal* length against the flanking coverage and severing the deviant one;
+/// - keeping the higher count when the lengths are *equal*, falling through to `Keep(1)` on an exact tie.
+///
+/// Those are precisely what destroys a collapsed two-copy repeat. Its two copies have equal length and
+/// equal coverage, so the old code reached that final `Keep(1)` and deleted one real copy on a coin
+/// flip. There is no coverage signal at such a locus, so nothing is now done with it — the fork stays,
+/// the contig breaks, and both copies survive for the evidence-k pass or the user to deal with.
 fn choose_branch_by_counts(
     ptgraph: &DbgGraph,
-    startn: NodeId,
     midconns: &[(NodeId, EdgeType)],
+    pop_ratio: f32,
 ) -> BubbleChoice {
-    let node0w = ptgraph.node_weight(midconns[0].0).unwrap();
-    let node1w = ptgraph.node_weight(midconns[1].0).unwrap();
+    let c0 = ptgraph.node_weight(midconns[0].0).unwrap().counts;
+    let c1 = ptgraph.node_weight(midconns[1].0).unwrap().counts;
+    let hi = max(c0, c1);
+    let lo = min(c0, c1);
 
-    // Inspired by Skesa: a branch carrying less than 10% of the stronger branch's coverage is noise.
-    // The floor of 1 is there so a `counts == 0` branch is always dropped; it must be a floor, not a
-    // ceiling. This was `min`, which clamped the threshold to at most 1 — and since every surviving
-    // k-mer has `counts >= min_count`, the two arms below could then never fire, so the whole filter
-    // was dead code.
-    let count_threshold = max(
-        (0.1_f32 * max(node0w.counts, node1w.counts) as f32).round() as u32,
-        1,
-    );
-
-    if node0w.counts < count_threshold {
-        return BubbleChoice::Keep(1);
-    }
-    if node1w.counts < count_threshold {
-        return BubbleChoice::Keep(0);
-    }
-
-    // Cast before subtracting: these are usizes, so `a - b` underflows whenever branch 0 is the shorter
-    // one. Release wrapped and the `as i32` truncation recovered the right negative value by accident;
-    // debug panicked with "attempt to subtract with overflow".
-    let lendiff = (node0w.abs_ind.len() as i32 - node1w.abs_ind.len() as i32).abs() as f32
-        / (max(node0w.abs_ind.len(), node1w.abs_ind.len()) as f32);
-
-    if lendiff > 0.025 {
-        // The branches differ in length, so coverage alone cannot say which is right. Compare each
-        // against the coverage of the sequence flanking the bubble instead, and cut loose whichever
-        // deviates. If both deviate, or neither does, cut both: an ambiguous bubble becomes a contig
-        // break rather than a guess.
-        let startn_counts = ptgraph.node_weight(startn).unwrap().counts;
-        let endn_counts = ptgraph
-            .node_weight(
-                ptgraph.out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)[0].0,
-            )
-            .unwrap()
-            .counts;
-        let average_surrounding_counts = ((startn_counts + endn_counts) as f32 / 2.0).round() as u32;
-
-        // i64, not i32: with u32 counts the difference no longer fits in an i32.
-        let rel_diff = |c: u32| {
-            ((c as i64) - (average_surrounding_counts as i64)).abs() as f32
-                / (average_surrounding_counts as f32)
-        };
-        let (rel_diff_0, rel_diff_1) = (rel_diff(node0w.counts), rel_diff(node1w.counts));
-
-        if rel_diff_0 > 0.2 && rel_diff_1 <= 0.2 {
-            BubbleChoice::SeverOne(0)
-        } else if rel_diff_0 <= 0.2 && rel_diff_1 > 0.2 {
-            BubbleChoice::SeverOne(1)
-        } else {
-            BubbleChoice::SeverBoth
-        }
-    } else if node0w.counts > node1w.counts {
-        BubbleChoice::Keep(0)
-    } else if node0w.counts < node1w.counts {
-        BubbleChoice::Keep(1)
-    } else if node0w.abs_ind.len() > node1w.abs_ind.len() {
-        BubbleChoice::Keep(0)
+    // Strict `<`, so equal coverages can never pop however the ratio is set. That also removes the
+    // need for the old floor of 1: a `0` branch beside anything positive is already below the
+    // threshold, and a `0/0` bubble — where there is nothing to choose between — is left alone.
+    if (lo as f32) < pop_ratio * hi as f32 {
+        BubbleChoice::Keep(if c0 > c1 { 0 } else { 1 })
     } else {
-        BubbleChoice::Keep(1)
+        BubbleChoice::Leave
     }
 }
 
@@ -415,8 +389,8 @@ pub fn apply_bubble_collapse(
     true
 }
 
-/// This function collapses standard bubbles depending on the number of counts (very naive)
-fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
+/// Collapse one standard bubble, if and only if the coverage difference between its branches is stark.
+fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId, pop_ratio: f32) -> bool {
     // Deliberately weaker than `check_bubble_structure`: earlier collapses in the same pass may have
     // reshaped the graph, and this is the guard the heuristic has always used. Tightening it here would
     // change which bubbles get collapsed.
@@ -430,17 +404,11 @@ fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
         return false;
     }
 
-    match choose_branch_by_counts(ptgraph, startn, &midconns) {
+    match choose_branch_by_counts(ptgraph, &midconns, pop_ratio) {
         BubbleChoice::Keep(w) => apply_bubble_collapse(ptgraph, startn, &midconns, w),
-        BubbleChoice::SeverOne(b) => {
-            ptgraph.remove_all_edges_of(midconns[b].0);
-            true
-        }
-        BubbleChoice::SeverBoth => {
-            ptgraph.remove_all_edges_of(midconns[0].0);
-            ptgraph.remove_all_edges_of(midconns[1].0);
-            true
-        }
+        // `false`, not `true`: the graph is untouched, so reporting a change would spin the caller's
+        // fixed-point loop forever on a bubble nothing will ever act on.
+        BubbleChoice::Leave => false,
     }
 }
 
@@ -473,8 +441,7 @@ fn check_dead_path(
     }
 
     let (mut ty, _) = carryedge.get_from_and_to();
-    let minnts = 100;
-    let limit = max(0, minnts - k + 1);
+    let limit = short_path_limit(100, k);
 
     loop {
         if cnt >= limit {
@@ -567,25 +534,43 @@ mod tests {
 
     // ── dead-path limit formula ──────────────────────────────────────────────
 
-    #[test]
-    fn dead_path_limit_k3() {
-        let (minnts, k) = (100usize, 3usize);
-        let limit = std::cmp::max(0, minnts - k + 1);
-        assert_eq!(limit, 98);
-    }
+    // These used to re-implement the formula inline instead of calling it, which is precisely why an
+    // integer underflow above k = 100 survived: every case they covered was under the boundary, and a
+    // copy of the code cannot disagree with itself.
 
     #[test]
-    fn dead_path_limit_k100() {
-        let (minnts, k) = (100usize, 100usize);
-        let limit = std::cmp::max(0, minnts - k + 1);
-        assert_eq!(limit, 1);
+    fn dead_path_limit_k3() {
+        assert_eq!(short_path_limit(100, 3), 98);
     }
 
     #[test]
     fn dead_path_limit_k31() {
-        let (minnts, k) = (100usize, 31usize);
-        let limit = std::cmp::max(0, minnts - k + 1);
-        assert_eq!(limit, 70);
+        assert_eq!(short_path_limit(100, 31), 70);
+    }
+
+    #[test]
+    fn dead_path_limit_k100() {
+        assert_eq!(short_path_limit(100, 100), 1);
+    }
+
+    /// The first k that underflowed. `100 - 101 + 1` on `usize` wraps to ~1.8e19, after which every
+    /// contig is dropped and every path is judged dead — a k > 100 assembly came out entirely empty.
+    #[test]
+    fn dead_path_limit_does_not_underflow_above_minnts() {
+        assert_eq!(short_path_limit(100, 101), 0);
+        assert_eq!(short_path_limit(100, 139), 0);
+        assert_eq!(short_path_limit(100, 255), 0);
+    }
+
+    /// A single k-mer already spans k bases, so above the threshold nothing may be filtered for length.
+    #[test]
+    fn a_single_kmer_contig_survives_when_k_exceeds_the_floor() {
+        for k in [101usize, 139, 255] {
+            assert!(
+                1 > short_path_limit(100, k),
+                "one k-mer spans {k} bases, which is over the 100 nt floor"
+            );
+        }
     }
 
     // ── check_bubble_structure ───────────────────────────────────────────────
@@ -606,6 +591,117 @@ mod tests {
         g.add_bi_edge(e, f, EdgeType::MinToMin);
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         (g, s, edges)
+    }
+
+    // ── the pop rule ─────────────────────────────────────────────────────────
+
+    /// The same diamond, with the two branches given explicit coverages and an **upstream flank**.
+    ///
+    /// The flank matters: `pop_bubbles_by_coverage` filters candidates on `out_degree(start) == 3`,
+    /// which decomposes as the two outgoing `Min` branches plus the one outgoing `Max` back-link that
+    /// `add_bi_edge` installs for the incoming flank edge. Without `f0 -> s` the degree is 2 and the
+    /// bubble is never even offered to the heuristic.
+    fn bubble_with_counts(c0: u32, c1: u32) -> (DbgGraph, NodeId, Vec<(NodeId, EdgeType)>) {
+        let mut g = DbgGraph::new(3);
+        let f0 = g.add_node(make_node());
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(NodeStruct { counts: c0, ..make_node() });
+        let m2 = g.add_node(NodeStruct { counts: c1, ..make_node() });
+        let e = g.add_node(make_node());
+        let f = g.add_node(make_node());
+        g.add_bi_edge(f0, s, EdgeType::MinToMin);
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        g.add_bi_edge(s, m2, EdgeType::MinToMin);
+        g.add_bi_edge(m1, e, EdgeType::MinToMin);
+        g.add_bi_edge(m2, e, EdgeType::MinToMin);
+        g.add_bi_edge(e, f, EdgeType::MinToMin);
+        assert_eq!(g.out_degree(s), 3, "fixture must be a candidate for the popper");
+        let mids = g.out_neighbours_min(s);
+        (g, s, mids)
+    }
+
+    /// Index in `mids` of the branch with the higher count.
+    ///
+    /// `out_neighbours_min` does not promise insertion order, so a test that assumed `mids[0]` is the
+    /// first node it added would be asserting on an artefact of `petgraph`'s edge storage rather than
+    /// on the rule. Ask the graph instead.
+    fn stronger(g: &DbgGraph, mids: &[(NodeId, EdgeType)]) -> usize {
+        let c0 = g.node_weight(mids[0].0).unwrap().counts;
+        let c1 = g.node_weight(mids[1].0).unwrap().counts;
+        if c0 >= c1 {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// **The regression this whole rule exists to prevent.** A collapsed two-copy repeat has branches
+    /// of equal length and equal coverage; the old heuristic fell through to an arbitrary `Keep(1)` and
+    /// deleted one real copy. Nothing may be touched here, however the ratio is set.
+    #[test]
+    fn equal_coverage_bubble_is_left_alone() {
+        let (g, _s, mids) = bubble_with_counts(40, 40);
+        for ratio in [0.01_f32, 0.1, 0.5, 0.99] {
+            assert_eq!(
+                choose_branch_by_counts(&g, &mids, ratio),
+                BubbleChoice::Leave,
+                "equal coverage must never pop, ratio {ratio}"
+            );
+        }
+
+        let (mut g, _s, _) = bubble_with_counts(40, 40);
+        let before = g.node_count();
+        assert!(!pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO));
+        assert_eq!(g.node_count(), before, "the graph must be untouched");
+    }
+
+    /// A branch carrying a twentieth of the other is noise, and is popped — whichever way round the
+    /// two are stored.
+    #[test]
+    fn a_noise_branch_is_popped() {
+        for (c0, c1) in [(100u32, 5u32), (5, 100)] {
+            let (g, _s, mids) = bubble_with_counts(c0, c1);
+            assert_eq!(
+                choose_branch_by_counts(&g, &mids, 0.1),
+                BubbleChoice::Keep(stronger(&g, &mids)),
+                "must keep the stronger branch for ({c0}, {c1})"
+            );
+        }
+
+        let (mut g, _s, _) = bubble_with_counts(100, 5);
+        let before = g.node_count();
+        assert!(pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO));
+        assert!(g.node_count() < before, "the popped branch and end node are gone");
+    }
+
+    /// Pins the boundary: the comparison is a strict `<`, so a branch sitting exactly on the ratio
+    /// survives. Getting this backwards would pop bubbles at exactly 10 %, which is the side of the
+    /// line where two real things start to look alike.
+    #[test]
+    fn a_branch_exactly_on_the_ratio_survives() {
+        let (g, _s, mids) = bubble_with_counts(100, 10);
+        assert_eq!(choose_branch_by_counts(&g, &mids, 0.1), BubbleChoice::Leave);
+
+        let (g, _s, mids) = bubble_with_counts(100, 9);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, 0.1),
+            BubbleChoice::Keep(stronger(&g, &mids))
+        );
+    }
+
+    /// A `0/0` bubble decides nothing and is left alone — the old code had a floor of 1 on the
+    /// threshold specifically to force a drop here, and that floor is gone.
+    #[test]
+    fn a_zero_coverage_bubble_is_left_alone() {
+        let (g, _s, mids) = bubble_with_counts(0, 0);
+        assert_eq!(choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO), BubbleChoice::Leave);
+
+        // But zero beside anything real is still noise.
+        let (g, _s, mids) = bubble_with_counts(50, 0);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO),
+            BubbleChoice::Keep(stronger(&g, &mids))
+        );
     }
 
     #[test]

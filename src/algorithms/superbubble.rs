@@ -524,7 +524,7 @@ where
         };
 
         let window = w.window(k1, ev.k);
-        let e = ev.evidence_for::<IntT>(&seq, window);
+        let e = ev.evidence_for(&seq, window);
         if e.flank_fraction < FLANK_SUPPORT || e.n_window < min_evidence {
             return (SbVerdict::InconclusiveContext, truncated);
         }
@@ -778,7 +778,7 @@ where
         let Ok(seq) = spell_path(hashes, dict, k1) else {
             return false;
         };
-        let e = ev.evidence_for::<IntT>(&seq, (0, 0));
+        let e = ev.evidence_for(&seq, (0, 0));
         e.flank_fraction >= 1.0 && e.runs.len() == 1
     };
 
@@ -1084,13 +1084,13 @@ pub fn survey_superbubbles<IntT>(
 
 /// Judge every superbubble and split the complex ones the evidence resolves.
 ///
-/// Returns the entrances of superbubbles we *intended* to split but could not on this pass, so the
-/// caller can veto the coverage heuristic on them and they survive to the next round — otherwise the
-/// heuristic pops one and the sequence we were about to recover is gone before the second chance.
-///
 /// Splits are collected first and applied afterwards, exactly as the simple-bubble pass does and for the
 /// same reason: each one rewires the neighbourhood the next was judged against. Each is therefore
 /// re-derived immediately before it is applied, and abandoned if the structure moved.
+///
+/// This used to return the entrances it could not split, so the caller could veto the coverage
+/// heuristic on them. That is no longer needed: the popper leaves a comparable-coverage locus alone, so
+/// a superbubble whose split was skipped survives on its own merits rather than on an exemption list.
 #[allow(clippy::too_many_arguments)]
 pub fn correct_superbubbles_with_evidence<IntT>(
     ev: &EvidenceGraph,
@@ -1101,8 +1101,7 @@ pub fn correct_superbubbles_with_evidence<IntT>(
     min_evidence: usize,
     max_nodes: usize,
     stats: &mut SuperbubbleStats,
-) -> BTreeSet<NodeId>
-where
+) where
     IntT: for<'a> UInt<'a>,
 {
     let plans = judge_and_assess::<IntT>(
@@ -1116,7 +1115,6 @@ where
         stats,
     );
 
-    let mut deferred: BTreeSet<NodeId> = BTreeSet::new();
     for (sb, chain, pairing) in &plans {
         let outcome = if !g.contains_node(sb.entrance.node) {
             SplitOutcome::StaleNoBubble
@@ -1147,7 +1145,6 @@ where
         stats.record_split(outcome);
 
         if outcome != SplitOutcome::Applied {
-            deferred.insert(sb.entrance.node);
             // One line per locus: there are few enough of these to be worth reading individually
             // rather than inferring from totals, and they are the only window on whether the
             // collect-then-apply discipline is costing anything.
@@ -1162,7 +1159,156 @@ where
             );
         }
     }
-    deferred
+}
+
+/// Coverage of a path: the weakest node on it.
+///
+/// Minimum, not mean — a path is only as real as its least-supported unitig, and a mean lets one
+/// well-covered unitig carry a noise unitig through the test below.
+fn path_coverage(g: &DbgGraph, path: &[Oriented]) -> u32 {
+    path.iter()
+        .map(|o| g.node_weight(o.node).map_or(0, |w| w.counts))
+        .min()
+        .unwrap_or(0)
+}
+
+/// Which path, if any, the coverage clearly favours: one winner, every other under `pop_ratio` of it.
+///
+/// Deliberately the same shape as `corrector::choose_branch_by_counts`, and strictly harder to satisfy
+/// as N grows — which is the intent. The more branches a locus has, the less a coverage argument for
+/// deleting all but one of them is worth.
+fn coverage_winner(g: &DbgGraph, sb: &Superbubble, pop_ratio: f32) -> Option<usize> {
+    let covs: Vec<u32> = sb.paths.iter().map(|p| path_coverage(g, p)).collect();
+    if covs.len() < 2 {
+        return None;
+    }
+    let mut best = 0usize;
+    for (i, c) in covs.iter().enumerate() {
+        if *c > covs[best] {
+            best = i; // strict, so a tie for the top keeps the lowest index and is deterministic
+        }
+    }
+    // Strict `<` on the losers, so paths of equal coverage — a collapsed repeat — never collapse,
+    // however the ratio is set. A tie for the top therefore always falls through to `None`.
+    let hi = covs[best] as f32;
+    covs.iter()
+        .enumerate()
+        .all(|(i, c)| i == best || (*c as f32) < pop_ratio * hi)
+        .then_some(best)
+}
+
+/// Collapse a superbubble onto one path by deleting the others.
+///
+/// Deliberately **not** modelled on `corrector::apply_bubble_collapse`, which fuses start, winner and
+/// end into a single node and asserts that start and end hold exactly one k-mer each. Neither holds
+/// here: a superbubble's entrance and exit are whole unitigs. Deleting the losing paths and letting the
+/// next `shrink` fuse `entrance -> winner -> exit` reaches the same state with none of the bidirected
+/// bookkeeping, and `remove_node` drops the incident edges for us.
+///
+/// Sound **only on a parallel bundle** — paths pairwise disjoint and together covering the interior.
+/// Otherwise deleting them would either remove a node another surviving path needs, or strand an
+/// interior node that no path owns.
+fn collapse_onto(g: &mut DbgGraph, sb: &Superbubble, winner: usize) {
+    for (i, path) in sb.paths.iter().enumerate() {
+        if i == winner {
+            continue;
+        }
+        for o in path {
+            g.remove_node(o.node);
+        }
+    }
+}
+
+/// Counts for the post-ladder, coverage-only superbubble collapse.
+#[derive(Debug, Clone, Default)]
+pub struct SbCollapseStats {
+    /// Superbubbles examined, summed over every pass.
+    pub seen: usize,
+    /// …that are simple bubbles, so the simple popper owns them.
+    pub simple_equivalent: usize,
+    /// …whose paths are not a parallel bundle, so deletion could strand or steal a node.
+    pub not_a_bundle: usize,
+    /// …where no single path dominates. **Expected to be the overwhelming majority.**
+    pub no_clear_winner: usize,
+    /// Collapses performed.
+    pub applied: usize,
+    /// Planned, but the neighbourhood moved before it could be applied.
+    pub stale: usize,
+}
+
+impl SbCollapseStats {
+    /// Report at `info`, and check that every superbubble seen landed in exactly one bucket.
+    pub fn report(&self) {
+        assert_eq!(
+            self.simple_equivalent + self.not_a_bundle + self.no_clear_winner + self.applied + self.stale,
+            self.seen,
+            "superbubble collapse accounting does not balance for {} superbubbles seen",
+            self.seen
+        );
+        if self.seen == 0 {
+            return;
+        }
+        log::info!("Superbubble collapse (coverage only), over all passes:");
+        log::info!("  superbubbles examined              {:5}", self.seen);
+        log::info!("    simple bubble (other pass owns)  {:5}", self.simple_equivalent);
+        log::info!("    not a parallel bundle            {:5}", self.not_a_bundle);
+        log::info!("    no path dominates (left alone)   {:5}", self.no_clear_winner);
+        log::info!("    stale by the time it was applied {:5}", self.stale);
+        log::info!("  COLLAPSED                          {:5}", self.applied);
+    }
+}
+
+/// Collapse superbubbles where coverage clearly favours one path. **Deletes nodes.**
+///
+/// The post-ladder counterpart to `corrector::pop_bubbles_by_coverage`, on the same rule and the same
+/// threshold: this runs on what the evidence k could not resolve, and declines unless one path
+/// dominates every other. `no_clear_winner` is expected to dominate the tally — a collapsed repeat's
+/// paths have comparable coverage by construction, and those must survive untouched.
+///
+/// Collect-then-apply with re-derivation, exactly as `correct_superbubbles_with_evidence` does and for
+/// the same reason: each collapse reshapes the neighbourhood the next one was judged against.
+pub fn collapse_superbubbles_by_coverage(
+    g: &mut DbgGraph,
+    pop_ratio: f32,
+    stats: &mut SbCollapseStats,
+) -> bool {
+    let (sbs, _) = find_all(g);
+    let mut plan: Vec<(Superbubble, usize)> = Vec::new();
+
+    for sb in &sbs {
+        stats.seen += 1;
+        let simple = sb.paths.len() == 2
+            && sb.paths.iter().all(|p| p.len() == 1)
+            && crate::algorithms::corrector::bubble_parts(g, sb.entrance.node).is_some();
+        if simple {
+            // The simple popper's business. Acting here too would collapse the same locus twice.
+            stats.simple_equivalent += 1;
+        } else if !is_parallel_bundle(sb) {
+            stats.not_a_bundle += 1;
+        } else if let Some(w) = coverage_winner(g, sb, pop_ratio) {
+            plan.push((sb.clone(), w));
+        } else {
+            stats.no_clear_winner += 1;
+        }
+    }
+
+    let mut changed = false;
+    for (sb, w) in &plan {
+        let fresh = if g.contains_node(sb.entrance.node) {
+            find_superbubble(g, sb.entrance).ok()
+        } else {
+            None
+        };
+        match fresh {
+            Some(f) if f.exit == sb.exit && f.paths == sb.paths => {
+                collapse_onto(g, sb, *w);
+                stats.applied += 1;
+                changed = true;
+            }
+            _ => stats.stale += 1,
+        }
+    }
+    changed
 }
 
 /// Counts of what the oracle said about superbubbles.
@@ -2003,6 +2149,102 @@ mod tests {
         // neighbour cannot serve two loci, however the rows are read.
         let collision = vec![vec![false, true], vec![false, true]];
         assert_eq!(bijection(&collision), None, "one neighbour, two paths");
+    }
+
+    // ── the coverage-only collapse ───────────────────────────────────────────
+
+    /// Give every node of path `i` the coverage `covs[i]`, leaving the shared chain alone.
+    fn set_path_counts(c: &mut Collapsed, covs: &[u32]) {
+        for (path, cov) in c.paths.iter().zip(covs) {
+            for n in path {
+                c.g.node_weight_mut(*n).unwrap().counts = *cov;
+            }
+        }
+    }
+
+    /// **The regression the threshold exists for.** Three paths at equal coverage is what a collapsed
+    /// three-copy repeat looks like; nothing may be deleted.
+    #[test]
+    fn a_bundle_with_equal_coverage_is_left_alone() {
+        let mut c = collapsed_repeat(&[1, 1, 1]);
+        set_path_counts(&mut c, &[40, 40, 40]);
+        let sb = find_superbubble(&c.g, omin(c.entrance)).unwrap();
+        assert!(coverage_winner(&c.g, &sb, 0.1).is_none());
+
+        let before = c.g.node_count();
+        let mut stats = SbCollapseStats::default();
+        assert!(!collapse_superbubbles_by_coverage(&mut c.g, 0.1, &mut stats));
+        assert_eq!(c.g.node_count(), before, "the graph must be untouched");
+        assert!(stats.no_clear_winner >= 1);
+        assert_eq!(stats.applied, 0);
+        stats.report(); // also exercises the accounting assert
+    }
+
+    /// One dominant path, the other two noise: collapse onto the winner and delete the losers.
+    #[test]
+    fn a_bundle_with_one_dominant_path_collapses() {
+        let mut c = collapsed_repeat(&[1, 1, 1]);
+        set_path_counts(&mut c, &[100, 3, 4]);
+        let sb = find_superbubble(&c.g, omin(c.entrance)).unwrap();
+        // Which index dominates is whatever `enumerate_paths` produced; ask rather than assume.
+        let w = coverage_winner(&c.g, &sb, 0.1).expect("100 vs 3 and 4 is a clear winner");
+        let winner_node = sb.paths[w][0].node;
+
+        let before = c.g.node_count();
+        let mut stats = SbCollapseStats::default();
+        assert!(collapse_superbubbles_by_coverage(&mut c.g, 0.1, &mut stats));
+        assert_eq!(stats.applied, 1);
+        // Two one-node paths deleted, nothing else.
+        assert_eq!(c.g.node_count(), before - 2);
+        assert!(c.g.contains_node(winner_node), "the winner survives");
+        assert!(c.g.contains_node(c.entrance), "the entrance survives");
+        for path in &c.paths {
+            if path[0] != winner_node {
+                assert!(!c.g.contains_node(path[0]), "a losing path must be gone");
+            }
+        }
+        stats.report();
+    }
+
+    /// A multi-unitig path is judged by its *weakest* node, so one well-covered unitig cannot carry a
+    /// noise unitig through the test.
+    #[test]
+    fn path_coverage_is_the_weakest_node() {
+        let mut c = collapsed_repeat(&[2, 1]);
+        let sb = find_superbubble(&c.g, omin(c.entrance)).unwrap();
+        let long = sb.paths.iter().find(|p| p.len() == 2).unwrap().clone();
+        c.g.node_weight_mut(long[0].node).unwrap().counts = 100;
+        c.g.node_weight_mut(long[1].node).unwrap().counts = 2;
+        assert_eq!(path_coverage(&c.g, &long), 2, "the mean would have said 51");
+    }
+
+    /// A superbubble that is a plain simple bubble belongs to `corrector`; collapsing it here as well
+    /// would act on the same locus twice.
+    #[test]
+    fn a_simple_bubble_is_left_to_the_simple_popper() {
+        let mut g = DbgGraph::new(3);
+        let f0 = g.add_node(make_node());
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(make_node());
+        let m2 = g.add_node(make_node());
+        let e = g.add_node(make_node());
+        let f1 = g.add_node(make_node());
+        g.add_bi_edge(f0, s, EdgeType::MinToMin);
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        g.add_bi_edge(s, m2, EdgeType::MinToMin);
+        g.add_bi_edge(m1, e, EdgeType::MinToMin);
+        g.add_bi_edge(m2, e, EdgeType::MinToMin);
+        g.add_bi_edge(e, f1, EdgeType::MinToMin);
+        g.node_weight_mut(m1).unwrap().counts = 100;
+        g.node_weight_mut(m2).unwrap().counts = 2;
+
+        let before = g.node_count();
+        let mut stats = SbCollapseStats::default();
+        assert!(!collapse_superbubbles_by_coverage(&mut g, 0.1, &mut stats));
+        assert_eq!(g.node_count(), before);
+        assert!(stats.simple_equivalent >= 1, "recognised as the other pass's business");
+        assert_eq!(stats.applied, 0);
+        stats.report();
     }
 
     /// Detection must not depend on the order edges were inserted.

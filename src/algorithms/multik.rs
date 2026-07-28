@@ -24,7 +24,7 @@ use sparrowhawk_graph::{CarryType, DbgGraph, EdgeType, NodeId, NodeStruct};
 
 use crate::algorithms::corrector::BubbleParts;
 use crate::algorithms::shrinker::Shrinkable;
-use crate::bit_encoding::UInt;
+use crate::bit_encoding::{UInt, U256, U512};
 use crate::graph_works::populate_neighbours;
 use crate::kmer::Kmer;
 use crate::preprocessing::PreprocessedK;
@@ -141,12 +141,30 @@ impl EvidenceGraph {
     /// Look up every k2-mer of `seq`, splitting them into the discriminating window and the flanking
     /// guard.
     ///
+    /// **Not generic**, and deliberately so. The packed-k-mer width this needs is set by *this graph's*
+    /// k, which the graph already knows — so it dispatches on `self.k` rather than making every caller
+    /// carry a type parameter sized for the evidence k. That matters: `judge_bubble`,
+    /// `judge_superbubble`, `correct_with_evidence`, `survey_bubbles` and every superbubble entry point
+    /// would otherwise need a second type parameter threaded through them, which is exactly why the
+    /// whole run used to take one width from the largest k and pay for it on the assembly k's pass.
+    ///
+    /// The cost is four monomorphisations of `evidence_for_impl` instead of one; `EvidenceGraph` itself
+    /// stores no packed k-mers, so nothing of this width escapes the call.
+    pub fn evidence_for(&self, seq: &[u8], window: (usize, usize)) -> BranchEvidence {
+        match self.k {
+            0..=32 => self.evidence_for_impl::<u64>(seq, window),
+            33..=64 => self.evidence_for_impl::<u128>(seq, window),
+            65..=128 => self.evidence_for_impl::<U256>(seq, window),
+            _ => self.evidence_for_impl::<U512>(seq, window),
+        }
+    }
+
     /// `window` is the half-open range of k2-mer *start positions* that overlap the divergent middle.
     ///
     /// Hashing reuses `Kmer`'s light iterators, which yield `(hc, hnc, b)` without the packed k-mer —
     /// exactly what a presence test needs. `seq` is our own reconstructed ACGT, so there are no Ns and
     /// no quality mask, and the roller never restarts its window: one hash per position.
-    pub fn evidence_for<IntT>(&self, seq: &[u8], window: (usize, usize)) -> BranchEvidence
+    fn evidence_for_impl<IntT>(&self, seq: &[u8], window: (usize, usize)) -> BranchEvidence
     where
         IntT: for<'a> UInt<'a>,
     {
@@ -453,7 +471,7 @@ where
         let Ok(seq) = spell_path(hashes, dict, k1) else {
             return false;
         };
-        let e = ev.evidence_for::<IntT>(&seq, (0, 0));
+        let e = ev.evidence_for(&seq, (0, 0));
         e.flank_fraction >= 1.0 && e.runs.len() == 1
     };
 
@@ -766,7 +784,7 @@ where
         };
 
         let window = w.window(k1, ev.k);
-        *slot = ev.evidence_for::<IntT>(&seq, window);
+        *slot = ev.evidence_for(&seq, window);
 
         if slot.flank_fraction < FLANK_SUPPORT || slot.n_window < min_evidence {
             return (Verdict::InconclusiveContext, truncated);
@@ -802,16 +820,16 @@ where
 
 /// Ask the evidence graph about every bubble, and act on what it says.
 ///
-/// Returns the set of bubble starts the coverage heuristic must not touch.
+/// One action: **resolve** (`--multik-resolve-repeats`). Where k2 spans the collapsed repeat *and* the
+/// reads pair each predecessor unambiguously with a branch, duplicate the shared repeat so both genomic
+/// copies survive and contigs run through. It is the only correction here that throws nothing away.
 ///
-/// Two actions, and they are not the same:
-///
-/// - **Resolve** (`--multik-resolve-repeats`): where k2 spans the collapsed repeat *and* the reads pair
-///   each predecessor unambiguously with a branch, duplicate the shared repeat so both genomic copies
-///   survive and contigs run through. This is the only action that throws nothing away.
-/// - **Protect** (`--multik-protect`): merely refuse to pop. Measured, this *loses* genome fraction:
-///   an unpopped branch is left unattached, and at a median 61 bp it falls under the 100 bp contig
-///   filter, so both copies are dropped where popping loses one. Kept only for the A/B.
+/// There used to be a second action, **protect** — return the judged bubbles so the coverage heuristic
+/// would refuse to pop them. It is gone, along with `--multik-protect`. It measured as a regression
+/// (a "protected" branch was severed rather than kept, and an isolated node under 100 nt is dropped at
+/// `collapser.rs:45-51`, so it lost *both* copies where popping lost one), and it is now unnecessary:
+/// `corrector::choose_branch_by_counts` will not touch a bubble whose branches have comparable
+/// coverage, which is exactly the case protection existed for.
 #[allow(clippy::too_many_arguments)]
 pub fn correct_with_evidence<IntT>(
     ev: &EvidenceGraph,
@@ -822,16 +840,12 @@ pub fn correct_with_evidence<IntT>(
     min_evidence: usize,
     max_nodes: usize,
     do_resolve: bool,
-    do_protect: bool,
     stats: &mut MultiKStats,
     prev_skipped: &BTreeSet<NodeId>,
     skipped_out: &mut BTreeSet<NodeId>,
-) -> BTreeSet<NodeId>
-where
+) where
     IntT: for<'a> UInt<'a>,
 {
-    let mut protected = BTreeSet::new();
-
     let candidates: Vec<BubbleParts> = g
         .node_indices()
         .filter_map(|n| crate::algorithms::corrector::bubble_parts(g, n))
@@ -874,20 +888,11 @@ where
                 None => stats.pairing_ambiguous += 1,
             }
         }
-
-        if matches!(v, Verdict::ResolvableRepeat | Verdict::ProtectedRepeat) {
-            protected.insert(p.start);
-        }
     }
 
     // Anything skipped last round that did not even come back as a candidate. `revisit_seen` counts
     // reappearances, so the remainder vanished — absorbed by `shrink`, or popped.
     stats.revisit_absent = prev_skipped.len().saturating_sub(stats.revisit_seen);
-
-    if !do_protect {
-        // Judged and reported, but the heuristic still gets every bubble it would have had.
-        protected.clear();
-    }
 
     if do_resolve {
         for (p, c, pr) in &to_split {
@@ -902,10 +907,9 @@ where
             stats.record_split(outcome);
 
             if outcome != SplitOutcome::Applied {
-                // We *intend* to split this one, we just could not on this pass. Veto the coverage
-                // heuristic on it so it survives to the next round — otherwise the heuristic pops it
-                // and the sequence we were about to recover is gone before we get a second chance.
-                protected.insert(p.start);
+                // We *intend* to split this one, we just could not on this pass. Record it so the
+                // next round can report what became of it. No veto is needed any more: the popper
+                // leaves a comparable-coverage bubble alone, so the locus survives on its own.
                 skipped_out.insert(p.start);
 
                 // One line per locus — there are only ~12-25 of these per dataset, so they are worth
@@ -941,7 +945,6 @@ where
             }
         }
     }
-    protected
 }
 
 /// Ask the evidence graph about every bubble in the graph, recording what it said.

@@ -275,17 +275,6 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_multik_resolve: bool,
 
-        /// Multi-k: refuse to pop a bubble whose branches are BOTH corroborated at the evidence k.
-        ///
-        /// A MEASURED REGRESSION, kept only so the comparison can be reproduced. Do not turn it on. It
-        /// sounds right — there is no wrong branch to remove, so popping must be deleting real sequence —
-        /// but an unpopped branch is left unattached to anything, and at a median 61 bp it falls below
-        /// the 100 bp contig filter. So it drops BOTH copies where popping loses one: measured, it costs
-        /// 1,224 bp of genome to fix ~2 mismatches. Resolving the repeat (the default) is what actually
-        /// keeps both.
-        #[arg(long, default_value_t = false)]
-        multik_protect: bool,
-
         /// Multi-k: also split SUPERBUBBLES — forks with three or more branches, or branches more than
         /// one unitig long — and not just simple bubbles.
         ///
@@ -314,6 +303,19 @@ pub enum Commands {
         /// the contig.
         #[arg(long, default_value_t = false)]
         multik_survey_only: bool,
+
+        /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
+        /// treated as an error and popped.
+        ///
+        /// This is the ONLY thing that licenses popping. At or above it both branches are taken to be
+        /// real — which is what a collapsed repeat looks like, its two copies having equal length and
+        /// equal coverage — and the bubble is left exactly as it is, contig break and all. Applies to
+        /// superbubbles too: there, every losing path must be under this fraction of the winner.
+        ///
+        /// Raising it pops more aggressively and risks deleting one copy of a real repeat; lowering it
+        /// leaves more forks, and so more contig breaks, but destroys nothing.
+        #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
+        bubble_pop_ratio: f32,
 
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this

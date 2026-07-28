@@ -15,12 +15,13 @@ use needletail::parser::write_fasta;
 use crate::algorithms::collapser::Collapsable;
 use crate::algorithms::corrector::Correctable;
 #[cfg(not(target_family = "wasm"))]
-use crate::algorithms::corrector::correct_bubbles_skipping;
+use crate::algorithms::corrector::pop_bubbles_by_coverage;
 #[cfg(not(target_family = "wasm"))]
 use crate::algorithms::multik::{correct_with_evidence, EvidenceGraph, MultiKStats};
 #[cfg(not(target_family = "wasm"))]
 use crate::algorithms::superbubble::{
-    correct_superbubbles_with_evidence, survey_superbubbles, SuperbubbleStats,
+    collapse_superbubbles_by_coverage, correct_superbubbles_with_evidence, survey_superbubbles,
+    SbCollapseStats, SuperbubbleStats,
 };
 use crate::algorithms::shrinker::Shrinkable;
 #[cfg(not(target_family = "wasm"))]
@@ -547,8 +548,6 @@ pub struct MultiKCtx<'a, IntT> {
     pub min_evidence: usize,
     /// Maximum evidence nodes a supported branch's discriminating window may span.
     pub max_nodes: usize,
-    /// Veto the coverage heuristic on bubbles whose branches are both corroborated at the evidence k.
-    pub protect: bool,
     /// Duplicate the collapsed repeat where the evidence k resolves it, so both genomic copies survive
     /// and contigs run through.
     pub resolve: bool,
@@ -579,6 +578,7 @@ pub trait Assemble {
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
+        pop_ratio: f32,
         multik: Option<MultiKCtx<'_, IntT>>,
     ) -> Contigs;
 
@@ -607,6 +607,7 @@ impl Assemble for BasicAsm {
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
+        pop_ratio: f32,
         multik: Option<MultiKCtx<'_, IntT>>,
     ) -> Contigs {
         logw(
@@ -652,26 +653,36 @@ impl Assemble for BasicAsm {
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
 
-        let mut didanyofusdoanything = true;
-        let mut bool1: bool;
-        let mut bool2: bool = false;
-        let mut bool3: bool = false;
-        let mut bool4: bool = false;
         // One stats block per evidence k, so the ladder can be read rung by rung.
-        let mut ladder_done = false;
         let mut ev_stats: Vec<(usize, MultiKStats)> = Vec::new();
         let mut sb_stats: Vec<(usize, SuperbubbleStats)> = Vec::new();
-        let mut protected: BTreeSet<NodeId> = BTreeSet::new();
-        while didanyofusdoanything {
-            bool1 = ptgraph.shrink();
 
-            // Ask the evidence graph about every bubble, on the freshly-shrunk graph — the flanks must
-            // be unitigs before there is any context to gather. Read-only: it changes nothing, so the
-            // assembly is bit-for-bit what a single-k run would produce. That is the point. It lets the
-            // whole oracle be validated on real data before it is trusted to act.
-            if let (Some(ctx), false) = (&multik, ladder_done) {
-                ladder_done = true;
+        // ── Phase 1: compaction and tip clipping, to a JOINT fixed point ──────────────────────────
+        //
+        // Each feeds the other: pruning a tip leaves its junction at degree 1 so `shrink` can absorb
+        // it, and absorbing it can expose the next tip. Both are monotone reductions, so the pair
+        // terminates. Running them out here, before anything else, is what lets the ladder see maximal
+        // unitigs — the flank context the evidence test needs and cannot fabricate for itself.
+        let t_phase1 = Instant::now();
+        loop {
+            let compacted = ptgraph.shrink();
+            let pruned = if do_dead_end_removal {
+                ptgraph.remove_dead_paths()
+            } else {
+                false
+            };
+            if !compacted && !pruned {
+                break;
+            }
+        }
+        log::info!(
+            "  phase 1 (shrink + prune to fixed point): {} ms",
+            t_phase1.elapsed().as_millis()
+        );
 
+        // ── Phase 2: the ladder ───────────────────────────────────────────────────────────────────
+        {
+            if let Some(ctx) = &multik {
                 // Survey mode: judge everything, act on nothing, and leave the ladder. `protected`
                 // stays empty, so the coverage heuristic below sees exactly the graph a single-k run
                 // would hand it — which is what makes the contigs byte-identical to `-k <k1>` and so
@@ -721,10 +732,12 @@ impl Assemble for BasicAsm {
                     // previous one could not split. Reset per evidence k: the ladder changes the graph
                     // enough that node ids from a lower rung mean nothing here.
                     let mut prev_skipped: BTreeSet<NodeId> = BTreeSet::new();
+                    let t_rung = Instant::now();
+                    let mut sb_ms: u128 = 0;
                     for round in 0..ctx.max_rounds {
                         let mut r = MultiKStats::default();
                         let mut skipped: BTreeSet<NodeId> = BTreeSet::new();
-                        protected = correct_with_evidence::<IntT>(
+                        correct_with_evidence::<IntT>(
                             ev,
                             &mut ptgraph,
                             ctx.dict,
@@ -733,7 +746,6 @@ impl Assemble for BasicAsm {
                             ctx.min_evidence,
                             ctx.max_nodes,
                             ctx.resolve,
-                            ctx.protect,
                             &mut r,
                             &prev_skipped,
                             &mut skipped,
@@ -773,7 +785,8 @@ impl Assemble for BasicAsm {
                         let mut sb_split = 0usize;
                         if ctx.resolve_superbubbles {
                             let mut rsb = SuperbubbleStats::default();
-                            let deferred = correct_superbubbles_with_evidence::<IntT>(
+                            let t_sb = Instant::now();
+                            correct_superbubbles_with_evidence::<IntT>(
                                 ev,
                                 &mut ptgraph,
                                 ctx.dict,
@@ -783,6 +796,7 @@ impl Assemble for BasicAsm {
                                 ctx.max_nodes,
                                 &mut rsb,
                             );
+                            sb_ms += t_sb.elapsed().as_millis();
                             sb_split = rsb.split_applied;
                             log::info!(
                                 "  superbubbles k2={} round {}: {} found ({} complex), \
@@ -798,9 +812,6 @@ impl Assemble for BasicAsm {
                             );
                             sbstats.accumulate(&rsb);
                             sbstats.rounds = round + 1;
-                            // A superbubble we meant to split but could not must survive to the next
-                            // round, exactly as a simple bubble in the same position does.
-                            protected.extend(deferred);
                         }
 
                         let split = r.split_applied + sb_split;
@@ -815,8 +826,22 @@ impl Assemble for BasicAsm {
                         // candidates an earlier split in the same pass had invalidated, and it lengthens
                         // the unitigs the next rung of the ladder will need.
                         ptgraph.shrink();
-                        bool1 = true;
                     }
+
+                    // One shrink closes the rung. Usually a no-op — the round loop only exits after a
+                    // round that split nothing, and any round that did split shrank on its way out —
+                    // but the next k up depends on maximal unitigs for its flank context, so the
+                    // guarantee is made explicit here rather than inferred from the exit condition.
+                    ptgraph.shrink();
+
+                    log::info!(
+                        "  phase 2 rung k2={}: {} ms total, {} ms in superbubble detection+judging, \
+                         {} rounds",
+                        ev.k,
+                        t_rung.elapsed().as_millis(),
+                        sb_ms,
+                        stats.rounds,
+                    );
                     stats.report(k, ev.k);
                     ev_stats.push((ev.k, stats));
                     if ctx.resolve_superbubbles {
@@ -824,25 +849,39 @@ impl Assemble for BasicAsm {
                         sb_stats.push((ev.k, sbstats));
                     }
                 }
-
-                // The ladder is done. Release anything we were holding back and let the coverage
-                // heuristic deal with whatever it could not resolve.
-                if !ctx.protect {
-                    protected.clear();
-                }
             }
-
-            if do_dead_end_removal {
-                bool2 = ptgraph.remove_dead_paths();
-                bool3 = ptgraph.shrink();
-            }
-
-            if do_bubble_collapse {
-                bool4 = correct_bubbles_skipping(&mut ptgraph, &protected);
-            }
-
-            didanyofusdoanything = bool1 || bool2 || bool3 || bool4;
         }
+
+        // ── Phase 3: coverage-only correction, to a fixed point ───────────────────────────────────
+        //
+        // Whatever the evidence could not resolve now reaches the heuristics. They decline unless the
+        // coverage difference is stark, so an unresolved repeat is left intact — a contig break instead
+        // of a deleted copy. Looped because a pop fuses nodes, which can expose a new bubble or tip.
+        //
+        // `|=` on `bool` does not short-circuit, so every stage runs every iteration. That is
+        // deliberate: the shrink and prune have to see what the poppers did.
+        let t_phase3 = Instant::now();
+        let mut sb_collapse = SbCollapseStats::default();
+        loop {
+            let mut changed = false;
+            if do_bubble_collapse {
+                changed |= pop_bubbles_by_coverage(&mut ptgraph, pop_ratio);
+                changed |=
+                    collapse_superbubbles_by_coverage(&mut ptgraph, pop_ratio, &mut sb_collapse);
+            }
+            changed |= ptgraph.shrink();
+            if do_dead_end_removal {
+                changed |= ptgraph.remove_dead_paths();
+            }
+            if !changed {
+                break;
+            }
+        }
+        log::info!(
+            "  phase 3 (coverage popping to fixed point): {} ms",
+            t_phase3.elapsed().as_millis()
+        );
+        sb_collapse.report();
 
         if let Some(ctx) = &multik {
             if let Some(path) = &ctx.stats_path {
@@ -973,24 +1012,37 @@ impl Assemble for BasicAsm {
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
 
-        let mut didanyofusdoanything = true;
-        let mut bool1: bool;
-        let mut bool2: bool = false;
-        let mut bool3: bool = false;
-        let mut bool4: bool = false;
-        while didanyofusdoanything {
-            bool1 = ptgraph.shrink();
-
-            if do_dead_end_removal {
-                bool2 = ptgraph.remove_dead_paths();
-                bool3 = ptgraph.shrink();
+        // The same two phases as the native path (`BasicAsm::assemble`) minus the ladder, which needs
+        // an evidence graph the wasm build never has. Kept structurally identical on purpose: the two
+        // used to be one interleaved loop each, and they drifted.
+        //
+        // Phase 1: compaction and tip clipping to a joint fixed point.
+        loop {
+            let compacted = ptgraph.shrink();
+            let pruned = if do_dead_end_removal {
+                ptgraph.remove_dead_paths()
+            } else {
+                false
+            };
+            if !compacted && !pruned {
+                break;
             }
+        }
 
+        // Phase 3: coverage-only correction to a fixed point. `DEFAULT_POP_RATIO` rather than a
+        // parameter — the wasm entry point takes no CLI, so there is nothing to thread through.
+        loop {
+            let mut changed = false;
             if do_bubble_collapse {
-                bool4 = ptgraph.correct_bubbles();
+                changed |= ptgraph.correct_bubbles(crate::algorithms::corrector::DEFAULT_POP_RATIO);
             }
-
-            didanyofusdoanything = bool1 || bool2 || bool3 || bool4;
+            changed |= ptgraph.shrink();
+            if do_dead_end_removal {
+                changed |= ptgraph.remove_dead_paths();
+            }
+            if !changed {
+                break;
+            }
         }
 
         logw("Shrinkage and pruning finished", Some("info"));

@@ -179,8 +179,8 @@ struct BuildOpts<'a> {
     min_evidence: usize,
     /// Multi-k oracle: maximum evidence nodes a supported branch's discriminating window may span.
     max_nodes: usize,
-    /// Multi-k: veto the coverage heuristic on bubbles whose branches are both real.
-    protect: bool,
+    /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is popped.
+    pop_ratio: f32,
     /// Multi-k: duplicate collapsed repeats the evidence k can resolve.
     resolve: bool,
     /// Multi-k: do the same for complex superbubbles, not just simple bubbles.
@@ -250,21 +250,39 @@ fn run_build<IntT>(
         assembly = pre.pop().unwrap();
     } else {
         for (i, &k_ev) in opts.ks.iter().enumerate().skip(1) {
-            let ev_pre = preprocessing::preprocessing_standalone::<IntT>(
-                opts.input_files,
-                k_ev,
-                opts.quality,
-                timevec,
-                &mut out_paths_histo[i],
-                opts.chunk_size,
-                opts.counter,
-                opts.do_bloom,
-                opts.do_fit,
-                // Only ever asked whether a branch is corroborated, so a surviving error k-mer here
-                // is a false corroboration rather than a fragmented contig — floored accordingly.
-                preprocessing::FitFloor::Evidence,
-            );
-            evidence.push(algorithms::multik::build_evidence::<IntT>(ev_pre));
+            // Each evidence k picks the width **it** needs and gives it straight back.
+            //
+            // This is only legal because `EvidenceGraph` is not generic — it holds a `DbgGraph` and a
+            // `HashMap<u64, (NodeId, u32)>`, no packed k-mers — so `build_evidence` consumes the
+            // `PreprocessedK<W>` and `W` never leaves this match. Without that, a large evidence k
+            // would force its width on the assembly k's pass too, which is the majority of the work.
+            macro_rules! build_ev {
+                ($w:ty) => {
+                    algorithms::multik::build_evidence::<$w>(
+                        preprocessing::preprocessing_standalone::<$w>(
+                            opts.input_files,
+                            k_ev,
+                            opts.quality,
+                            timevec,
+                            &mut out_paths_histo[i],
+                            opts.chunk_size,
+                            opts.counter,
+                            opts.do_bloom,
+                            opts.do_fit,
+                            // Only ever asked whether a branch is corroborated, so a surviving error
+                            // k-mer here is a false corroboration rather than a fragmented contig —
+                            // floored accordingly.
+                            preprocessing::FitFloor::Evidence,
+                        ),
+                    )
+                };
+            }
+            evidence.push(match k_ev {
+                0..=32 => build_ev!(u64),
+                33..=64 => build_ev!(u128),
+                65..=128 => build_ev!(U256),
+                _ => build_ev!(U512),
+            });
         }
         assembly = preprocessing::preprocessing_standalone::<IntT>(
             opts.input_files,
@@ -289,7 +307,6 @@ fn run_build<IntT>(
             flank_budget: opts.flank_context,
             min_evidence: opts.min_evidence,
             max_nodes: opts.max_nodes,
-            protect: opts.protect,
             resolve: opts.resolve,
             resolve_superbubbles: opts.resolve_superbubbles,
             max_rounds: opts.max_rounds,
@@ -307,6 +324,7 @@ fn run_build<IntT>(
         out_path_graph,
         opts.do_bubble_collapse,
         opts.do_dead_end_removal,
+        opts.pop_ratio,
         multik,
     );
 
@@ -340,9 +358,9 @@ pub fn main() {
             multik_max_nodes,
             multik_flank_context,
             multik_max_rounds,
-            multik_protect,
             multik_resolve_superbubbles,
             multik_survey_only,
+            bubble_pop_ratio,
             no_multik_resolve,
             no_histo,
             no_graphs,
@@ -442,6 +460,19 @@ pub fn main() {
                 );
                 std::process::exit(2);
             }
+            // At or above 1.0 every bubble pops (the weaker branch is always "under" the stronger);
+            // at or below 0.0 none ever does. Both are almost certainly a typo rather than intent, and
+            // the first would silently reinstate exactly the coin-flip deletion this threshold exists
+            // to prevent.
+            if !(*bubble_pop_ratio > 0.0 && *bubble_pop_ratio < 1.0) {
+                eprintln!(
+                    "error: --bubble-pop-ratio must be strictly between 0 and 1 (got \
+                     {bubble_pop_ratio}). It is the fraction of the stronger branch's coverage below \
+                     which the weaker branch counts as an error; 1.0 or more pops every bubble, 0.0 or \
+                     less pops none."
+                );
+                std::process::exit(2);
+            }
             if k.len() > 1 {
                 log::info!(
                     "Multi-k: assembling at k={}, with evidence ladder k={:?}",
@@ -464,7 +495,7 @@ pub fn main() {
                 flank_context: *multik_flank_context,
                 min_evidence: *multik_min_evidence,
                 max_nodes: *multik_max_nodes,
-                protect: *multik_protect,
+                pop_ratio: *bubble_pop_ratio,
                 resolve: !no_multik_resolve,
                 resolve_superbubbles: *multik_resolve_superbubbles,
                 max_rounds: *multik_max_rounds,
@@ -487,30 +518,42 @@ pub fn main() {
                 output,
             };
 
-            // The packed k-mer must fit in 2*k bits, so k picks the integer width. Both graphs share
-            // one width, taken from the LARGER k: it costs a little memory on the assembly k's
-            // `thedict` (post-filter, so roughly genome-sized) and saves monomorphising the whole
-            // pipeline twice.
+            // The packed k-mer must fit in 2*k bits, so k picks the integer width.
+            //
+            // `run_build` is monomorphised on the **assembly** k, not on the largest k, because each
+            // evidence k now chooses its own width inside `run_build` and hands it straight back
+            // (`EvidenceGraph` keeps no packed k-mers). Taking the width from the largest k made the
+            // k1 pass — the majority of the work — roll a U256 for a 31-mer whenever a large evidence
+            // k was asked for.
+            //
+            // `--multik-extraction joint` is the exception and must keep the old rule: it counts every
+            // k in a single pass and returns one `Vec<PreprocessedK<IntT>>`, so by construction all k
+            // share a type and it has to be the widest.
             let max_k = *k.iter().max().unwrap();
             if max_k % 2 == 0 {
                 panic!("Support for even k-mer lengths not implemented");
             }
-            match max_k {
+            let width_k = if *multik_extraction == cli::MultiKExtraction::Joint {
+                max_k
+            } else {
+                k[0]
+            };
+            match width_k {
                 0..=2 => panic!("kmer length too small (min. 3)"),
                 3..=32 => {
-                    log::info!("max k={max_k}: using 64-bit representation");
+                    log::info!("assembly k={width_k}: using 64-bit representation");
                     run_build::<u64>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
                 }
                 33..=64 => {
-                    log::info!("max k={max_k}: using 128-bit representation");
+                    log::info!("assembly k={width_k}: using 128-bit representation");
                     run_build::<u128>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
                 }
                 65..=128 => {
-                    log::info!("max k={max_k}: using 256-bit representation");
+                    log::info!("assembly k={width_k}: using 256-bit representation");
                     run_build::<U256>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
                 }
                 129..=256 => {
-                    log::info!("max k={max_k}: using 512-bit representation");
+                    log::info!("assembly k={width_k}: using 512-bit representation");
                     run_build::<U512>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
                 }
                 _ => panic!("kmer length larger than 256 currently not supported."),
