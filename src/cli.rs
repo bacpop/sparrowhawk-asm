@@ -147,9 +147,13 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         do_bloom: bool,
 
-        /// DEPRECATED. Bounds the occurrence buffer of the `sort` counter only; the default counter is
-        /// now `map`, which buffers nothing, so this has no effect there. Slated for removal with `sort`.
-        /// A value of zero disables chunking (`sort` only).
+        /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
+        /// Nonzero values enable it, allowing for potential peak memory reduction. There is a tradeoff with
+        /// computing time: very low values will make the whole execution slower.
+        ///
+        /// It bounds how many *records* worth of k-mer occurrences are buffered before a sort-and-count
+        /// flush. A chunk closes at the first batch boundary at or past this many records, so it is a
+        /// memory hint rather than an exact contract.
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
 

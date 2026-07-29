@@ -12,25 +12,12 @@ use std::{
     vec::Drain,
 };
 
-/// Minimum number of k-mers a path must **exceed** to be worth keeping.
-///
-/// A run of `n` k-mers spans `n + k - 1` bases, so "longer than `minnts` bases" is `n > minnts + 1 - k`.
-///
-/// Saturating, because these are `usize`. Written as `minnts - k + 1` it underflows for every k above
-/// `minnts` and wraps to ~1.8e19 in release, whereupon `collapser` drops every contig and
-/// `check_dead_path` judges every path dead — a k = 139 assembly comes out completely empty. Above
-/// `minnts` a single k-mer already spans more than `minnts` bases, so 0 is the right limit there.
-///
-/// Shared by `check_dead_path` and `Collapsable::collapse` so both agree, and so the tests exercise
-/// this rather than a copy of it — the copies are what let the underflow survive.
+/// Minimum number of k-mers a path must exceed to be worth keeping in dead-end removal.
 pub(crate) fn short_path_limit(minnts: usize, k: usize) -> usize {
-    (minnts + 1).saturating_sub(k)
+    (minnts + 1).saturating_sub(k) // sat_sub is compulsory, becase as these are usize, going negative my change the path to an absurd value!!!
 }
 
-/// A branch carrying less than this fraction of the stronger branch's coverage is noise.
-///
-/// Default for `--bubble-pop-ratio`, and the SKESA-inspired rule that was already the first arm of the
-/// old heuristic. It is now the *only* thing that licenses popping a bubble.
+/// A branch carrying less than this fraction of the stronger branch's coverage is noise. SKESA-inspired.
 pub const DEFAULT_POP_RATIO: f32 = 0.1;
 
 /// Mark graph as correctable.
@@ -47,7 +34,7 @@ pub trait Correctable {
     /// Remove edges that are self-loops, i.e. those whose source and destination nodes are the same.
     fn remove_self_loops(&mut self);
 
-    /// Solve bubbles from the graph, popping only where the coverage difference is stark.
+    /// Solve bubbles from the graph, popping only where the coverage difference is big.
     fn correct_bubbles(&mut self, pop_ratio: f32) -> bool;
 
     /// Remove all input and output dead paths
@@ -125,12 +112,7 @@ impl Correctable for DbgGraph {
     }
 }
 
-/// Collapse every bubble whose two branches differ starkly enough in coverage; leave the rest alone.
-///
-/// There used to be a `protected` set here, by which the multi-k evidence path vetoed the heuristic on
-/// bubbles it had corroborated. It is gone, and nothing replaced it: `choose_branch_by_counts` now
-/// refuses to touch a bubble whose branches have comparable coverage, which is exactly the case the
-/// veto existed for. A rule that cannot destroy a collapsed repeat needs no exemption list.
+/// Collapse every bubble whose two branches differ significantly enough in coverage; leave the rest alone.
 pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32) -> bool {
     let mut dididoanything = false;
 
@@ -145,7 +127,7 @@ pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32) -> bool {
             }
 
             if vmin.len() == 2 {
-                check_bubble_structure(g, *n, vmin).is_some()
+                check_bubble_structure(g, *n, vmin)
             } else {
                 false
             }
@@ -186,59 +168,25 @@ pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32) -> bool {
     dididoanything
 }
 
-/// Every part of a bubble, as `check_bubble_structure` derives it.
-///
-/// It used to compute all of this and then throw it away to return a `bool`, leaving `collapse_bubble`
-/// to rebuild it from scratch. The multi-k oracle needs the same parts — plus the two flanking unitigs,
-/// which are what supply the context a larger k needs to judge the branches — so hand them back.
-#[derive(Debug, Clone)]
-pub struct BubbleParts {
-    /// The fork. Exactly one k-mer, traversed on `CarryType::Min`.
-    pub start: NodeId,
-    /// The two branches, with the edge that reaches each from `start`.
-    pub mid: [(NodeId, EdgeType); 2],
-    /// Traversal carry of each branch.
-    pub midct: [CarryType; 2],
-    /// The join. Exactly one k-mer.
-    pub end: NodeId,
-    /// Traversal carry of `end`.
-    pub endct: CarryType,
-    /// Downstream flanking unitig, and the edge reaching it from `end`.
-    pub right: (NodeId, EdgeType),
-    /// Upstream flanking unitig, and the edge reaching `start` from it.
-    ///
-    /// `out_degree(start) == 3` decomposes as two outgoing `Min` branches plus one outgoing `Max`
-    /// back-link — the mate `add_bi_edge` installs for the incoming flank edge — so a well-formed
-    /// bubble start has exactly one of these. `None` if it does not, which the oracle treats as
-    /// "no context" rather than trusting it.
-    pub left: Option<(NodeId, EdgeType)>,
-}
-
-/// Checks whether the candidate area can be a good bubble for error correction, returning its parts.
-fn check_bubble_structure(
-    ptgraph: &DbgGraph,
-    startn: NodeId,
-    invec: Vec<BubbleStartEdge>,
-) -> Option<BubbleParts> {
+/// Checks whether the candidate area can be a good bubble for error correction.
+fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleStartEdge>) -> bool {
     let mut midnodes = Vec::with_capacity(2);
     let mut midcts = Vec::with_capacity(2);
-    let mut midedges = Vec::with_capacity(2);
 
     for e in invec {
         midnodes.push(e.target);
         midcts.push(e.edge_type.get_from_and_to().1);
-        midedges.push(e.edge_type);
     }
 
     // We need to check that the two intermediate nodes are different
     if midnodes[0] == midnodes[1] || midnodes[0] == startn || midnodes[1] == startn {
-        return None;
+        return false;
     }
 
     // Now, how many neighbours do we have from the middle nodes?
     let tmpv0 = ptgraph.out_neighbours_bi(midnodes[0], midcts[0]);
     if tmpv0.len() != 1 || ptgraph.in_neighbours_bi(midnodes[0], midcts[0]).len() != 1 {
-        return None;
+        return false;
     }
     let outnode = tmpv0[0].0;
     let tmpv1 = ptgraph.out_neighbours_bi(midnodes[1], midcts[1]);
@@ -249,76 +197,23 @@ fn check_bubble_structure(
         || (outct != tmpv1[0].1.get_from_and_to().1)
         || (ptgraph.in_neighbours_bi(midnodes[1], midcts[1]).len() != 1)
     {
-        return None;
+        return false;
     }
 
     let tmpv3 = ptgraph.out_neighbours_bi(outnode, outct);
-    if tmpv3.len() != 1
-        || tmpv3[0].0 == startn
-        || ptgraph.in_neighbours_bi(outnode, outct).len() != 2
-    {
-        return None;
-    }
-
-    // The upstream flank. Not part of the structural test — a bubble is still a bubble without one —
-    // so it is optional, and only the oracle cares.
-    let inmin = ptgraph.in_neighbours_bi(startn, CarryType::Min);
-    let left = if inmin.len() == 1 { Some(inmin[0]) } else { None };
-
-    Some(BubbleParts {
-        start: startn,
-        mid: [(midnodes[0], midedges[0]), (midnodes[1], midedges[1])],
-        midct: [midcts[0], midcts[1]],
-        end: outnode,
-        endct: outct,
-        right: tmpv3[0],
-        left,
-    })
-}
-
-/// Derive a bubble's parts from its start node alone. The multi-k oracle's entry point.
-pub fn bubble_parts(ptgraph: &DbgGraph, startn: NodeId) -> Option<BubbleParts> {
-    if ptgraph.out_degree(startn) != 3 {
-        return None;
-    }
-    let vmin = ptgraph.bubble_start_edges_by_carry(startn, CarryType::Min);
-    if vmin.len() != 2 {
-        return None;
-    }
-    check_bubble_structure(ptgraph, startn, vmin)
+    tmpv3.len() == 1 && tmpv3[0].0 != startn && ptgraph.in_neighbours_bi(outnode, outct).len() == 2
 }
 
 /// What the coverage heuristic decided to do with a bubble.
-///
-/// Split out of `collapse_bubble` so the multi-k path can substitute its own decision and still reuse
-/// the surgery verbatim — the bidirected bookkeeping in `apply_bubble_collapse` is the hardest code
-/// here and must not be reimplemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BubbleChoice {
     /// Collapse the bubble onto this branch, discarding the other.
     Keep(usize),
     /// Do nothing at all. The bubble stays exactly as it is, contig break and all.
-    ///
-    /// Replaces the old `SeverOne`/`SeverBoth`. Severing *detached* a branch rather than deleting it,
-    /// and an isolated node under 100 nt is then dropped at collapse (`collapser.rs:45-51`) — so
-    /// "sever" meant "delete, one stage later", and on the bubbles it fired for (median 61 bp) it lost
-    /// *both* copies where popping loses one. Leaving the fork in place costs the same contig break
-    /// and keeps the sequence.
     Leave,
 }
 
-/// The coverage heuristic. Pure: it inspects the graph and decides, but changes nothing.
-///
-/// Pops only when the weaker branch is noise beside the stronger one — the SKESA-inspired ratio that
-/// was already the first arm of this function. The two rules it replaces are gone on purpose:
-///
-/// - comparing branches of *unequal* length against the flanking coverage and severing the deviant one;
-/// - keeping the higher count when the lengths are *equal*, falling through to `Keep(1)` on an exact tie.
-///
-/// Those are precisely what destroys a collapsed two-copy repeat. Its two copies have equal length and
-/// equal coverage, so the old code reached that final `Keep(1)` and deleted one real copy on a coin
-/// flip. There is no coverage signal at such a locus, so nothing is now done with it — the fork stays,
-/// the contig breaks, and both copies survive for the evidence-k pass or the user to deal with.
+/// The coverage heuristic. It inspects the graph and decides, but changes nothing.
 fn choose_branch_by_counts(
     ptgraph: &DbgGraph,
     midconns: &[(NodeId, EdgeType)],
@@ -329,9 +224,7 @@ fn choose_branch_by_counts(
     let hi = max(c0, c1);
     let lo = min(c0, c1);
 
-    // Strict `<`, so equal coverages can never pop however the ratio is set. That also removes the
-    // need for the old floor of 1: a `0` branch beside anything positive is already below the
-    // threshold, and a `0/0` bubble — where there is nothing to choose between — is left alone.
+    // Strict `<`, so equal coverages can never pop however the ratio is set.
     if (lo as f32) < pop_ratio * hi as f32 {
         BubbleChoice::Keep(if c0 > c1 { 0 } else { 1 })
     } else {
@@ -339,13 +232,7 @@ fn choose_branch_by_counts(
     }
 }
 
-/// The surgery: fuse the bubble onto `winner`, discarding the other branch.
-///
-/// Removes both branches and the end node, merges the winner into `start`, appends the end node's
-/// single k-mer, and reattaches to the downstream flank. The precondition — `start` and `end` each hold
-/// exactly one k-mer — is what makes the hardcoded `set_internal_edge(MinToMin)` sound: `start` was
-/// reached on the `Min` strand and its lone k-mer sits at index 0, so the fused `abs_ind` reads
-/// front-to-back in `Min`. `shrink` never merges a junction node, so it holds in practice.
+/// Get the final graph with the chosen branch (if so) in it..
 pub fn apply_bubble_collapse(
     ptgraph: &mut DbgGraph,
     startn: NodeId,
@@ -389,11 +276,8 @@ pub fn apply_bubble_collapse(
     true
 }
 
-/// Collapse one standard bubble, if and only if the coverage difference between its branches is stark.
+/// Collapse one standard bubble, if the coverage difference between its branches is big enough.
 fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId, pop_ratio: f32) -> bool {
-    // Deliberately weaker than `check_bubble_structure`: earlier collapses in the same pass may have
-    // reshaped the graph, and this is the guard the heuristic has always used. Tightening it here would
-    // change which bubbles get collapsed.
     let midconns = ptgraph.out_neighbours_min(startn);
     if midconns.len() != 2
         || ptgraph
@@ -406,8 +290,6 @@ fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId, pop_ratio: f32) -> bo
 
     match choose_branch_by_counts(ptgraph, &midconns, pop_ratio) {
         BubbleChoice::Keep(w) => apply_bubble_collapse(ptgraph, startn, &midconns, w),
-        // `false`, not `true`: the graph is untouched, so reporting a change would spin the caller's
-        // fixed-point loop forever on a bubble nothing will ever act on.
         BubbleChoice::Leave => false,
     }
 }
@@ -707,7 +589,7 @@ mod tests {
     #[test]
     fn valid_bubble_returns_true() {
         let (g, s, edges) = make_valid_bubble();
-        assert!(check_bubble_structure(&g, s, edges).is_some());
+        assert!(check_bubble_structure(&g, s, edges));
     }
 
     #[test]
@@ -720,7 +602,7 @@ mod tests {
         g.add_edge(s, m1, EdgeType::MinToMax); // second edge to same node
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         assert_eq!(edges.len(), 2);
-        assert!(check_bubble_structure(&g, s, edges).is_none());
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 
     #[test]
@@ -733,7 +615,7 @@ mod tests {
         g.add_bi_edge(s, m1, EdgeType::MinToMin);
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         assert_eq!(edges.len(), 2);
-        assert!(check_bubble_structure(&g, s, edges).is_none());
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 
     #[test]
@@ -744,7 +626,7 @@ mod tests {
         let m1 = edges[0].target;
         g.add_bi_edge(extra, m1, EdgeType::MinToMin);
         // Now in_neighbours_bi(M1, Min).len() == 2 != 1, so the structure is invalid.
-        assert!(check_bubble_structure(&g, s, edges).is_none());
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 
     #[test]
@@ -763,7 +645,7 @@ mod tests {
         g.add_bi_edge(m2, e2, EdgeType::MinToMin); // different end
         g.add_bi_edge(e1, f, EdgeType::MinToMin);
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        assert!(check_bubble_structure(&g, s, edges).is_none());
+        assert!(!check_bubble_structure(&g, s, edges));
     }
 }
 
