@@ -28,7 +28,7 @@ use crate::bit_encoding::{UInt, U256, U512};
 use crate::graph_works::populate_neighbours;
 use crate::kmer::Kmer;
 use crate::preprocessing::PreprocessedK;
-use crate::spelling::{spell_path, SpellError};
+use crate::graph_works::{spell_path, SpellError};
 
 /// The larger-k graph, kept purely as evidence about the reads.
 ///

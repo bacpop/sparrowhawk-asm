@@ -15,7 +15,7 @@ use crate::bit_encoding::UInt;
 use crate::graph_works::Contigs;
 #[cfg(target_family = "wasm")]
 use crate::logw;
-use crate::spelling::spell_path;
+use crate::graph_works::spell_path;
 
 /// Writes the contig sequences and hopefully their average counts/coverage in the future
 ///

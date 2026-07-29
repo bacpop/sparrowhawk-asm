@@ -34,7 +34,7 @@ use crate::algorithms::multik::{
     SplitOutcome, FLANK_SUPPORT, MAX_SHARED_CHAIN,
 };
 use crate::bit_encoding::UInt;
-use crate::spelling::spell_path;
+use crate::graph_works::spell_path;
 
 /// Interior states we are willing to explore before giving up on an entrance.
 ///

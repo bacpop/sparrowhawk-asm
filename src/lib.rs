@@ -31,9 +31,6 @@ pub mod kmer;
 /// An implementation of ntHash, based on ntHash 2
 pub mod nthash;
 
-/// Turning a walk of canonical k-mer hashes back into nucleotides
-pub mod spelling;
-
 /// Contains functions to store the output of the program
 pub mod save_functions;
 
@@ -623,6 +620,9 @@ pub struct AssemblyHelper {
     do_fit: bool,
     no_bubble_collapse: bool,
     no_dead_end_removal: bool,
+    /// The CLI's `--bubble-pop-ratio`. Set through `set_bubble_pop_ratio`, not the constructor, so that
+    /// existing JS callers keep working and get the same default the CLI does.
+    bubble_pop_ratio: f32,
     preprocessed_data: Option<HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>>,
     maxmindict: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict64: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
@@ -675,6 +675,7 @@ impl AssemblyHelper {
             do_fit,
             no_bubble_collapse,
             no_dead_end_removal,
+            bubble_pop_ratio: algorithms::corrector::DEFAULT_POP_RATIO,
             preprocessed_data: None,
             maxmindict: None,
             seqdict64: None,
@@ -829,6 +830,30 @@ impl AssemblyHelper {
         post_state("preprocess:end");
     }
 
+    /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is popped.
+    ///
+    /// The wasm counterpart of the CLI's `--bubble-pop-ratio`. At or above this fraction both branches
+    /// are taken to be real — which is what a collapsed repeat looks like, its two copies having equal
+    /// length and equal coverage — and the bubble is left exactly as it is.
+    ///
+    /// Rejects anything outside `(0, 1)`: at or above 1 every bubble pops, at or below 0 none does, and
+    /// both are far more likely to be a mistake than an intention.
+    pub fn set_bubble_pop_ratio(&mut self, ratio: f32) {
+        if ratio > 0.0 && ratio < 1.0 {
+            self.bubble_pop_ratio = ratio;
+        } else {
+            logw(
+                format!(
+                    "Ignoring --bubble-pop-ratio {ratio}: it must be strictly between 0 and 1. \
+                     Keeping {}.",
+                    self.bubble_pop_ratio
+                )
+                .as_str(),
+                Some("warn"),
+            );
+        }
+    }
+
     /// Assemble method of the wasm version
     pub fn assemble(&mut self) {
         logw("Starting assembly...", Some("info"));
@@ -838,6 +863,7 @@ impl AssemblyHelper {
             self.maxmindict.as_mut().unwrap(),
             !self.no_bubble_collapse,
             !self.no_dead_end_removal,
+            self.bubble_pop_ratio,
         );
 
         post_state("assembly:saving");
