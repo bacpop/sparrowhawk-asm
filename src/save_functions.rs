@@ -35,11 +35,15 @@ pub fn write_sequences_and_coverages<IntT>(
             panic!("MORE THAN ONE ENTRY!!")
         };
 
-        // A contig is always a walk, so a failure here is an upstream orientation bug, not a bad base.
+        // A contig is a walk through the graph, so it always spells. Anything else is a bug in the
+        // orientation bookkeeping upstream, and we would rather hear about it than emit a wrong base:
+        // this used to count the failures and push a base from the failing orientation regardless.
         let full = spell_path(&contig[0].abs_ind, inmap, k)
             .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"));
 
-        // `full` is n + k - 1 bases for n k-mers; drop k-1 from each end, leaving n - k + 1.
+        // `full` is the whole walk: n + k - 1 bases, for n k-mers. Keep only the bases with a k-mer on
+        // each side, i.e. drop k-1 from each end, leaving n - k + 1. The guard is the old
+        // `outseq.len() >= k` (which was in units of k-mers, so n >= k) written in bases.
         if full.len() >= 2 * k - 1 {
             let body = &full[k - 1..full.len() - (k - 1)];
             if body.len() > 100 {

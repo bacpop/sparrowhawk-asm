@@ -58,3 +58,6 @@ lto = true
 
 [rust]
 lld = true
+
+#[patch."https://github.com/bacpop/sparrowhawk-graph.git"]
+#sparrowhawk-graph = { path = "../../../sparrowhawk-graph" }

@@ -24,6 +24,8 @@ use super::QualOpts;
 
 use crate::bit_encoding::UInt;
 use crate::bloom_filter::KmerFilter;
+#[cfg(not(target_family = "wasm"))]
+use crate::cli::{Counter, MultiKExtraction};
 use crate::kmer::Kmer;
 use crate::logw;
 use crate::spectrum_fitter::SpectrumFitter;
@@ -92,23 +94,72 @@ fn coverage_peak(histovec: &[u32]) -> usize {
 }
 
 /// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
-/// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
+///
+/// Not arbitrary: on a coverage ladder over the simulation and neiss the fitted cutoffs separate
+/// cleanly into a trustworthy group (14, 20, 23, 35, 36, 38, 52 — every reference assembly) and an
+/// untrustworthy one (2, 3, 5, 6, 7, 8), with nothing in between. This sits in that gap.
 const TRUST_FIT_ABOVE: usize = 10;
 
+/// What a k-mer set is *for*, which decides how cautious the fallback floor should be.
+///
+/// The two roles fail in opposite directions, so one floor cannot serve both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FitFloor {
+    /// The graph that becomes contigs. Too high a `min_count` deletes genuine single-copy k-mers and
+    /// fragments the assembly, which is the expensive failure — measured on a coverage ladder over the
+    /// simulation and neiss, `peak/8` was best or tied-best at every rung, and the next step up cost
+    /// 400 kb of assembly and half the N50.
+    Assembly,
+    /// A larger-k graph consulted only for whether a branch is corroborated. Here a *surviving error
+    /// k-mer* is the expensive failure: it corroborates a branch that is not real, and the correction
+    /// acts on that. Fragmenting this graph merely makes it answer "no evidence", which is safe. So it
+    /// is floored where trusted fits actually land, `peak/4`, rather than at the assembly's `peak/8`.
+    Evidence,
+}
+
+impl FitFloor {
+    /// Divisor applied to the histogram peak when the fit is not trusted.
+    fn peak_divisor(self) -> f64 {
+        match self {
+            Self::Assembly => 8.0,
+            Self::Evidence => 4.0,
+        }
+    }
+}
+
+/// In a k ladder the **first** k is the assembly k and every later one is evidence.
+///
+/// Single-k runs pass index 0 and so get [`FitFloor::Assembly`], which is right: there is no evidence
+/// graph, and the one graph built is the one that becomes contigs.
+pub fn role_for_k_index(i: usize) -> FitFloor {
+    if i == 0 {
+        FitFloor::Assembly
+    } else {
+        FitFloor::Evidence
+    }
+}
 
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
 /// both filter sites keep k-mers with `count >= min_count`.
-fn apply_spectrum_fit(histovec: &[u32]) -> u16 {
-    // Used whenever the fit is not trusted. Scaling off the peak keeps a deep library from collapsing
-    // to a near-useless 2 or 3; the divisor errs low because a surviving error k-mer fragments a contig.
+fn apply_spectrum_fit(histovec: &[u32], role: FitFloor) -> u16 {
+    // Used whenever the fit is not trusted. Scaling off the peak (rather than a constant) means a fit
+    // that fails on a *deep* library does not collapse to a near-useless 2 or 3.
     let peak = coverage_peak(histovec);
-    let floor = ((peak as f64 / 8.0).round() as u16).max(2);
+    let floor = ((peak as f64 / role.peak_divisor()).round() as u16).max(2);
 
     let mut fit = SpectrumFitter::new();
     match fit.fit_histogram(histovec[..(MAXSIZEHISTO - 1)].to_vec()) {
-        // A large cutoff means the fit separated the true-k-mer component cleanly, so trust it.
+        // A large cutoff means the fit found a well-separated true-k-mer component, and it should be
+        // trusted: every one of the fourteen reference assemblies lands here (fitted 14-52), and at
+        // 862x an erroneous k-mer needs only a handful of sightings to survive, so a small constant
+        // would be badly wrong.
         Ok(minc) if minc > TRUST_FIT_ABOVE => minc as u16,
-        // Below that, a fitted 5/6/7/8 costs up to 400 kb of assembly and halves N50, so use the floor.
+        // Below that the cutoff is not trustworthy — measured on a coverage ladder over both the
+        // simulation and neiss, a fitted 5/6/7/8 loses up to 400 kb of assembly and halves N50
+        // against a small constant. What replaced it used to be a hardcoded 3, which is itself too
+        // aggressive at the bottom of the range: at 10x, min_count 3 discards every k-mer seen twice
+        // and with it most of the genome (neiss 1.01 Mb at 3 vs 1.49 Mb at 2). Scaling off the
+        // histogram gets both ends right.
         outcome => {
             let why = match &outcome {
                 Ok(minc) => format!("returned {minc}, too small to be reliable"),
@@ -117,7 +168,7 @@ fn apply_spectrum_fit(histovec: &[u32]) -> u16 {
             logw(
                 &format!(
                     "The k-mer spectrum fit {why}. Falling back to the histogram: its peak is at count \
-                     {peak}, so a minimum count of {floor} will be used This usually \
+                     {peak}, so a minimum count of {floor} will be used ({role:?} graph). This usually \
                      means the spectrum is thin — low coverage, or a large k. Check the k-mer spectrum \
                      histogram to confirm the value is appropriate."
                 ),
@@ -186,18 +237,23 @@ where
     log::info!("Finished getting kmers from {} file(s)", files.len());
 }
 
-/// One FASTQ record, owned: needletail's `Cow` borrows a reader buffer invalidated on the next
-/// `next()`, so a batch processed in parallel must own its bytes.
+/// One FASTQ record, owned. needletail hands out a `Cow` borrowing its internal reader buffer, which
+/// is invalidated on the next `next()`, so a batch that is to be processed in parallel must own its
+/// bytes.
 #[cfg(not(target_family = "wasm"))]
 type OwnedRecord = (Vec<u8>, Option<Vec<u8>>);
 
-/// How many records go to the workers at a time: ~1M k-mers at 150 bp and k=31, small enough to stay
-/// cache-friendly and large enough to amortise the rayon fork/join.
+/// How many records are handed to the workers at a time. At ~150 bp and k=31 a batch of 8192 records
+/// yields ~1M k-mers, i.e. a few tens of MB of intermediate — small enough to stay cache-friendly,
+/// large enough to amortise the rayon fork/join.
 #[cfg(not(target_family = "wasm"))]
 const BATCH_RECORDS: usize = 8192;
 
-/// Parse `files` into owned batches of records, handing each batch to `on_batch`. The parse stays
-/// serial but overlaps with the workers processing the previous batch.
+/// Parse `files` into owned batches of records, handing each batch to `on_batch`.
+///
+/// This is the batched twin of [`extract_kmers_from_files`]. Batching is what makes the per-record
+/// k-mer work parallelisable: the parse itself stays serial (needletail is a serial reader), but it
+/// overlaps with the workers chewing on the previous batch.
 #[cfg(not(target_family = "wasm"))]
 fn extract_kmers_from_files_batched<F>(files: &[String], batch_records: usize, mut on_batch: F)
 where
@@ -326,6 +382,80 @@ fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
 //     }
 // }
 
+/// CPU bulk extraction: counts every k-mer straight into a [`CountMap`].
+///
+/// This replaces the old "push every occurrence into a flat vector, sort it, then run-length count
+/// it" scheme. Bringing equal k-mers together is the only thing that vector ever did, and a hash map
+/// does it in one probe per occurrence — whereas the old path paid a push, a 130M-element sort, *and*
+/// two map probes (`outdict` + `minmaxdict`) per occurrence. Counting here is therefore strictly less
+/// work, and it drops the multi-GB occurrence buffer entirely.
+#[cfg(not(target_family = "wasm"))]
+fn bulk_preprocessing_standalone_cpu<IntT>(
+    files: &[String],
+    k: usize,
+    qual: &QualOpts,
+) -> Vec<CountMap<IntT>>
+where
+    IntT: for<'a> UInt<'a> + Send,
+{
+    let mut shards: Vec<CountMap<IntT>> = (0..COUNTMAP_SHARDS)
+        .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
+        .collect();
+    // Reused across batches so the per-batch split does not churn allocations.
+    let mut buckets: Vec<Vec<(u64, u64, u8, IntT)>> =
+        (0..COUNTMAP_SHARDS).map(|_| Vec::new()).collect();
+
+    extract_kmers_from_files_batched(files, BATCH_RECORDS, |batch| {
+        // Parallel: hash the batch. `km` is materialised here because the counting stage below cannot
+        // reach back into the k-mer iterator.
+        let items: Vec<(u64, u64, u8, IntT)> = hash_batch::<IntT>(batch, k, qual.min_qual);
+        absorb_into_shards(items, &mut shards, &mut buckets);
+    });
+
+    shards
+}
+
+/// Count one batch's occurrences into the sharded count-map.
+///
+/// Split by shard, then count each shard on its own thread. Shards partition the key space, so no two
+/// threads can ever reach the same entry — no locking, and each map is a fraction of the working set,
+/// which probes far better than one big one.
+///
+/// `hnc`, `b` and `km` are identical for every occurrence of a given `hc` (they describe the k-mer, not
+/// the sighting), so recording them on first sight leaves the result independent of the order in which
+/// batches, records or threads arrive.
+#[cfg(not(target_family = "wasm"))]
+fn absorb_into_shards<IntT>(
+    items: Vec<(u64, u64, u8, IntT)>,
+    shards: &mut [CountMap<IntT>],
+    buckets: &mut [Vec<(u64, u64, u8, IntT)>],
+) where
+    IntT: for<'a> UInt<'a>,
+{
+    for bucket in buckets.iter_mut() {
+        bucket.clear();
+    }
+    for item in items {
+        buckets[shard_of(item.0)].push(item);
+    }
+
+    shards
+        .par_iter_mut()
+        .zip(buckets.par_iter_mut())
+        .for_each(|(map, bucket)| {
+            for (hc, hnc, b, km) in bucket.drain(..) {
+                map.entry(hc)
+                    .and_modify(|e| e.count = e.count.saturating_add(1))
+                    .or_insert(KmerInfo {
+                        count: 1,
+                        hnc,
+                        b,
+                        km,
+                    });
+            }
+        });
+}
+
 #[cfg(target_family = "wasm")]
 fn chunked_processing_wasm<IntT>(
     file1: &mut WebSysFile,
@@ -335,6 +465,7 @@ fn chunked_processing_wasm<IntT>(
     outvec: &mut Vec<(u64, u64, u8)>,
     csize: usize,
     do_fit: bool,
+    role: FitFloor,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -505,7 +636,7 @@ where
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
         logw("Counting finished. Starting fit...", Some("info"));
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         logw(
             format!(
                 "Fit done! Fitted min_count value: {}. Starting filtering...",
@@ -551,6 +682,7 @@ fn bloom_filter_preprocessing_wasm<IntT>(
     k: usize,
     qual: &QualOpts,
     do_fit: bool,
+    role: FitFloor,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -675,7 +807,7 @@ where
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
         logw("Counting finished. Starting fit...", Some("info"));
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         logw(
             format!(
                 "Fit done! Fitted min_count value: {}. Starting filtering...",
@@ -721,6 +853,7 @@ fn bloom_filter_preprocessing_standalone<IntT>(
     k: usize,
     qual: &QualOpts,
     do_fit: bool,
+    role: FitFloor,
     out_path: &mut Option<PathBuf>,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -775,7 +908,7 @@ where
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
         log::info!("Starting fit...");
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         log::info!(
             "Fit done! Minimum count value to be used: {}. Filtering k-mers...",
             minc
@@ -811,6 +944,91 @@ where
 
     histovec.shrink_to_fit();
     (outdict, minmaxdict, themap, histovec, minc)
+}
+
+/// One distinct k-mer, accumulated while counting in bulk.
+///
+/// `hnc`, `b` and `km` are properties of the *k-mer*, not of the *occurrence*, so they are recorded
+/// once, on first sight, rather than once per occurrence as the old sorting vector did.
+#[cfg(not(target_family = "wasm"))]
+struct KmerInfo<IntT> {
+    /// `u32`, not `u16`: real high-coverage libraries exceed 65,535 sightings for short high-copy
+    /// elements, which used to clip silently. Free — struct padding absorbs the widening.
+    count: u32,
+    hnc: u64,
+    b: u8,
+    km: IntT,
+}
+
+#[cfg(not(target_family = "wasm"))]
+type CountMap<IntT> = HashMap<u64, KmerInfo<IntT>, BuildHasherDefault<NoHashHasher<u64>>>;
+
+/// The count-map is split into shards so that counting can run on all cores: shards partition the key
+/// space, so two threads never touch the same entry and no locking is needed. Smaller maps also probe
+/// better — each shard is a fraction of the working set.
+#[cfg(not(target_family = "wasm"))]
+const COUNTMAP_SHARDS: usize = 16;
+
+/// Pick a shard for a canonical hash, mixing first.
+///
+/// Neither end of `hc` can be used raw:
+///
+/// - **Not the high bits.** ntHash itself is uniform, but `hc = min(fwd, rc)` is not — the minimum of
+///   two uniform values has a triangular density. Measured on real reads (k=31), the top 4 bits of `hc`
+///   run from 12.2% in bin 0 down to 0.37% in bin 15, a 33x spread. Sharding on them put ~2x the ideal
+///   load on shard 0 and left shard 15 all but empty, so 16 shards behaved like 8.
+/// - **Not the low bits.** `NoHashHasher` passes the hash straight through and hashbrown indexes its
+///   buckets with the low bits, so every key in a shard would land in the same buckets.
+///
+/// One multiply gives bits that are uniform and independent of both. Note an xor-fold does *not* work
+/// here: it shuffles bits without removing the magnitude bias, and leaves the 33x spread intact.
+#[cfg(not(target_family = "wasm"))]
+#[inline(always)]
+fn shard_of(hc: u64) -> usize {
+    const MIX: u64 = 0x9E37_79B9_7F4A_7C15; // odd, golden-ratio derived
+    ((hc.wrapping_mul(MIX) >> (64 - COUNTMAP_SHARDS.trailing_zeros())) as usize)
+        & (COUNTMAP_SHARDS - 1)
+}
+
+/// Split the count-map into the two artefacts the assembler needs, keeping only k-mers seen at least
+/// `minc` times.
+///
+/// Unlike [`drain_countmap_into_themap`], which *prunes* dictionaries that were already fully
+/// populated, this one *builds* them, so k-mers below the threshold never enter a map at all.
+#[cfg(not(target_family = "wasm"))]
+fn drain_countmap_bulk<IntT>(
+    shards: Vec<CountMap<IntT>>,
+    minc: u16,
+) -> (
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+)
+where
+    IntT: for<'a> UInt<'a>,
+{
+    let mut themap = HashMap::with_hasher(BuildHasherDefault::default());
+    let mut thedict = HashMap::with_hasher(BuildHasherDefault::default());
+
+    // Shards are drained in order, so the result is independent of how many threads did the counting.
+    for shard in shards {
+        for (hc, info) in shard {
+            if info.count >= minc as u32 {
+                themap.insert(
+                    hc,
+                    HashInfoSimple {
+                        hnc: info.hnc,
+                        b: info.b,
+                        pre: Vec::new(),
+                        post: Vec::new(),
+                        counts: info.count,
+                    },
+                );
+                thedict.insert(hc, info.km);
+            }
+        }
+    }
+
+    (themap, thedict)
 }
 
 fn update_countmap(
@@ -873,8 +1091,44 @@ where
         .collect()
 }
 
-/// Buffer k-mer occurrences, sort them so equal k-mers become adjacent, and run-length count them.
-/// `csize` is the memory knob: records buffered before a flush, with `usize::MAX` meaning no chunking.
+/// Hash one batch at *every* k in `ks`.
+///
+/// This is what "extract both k in one go" actually buys, and it is worth being precise: the file read,
+/// the needletail record decode, and the owned-`Vec` copy of every record happen **once** instead of
+/// once per k. That last one is the real prize — the batched reader must allocate a `Vec` per record,
+/// because needletail's `Cow` borrows a buffer it invalidates on the very next record.
+///
+/// It does **not** save the hashing. ntHash's rolling state is k-dependent (k indexes the multi-shift
+/// tables), so each k genuinely needs its own roller and the roll cost is inherently k-fold.
+///
+/// Note we call `hash_batch` once per k over the whole batch, rather than rolling every k inside a
+/// single pass over the records. The single-pass version is the obvious thing to write and it is
+/// *measurably slower*: gathering per-k vectors needs a `fold`/`reduce`, and rayon's reduce combines
+/// accumulators pairwise up a tree, memcpying the whole occurrence stream at every level. It cost
+/// ~35% on this workload. Re-walking the batch is nearly free by comparison — a batch is ~1 MB, so it
+/// stays in cache — and it keeps `flat_map_iter().collect()`, which writes straight into the final
+/// buffer. It also gives each k byte-for-byte the same occurrence stream as the sequential path, which
+/// is what makes the two extraction modes agree exactly.
+#[cfg(not(target_family = "wasm"))]
+fn hash_batch_multik<IntT>(
+    batch: &[OwnedRecord],
+    ks: &[usize],
+    min_qual: u8,
+) -> Vec<Vec<(u64, u64, u8, IntT)>>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    ks.iter()
+        .map(|&k| hash_batch::<IntT>(batch, k, min_qual))
+        .collect()
+}
+
+/// The **sort** counter: buffer k-mer occurrences, sort them so equal k-mers become adjacent, and
+/// run-length count them.
+///
+/// `csize` bounds how many *records* worth of occurrences are buffered before a sort+count flush, and
+/// is therefore the memory knob. `usize::MAX` means "one unbounded chunk", which is what the old bulk
+/// path was — the two are the same algorithm, so there is only this one implementation.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
 fn chunked_preprocessing_standalone<IntT>(
@@ -884,6 +1138,7 @@ fn chunked_preprocessing_standalone<IntT>(
     outvec: &mut Vec<(u64, u64, u8)>,
     csize: usize,
     do_fit: bool,
+    role: FitFloor,
     out_path: &mut Option<PathBuf>,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -943,7 +1198,7 @@ where
     }
 
     finish_sort_counter(
-        countmap, outdict, minmaxdict, histovec, qual, do_fit, out_path,
+        countmap, outdict, minmaxdict, histovec, qual, do_fit, role, out_path,
     )
 }
 
@@ -958,6 +1213,7 @@ fn finish_sort_counter<IntT>(
     mut histovec: Vec<u32>,
     qual: &QualOpts,
     do_fit: bool,
+    role: FitFloor,
     out_path: &mut Option<PathBuf>,
 ) -> (
     HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -983,7 +1239,7 @@ where
         build_histogram_from_countmap(&countmap, &mut histovec);
 
         log::info!("Counting finished. Starting fit...");
-        minc = apply_spectrum_fit(&histovec);
+        minc = apply_spectrum_fit(&histovec, role);
         log::info!(
             "Fit done! Fitted min_count value: {}. Starting filtering...",
             minc
@@ -1021,6 +1277,290 @@ where
     (outdict, minmaxdict, themap, histovec, minc)
 }
 
+/// Fit, filter and plot a finished sharded count-map, whatever drove it.
+///
+/// Split out of `preprocessing_standalone` for the same reason as [`finish_sort_counter`]: the joint
+/// multi-k path must finish through identical code, or the two extraction modes could silently diverge.
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::type_complexity)]
+fn finish_map_counter<IntT>(
+    shards: Vec<CountMap<IntT>>,
+    qual: &QualOpts,
+    do_fit: bool,
+    role: FitFloor,
+    out_path: &mut Option<PathBuf>,
+) -> (
+    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+    Vec<u32>,
+    u16,
+)
+where
+    IntT: for<'a> UInt<'a>,
+{
+    // The slowest shard sets the pace of the parallel counting, so report the balance rather than
+    // assume it: an imbalanced `shard_of` silently costs parallelism, which is exactly what a naive
+    // high-bit shard selector did here (see `shard_of`).
+    let sizes: Vec<usize> = shards.iter().map(|s| s.len()).collect();
+    let total: usize = sizes.iter().sum();
+    log::debug!("Number of distinct kmers BEFORE cleaning: {total:?}");
+    if total > 0 {
+        let ideal = total as f64 / sizes.len() as f64;
+        let worst = *sizes.iter().max().unwrap() as f64 / ideal;
+        log::info!("Count-map shard balance: busiest shard {worst:.2}x ideal");
+        log::debug!("Count-map shard sizes: {sizes:?}");
+        if worst > 1.5 {
+            log::warn!(
+                "Count-map shards are badly imbalanced (busiest {worst:.2}x ideal). Parallel \
+                 counting is limited by the busiest shard, so this costs speed."
+            );
+        }
+    }
+
+    // The count-map holds every distinct k-mer with its exact count, singletons included, so the
+    // spectrum is the same one the sort counter produces: count everything, then histogram, then fit,
+    // then filter.
+    let mut histovec = vec![0_u32; MAXSIZEHISTO];
+    for shard in &shards {
+        for info in shard.values() {
+            add_to_histogram(&mut histovec, info.count);
+        }
+    }
+
+    let minc = if do_fit {
+        log::info!("Counting finished. Starting fit...");
+        let minc = apply_spectrum_fit(&histovec, role);
+        log::info!("Fit done! Fitted min_count value: {minc}. Starting filtering...");
+        minc
+    } else {
+        qual.min_count
+    };
+
+    let (themap, thedict) = drain_countmap_bulk::<IntT>(shards, minc);
+
+    // Falls out of `themap` for free: `HashInfoSimple` already carries `hnc`, and every consumer
+    // (`check_bkg`/`check_fwd`) re-validates the hash it gets back against `themap` anyway, so entries
+    // for non-surviving k-mers were only ever dead weight.
+    let maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> =
+        themap.iter().map(|(hc, hi)| (hi.hnc, *hc)).collect();
+
+    if let Some(p) = out_path {
+        plot_kmer_histogram(&histovec, p.as_path());
+    }
+
+    (thedict, maxmindict, themap, histovec, minc)
+}
+
+/// Preprocess every k in `ks`, returning one [`PreprocessedK`] per k, in the same order.
+///
+/// `Sequential` simply runs the single-k path once per k: two passes over the reads, but the caller can
+/// drop each k's structures before starting the next, which is the whole point of offering it.
+///
+/// `Joint` reads the files once and rolls every k on each record. It saves the I/O, the record decode
+/// and the owned-copy — not the hashing, which is inherently per-k. Both must produce identical counts.
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
+pub fn preprocessing_standalone_multik<IntT>(
+    input_files: &[InputFastx],
+    ks: &[usize],
+    qual: &QualOpts,
+    timevec: &mut Vec<Instant>,
+    out_paths: &mut [Option<PathBuf>],
+    csize: usize,
+    counter: Counter,
+    do_bloom: bool,
+    do_fit: bool,
+    extraction: MultiKExtraction,
+) -> Vec<PreprocessedK<IntT>>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    assert_eq!(
+        ks.len(),
+        out_paths.len(),
+        "one histogram path is needed per k"
+    );
+
+    // A single k is a single k however you slice it. The bloom filter owns its own per-k structure and
+    // has no joint form, so it lands here too rather than growing a second implementation.
+    if ks.len() == 1 || extraction == MultiKExtraction::Sequential || do_bloom {
+        if ks.len() > 1 {
+            log::info!(
+                "Extracting k-mers sequentially: one pass over the reads per k ({} passes)",
+                ks.len()
+            );
+        }
+        return ks
+            .iter()
+            .zip(out_paths.iter_mut())
+            .enumerate()
+            .map(|(i, (&k, out_path))| {
+                preprocessing_standalone::<IntT>(
+                    input_files,
+                    k,
+                    qual,
+                    timevec,
+                    out_path,
+                    csize,
+                    counter,
+                    do_bloom,
+                    do_fit,
+                    role_for_k_index(i),
+                )
+            })
+            .collect();
+    }
+
+    log::info!("Extracting k-mers jointly for k = {ks:?}: one pass over the reads");
+
+    let mut all_files: Vec<String> = input_files[0].1.clone();
+    if input_files.len() > 1 {
+        for ifile in input_files.iter().skip(1) {
+            all_files.extend(ifile.1.clone());
+        }
+    }
+
+    let nk = ks.len();
+    let results = match counter {
+        Counter::Sort => {
+            // Same guard as the single-k path: `i_record >= 0` holds on every record, so a raw 0 would
+            // sort and count after every single read rather than never.
+            let csize = if csize == 0 { usize::MAX } else { csize };
+
+            let mut outvecs: Vec<Vec<(u64, u64, u8)>> = (0..nk).map(|_| Vec::new()).collect();
+            let mut countmaps: Vec<HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>> =
+                (0..nk)
+                    .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
+                    .collect();
+            let mut outdicts: Vec<HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>> = (0..nk)
+                .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
+                .collect();
+            let mut minmaxdicts: Vec<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>> = (0
+                ..nk)
+                .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
+                .collect();
+
+            // One record counter for all k: they see the same batches, so their chunks close together.
+            let mut i_record = 0usize;
+
+            extract_kmers_from_files_batched(&all_files, BATCH_RECORDS, |batch| {
+                let per_k = hash_batch_multik::<IntT>(batch, ks, qual.min_qual);
+
+                for (ik, items) in per_k.into_iter().enumerate() {
+                    outvecs[ik].extend(items.iter().map(|&(hc, hnc, b, _)| (hc, hnc, b)));
+                    for (hc, hnc, _, km) in items {
+                        outdicts[ik].entry(hc).or_insert(km);
+                        minmaxdicts[ik].entry(hnc).or_insert(hc);
+                    }
+                }
+
+                i_record += batch.len();
+                if i_record >= csize {
+                    for ik in 0..nk {
+                        if !outvecs[ik].is_empty() {
+                            outvecs[ik].par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                            update_countmap(&outvecs[ik], &mut countmaps[ik]);
+                        }
+                        outvecs[ik].clear();
+                    }
+                    i_record = 0;
+                }
+            });
+
+            // The residual chunk, outside the closure so it runs whatever the input was.
+            for ik in 0..nk {
+                if !outvecs[ik].is_empty() {
+                    outvecs[ik].par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    update_countmap(&outvecs[ik], &mut countmaps[ik]);
+                    outvecs[ik].clear();
+                }
+            }
+            drop(outvecs);
+
+            countmaps
+                .into_iter()
+                .zip(outdicts)
+                .zip(minmaxdicts)
+                .zip(out_paths.iter_mut())
+                .enumerate()
+                .map(|(i, (((countmap, outdict), minmaxdict), out_path))| {
+                    finish_sort_counter::<IntT>(
+                        countmap,
+                        outdict,
+                        minmaxdict,
+                        vec![0; MAXSIZEHISTO],
+                        qual,
+                        do_fit,
+                        role_for_k_index(i),
+                        out_path,
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+        Counter::Map => {
+            if csize != 0 {
+                log::warn!(
+                    "--chunk-size is ignored by --counter map: it buffers no occurrences, so its \
+                     memory is bounded by the number of distinct k-mers instead."
+                );
+            }
+
+            let mut all_shards: Vec<Vec<CountMap<IntT>>> = (0..nk)
+                .map(|_| {
+                    (0..COUNTMAP_SHARDS)
+                        .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
+                        .collect()
+                })
+                .collect();
+            let mut buckets: Vec<Vec<(u64, u64, u8, IntT)>> =
+                (0..COUNTMAP_SHARDS).map(|_| Vec::new()).collect();
+
+            extract_kmers_from_files_batched(&all_files, BATCH_RECORDS, |batch| {
+                let per_k = hash_batch_multik::<IntT>(batch, ks, qual.min_qual);
+                for (ik, items) in per_k.into_iter().enumerate() {
+                    absorb_into_shards(items, &mut all_shards[ik], &mut buckets);
+                }
+            });
+
+            all_shards
+                .into_iter()
+                .zip(out_paths.iter_mut())
+                .enumerate()
+                .map(|(i, (shards, out_path))| {
+                    finish_map_counter::<IntT>(shards, qual, do_fit, role_for_k_index(i), out_path)
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+
+    timevec.push(Instant::now());
+    log::info!(
+        "k-mers extracted, counted and filtered for all k in {} s",
+        timevec
+            .last()
+            .unwrap()
+            .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+            .as_secs()
+    );
+
+    results
+        .into_iter()
+        .zip(ks)
+        .map(|((thedict, maxmindict, themap, histovec, used_min_count), &k)| {
+            log::info!("k={k}: minimum count per k-mer used: {used_min_count}");
+            PreprocessedK {
+                k,
+                themap,
+                thedict,
+                maxmindict,
+                histovec,
+                used_min_count,
+            }
+        })
+        .collect()
+}
+
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
 #[cfg(not(target_family = "wasm"))]
 pub fn preprocessing_standalone<IntT>(
@@ -1030,8 +1570,10 @@ pub fn preprocessing_standalone<IntT>(
     timevec: &mut Vec<Instant>,
     out_path: &mut Option<PathBuf>,
     csize: usize,
+    counter: Counter,
     do_bloom: bool,
     do_fit: bool,
+    role: FitFloor,
 ) -> PreprocessedK<IntT>
 where
     IntT: for<'a> UInt<'a>,
@@ -1048,28 +1590,45 @@ where
 
     let (thedict, maxmindict, themap, histovec, used_min_count) = if do_bloom {
         log::info!("Processing using a Bloom filter");
-        bloom_filter_preprocessing_standalone::<IntT>(&all_files, k, qual, do_fit, out_path)
+        bloom_filter_preprocessing_standalone::<IntT>(&all_files, k, qual, do_fit, role, out_path)
     } else {
-        // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
-        // record, so passing 0 through would sort and count after every single read.
-        let csize = if csize == 0 { usize::MAX } else { csize };
-        if csize == usize::MAX {
-            log::info!("Counting k-mers by sorting, without chunking");
-        } else {
-            log::info!("Counting k-mers by sorting, in chunks of {csize} records");
-        }
+        match counter {
+            Counter::Sort => {
+                // Chunking only ever bounded the occurrence buffer, so "no chunking" is simply one
+                // unbounded chunk. Guarding here matters: `i_record >= 0` is true on every record, so
+                // passing 0 straight through would sort and count after every single read.
+                let csize = if csize == 0 { usize::MAX } else { csize };
+                if csize == usize::MAX {
+                    log::info!("Counting k-mers by sorting, without chunking");
+                } else {
+                    log::info!("Counting k-mers by sorting, in chunks of {csize} records");
+                }
 
-        let estimated_kmers = all_files
-            .iter()
-            .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
-            .sum::<u64>() as usize
-            / 5;
-        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers);
-        let out = chunked_preprocessing_standalone::<IntT>(
-            &all_files, k, qual, &mut tmpvec, csize, do_fit, out_path,
-        );
-        drop(tmpvec);
-        out
+                let estimated_kmers = all_files
+                    .iter()
+                    .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
+                    .sum::<u64>() as usize
+                    / 5;
+                let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers);
+                let out = chunked_preprocessing_standalone::<IntT>(
+                    &all_files, k, qual, &mut tmpvec, csize, do_fit, role, out_path,
+                );
+                drop(tmpvec);
+                out
+            }
+            Counter::Map => {
+                if csize != 0 {
+                    log::warn!(
+                        "--chunk-size is ignored by --counter map: it buffers no occurrences, so its \
+                         memory is bounded by the number of distinct k-mers instead."
+                    );
+                }
+                log::info!("EXPERIMENTAL: counting k-mers into a hash map (no sort)");
+
+                let shards = bulk_preprocessing_standalone_cpu::<IntT>(&all_files, k, qual);
+                finish_map_counter::<IntT>(shards, qual, do_fit, role, out_path)
+            }
+        }
     };
 
     timevec.push(Instant::now());
@@ -1270,6 +1829,22 @@ mod tests {
         assert_eq!(coverage_peak(&only_errors), 2);
     }
 
+    /// The evidence graph is floored twice as high as the assembly graph, and the first k of a ladder
+    /// is the assembly k. A single-k run passes index 0 and so is treated as an assembly graph.
+    #[test]
+    fn evidence_graphs_are_floored_higher_than_the_assembly_graph() {
+        assert_eq!(role_for_k_index(0), FitFloor::Assembly);
+        assert_eq!(role_for_k_index(1), FitFloor::Evidence);
+        assert_eq!(role_for_k_index(2), FitFloor::Evidence);
+
+        // A spectrum whose fit cannot be trusted, so both roles fall back to the histogram floor.
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        h[0] = 1_000_000;
+        h[23] = 5_000; // peak at count 24 -> assembly 24/8 = 3, evidence 24/4 = 6
+        assert_eq!(coverage_peak(&h), 24);
+        assert_eq!(apply_spectrum_fit(&h, FitFloor::Assembly), 3);
+        assert_eq!(apply_spectrum_fit(&h, FitFloor::Evidence), 6);
+    }
 
     /// The last bin saturates (it absorbs every count >= MAXSIZEHISTO), so it must not be mistaken for
     /// a peak — `fit_histogram` excludes it for the same reason.
@@ -1307,11 +1882,16 @@ where
         logw("Processing using a Bloom filter", Some("info"));
 
         let (thedict, maxmindict, themap, histovec, used_min_count) =
-            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit);
+            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit, FitFloor::Assembly);
         (themap, Some(thedict), maxmindict, histovec, used_min_count)
     } else {
-        // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
-        // record, so passing 0 through would sort and count after every single read.
+        // Chunking only ever bounded the occurrence buffer, so "no chunking" is one unbounded chunk.
+        // The guard matters: `i_record >= 0` is true on every record, so passing 0 straight through
+        // would sort and count after every single read.
+        //
+        // The old separate bulk path (`get_kmers_from_both_files_wasm` + `get_map_wasm`) is gone: it
+        // was the same sort-and-count algorithm, and it returned `thedict`/`maxmindict` *unpruned*,
+        // still holding every singleton, unlike this one and unlike native.
         let csize = if csize == 0 { usize::MAX } else { csize };
         if csize == usize::MAX {
             logw("Counting k-mers by sorting, without chunking", Some("info"));
@@ -1332,6 +1912,7 @@ where
                 &mut tmpvec,
                 csize,
                 do_fit,
+                FitFloor::Assembly,
             );
         drop(tmpvec);
         histovec.shrink_to_fit();
