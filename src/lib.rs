@@ -2,8 +2,6 @@
 #![warn(missing_docs)]
 use std::fmt;
 
-// Only the wasm `AssemblyHelper` still names these types directly; on native the k-mer maps now live
-// behind `preprocessing::PreprocessedK`.
 #[cfg(target_family = "wasm")]
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
@@ -238,10 +236,6 @@ pub fn main() {
             std::fs::create_dir_all(output_dir)
                 .unwrap_or_else(|e| panic!("cannot create output directory {output_dir:?}: {e}"));
 
-            // NB: build every output path with `join`, NOT `set_file_name`. `set_file_name` *replaces*
-            // the last path component, so `--output-dir /tmp/` + `set_file_name("sphk_log")` yields
-            // `/sphk_log` (filesystem root -> permission denied), and `--output-dir reports` silently
-            // drops the directory. `join` appends into the directory, which is what is meant.
             let outputlogfile: PathBuf =
                 Path::new(output_dir).join(format!("{output_prefix}_log.txt"));
             if args.verbose {
@@ -301,10 +295,6 @@ pub fn main() {
             let output: PathBuf =
                 Path::new(output_dir).join(format!("{output_prefix}_contigs.fasta"));
 
-            // At or above 1.0 every bubble pops (the weaker branch is always "under" the stronger);
-            // at or below 0.0 none ever does. Both are almost certainly a typo rather than intent, and
-            // the first would silently reinstate exactly the coin-flip deletion this threshold exists
-            // to prevent.
             if !(*bubble_pop_ratio > 0.0 && *bubble_pop_ratio < 1.0) {
                 eprintln!(
                     "error: --bubble-pop-ratio must be strictly between 0 and 1 (got \
@@ -627,14 +617,7 @@ impl AssemblyHelper {
         post_state("preprocess:end");
     }
 
-    /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is popped.
-    ///
-    /// The wasm counterpart of the CLI's `--bubble-pop-ratio`. At or above this fraction both branches
-    /// are taken to be real — which is what a collapsed repeat looks like, its two copies having equal
-    /// length and equal coverage — and the bubble is left exactly as it is.
-    ///
-    /// Rejects anything outside `(0, 1)`: at or above 1 every bubble pops, at or below 0 none does, and
-    /// both are far more likely to be a mistake than an intention.
+    /// Fraction of counts needed for popping bubble
     pub fn set_bubble_pop_ratio(&mut self, ratio: f32) {
         if ratio > 0.0 && ratio < 1.0 {
             self.bubble_pop_ratio = ratio;

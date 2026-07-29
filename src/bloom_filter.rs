@@ -86,8 +86,6 @@ impl KmerFilter {
     /// Creates a new filter with given threshold
     ///
     /// Note:
-    /// - Counts are `u32`; the counting Bloom filter's own cells remain 8-bit
-    /// - Must call [`KmerFilter::init()`] before using.
     pub fn new(min_count: u16) -> Self {
         let buf_size =
             f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64 / 8.0) / (u64::BITS as f64))

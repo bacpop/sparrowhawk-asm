@@ -24,7 +24,6 @@ use super::QualOpts;
 
 use crate::bit_encoding::UInt;
 use crate::bloom_filter::KmerFilter;
-#[cfg(not(target_family = "wasm"))]
 use crate::kmer::Kmer;
 use crate::logw;
 use crate::spectrum_fitter::SpectrumFitter;
@@ -32,12 +31,8 @@ use crate::spectrum_fitter::SpectrumFitter;
 /// Tuple for name and list of input files
 pub type InputFastx = (String, Vec<String>);
 
-/// Everything the preprocessing of one k value produces.
-///
-/// This replaces a 5-tuple that was returned in *two different field orders* — the inner backends
-/// hand back `(thedict, maxmindict, themap, histovec, minc)` while the public entry point returned
-/// `(themap, thedict, maxmindict, ...)` and silently re-ordered on destructuring. With more than one
-/// k in flight that is a trap waiting to be sprung, so name the fields instead.
+/// Everything the preprocessing of one k value produces. Named fields rather than a tuple, since the
+/// backends and the public entry point order these differently.
 #[cfg(not(target_family = "wasm"))]
 pub struct PreprocessedK<IntT> {
     /// The k this was built with. Hashes from different k live in disjoint spaces, so carrying it
@@ -81,18 +76,8 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
 
 /// Single-copy coverage estimate straight from the spectrum: the tallest bin above the error peak.
 ///
-/// Independent of the fit, so it is available when the fit does *not* converge — which is exactly when
-/// it is needed, and where `SpectrumFitter`'s own `c` must not be trusted, since that field is assigned
-/// only on convergence and otherwise still holds its initial guess of 20.
-///
-/// `add_to_histogram` stores at `count - 1`, so `histovec[i]` counts k-mers seen exactly `i+1` times.
-/// This scans counts 3..=499 and returns a **count, not an index**: counts 1 and 2 are the error peak,
-/// and the final bin saturates (it absorbs every count >= `MAXSIZEHISTO`), so it is excluded for the
-/// same reason `fit_histogram` excludes it.
-///
-/// Consequence of that exclusion: above ~500x the true peak is inside the saturating bin and cannot be
-/// seen here. That does not matter for the fallback, which only runs on *thin* spectra — at those
-/// depths the fit converges — but it does bound any other use of this function.
+/// Scans counts 3..=499 and returns a **count, not an index**; the saturating final bin is excluded, so
+/// above ~500x the true peak is invisible here.
 fn coverage_peak(histovec: &[u32]) -> usize {
     let mut best_count = 2usize; // nothing above the error peak; the caller's floor of 2 then applies
     let mut best_n = 0u32;
@@ -107,37 +92,23 @@ fn coverage_peak(histovec: &[u32]) -> usize {
 }
 
 /// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
-///
-/// Not arbitrary: on a coverage ladder over the simulation and neiss the fitted cutoffs separate
-/// cleanly into a trustworthy group (14, 20, 23, 35, 36, 38, 52 — every reference assembly) and an
-/// untrustworthy one (2, 3, 5, 6, 7, 8), with nothing in between. This sits in that gap.
+/// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
 const TRUST_FIT_ABOVE: usize = 10;
 
 
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
 /// both filter sites keep k-mers with `count >= min_count`.
 fn apply_spectrum_fit(histovec: &[u32]) -> u16 {
-    // Used whenever the fit is not trusted. Scaling off the peak (rather than a constant) means a fit
-    // that fails on a *deep* library does not collapse to a near-useless 2 or 3.
-    //
-    // The divisor is 8 because this graph is *assembled*: a surviving error k-mer fragments a contig,
-    // which is the failure that matters here, so the floor errs low.
+    // Used whenever the fit is not trusted. Scaling off the peak keeps a deep library from collapsing
+    // to a near-useless 2 or 3; the divisor errs low because a surviving error k-mer fragments a contig.
     let peak = coverage_peak(histovec);
     let floor = ((peak as f64 / 8.0).round() as u16).max(2);
 
     let mut fit = SpectrumFitter::new();
     match fit.fit_histogram(histovec[..(MAXSIZEHISTO - 1)].to_vec()) {
-        // A large cutoff means the fit found a well-separated true-k-mer component, and it should be
-        // trusted: every one of the fourteen reference assemblies lands here (fitted 14-52), and at
-        // 862x an erroneous k-mer needs only a handful of sightings to survive, so a small constant
-        // would be badly wrong.
+        // A large cutoff means the fit separated the true-k-mer component cleanly, so trust it.
         Ok(minc) if minc > TRUST_FIT_ABOVE => minc as u16,
-        // Below that the cutoff is not trustworthy — measured on a coverage ladder over both the
-        // simulation and neiss, a fitted 5/6/7/8 loses up to 400 kb of assembly and halves N50
-        // against a small constant. What replaced it used to be a hardcoded 3, which is itself too
-        // aggressive at the bottom of the range: at 10x, min_count 3 discards every k-mer seen twice
-        // and with it most of the genome (neiss 1.01 Mb at 3 vs 1.49 Mb at 2). Scaling off the
-        // histogram gets both ends right.
+        // Below that, a fitted 5/6/7/8 costs up to 400 kb of assembly and halves N50, so use the floor.
         outcome => {
             let why = match &outcome {
                 Ok(minc) => format!("returned {minc}, too small to be reliable"),
@@ -215,23 +186,18 @@ where
     log::info!("Finished getting kmers from {} file(s)", files.len());
 }
 
-/// One FASTQ record, owned. needletail hands out a `Cow` borrowing its internal reader buffer, which
-/// is invalidated on the next `next()`, so a batch that is to be processed in parallel must own its
-/// bytes.
+/// One FASTQ record, owned: needletail's `Cow` borrows a reader buffer invalidated on the next
+/// `next()`, so a batch processed in parallel must own its bytes.
 #[cfg(not(target_family = "wasm"))]
 type OwnedRecord = (Vec<u8>, Option<Vec<u8>>);
 
-/// How many records are handed to the workers at a time. At ~150 bp and k=31 a batch of 8192 records
-/// yields ~1M k-mers, i.e. a few tens of MB of intermediate — small enough to stay cache-friendly,
-/// large enough to amortise the rayon fork/join.
+/// How many records go to the workers at a time: ~1M k-mers at 150 bp and k=31, small enough to stay
+/// cache-friendly and large enough to amortise the rayon fork/join.
 #[cfg(not(target_family = "wasm"))]
 const BATCH_RECORDS: usize = 8192;
 
-/// Parse `files` into owned batches of records, handing each batch to `on_batch`.
-///
-/// This is the batched twin of [`extract_kmers_from_files`]. Batching is what makes the per-record
-/// k-mer work parallelisable: the parse itself stays serial (needletail is a serial reader), but it
-/// overlaps with the workers chewing on the previous batch.
+/// Parse `files` into owned batches of records, handing each batch to `on_batch`. The parse stays
+/// serial but overlaps with the workers processing the previous batch.
 #[cfg(not(target_family = "wasm"))]
 fn extract_kmers_from_files_batched<F>(files: &[String], batch_records: usize, mut on_batch: F)
 where
@@ -513,11 +479,8 @@ where
 
     logw("Finished getting kmers from the input file(s)", Some("info"));
 
-    // The residual chunk, i.e. the records left over after the last full one.
-    //
-    // This MUST sit outside the `if let Some(file2)` block above. It used to be nested inside it, so a
-    // single-file input never counted its trailing partial chunk and silently lost the k-mers of up to
-    // `csize - 1` records (149,999 at the browser's default).
+    // The residual chunk. This MUST stay outside the `if let Some(file2)` block above, or single-file
+    // input silently loses the k-mers of its trailing partial chunk.
     if !outvec.is_empty() {
         logw("Processing last chunk. Sorting k-mers...", Some("info"));
         outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -750,11 +713,8 @@ where
     (outdict, minmaxdict, themap, histovec, minc)
 }
 
-/// Bloom-filter preprocessing.
-///
-/// Note its spectrum is **not** comparable to the exact counters': `KmerFilter` only records a k-mer
-/// once the bloom filter has already seen it, so the histogram has no count-1 bin, and bloom false
-/// positives inflate the rest. It is approximate by design.
+/// Bloom-filter preprocessing. Its spectrum is **not** comparable to the exact counter's: there is no
+/// count-1 bin, and false positives inflate the rest.
 #[cfg(not(target_family = "wasm"))]
 fn bloom_filter_preprocessing_standalone<IntT>(
     files: &[String],
@@ -883,13 +843,8 @@ fn update_countmap(
     tmpref.0 = tmpref.0.saturating_add(c);
 }
 
-/// Hash one batch of records at a single k, in parallel.
-///
-/// Both counters used to carry this block verbatim. It is the *single-k* path, and it is kept exactly
-/// as it was: the order of the occurrences it returns fixes the insertion order of `outdict`/`themap`,
-/// which fixes the hash-map iteration order, which fixes the petgraph node numbering in the GFA/DOT
-/// dumps. Contigs do not depend on it, but the graph dumps do, so do not "tidy" this into the multi-k
-/// version below.
+/// Hash one batch of records at a single k, in parallel. The occurrence order fixes the dictionary
+/// insertion order and so the node numbering in the GFA/DOT dumps; contigs do not depend on it.
 #[cfg(not(target_family = "wasm"))]
 fn hash_batch<IntT>(batch: &[OwnedRecord], k: usize, min_qual: u8) -> Vec<(u64, u64, u8, IntT)>
 where
@@ -918,12 +873,8 @@ where
         .collect()
 }
 
-/// The **sort** counter: buffer k-mer occurrences, sort them so equal k-mers become adjacent, and
-/// run-length count them.
-///
-/// `csize` bounds how many *records* worth of occurrences are buffered before a sort+count flush, and
-/// is therefore the memory knob. `usize::MAX` means "one unbounded chunk", which is what the old bulk
-/// path was — the two are the same algorithm, so there is only this one implementation.
+/// Buffer k-mer occurrences, sort them so equal k-mers become adjacent, and run-length count them.
+/// `csize` is the memory knob: records buffered before a flush, with `usize::MAX` meaning no chunking.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
 fn chunked_preprocessing_standalone<IntT>(
@@ -955,14 +906,8 @@ where
     let mut i_record = 0;
     // let mut ncols : usize = 0;
 
-    // The k-mer/hash work runs in parallel over a batch of records; the dictionaries are filled
-    // afterwards in a tight serial loop. Keeping the dictionary probes out of the hot loop matters on
-    // its own: interleaving `outvec.push` with two random hash-map probes evicts the rolling-hash
-    // working set on every k-mer, and costs about as much again as the hashing itself.
-    //
-    // A chunk therefore closes at the first batch boundary at or past `csize` records, rather than at
-    // exactly `csize`. `csize` is a memory hint, not a contract, so that is fine — and it is what lets
-    // the extraction be batched at all.
+    // The k-mer work runs in parallel per batch, with the dictionary probes kept out of the hot loop.
+    // A chunk therefore closes at the first batch boundary at or past `csize`: a hint, not a contract.
     extract_kmers_from_files_batched(files, BATCH_RECORDS, |batch| {
         let items: Vec<(u64, u64, u8, IntT)> = hash_batch::<IntT>(batch, k, qual.min_qual);
 
@@ -988,9 +933,7 @@ where
         }
     });
 
-    // The residual chunk. Note this sits outside the extraction closure, so it runs whatever the input
-    // was — the wasm twin of this function had the equivalent flush nested inside its `if let
-    // Some(file2)`, which silently dropped the tail of any single-file input.
+    // The residual chunk. Sits outside the extraction closure so it runs whatever the input was.
     if !outvec.is_empty() {
         log::info!("Processing last chunk. Sorting k-mers...");
         outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -1005,10 +948,6 @@ where
 }
 
 /// Fit, filter and plot a finished sort-counter, whatever drove it.
-///
-/// Split out of `chunked_preprocessing_standalone` so the joint multi-k path counts into exactly the
-/// same structures and then finishes through exactly the same code — the two must agree to the byte,
-/// and the cheapest way to guarantee that is to have one implementation.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
@@ -1111,9 +1050,8 @@ where
         log::info!("Processing using a Bloom filter");
         bloom_filter_preprocessing_standalone::<IntT>(&all_files, k, qual, do_fit, out_path)
     } else {
-        // Chunking only ever bounded the occurrence buffer, so "no chunking" is simply one unbounded
-        // chunk. Guarding here matters: `i_record >= 0` is true on every record, so passing 0 straight
-        // through would sort and count after every single read.
+        // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
+        // record, so passing 0 through would sort and count after every single read.
         let csize = if csize == 0 { usize::MAX } else { csize };
         if csize == usize::MAX {
             log::info!("Counting k-mers by sorting, without chunking");
@@ -1369,16 +1307,11 @@ where
         logw("Processing using a Bloom filter", Some("info"));
 
         let (thedict, maxmindict, themap, histovec, used_min_count) =
-            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit, FitFloor::Assembly);
+            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit);
         (themap, Some(thedict), maxmindict, histovec, used_min_count)
     } else {
-        // Chunking only ever bounded the occurrence buffer, so "no chunking" is one unbounded chunk.
-        // The guard matters: `i_record >= 0` is true on every record, so passing 0 straight through
-        // would sort and count after every single read.
-        //
-        // The old separate bulk path (`get_kmers_from_both_files_wasm` + `get_map_wasm`) is gone: it
-        // was the same sort-and-count algorithm, and it returned `thedict`/`maxmindict` *unpruned*,
-        // still holding every singleton, unlike this one and unlike native.
+        // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
+        // record, so passing 0 through would sort and count after every single read.
         let csize = if csize == 0 { usize::MAX } else { csize };
         if csize == usize::MAX {
             logw("Counting k-mers by sorting, without chunking", Some("info"));
@@ -1399,7 +1332,6 @@ where
                 &mut tmpvec,
                 csize,
                 do_fit,
-                FitFloor::Assembly,
             );
         drop(tmpvec);
         histovec.shrink_to_fit();

@@ -17,8 +17,6 @@ use crate::algorithms::corrector::Correctable;
 #[cfg(not(target_family = "wasm"))]
 use crate::algorithms::corrector::pop_bubbles_by_coverage;
 use crate::algorithms::shrinker::Shrinkable;
-// NOT gated: `spell_path` below is generic over `UInt` and is called from
-// `save_functions::write_sequences_and_coverages`, which builds on both targets.
 use crate::bit_encoding::UInt;
 use crate::nthash;
 use std::fmt;
@@ -148,9 +146,6 @@ pub(crate) fn populate_neighbours(
     indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
 ) -> (usize, usize, usize) {
-    // check_bkg/check_fwd are pure in (hc, hnc, k, bases) and only read the two dicts, so the whole
-    // neighbour search is parallel over the map. The mutation stays in the serial loop below.
-    //
     // Serial on wasm: rayon there falls back to a single-threaded registry, so `par_iter` buys nothing,
     // and its unindexed `collect` builds an intermediate linked list of `Vec`s — allocation we cannot
     // afford under the 4 GiB linear-memory cap.
@@ -162,6 +157,7 @@ pub(crate) fn populate_neighbours(
             (*h, pre, post)
         };
 
+        // Serial on wasm: rayon there falls back to a single-threaded registry, so `par_iter` buys nothing, and its unindexed `collect` builds an intermediate linked list of `Vec`s, so just add the gate to avoid consuming more memory.
         #[cfg(not(target_family = "wasm"))]
         {
             dict.par_iter().map(search).collect()
@@ -238,23 +234,7 @@ impl Contigs {
     }
 }
 
-// ── Spelling: turning a walk of canonical k-mer hashes back into nucleotides ──────────────────────
-//
-// The graph stores each k-mer once, under its *canonical* hash `hc = min(fwd, rc)`, so the packed
-// k-mer in `thedict` may be either the k-mer as it reads along the walk or its reverse complement.
-// Spelling therefore means recovering, for each k-mer in turn, which of the two strands continues the
-// previous one — which we can do because consecutive k-mers in a walk overlap by exactly `k-1` bases.
-//
-// Two consumers: the contig writer (`save_functions`, on **both** targets) and the multi-k evidence
-// oracle, which needs the *full* sequence of a candidate path so it can re-hash it at a larger k.
-// Neither this nor `spell_path` may be placed inside a `#[cfg(not(target_family = "wasm"))]` block.
-
 /// Why a walk could not be spelled.
-///
-/// Every variant is an invariant violation that should be impossible for a walk taken from the graph:
-/// an edge exists *iff* the `k-1` overlap holds, so a genuine walk always overlaps. Reporting rather
-/// than papering over them is the point — earlier code counted a non-overlap and then emitted a base
-/// from the failing orientation anyway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpellError {
     /// The walk was empty.
@@ -289,17 +269,6 @@ impl fmt::Display for SpellError {
 }
 
 /// Spell the nucleotides of a walk of canonical k-mer hashes.
-///
-/// Returns the **full** sequence, of length `hashes.len() + k - 1`. Note the contig writer deliberately
-/// trims `k-1` from each end of this; the oracle does not, because it wants every base the walk covers.
-///
-/// The caller only has to get the *order* of the hashes right — reversing a unitig's `abs_ind` if it is
-/// traversed backwards. It does **not** have to track each k-mer's strand: that is recovered here, from
-/// the overlap.
-///
-/// The spelled sequence may come out as the reverse complement of the genomic orientation, since what is
-/// pinned is the walk's *direction*, not its strand. That is harmless for canonical-hash lookups, which
-/// are reverse-complement invariant.
 pub fn spell_path<IntT>(
     hashes: &[u64],
     dict: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -912,12 +881,6 @@ impl Assemble for BasicAsm {
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
 
-        // ── Phase 1: compaction and tip clipping, to a JOINT fixed point ──────────────────────────
-        //
-        // Each feeds the other: pruning a tip leaves its junction at degree 1 so `shrink` can absorb
-        // it, and absorbing it can expose the next tip. Both are monotone reductions, so the pair
-        // terminates. Running them out here, before anything else, is what lets the ladder see maximal
-        // unitigs — the flank context the evidence test needs and cannot fabricate for itself.
         let t_phase1 = Instant::now();
         loop {
             let compacted = ptgraph.shrink();
@@ -931,18 +894,10 @@ impl Assemble for BasicAsm {
             }
         }
         log::info!(
-            "  phase 1 (shrink + prune to fixed point): {} ms",
+            "  Initial simplification and dead end removal: {} ms",
             t_phase1.elapsed().as_millis()
         );
 
-        // ── Phase 3: coverage-only correction, to a fixed point ───────────────────────────────────
-        //
-        // Whatever the evidence could not resolve now reaches the heuristics. They decline unless the
-        // coverage difference is stark, so an unresolved repeat is left intact — a contig break instead
-        // of a deleted copy. Looped because a pop fuses nodes, which can expose a new bubble or tip.
-        //
-        // `|=` on `bool` does not short-circuit, so every stage runs every iteration. That is
-        // deliberate: the shrink and prune have to see what the poppers did.
         let t_phase3 = Instant::now();
         loop {
             let mut changed = false;
@@ -958,7 +913,7 @@ impl Assemble for BasicAsm {
             }
         }
         log::info!(
-            "  phase 3 (coverage popping to fixed point): {} ms",
+            "  Bubble correction step (coverage popping to fixed point): {} ms",
             t_phase3.elapsed().as_millis()
         );
 
@@ -1064,11 +1019,6 @@ impl Assemble for BasicAsm {
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
 
-        // The same two phases as the native path (`BasicAsm::assemble`) minus the ladder, which needs
-        // an evidence graph the wasm build never has. Kept structurally identical on purpose: the two
-        // used to be one interleaved loop each, and they drifted.
-        //
-        // Phase 1: compaction and tip clipping to a joint fixed point.
         loop {
             let compacted = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
@@ -1081,9 +1031,6 @@ impl Assemble for BasicAsm {
             }
         }
 
-        // Phase 3: coverage-only correction to a fixed point. `pop_ratio` is the wasm counterpart of
-        // the CLI's `--bubble-pop-ratio`, set via `AssemblyHelper::set_bubble_pop_ratio`, so the two
-        // targets share the knob rather than wasm being stuck on the default.
         loop {
             let mut changed = false;
             if do_bubble_collapse {

@@ -19,9 +19,7 @@ use crate::graph_works::spell_path;
 
 /// Writes the contig sequences and hopefully their average counts/coverage in the future
 ///
-/// Each contig is trimmed by `k-1` bases at **both** ends. Only the interior of a contig is flanked by
-/// a k-mer on either side, so those are the only bases two independent k-mers agree on; the ends are
-/// spelled by a single k-mer each and are dropped, as SKESA also does.
+/// Each contig is trimmed by `k-1` at both ends, keeping only bases two k-mers agree on, as SKESA does.
 pub fn write_sequences_and_coverages<IntT>(
     invec: &mut Contigs,
     inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -37,15 +35,11 @@ pub fn write_sequences_and_coverages<IntT>(
             panic!("MORE THAN ONE ENTRY!!")
         };
 
-        // A contig is a walk through the graph, so it always spells. Anything else is a bug in the
-        // orientation bookkeeping upstream, and we would rather hear about it than emit a wrong base:
-        // this used to count the failures and push a base from the failing orientation regardless.
+        // A contig is always a walk, so a failure here is an upstream orientation bug, not a bad base.
         let full = spell_path(&contig[0].abs_ind, inmap, k)
             .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"));
 
-        // `full` is the whole walk: n + k - 1 bases, for n k-mers. Keep only the bases with a k-mer on
-        // each side, i.e. drop k-1 from each end, leaving n - k + 1. The guard is the old
-        // `outseq.len() >= k` (which was in units of k-mers, so n >= k) written in bases.
+        // `full` is n + k - 1 bases for n k-mers; drop k-1 from each end, leaving n - k + 1.
         if full.len() >= 2 * k - 1 {
             let body = &full[k - 1..full.len() - (k - 1)];
             if body.len() > 100 {
@@ -148,9 +142,8 @@ mod tests {
             .collect()
     }
 
-    /// Turn a sequence into the (thedict, abs_ind) pair that `write_sequences_and_coverages` consumes,
-    /// exactly as preprocessing would: `thedict` maps canonical hash -> canonical packed k-mer, and
-    /// `abs_ind` is the ordered list of canonical hashes along the walk.
+    /// The (dict, abs_ind) pair preprocessing would produce: canonical hash -> packed k-mer, plus the
+    /// ordered hashes along the walk.
     fn dict_and_path(
         seq: &[u8],
         k: usize,
@@ -172,9 +165,8 @@ mod tests {
         (dict, path)
     }
 
-    /// A contig is spelled one nucleotide per k-mer (the *last* base of each), so it starts at S[k-1].
-    /// We then trim k-1 from the tail, so the emitted contig must be exactly `S[k-1 .. n]`, where
-    /// `n = |S| - k + 1` is the number of k-mers. Equivalently: k-1 bases dropped from each end.
+    /// Spelled one base per k-mer from S[k-1], then trimmed k-1 from the tail, so the contig must be
+    /// exactly `S[k-1 .. n]` with `n = |S| - k + 1`.
     #[test]
     fn contig_is_trimmed_by_k_minus_one_at_each_end() {
         let k = 31;
@@ -199,8 +191,7 @@ mod tests {
         assert_eq!(got.len(), seq.len() - 2 * (k - 1));
     }
 
-    /// The old code trimmed k from the tail instead of k-1, making every contig one base short.
-    /// Pin that down so it cannot regress.
+    /// The last base must be the final one two k-mers confirm, `S[n-1]`.
     #[test]
     fn contig_keeps_the_final_confirmed_base() {
         let k = 31;

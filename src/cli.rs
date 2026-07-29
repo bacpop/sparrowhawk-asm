@@ -126,11 +126,6 @@ pub enum Commands {
         k: usize,
 
         /// Minimum k-mer count. If omitted, it is FITTED from the k-mer spectrum, separately for each k.
-        ///
-        /// The old fixed default of 5 is far too low for real data: fitted values on six real datasets
-        /// (172x-862x coverage) ranged from 20 to 52. At 862x an erroneous k-mer needs only 5 sightings
-        /// to survive, so a fixed 5 floods the graph with error k-mers. Give an explicit number to
-        /// override the fit.
         #[arg(long)]
         min_count: Option<u16>,
 
@@ -148,12 +143,6 @@ pub enum Commands {
         do_bloom: bool,
 
         /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
-        /// Nonzero values enable it, allowing for potential peak memory reduction. There is a tradeoff with
-        /// computing time: very low values will make the whole execution slower.
-        ///
-        /// It bounds how many *records* worth of k-mer occurrences are buffered before a sort-and-count
-        /// flush. A chunk closes at the first batch boundary at or past this many records, so it is a
-        /// memory hint rather than an exact contract.
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
 
@@ -161,13 +150,6 @@ pub enum Commands {
 
         /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
         /// treated as an error and popped.
-        ///
-        /// This is the ONLY thing that licenses popping. At or above it both branches are taken to be
-        /// real — which is what a collapsed repeat looks like, its two copies having equal length and
-        /// equal coverage — and the bubble is left exactly as it is, contig break and all.
-        ///
-        /// Raising it pops more aggressively and risks deleting one copy of a real repeat; lowering it
-        /// leaves more forks, and so more contig breaks, but destroys nothing.
         #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
         bubble_pop_ratio: f32,
 
