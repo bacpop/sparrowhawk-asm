@@ -1,7 +1,7 @@
 //! Corrects parts of the provided graph, if needed
 use crate::logw;
 use sparrowhawk_graph::{
-    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId, NodeStruct,
+    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId,
 };
 
 use crate::EdgeWeight;
@@ -11,6 +11,27 @@ use std::{
     collections::BTreeSet,
     vec::Drain,
 };
+
+/// Minimum number of k-mers a path must **exceed** to be worth keeping.
+///
+/// A run of `n` k-mers spans `n + k - 1` bases, so "longer than `minnts` bases" is `n > minnts + 1 - k`.
+///
+/// Saturating, because these are `usize`. Written as `minnts - k + 1` it underflows for every k above
+/// `minnts` and wraps to ~1.8e19 in release, whereupon `collapser` drops every contig and
+/// `check_dead_path` judges every path dead — a k = 139 assembly comes out completely empty. Above
+/// `minnts` a single k-mer already spans more than `minnts` bases, so 0 is the right limit there.
+///
+/// Shared by `check_dead_path` and `Collapsable::collapse` so both agree, and so the tests exercise
+/// this rather than a copy of it — the copies are what let the underflow survive.
+pub(crate) fn short_path_limit(minnts: usize, k: usize) -> usize {
+    (minnts + 1).saturating_sub(k)
+}
+
+/// A branch carrying less than this fraction of the stronger branch's coverage is noise.
+///
+/// Default for `--bubble-pop-ratio`, and the SKESA-inspired rule that was already the first arm of the
+/// old heuristic. It is now the *only* thing that licenses popping a bubble.
+pub const DEFAULT_POP_RATIO: f32 = 0.1;
 
 /// Mark graph as correctable.
 pub trait Correctable {
@@ -26,14 +47,11 @@ pub trait Correctable {
     /// Remove edges that are self-loops, i.e. those whose source and destination nodes are the same.
     fn remove_self_loops(&mut self);
 
-    /// Solve bubbles from the graph
-    fn correct_bubbles(&mut self) -> bool;
+    /// Solve bubbles from the graph, popping only where the coverage difference is stark.
+    fn correct_bubbles(&mut self, pop_ratio: f32) -> bool;
 
     /// Remove all input and output dead paths
     fn remove_dead_paths(&mut self) -> bool;
-
-    /// Find and remove all links that are impossible in bi-directed de Bruijn graphs derived from DNA sequences.
-    fn remove_conflictive_links(&mut self) -> bool;
 }
 
 impl Correctable for DbgGraph {
@@ -49,59 +67,8 @@ impl Correctable for DbgGraph {
         DbgGraph::remove_self_loops(self);
     }
 
-    fn correct_bubbles(&mut self) -> bool {
-        let mut dididoanything = false;
-
-        logw("Starting resolution of standard bubbles", Some("info"));
-        let bubbles = self
-            .node_indices()
-            .filter(|n| self.out_degree(*n) == 3)
-            .filter(|n| {
-                let vmin = self.bubble_start_edges_by_carry(*n, CarryType::Min);
-                if vmin.len() > 2 {
-                    return false;
-                }
-
-                if vmin.len() == 2 {
-                    check_bubble_structure(self, *n, vmin)
-                } else {
-                    false
-                }
-            })
-            .collect::<BTreeSet<NodeId>>();
-
-        if bubbles.is_empty() {
-            return false;
-        } else {
-            logw(
-                format!(
-                    "Found {:?} potential bubbles (they might be less). Starting to collapse them ",
-                    bubbles.len()
-                )
-                .as_str(),
-                Some("trace"),
-            );
-            for n in bubbles {
-                if self.contains_node(n) {
-                    let tmpb = collapse_bubble(self, n);
-                    if tmpb {
-                        dididoanything = true;
-                    }
-                }
-            }
-        }
-
-        logw(
-            format!(
-                "Bubble correction ended. Corrected graph has {} nodes and {} edges",
-                self.node_count(),
-                self.edge_count()
-            )
-            .as_str(),
-            Some("info"),
-        );
-
-        dididoanything
+    fn correct_bubbles(&mut self, pop_ratio: f32) -> bool {
+        pop_bubbles_by_coverage(self, pop_ratio)
     }
 
     fn remove_dead_paths(&mut self) -> bool {
@@ -156,31 +123,122 @@ impl Correctable for DbgGraph {
             remove_paths(self, to_remove.drain(..));
         }
     }
-
-    fn remove_conflictive_links(&mut self) -> bool {
-        false
-    }
 }
 
-/// Checks whether the candidate area can be a good bubble for error correction.
-fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleStartEdge>) -> bool {
+/// Collapse every bubble whose two branches differ starkly enough in coverage; leave the rest alone.
+///
+/// There used to be a `protected` set here, by which the multi-k evidence path vetoed the heuristic on
+/// bubbles it had corroborated. It is gone, and nothing replaced it: `choose_branch_by_counts` now
+/// refuses to touch a bubble whose branches have comparable coverage, which is exactly the case the
+/// veto existed for. A rule that cannot destroy a collapsed repeat needs no exemption list.
+pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32) -> bool {
+    let mut dididoanything = false;
+
+    logw("Starting resolution of standard bubbles", Some("info"));
+    let bubbles = g
+        .node_indices()
+        .filter(|n| g.out_degree(*n) == 3)
+        .filter(|n| {
+            let vmin = g.bubble_start_edges_by_carry(*n, CarryType::Min);
+            if vmin.len() > 2 {
+                return false;
+            }
+
+            if vmin.len() == 2 {
+                check_bubble_structure(g, *n, vmin).is_some()
+            } else {
+                false
+            }
+        })
+        .collect::<BTreeSet<NodeId>>();
+
+    if bubbles.is_empty() {
+        return false;
+    } else {
+        logw(
+            format!(
+                "Found {:?} potential bubbles (they might be less). Starting to collapse them ",
+                bubbles.len()
+            )
+            .as_str(),
+            Some("info"),
+        );
+        for n in bubbles {
+            if g.contains_node(n) {
+                let tmpb = collapse_bubble(g, n, pop_ratio);
+                if tmpb {
+                    dididoanything = true;
+                }
+            }
+        }
+    }
+
+    logw(
+        format!(
+            "Bubble correction ended. Corrected graph has {} nodes and {} edges",
+            g.node_count(),
+            g.edge_count()
+        )
+        .as_str(),
+        Some("info"),
+    );
+
+    dididoanything
+}
+
+/// Every part of a bubble, as `check_bubble_structure` derives it.
+///
+/// It used to compute all of this and then throw it away to return a `bool`, leaving `collapse_bubble`
+/// to rebuild it from scratch. The multi-k oracle needs the same parts — plus the two flanking unitigs,
+/// which are what supply the context a larger k needs to judge the branches — so hand them back.
+#[derive(Debug, Clone)]
+pub struct BubbleParts {
+    /// The fork. Exactly one k-mer, traversed on `CarryType::Min`.
+    pub start: NodeId,
+    /// The two branches, with the edge that reaches each from `start`.
+    pub mid: [(NodeId, EdgeType); 2],
+    /// Traversal carry of each branch.
+    pub midct: [CarryType; 2],
+    /// The join. Exactly one k-mer.
+    pub end: NodeId,
+    /// Traversal carry of `end`.
+    pub endct: CarryType,
+    /// Downstream flanking unitig, and the edge reaching it from `end`.
+    pub right: (NodeId, EdgeType),
+    /// Upstream flanking unitig, and the edge reaching `start` from it.
+    ///
+    /// `out_degree(start) == 3` decomposes as two outgoing `Min` branches plus one outgoing `Max`
+    /// back-link — the mate `add_bi_edge` installs for the incoming flank edge — so a well-formed
+    /// bubble start has exactly one of these. `None` if it does not, which the oracle treats as
+    /// "no context" rather than trusting it.
+    pub left: Option<(NodeId, EdgeType)>,
+}
+
+/// Checks whether the candidate area can be a good bubble for error correction, returning its parts.
+fn check_bubble_structure(
+    ptgraph: &DbgGraph,
+    startn: NodeId,
+    invec: Vec<BubbleStartEdge>,
+) -> Option<BubbleParts> {
     let mut midnodes = Vec::with_capacity(2);
     let mut midcts = Vec::with_capacity(2);
+    let mut midedges = Vec::with_capacity(2);
 
     for e in invec {
         midnodes.push(e.target);
         midcts.push(e.edge_type.get_from_and_to().1);
+        midedges.push(e.edge_type);
     }
 
     // We need to check that the two intermediate nodes are different
     if midnodes[0] == midnodes[1] || midnodes[0] == startn || midnodes[1] == startn {
-        return false;
+        return None;
     }
 
     // Now, how many neighbours do we have from the middle nodes?
     let tmpv0 = ptgraph.out_neighbours_bi(midnodes[0], midcts[0]);
     if tmpv0.len() != 1 || ptgraph.in_neighbours_bi(midnodes[0], midcts[0]).len() != 1 {
-        return false;
+        return None;
     }
     let outnode = tmpv0[0].0;
     let tmpv1 = ptgraph.out_neighbours_bi(midnodes[1], midcts[1]);
@@ -191,7 +249,7 @@ fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleS
         || (outct != tmpv1[0].1.get_from_and_to().1)
         || (ptgraph.in_neighbours_bi(midnodes[1], midcts[1]).len() != 1)
     {
-        return false;
+        return None;
     }
 
     let tmpv3 = ptgraph.out_neighbours_bi(outnode, outct);
@@ -199,91 +257,105 @@ fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleS
         || tmpv3[0].0 == startn
         || ptgraph.in_neighbours_bi(outnode, outct).len() != 2
     {
-        return false;
+        return None;
     }
 
-    true
+    // The upstream flank. Not part of the structural test — a bubble is still a bubble without one —
+    // so it is optional, and only the oracle cares.
+    let inmin = ptgraph.in_neighbours_bi(startn, CarryType::Min);
+    let left = if inmin.len() == 1 { Some(inmin[0]) } else { None };
+
+    Some(BubbleParts {
+        start: startn,
+        mid: [(midnodes[0], midedges[0]), (midnodes[1], midedges[1])],
+        midct: [midcts[0], midcts[1]],
+        end: outnode,
+        endct: outct,
+        right: tmpv3[0],
+        left,
+    })
 }
 
-/// This function collapses standard bubbles depending on the number of counts (very naive)
-fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
-    let midconns = ptgraph.out_neighbours_min(startn);
-    if midconns.len() != 2
-        || ptgraph
-            .out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)
-            .len()
-            != 1
-    {
-        return false;
+/// Derive a bubble's parts from its start node alone. The multi-k oracle's entry point.
+pub fn bubble_parts(ptgraph: &DbgGraph, startn: NodeId) -> Option<BubbleParts> {
+    if ptgraph.out_degree(startn) != 3 {
+        return None;
     }
-    let chosennode: usize;
-    let node0w = ptgraph.node_weight(midconns[0].0).unwrap();
-    let node1w = ptgraph.node_weight(midconns[1].0).unwrap();
-    let savedmidw: NodeStruct;
+    let vmin = ptgraph.bubble_start_edges_by_carry(startn, CarryType::Min);
+    if vmin.len() != 2 {
+        return None;
+    }
+    check_bubble_structure(ptgraph, startn, vmin)
+}
 
-    let count_threshold = min(
-        (0.1_f32 * max(node0w.counts, node1w.counts) as f32).round() as u16,
-        1,
-    ); // Inspired by Skesa
+/// What the coverage heuristic decided to do with a bubble.
+///
+/// Split out of `collapse_bubble` so the multi-k path can substitute its own decision and still reuse
+/// the surgery verbatim — the bidirected bookkeeping in `apply_bubble_collapse` is the hardest code
+/// here and must not be reimplemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BubbleChoice {
+    /// Collapse the bubble onto this branch, discarding the other.
+    Keep(usize),
+    /// Do nothing at all. The bubble stays exactly as it is, contig break and all.
+    ///
+    /// Replaces the old `SeverOne`/`SeverBoth`. Severing *detached* a branch rather than deleting it,
+    /// and an isolated node under 100 nt is then dropped at collapse (`collapser.rs:45-51`) — so
+    /// "sever" meant "delete, one stage later", and on the bubbles it fired for (median 61 bp) it lost
+    /// *both* copies where popping loses one. Leaving the fork in place costs the same contig break
+    /// and keeps the sequence.
+    Leave,
+}
 
-    if node0w.counts < count_threshold {
-        chosennode = 1;
-        savedmidw = node1w.clone();
-    } else if node1w.counts < count_threshold {
-        chosennode = 0;
-        savedmidw = node0w.clone();
+/// The coverage heuristic. Pure: it inspects the graph and decides, but changes nothing.
+///
+/// Pops only when the weaker branch is noise beside the stronger one — the SKESA-inspired ratio that
+/// was already the first arm of this function. The two rules it replaces are gone on purpose:
+///
+/// - comparing branches of *unequal* length against the flanking coverage and severing the deviant one;
+/// - keeping the higher count when the lengths are *equal*, falling through to `Keep(1)` on an exact tie.
+///
+/// Those are precisely what destroys a collapsed two-copy repeat. Its two copies have equal length and
+/// equal coverage, so the old code reached that final `Keep(1)` and deleted one real copy on a coin
+/// flip. There is no coverage signal at such a locus, so nothing is now done with it — the fork stays,
+/// the contig breaks, and both copies survive for the evidence-k pass or the user to deal with.
+fn choose_branch_by_counts(
+    ptgraph: &DbgGraph,
+    midconns: &[(NodeId, EdgeType)],
+    pop_ratio: f32,
+) -> BubbleChoice {
+    let c0 = ptgraph.node_weight(midconns[0].0).unwrap().counts;
+    let c1 = ptgraph.node_weight(midconns[1].0).unwrap().counts;
+    let hi = max(c0, c1);
+    let lo = min(c0, c1);
+
+    // Strict `<`, so equal coverages can never pop however the ratio is set. That also removes the
+    // need for the old floor of 1: a `0` branch beside anything positive is already below the
+    // threshold, and a `0/0` bubble — where there is nothing to choose between — is left alone.
+    if (lo as f32) < pop_ratio * hi as f32 {
+        BubbleChoice::Keep(if c0 > c1 { 0 } else { 1 })
     } else {
-        if ((node0w.abs_ind.len() - node1w.abs_ind.len()) as i32).abs() as f32
-            / (max(node0w.abs_ind.len(), node1w.abs_ind.len()) as f32)
-            > 0.025
-        {
-            let startn_counts = ptgraph.node_weight(startn).unwrap().counts;
-
-            let endn_counts = ptgraph
-                .node_weight(
-                    ptgraph.out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)[0]
-                        .0,
-                )
-                .unwrap()
-                .counts;
-            let average_surrounding_counts =
-                ((startn_counts + endn_counts) as f32 / 2.0).round() as u16;
-
-            let rel_diff_0 = ((node0w.counts as i32) - (average_surrounding_counts as i32)).abs()
-                as f32
-                / (average_surrounding_counts as f32);
-            let rel_diff_1 = ((node1w.counts as i32) - (average_surrounding_counts as i32)).abs()
-                as f32
-                / (average_surrounding_counts as f32);
-
-            if rel_diff_0 > 0.2 && rel_diff_1 <= 0.2 {
-                ptgraph.remove_all_edges_of(midconns[0].0);
-            } else if rel_diff_0 <= 0.2 && rel_diff_1 > 0.2 {
-                ptgraph.remove_all_edges_of(midconns[1].0);
-            } else {
-                ptgraph.remove_all_edges_of(midconns[0].0);
-                ptgraph.remove_all_edges_of(midconns[1].0);
-            }
-            return true;
-        } else {
-            if node0w.counts > node1w.counts {
-                chosennode = 0;
-                savedmidw = node0w.clone();
-            } else if node0w.counts < node1w.counts {
-                chosennode = 1;
-                savedmidw = node1w.clone();
-            } else if node0w.abs_ind.len() > node1w.abs_ind.len() {
-                chosennode = 0;
-                savedmidw = node0w.clone();
-            } else {
-                chosennode = 1;
-                savedmidw = node1w.clone();
-            }
-        }
+        BubbleChoice::Leave
     }
+}
 
-    let midnodect = midconns[chosennode].1.get_from_and_to().1;
-    let midconn2 = ptgraph.out_neighbours_bi(midconns[chosennode].0, midnodect)[0];
+/// The surgery: fuse the bubble onto `winner`, discarding the other branch.
+///
+/// Removes both branches and the end node, merges the winner into `start`, appends the end node's
+/// single k-mer, and reattaches to the downstream flank. The precondition — `start` and `end` each hold
+/// exactly one k-mer — is what makes the hardcoded `set_internal_edge(MinToMin)` sound: `start` was
+/// reached on the `Min` strand and its lone k-mer sits at index 0, so the fused `abs_ind` reads
+/// front-to-back in `Min`. `shrink` never merges a junction node, so it holds in practice.
+pub fn apply_bubble_collapse(
+    ptgraph: &mut DbgGraph,
+    startn: NodeId,
+    midconns: &[(NodeId, EdgeType)],
+    winner: usize,
+) -> bool {
+    let savedmidw = ptgraph.node_weight(midconns[winner].0).unwrap().clone();
+
+    let midnodect = midconns[winner].1.get_from_and_to().1;
+    let midconn2 = ptgraph.out_neighbours_bi(midconns[winner].0, midnodect)[0];
     let outct = midconn2.1.get_from_and_to().1;
     let outconn = ptgraph.out_neighbours_bi(midconn2.0, outct)[0];
     let savedoutw = ptgraph.node_weight(midconn2.0).unwrap().clone();
@@ -300,7 +372,7 @@ fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
 
     let mutrefw = ptgraph.node_weight_mut(startn).unwrap();
 
-    mutrefw.merge(&savedmidw, midconns[chosennode].1);
+    mutrefw.merge(&savedmidw, midconns[winner].1);
     mutrefw.set_internal_edge(EdgeType::MinToMin);
     mutrefw.abs_ind.push(savedoutw.abs_ind[0]);
     mutrefw.set_mean_counts(&[mutrefw.counts, savedmidw.counts, savedoutw.counts]);
@@ -315,6 +387,29 @@ fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId) -> bool {
         }
     }
     true
+}
+
+/// Collapse one standard bubble, if and only if the coverage difference between its branches is stark.
+fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId, pop_ratio: f32) -> bool {
+    // Deliberately weaker than `check_bubble_structure`: earlier collapses in the same pass may have
+    // reshaped the graph, and this is the guard the heuristic has always used. Tightening it here would
+    // change which bubbles get collapsed.
+    let midconns = ptgraph.out_neighbours_min(startn);
+    if midconns.len() != 2
+        || ptgraph
+            .out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)
+            .len()
+            != 1
+    {
+        return false;
+    }
+
+    match choose_branch_by_counts(ptgraph, &midconns, pop_ratio) {
+        BubbleChoice::Keep(w) => apply_bubble_collapse(ptgraph, startn, &midconns, w),
+        // `false`, not `true`: the graph is untouched, so reporting a change would spin the caller's
+        // fixed-point loop forever on a bubble nothing will ever act on.
+        BubbleChoice::Leave => false,
+    }
 }
 
 /// Remove dead input path.
@@ -346,8 +441,7 @@ fn check_dead_path(
     }
 
     let (mut ty, _) = carryedge.get_from_and_to();
-    let minnts = 100;
-    let limit = max(0, minnts - k + 1);
+    let limit = short_path_limit(100, k);
 
     loop {
         if cnt >= limit {
@@ -440,25 +534,43 @@ mod tests {
 
     // ── dead-path limit formula ──────────────────────────────────────────────
 
-    #[test]
-    fn dead_path_limit_k3() {
-        let (minnts, k) = (100usize, 3usize);
-        let limit = std::cmp::max(0, minnts - k + 1);
-        assert_eq!(limit, 98);
-    }
+    // These used to re-implement the formula inline instead of calling it, which is precisely why an
+    // integer underflow above k = 100 survived: every case they covered was under the boundary, and a
+    // copy of the code cannot disagree with itself.
 
     #[test]
-    fn dead_path_limit_k100() {
-        let (minnts, k) = (100usize, 100usize);
-        let limit = std::cmp::max(0, minnts - k + 1);
-        assert_eq!(limit, 1);
+    fn dead_path_limit_k3() {
+        assert_eq!(short_path_limit(100, 3), 98);
     }
 
     #[test]
     fn dead_path_limit_k31() {
-        let (minnts, k) = (100usize, 31usize);
-        let limit = std::cmp::max(0, minnts - k + 1);
-        assert_eq!(limit, 70);
+        assert_eq!(short_path_limit(100, 31), 70);
+    }
+
+    #[test]
+    fn dead_path_limit_k100() {
+        assert_eq!(short_path_limit(100, 100), 1);
+    }
+
+    /// The first k that underflowed. `100 - 101 + 1` on `usize` wraps to ~1.8e19, after which every
+    /// contig is dropped and every path is judged dead — a k > 100 assembly came out entirely empty.
+    #[test]
+    fn dead_path_limit_does_not_underflow_above_minnts() {
+        assert_eq!(short_path_limit(100, 101), 0);
+        assert_eq!(short_path_limit(100, 139), 0);
+        assert_eq!(short_path_limit(100, 255), 0);
+    }
+
+    /// A single k-mer already spans k bases, so above the threshold nothing may be filtered for length.
+    #[test]
+    fn a_single_kmer_contig_survives_when_k_exceeds_the_floor() {
+        for k in [101usize, 139, 255] {
+            assert!(
+                1 > short_path_limit(100, k),
+                "one k-mer spans {k} bases, which is over the 100 nt floor"
+            );
+        }
     }
 
     // ── check_bubble_structure ───────────────────────────────────────────────
@@ -481,10 +593,121 @@ mod tests {
         (g, s, edges)
     }
 
+    // ── the pop rule ─────────────────────────────────────────────────────────
+
+    /// The same diamond, with the two branches given explicit coverages and an **upstream flank**.
+    ///
+    /// The flank matters: `pop_bubbles_by_coverage` filters candidates on `out_degree(start) == 3`,
+    /// which decomposes as the two outgoing `Min` branches plus the one outgoing `Max` back-link that
+    /// `add_bi_edge` installs for the incoming flank edge. Without `f0 -> s` the degree is 2 and the
+    /// bubble is never even offered to the heuristic.
+    fn bubble_with_counts(c0: u32, c1: u32) -> (DbgGraph, NodeId, Vec<(NodeId, EdgeType)>) {
+        let mut g = DbgGraph::new(3);
+        let f0 = g.add_node(make_node());
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(NodeStruct { counts: c0, ..make_node() });
+        let m2 = g.add_node(NodeStruct { counts: c1, ..make_node() });
+        let e = g.add_node(make_node());
+        let f = g.add_node(make_node());
+        g.add_bi_edge(f0, s, EdgeType::MinToMin);
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        g.add_bi_edge(s, m2, EdgeType::MinToMin);
+        g.add_bi_edge(m1, e, EdgeType::MinToMin);
+        g.add_bi_edge(m2, e, EdgeType::MinToMin);
+        g.add_bi_edge(e, f, EdgeType::MinToMin);
+        assert_eq!(g.out_degree(s), 3, "fixture must be a candidate for the popper");
+        let mids = g.out_neighbours_min(s);
+        (g, s, mids)
+    }
+
+    /// Index in `mids` of the branch with the higher count.
+    ///
+    /// `out_neighbours_min` does not promise insertion order, so a test that assumed `mids[0]` is the
+    /// first node it added would be asserting on an artefact of `petgraph`'s edge storage rather than
+    /// on the rule. Ask the graph instead.
+    fn stronger(g: &DbgGraph, mids: &[(NodeId, EdgeType)]) -> usize {
+        let c0 = g.node_weight(mids[0].0).unwrap().counts;
+        let c1 = g.node_weight(mids[1].0).unwrap().counts;
+        if c0 >= c1 {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// **The regression this whole rule exists to prevent.** A collapsed two-copy repeat has branches
+    /// of equal length and equal coverage; the old heuristic fell through to an arbitrary `Keep(1)` and
+    /// deleted one real copy. Nothing may be touched here, however the ratio is set.
+    #[test]
+    fn equal_coverage_bubble_is_left_alone() {
+        let (g, _s, mids) = bubble_with_counts(40, 40);
+        for ratio in [0.01_f32, 0.1, 0.5, 0.99] {
+            assert_eq!(
+                choose_branch_by_counts(&g, &mids, ratio),
+                BubbleChoice::Leave,
+                "equal coverage must never pop, ratio {ratio}"
+            );
+        }
+
+        let (mut g, _s, _) = bubble_with_counts(40, 40);
+        let before = g.node_count();
+        assert!(!pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO));
+        assert_eq!(g.node_count(), before, "the graph must be untouched");
+    }
+
+    /// A branch carrying a twentieth of the other is noise, and is popped — whichever way round the
+    /// two are stored.
+    #[test]
+    fn a_noise_branch_is_popped() {
+        for (c0, c1) in [(100u32, 5u32), (5, 100)] {
+            let (g, _s, mids) = bubble_with_counts(c0, c1);
+            assert_eq!(
+                choose_branch_by_counts(&g, &mids, 0.1),
+                BubbleChoice::Keep(stronger(&g, &mids)),
+                "must keep the stronger branch for ({c0}, {c1})"
+            );
+        }
+
+        let (mut g, _s, _) = bubble_with_counts(100, 5);
+        let before = g.node_count();
+        assert!(pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO));
+        assert!(g.node_count() < before, "the popped branch and end node are gone");
+    }
+
+    /// Pins the boundary: the comparison is a strict `<`, so a branch sitting exactly on the ratio
+    /// survives. Getting this backwards would pop bubbles at exactly 10 %, which is the side of the
+    /// line where two real things start to look alike.
+    #[test]
+    fn a_branch_exactly_on_the_ratio_survives() {
+        let (g, _s, mids) = bubble_with_counts(100, 10);
+        assert_eq!(choose_branch_by_counts(&g, &mids, 0.1), BubbleChoice::Leave);
+
+        let (g, _s, mids) = bubble_with_counts(100, 9);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, 0.1),
+            BubbleChoice::Keep(stronger(&g, &mids))
+        );
+    }
+
+    /// A `0/0` bubble decides nothing and is left alone — the old code had a floor of 1 on the
+    /// threshold specifically to force a drop here, and that floor is gone.
+    #[test]
+    fn a_zero_coverage_bubble_is_left_alone() {
+        let (g, _s, mids) = bubble_with_counts(0, 0);
+        assert_eq!(choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO), BubbleChoice::Leave);
+
+        // But zero beside anything real is still noise.
+        let (g, _s, mids) = bubble_with_counts(50, 0);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO),
+            BubbleChoice::Keep(stronger(&g, &mids))
+        );
+    }
+
     #[test]
     fn valid_bubble_returns_true() {
         let (g, s, edges) = make_valid_bubble();
-        assert!(check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_some());
     }
 
     #[test]
@@ -497,7 +720,7 @@ mod tests {
         g.add_edge(s, m1, EdgeType::MinToMax); // second edge to same node
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         assert_eq!(edges.len(), 2);
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 
     #[test]
@@ -510,7 +733,7 @@ mod tests {
         g.add_bi_edge(s, m1, EdgeType::MinToMin);
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
         assert_eq!(edges.len(), 2);
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 
     #[test]
@@ -521,7 +744,7 @@ mod tests {
         let m1 = edges[0].target;
         g.add_bi_edge(extra, m1, EdgeType::MinToMin);
         // Now in_neighbours_bi(M1, Min).len() == 2 != 1, so the structure is invalid.
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 
     #[test]
@@ -540,7 +763,7 @@ mod tests {
         g.add_bi_edge(m2, e2, EdgeType::MinToMin); // different end
         g.add_bi_edge(e1, f, EdgeType::MinToMin);
         let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        assert!(!check_bubble_structure(&g, s, edges));
+        assert!(check_bubble_structure(&g, s, edges).is_none());
     }
 }
 

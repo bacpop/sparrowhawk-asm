@@ -14,6 +14,7 @@ pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 
+
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
     let k: usize = s
@@ -124,9 +125,14 @@ pub enum Commands {
         #[arg(short, value_parser = valid_kmer, default_value_t = DEFAULT_KMER)]
         k: usize,
 
-        /// Minimum k-mer count (with reads)
-        #[arg(long, default_value_t = DEFAULT_MINCOUNT)]
-        min_count: u16,
+        /// Minimum k-mer count. If omitted, it is FITTED from the k-mer spectrum, separately for each k.
+        ///
+        /// The old fixed default of 5 is far too low for real data: fitted values on six real datasets
+        /// (172x-862x coverage) ranged from 20 to 52. At 862x an erroneous k-mer needs only 5 sightings
+        /// to survive, so a fixed 5 floods the graph with error k-mers. Give an explicit number to
+        /// override the fit.
+        #[arg(long)]
+        min_count: Option<u16>,
 
         /// Minimum k-mer quality (with reads)
         #[arg(long, default_value_t = DEFAULT_MINQUAL)]
@@ -136,20 +142,30 @@ pub enum Commands {
         #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
         threads: usize,
 
-        /// Do the automatic fit to the k-mer spectrum to get the min_count or not
-        #[arg(long, default_value_t = false)]
-        auto_min_count: bool,
-
         /// Use, instead of the default filtering, a Bloom filter. This will use less memory and be faster, but will add
         /// false positive matches to the counting, making possible that a k-mer is counted more times that it should be.
         #[arg(long, default_value_t = false)]
         do_bloom: bool,
 
-        /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
-        /// Nonzero values enable it, allowing for potential peak memory reduction. There is a tradeoff with computing time:
-        /// very low values will make the whole execution slower.
+        /// DEPRECATED. Bounds the occurrence buffer of the `sort` counter only; the default counter is
+        /// now `map`, which buffers nothing, so this has no effect there. Slated for removal with `sort`.
+        /// A value of zero disables chunking (`sort` only).
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
+
+
+
+        /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
+        /// treated as an error and popped.
+        ///
+        /// This is the ONLY thing that licenses popping. At or above it both branches are taken to be
+        /// real — which is what a collapsed repeat looks like, its two copies having equal length and
+        /// equal coverage — and the bubble is left exactly as it is, contig break and all.
+        ///
+        /// Raising it pops more aggressively and risks deleting one copy of a real repeat; lowering it
+        /// leaves more forks, and so more contig breaks, but destroys nothing.
+        #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
+        bubble_pop_ratio: f32,
 
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this

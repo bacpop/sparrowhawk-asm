@@ -36,7 +36,7 @@ pub struct KmerFilter {
     /// Buffer for the bloom filter
     buffer: Vec<u64>,
     /// Table of counts
-    counts: HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    counts: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     /// Minimum count to pass filter
     min_count: u16,
 }
@@ -86,7 +86,7 @@ impl KmerFilter {
     /// Creates a new filter with given threshold
     ///
     /// Note:
-    /// - Maximum count is [`u16::MAX`] i.e. 65535
+    /// - Counts are `u32`; the counting Bloom filter's own cells remain 8-bit
     /// - Must call [`KmerFilter::init()`] before using.
     pub fn new(min_count: u16) -> Self {
         let buf_size =
@@ -128,7 +128,7 @@ impl KmerFilter {
             // Bloom filter then hash table
             _ => {
                 if self.bloom_add_and_check(kmer_hash) {
-                    let mut count: u16 = 2;
+                    let mut count: u32 = 2;
                     self.counts
                         .entry(kmer_hash)
                         .and_modify(|tuple| {
@@ -136,7 +136,7 @@ impl KmerFilter {
                             tuple.0 = count;
                         })
                         .or_insert((count, kmer_nc_hash, bases));
-                    self.min_count.cmp(&count)
+                    (self.min_count as u32).cmp(&count)
                 } else {
                     Ordering::Less
                 }
@@ -147,7 +147,7 @@ impl KmerFilter {
     /// Get method to retrieve the count map
     pub fn get_counts_map(
         &mut self,
-    ) -> &mut HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
+    ) -> &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
         &mut self.counts
     }
 }

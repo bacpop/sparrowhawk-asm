@@ -1,4 +1,6 @@
 use nohash_hasher::NoHashHasher;
+#[cfg(not(target_family = "wasm"))]
+use rayon::prelude::*;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
@@ -12,8 +14,14 @@ use needletail::parser::write_fasta;
 
 use crate::algorithms::collapser::Collapsable;
 use crate::algorithms::corrector::Correctable;
+#[cfg(not(target_family = "wasm"))]
+use crate::algorithms::corrector::pop_bubbles_by_coverage;
 use crate::algorithms::shrinker::Shrinkable;
+// NOT gated: `spell_path` below is generic over `UInt` and is called from
+// `save_functions::write_sequences_and_coverages`, which builds on both targets.
+use crate::bit_encoding::UInt;
 use crate::nthash;
+use std::fmt;
 
 use crate::bit_encoding::rc_base;
 use crate::logw;
@@ -135,19 +143,34 @@ pub fn check_fwd(
     outvec
 }
 
-fn populate_neighbours(
+pub(crate) fn populate_neighbours(
     k: usize,
     indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
 ) -> (usize, usize, usize) {
-    let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = indict
-        .iter()
-        .map(|(h, hi)| {
-            let pre = check_bkg(*h, hi.hnc, k, hi.b, indict, maxmindict);
-            let post = check_fwd(*h, hi.hnc, k, hi.b, indict, maxmindict);
+    // check_bkg/check_fwd are pure in (hc, hnc, k, bases) and only read the two dicts, so the whole
+    // neighbour search is parallel over the map. The mutation stays in the serial loop below.
+    //
+    // Serial on wasm: rayon there falls back to a single-threaded registry, so `par_iter` buys nothing,
+    // and its unindexed `collect` builds an intermediate linked list of `Vec`s — allocation we cannot
+    // afford under the 4 GiB linear-memory cap.
+    let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = {
+        let dict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> = indict;
+        let search = |(h, hi): (&u64, &HashInfoSimple)| {
+            let pre = check_bkg(*h, hi.hnc, k, hi.b, dict, maxmindict);
+            let post = check_fwd(*h, hi.hnc, k, hi.b, dict, maxmindict);
             (*h, pre, post)
-        })
-        .collect();
+        };
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            dict.par_iter().map(search).collect()
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            dict.iter().map(search).collect()
+        }
+    };
 
     let mut nkmers = 0;
     let mut nalone = 0;
@@ -213,6 +236,142 @@ impl Contigs {
             );
         }
     }
+}
+
+// ── Spelling: turning a walk of canonical k-mer hashes back into nucleotides ──────────────────────
+//
+// The graph stores each k-mer once, under its *canonical* hash `hc = min(fwd, rc)`, so the packed
+// k-mer in `thedict` may be either the k-mer as it reads along the walk or its reverse complement.
+// Spelling therefore means recovering, for each k-mer in turn, which of the two strands continues the
+// previous one — which we can do because consecutive k-mers in a walk overlap by exactly `k-1` bases.
+//
+// Two consumers: the contig writer (`save_functions`, on **both** targets) and the multi-k evidence
+// oracle, which needs the *full* sequence of a candidate path so it can re-hash it at a larger k.
+// Neither this nor `spell_path` may be placed inside a `#[cfg(not(target_family = "wasm"))]` block.
+
+/// Why a walk could not be spelled.
+///
+/// Every variant is an invariant violation that should be impossible for a walk taken from the graph:
+/// an edge exists *iff* the `k-1` overlap holds, so a genuine walk always overlaps. Reporting rather
+/// than papering over them is the point — earlier code counted a non-overlap and then emitted a base
+/// from the failing orientation anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpellError {
+    /// The walk was empty.
+    Empty,
+    /// A hash in the walk is absent from the dictionary.
+    UnknownKmer {
+        /// Position in the walk.
+        index: usize,
+        /// The offending canonical hash.
+        hash: u64,
+    },
+    /// Consecutive k-mers overlap in neither orientation: the "walk" is not a walk.
+    NotAWalk {
+        /// Position of the k-mer that failed to follow its predecessor.
+        index: usize,
+    },
+}
+
+impl fmt::Display for SpellError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "the walk is empty"),
+            Self::UnknownKmer { index, hash } => {
+                write!(f, "k-mer {index} (hash {hash}) is not in the dictionary")
+            }
+            Self::NotAWalk { index } => write!(
+                f,
+                "k-mer {index} does not overlap its predecessor in either orientation"
+            ),
+        }
+    }
+}
+
+/// Spell the nucleotides of a walk of canonical k-mer hashes.
+///
+/// Returns the **full** sequence, of length `hashes.len() + k - 1`. Note the contig writer deliberately
+/// trims `k-1` from each end of this; the oracle does not, because it wants every base the walk covers.
+///
+/// The caller only has to get the *order* of the hashes right — reversing a unitig's `abs_ind` if it is
+/// traversed backwards. It does **not** have to track each k-mer's strand: that is recovered here, from
+/// the overlap.
+///
+/// The spelled sequence may come out as the reverse complement of the genomic orientation, since what is
+/// pinned is the walk's *direction*, not its strand. That is harmless for canonical-hash lookups, which
+/// are reverse-complement invariant.
+pub fn spell_path<IntT>(
+    hashes: &[u64],
+    dict: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    k: usize,
+) -> Result<Vec<u8>, SpellError>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    if hashes.is_empty() {
+        return Err(SpellError::Empty);
+    }
+
+    let get = |i: usize| -> Result<IntT, SpellError> {
+        dict.get(&hashes[i])
+            .copied()
+            .ok_or(SpellError::UnknownKmer {
+                index: i,
+                hash: hashes[i],
+            })
+    };
+
+    let mut prev = get(0)?;
+
+    // Number of high bits to shift out to leave the last `k-1` bases. This is a property of the integer
+    // type, not of k alone, so it is correct for u64/u128/U256/U512 alike.
+    let clear_high = prev.n_bits() as usize - 2 * (k - 1);
+    let suffix = |kmer: IntT| -> IntT { (kmer << clear_high) >> clear_high };
+    // The first `k-1` bases of a k-mer: drop the last base.
+    let prefix = |kmer: IntT| -> IntT { kmer >> 2 };
+
+    // The first k-mer's strand is not determined by itself — only by whether it can be continued. Pick
+    // the orientation that the second k-mer follows.
+    if hashes.len() > 1 {
+        let next = get(1)?;
+        let (nf, nr) = (prefix(next), prefix(next.rev_comp(k)));
+        if suffix(prev) != nf && suffix(prev) != nr {
+            prev = prev.rev_comp(k);
+            if suffix(prev) != nf && suffix(prev) != nr {
+                return Err(SpellError::NotAWalk { index: 1 });
+            }
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(hashes.len() + k - 1);
+
+    // All k bases of the first k-mer. `get_one_nucleotide` indexes from the low end, and packing is
+    // MSB-first, so index k-1 is base 0 and index 0 is the last base.
+    for inc in 0..k {
+        out.push(prev.get_one_nucleotide(k - 1 - inc));
+    }
+
+    // Thereafter each k-mer contributes exactly one new base: its last.
+    for i in 1..hashes.len() {
+        let mut curr = get(i)?;
+        let psuf = suffix(prev);
+
+        // If both orientations overlapped we would have to guess; that needs the whole k-mer to be a
+        // reverse-complement palindrome, which needs even k, which the CLI rejects (`valid_kmer`).
+        // So the forward orientation below is unambiguous whenever it matches.
+        if psuf != prefix(curr) {
+            curr = curr.rev_comp(k);
+            if psuf != prefix(curr) {
+                return Err(SpellError::NotAWalk { index: i });
+            }
+        }
+
+        out.push(curr.get_one_nucleotide(0));
+        prev = curr;
+    }
+
+    debug_assert_eq!(out.len(), hashes.len() + k - 1);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -353,13 +512,325 @@ mod tests {
             .values()
             .any(|hi| !hi.pre.is_empty() || !hi.post.is_empty()));
     }
+
+    // ── the edge invariant ───────────────────────────────────────────────────
+    //
+    // "An edge exists iff the k-1 overlap holds" (see `spelling.rs`). This used to be guarded by a
+    // `remove_conflictive_links` pass that was a stub returning `false` and was never enabled; these
+    // tests are what replaced it. If neighbour construction ever starts inventing links, the junction
+    // walk stops spelling and these fail.
+
+    /// A deterministic ACGT sequence, with a repeat planted twice so the graph actually branches
+    /// rather than being one long chain.
+    fn seq_with_repeat(k: usize) -> Vec<u8> {
+        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    BASES[((state >> 33) & 3) as usize]
+                })
+                .collect()
+        };
+        let repeat = next(3 * k);
+        let mut s = next(200);
+        s.extend_from_slice(&repeat);
+        s.extend(next(200));
+        s.extend_from_slice(&repeat);
+        s.extend(next(200));
+        s
+    }
+
+    /// Build (packed-k-mer dict, thedict, maxmindict) for a sequence, as preprocessing would.
+    #[allow(clippy::type_complexity)]
+    fn build_dicts(
+        seq: &[u8],
+        k: usize,
+    ) -> (
+        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+    ) {
+        let mut packed: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> =
+            HashMap::with_hasher(BuildHasherDefault::default());
+        let mut dict = empty_thedict();
+        let mut maxmin = empty_maxmindict();
+
+        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
+        let mut cur = Some(it.get_curr_kmerhash_and_bases_and_kmer());
+        while let Some((hc, hnc, b, km)) = cur {
+            packed.insert(hc, km);
+            maxmin.insert(hnc, hc);
+            dict.entry(hc)
+                .and_modify(|hi: &mut HashInfoSimple| hi.counts += 1)
+                .or_insert(HashInfoSimple {
+                    hnc,
+                    b,
+                    pre: vec![],
+                    post: vec![],
+                    counts: 1,
+                });
+            cur = it.get_next_kmer_and_give_us_things();
+        }
+        (packed, dict, maxmin)
+    }
+
+    /// A node's k-mers in the order a walk on `carry` traverses them. Same rule as
+    /// `collapser`: `abs_ind` is stored in `innerdir`'s strand, so reverse it
+    /// when we walk the other way.
+    fn oriented(
+        g: &DbgGraph,
+        n: sparrowhawk_graph::NodeId,
+        carry: sparrowhawk_graph::CarryType,
+    ) -> Vec<u64> {
+        let w = g.node_weight(n).unwrap();
+        let mut h = w.abs_ind.clone();
+        if let Some(inn) = w.innerdir {
+            if carry != inn.get_from_and_to().0 {
+                h.reverse();
+            }
+        }
+        h
+    }
+
+    /// Every edge in a real graph joins two k-mers that genuinely overlap by `k-1`.
+    #[test]
+    fn every_edge_is_a_valid_k_minus_one_junction() {
+        use crate::algorithms::shrinker::Shrinkable;
+        use super::spell_path;
+
+        let k = 15;
+        let seq = seq_with_repeat(k);
+        let (packed, mut dict, maxmin) = build_dicts(&seq, k);
+        populate_neighbours(k, &mut dict, &maxmin);
+
+        let mut g = DbgGraph::from_kmer_map(k, &dict);
+        g.remove_self_loops();
+        g.shrink();
+
+        let mut checked = 0usize;
+        for n in g.node_indices().collect::<Vec<_>>() {
+            // The node's own k-mers must be a walk.
+            for carry in [
+                sparrowhawk_graph::CarryType::Min,
+                sparrowhawk_graph::CarryType::Max,
+            ] {
+                let h = oriented(&g, n, carry);
+                if h.len() > 1 {
+                    spell_path(&h, &packed, k)
+                        .unwrap_or_else(|e| panic!("node {n:?} on {carry:?} is not a walk: {e}"));
+                }
+            }
+            // And each outgoing edge must join two overlapping k-mers.
+            for (m, et) in g.outgoing_edges(n) {
+                let (sc, tc) = et.get_from_and_to();
+                let from = *oriented(&g, n, sc).last().unwrap();
+                let to = oriented(&g, m, tc)[0];
+                spell_path(&[from, to], &packed, k).unwrap_or_else(|e| {
+                    panic!("edge {n:?} -{et:?}-> {m:?} is not a k-1 junction: {e}")
+                });
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the test graph has no edges to check");
+    }
+
+    /// The companion to the above: a link that is *not* a valid junction is detected. Without this,
+    /// the test above could pass vacuously if `spell_path` accepted anything.
+    #[test]
+    fn a_fabricated_link_fails_the_junction_check() {
+        use super::{spell_path, SpellError};
+
+        let k = 15;
+        let seq = seq_with_repeat(k);
+        let (packed, mut dict, maxmin) = build_dicts(&seq, k);
+        populate_neighbours(k, &mut dict, &maxmin);
+        let g = DbgGraph::from_kmer_map(k, &dict);
+
+        // Two k-mers from far-apart positions cannot overlap by k-1.
+        let all: Vec<u64> = g
+            .node_indices()
+            .map(|n| g.node_weight(n).unwrap().abs_ind[0])
+            .collect();
+        assert!(all.len() > 100);
+        assert_eq!(
+            spell_path(&[all[0], all[all.len() - 1]], &packed, k),
+            Err(SpellError::NotAWalk { index: 1 }),
+            "an invented junction must be rejected"
+        );
+    }
+
+    // ── spelling ─────────────────────────────────────────────────────────
+
+    // ── spelling ─────────────────────────────────────────────────────────
+    /// A deterministic ACGT sequence; an LCG keeps it reproducible without pulling in an rng crate.
+    fn pseudo_seq(len: usize, seed: u64) -> Vec<u8> {
+        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                BASES[((state >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    /// Build the (dict, walk) pair that preprocessing would hand us for a sequence: `dict` maps
+    /// canonical hash -> canonical packed k-mer, and the walk is the ordered canonical hashes.
+    #[allow(clippy::type_complexity)]
+    fn dict_and_walk<IntT>(
+        seq: &[u8],
+        k: usize,
+    ) -> (
+        HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+        Vec<u64>,
+    )
+    where
+        IntT: for<'a> UInt<'a>,
+    {
+        let mut dict = HashMap::with_hasher(BuildHasherDefault::default());
+        let mut walk = Vec::new();
+        let mut it = Kmer::<IntT>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
+        let (hc, _, _, km) = it.get_curr_kmerhash_and_bases_and_kmer();
+        dict.insert(hc, km);
+        walk.push(hc);
+        while let Some((hc, _, _, km)) = it.get_next_kmer_and_give_us_things() {
+            dict.insert(hc, km);
+            walk.push(hc);
+        }
+        (dict, walk)
+    }
+
+    /// The core contract: spelling the k-mers of S gives back S, in full.
+    #[test]
+    fn round_trips_the_original_sequence() {
+        for k in [5, 15, 31] {
+            for len in [k, k + 1, 60, 300] {
+                let seq = pseudo_seq(len, 0x2545_F491_4F6C_DD1D ^ (len as u64));
+                let (dict, walk) = dict_and_walk::<u64>(&seq, k);
+                assert_eq!(walk.len(), len - k + 1, "k={k} len={len}: k-mer count");
+
+                let spelled = spell_path(&walk, &dict, k).expect("valid walk");
+                assert_eq!(
+                    spelled.len(),
+                    walk.len() + k - 1,
+                    "k={k} len={len}: spelled length"
+                );
+                assert_eq!(
+                    String::from_utf8(spelled).unwrap(),
+                    String::from_utf8(seq).unwrap(),
+                    "k={k} len={len}: spelled sequence"
+                );
+            }
+        }
+    }
+
+    /// The packed-k-mer width must not change what is spelled — multi-k sizes IntT from the LARGER k,
+    /// so a k=31 graph is spelled through u128 rather than u64.
+    #[test]
+    fn width_of_intt_does_not_change_the_spelling() {
+        let k = 31;
+        let seq = pseudo_seq(500, 99);
+        let (d64, w64) = dict_and_walk::<u64>(&seq, k);
+        let (d128, w128) = dict_and_walk::<u128>(&seq, k);
+        assert_eq!(w64, w128, "hashes are independent of the packing width");
+        assert_eq!(
+            spell_path(&w64, &d64, k).unwrap(),
+            spell_path(&w128, &d128, k).unwrap()
+        );
+    }
+
+    /// A lone k-mer has no successor to fix its strand, so it spells its canonical form: k bases.
+    #[test]
+    fn single_kmer_spells_exactly_k_bases() {
+        let k = 31;
+        let seq = pseudo_seq(k, 7);
+        let (dict, walk) = dict_and_walk::<u64>(&seq, k);
+        assert_eq!(walk.len(), 1);
+        let spelled = spell_path(&walk, &dict, k).unwrap();
+        assert_eq!(spelled.len(), k);
+        // Either strand is a legitimate answer here; the sequence itself is one of them.
+        let rc: Vec<u8> = seq
+            .iter()
+            .rev()
+            .map(|b| match b {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                _ => b'A',
+            })
+            .collect();
+        assert!(spelled == seq || spelled == rc, "spelled an unrelated k-mer");
+    }
+
+    #[test]
+    fn empty_walk_is_an_error() {
+        let dict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> = HashMap::default();
+        assert_eq!(spell_path(&[], &dict, 31), Err(SpellError::Empty));
+    }
+
+    #[test]
+    fn a_hash_missing_from_the_dict_is_reported_with_its_position() {
+        let k = 31;
+        let seq = pseudo_seq(200, 3);
+        let (mut dict, walk) = dict_and_walk::<u64>(&seq, k);
+        dict.remove(&walk[5]);
+        assert_eq!(
+            spell_path(&walk, &dict, k),
+            Err(SpellError::UnknownKmer {
+                index: 5,
+                hash: walk[5]
+            })
+        );
+    }
+
+    /// Two k-mers that do not overlap are not a walk. The old code counted this and emitted a base
+    /// anyway; it is now a hard error.
+    #[test]
+    fn a_non_overlapping_pair_is_not_a_walk() {
+        let k = 31;
+        let a = pseudo_seq(k, 11);
+        let b = pseudo_seq(k, 22);
+        let (mut dict, wa) = dict_and_walk::<u64>(&a, k);
+        let (db, wb) = dict_and_walk::<u64>(&b, k);
+        dict.extend(db);
+
+        let walk = vec![wa[0], wb[0]];
+        assert_eq!(
+            spell_path(&walk, &dict, k),
+            Err(SpellError::NotAWalk { index: 1 })
+        );
+    }
+
+    /// Splicing an unrelated k-mer into the middle of a good walk is caught at exactly that index.
+    #[test]
+    fn a_break_mid_walk_is_caught_at_its_index() {
+        let k = 31;
+        let seq = pseudo_seq(200, 5);
+        let other = pseudo_seq(k, 4242);
+        let (mut dict, mut walk) = dict_and_walk::<u64>(&seq, k);
+        let (dother, wother) = dict_and_walk::<u64>(&other, k);
+        dict.extend(dother);
+
+        walk[10] = wother[0];
+        assert_eq!(
+            spell_path(&walk, &dict, k),
+            Err(SpellError::NotAWalk { index: 10 })
+        );
+    }
+
 }
 
 /// Public API for assemblers.
 pub trait Assemble {
     #[cfg(not(target_family = "wasm"))]
     /// Assembles given data and writes results into the output file.
-    fn assemble(
+    fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -367,7 +838,7 @@ pub trait Assemble {
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
+        pop_ratio: f32,
     ) -> Contigs;
 
     #[cfg(target_family = "wasm")]
@@ -378,7 +849,7 @@ pub trait Assemble {
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
+        pop_ratio: f32,
     ) -> (Contigs, String, String, String);
 }
 
@@ -388,7 +859,7 @@ pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
     #[cfg(not(target_family = "wasm"))]
-    fn assemble(
+    fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -396,7 +867,7 @@ impl Assemble for BasicAsm {
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
+        pop_ratio: f32,
     ) -> Contigs {
         logw(
             "Constructing graph. Searching for neighbours...",
@@ -441,30 +912,55 @@ impl Assemble for BasicAsm {
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
 
-        if do_conflictive_links_removal {
-            logw("Removing conflictive links", Some("info"));
-            ptgraph.remove_conflictive_links();
-        }
-
-        let mut didanyofusdoanything = true;
-        let mut bool1: bool;
-        let mut bool2: bool = false;
-        let mut bool3: bool = false;
-        let mut bool4: bool = false;
-        while didanyofusdoanything {
-            bool1 = ptgraph.shrink();
-
-            if do_dead_end_removal {
-                bool2 = ptgraph.remove_dead_paths();
-                bool3 = ptgraph.shrink();
+        // ── Phase 1: compaction and tip clipping, to a JOINT fixed point ──────────────────────────
+        //
+        // Each feeds the other: pruning a tip leaves its junction at degree 1 so `shrink` can absorb
+        // it, and absorbing it can expose the next tip. Both are monotone reductions, so the pair
+        // terminates. Running them out here, before anything else, is what lets the ladder see maximal
+        // unitigs — the flank context the evidence test needs and cannot fabricate for itself.
+        let t_phase1 = Instant::now();
+        loop {
+            let compacted = ptgraph.shrink();
+            let pruned = if do_dead_end_removal {
+                ptgraph.remove_dead_paths()
+            } else {
+                false
+            };
+            if !compacted && !pruned {
+                break;
             }
+        }
+        log::info!(
+            "  phase 1 (shrink + prune to fixed point): {} ms",
+            t_phase1.elapsed().as_millis()
+        );
 
+        // ── Phase 3: coverage-only correction, to a fixed point ───────────────────────────────────
+        //
+        // Whatever the evidence could not resolve now reaches the heuristics. They decline unless the
+        // coverage difference is stark, so an unresolved repeat is left intact — a contig break instead
+        // of a deleted copy. Looped because a pop fuses nodes, which can expose a new bubble or tip.
+        //
+        // `|=` on `bool` does not short-circuit, so every stage runs every iteration. That is
+        // deliberate: the shrink and prune have to see what the poppers did.
+        let t_phase3 = Instant::now();
+        loop {
+            let mut changed = false;
             if do_bubble_collapse {
-                bool4 = ptgraph.correct_bubbles();
+                changed |= pop_bubbles_by_coverage(&mut ptgraph, pop_ratio);
             }
-
-            didanyofusdoanything = bool1 || bool2 || bool3 || bool4;
+            changed |= ptgraph.shrink();
+            if do_dead_end_removal {
+                changed |= ptgraph.remove_dead_paths();
+            }
+            if !changed {
+                break;
+            }
         }
+        log::info!(
+            "  phase 3 (coverage popping to fixed point): {} ms",
+            t_phase3.elapsed().as_millis()
+        );
 
         timevec.push(Instant::now());
         logw(
@@ -538,7 +1034,7 @@ impl Assemble for BasicAsm {
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
-        do_conflictive_links_removal: bool,
+        pop_ratio: f32,
     ) -> (Contigs, String, String, String) {
         logw("Starting assembler!", Some("info"));
 
@@ -568,29 +1064,38 @@ impl Assemble for BasicAsm {
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
 
-        if do_conflictive_links_removal {
-            logw("Removing conflictive links", Some("info"));
-            ptgraph.remove_conflictive_links();
+        // The same two phases as the native path (`BasicAsm::assemble`) minus the ladder, which needs
+        // an evidence graph the wasm build never has. Kept structurally identical on purpose: the two
+        // used to be one interleaved loop each, and they drifted.
+        //
+        // Phase 1: compaction and tip clipping to a joint fixed point.
+        loop {
+            let compacted = ptgraph.shrink();
+            let pruned = if do_dead_end_removal {
+                ptgraph.remove_dead_paths()
+            } else {
+                false
+            };
+            if !compacted && !pruned {
+                break;
+            }
         }
 
-        let mut didanyofusdoanything = true;
-        let mut bool1: bool;
-        let mut bool2: bool = false;
-        let mut bool3: bool = false;
-        let mut bool4: bool = false;
-        while didanyofusdoanything {
-            bool1 = ptgraph.shrink();
-
-            if do_dead_end_removal {
-                bool2 = ptgraph.remove_dead_paths();
-                bool3 = ptgraph.shrink();
-            }
-
+        // Phase 3: coverage-only correction to a fixed point. `pop_ratio` is the wasm counterpart of
+        // the CLI's `--bubble-pop-ratio`, set via `AssemblyHelper::set_bubble_pop_ratio`, so the two
+        // targets share the knob rather than wasm being stuck on the default.
+        loop {
+            let mut changed = false;
             if do_bubble_collapse {
-                bool4 = ptgraph.correct_bubbles();
+                changed |= ptgraph.correct_bubbles(pop_ratio);
             }
-
-            didanyofusdoanything = bool1 || bool2 || bool3 || bool4;
+            changed |= ptgraph.shrink();
+            if do_dead_end_removal {
+                changed |= ptgraph.remove_dead_paths();
+            }
+            if !changed {
+                break;
+            }
         }
 
         logw("Shrinkage and pruning finished", Some("info"));

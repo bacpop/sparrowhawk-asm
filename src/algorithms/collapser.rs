@@ -4,7 +4,6 @@ use super::shrinker::Shrinkable;
 use sparrowhawk_graph::{
     get_nodelist_kmer_length, CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs,
 };
-use std::cmp::max;
 
 /// Collapse `DbgGraph` into `SerializedContigs`.
 pub trait Collapsable: Shrinkable {
@@ -26,8 +25,8 @@ impl Collapsable for DbgGraph {
         );
 
         log::info!("Starting collapse loop.");
-        let minnts = 100; // independent of this value, the minimum number of nts will be always k
-        let limit = max(0, minnts - self.k() + 1);
+        // 100 nt, though independent of this value the minimum is always at least k.
+        let limit = crate::algorithms::corrector::short_path_limit(100, self.k());
 
         loop {
             loop {
