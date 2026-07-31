@@ -211,6 +211,13 @@ pub fn main() {
                 min_qual: *min_qual,
             };
 
+            let mut readers = input_files.iter().flat_map(|(_, files)| {
+                files.iter().map(|file| {
+                    let reader = needletail::parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+                    NeedletailIterator::new(reader)
+                }).collect::<Vec<NeedletailIterator>>()
+            }).collect::<Vec<NeedletailIterator>>();
+
             // Build, merge
             // let rc = !*single_strand;
 
@@ -262,6 +269,8 @@ pub fn main() {
             output.set_file_name(output_prefix.to_string() + "_contigs");
             output.set_extension("fasta");
 
+            let mut fasta_writer = set_ostream(&Some(output.into_os_string().into_string().unwrap()));
+
             if *k % 2 == 0 {
                 panic!("Support for even k-mer lengths not implemented");
             } else if *k < 3 {
@@ -270,11 +279,11 @@ pub fn main() {
                 log::info!("k={}: using 64-bit representation", *k);
                 let thedict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
                 (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<u64>(
-                        &input_files,
+                    preprocessing::preprocessing_standalone::<u64, _>(
+                        &mut readers,
                         *k,
                         &quality,
-                        &mut timevec,
+                        &mut Some(&mut timevec),
                         &mut out_path_histo,
                         *chunk_size,
                         *do_bloom,
@@ -285,7 +294,7 @@ pub fn main() {
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
-                    &mut timevec,
+                    &mut Some(&mut timevec),
                     &mut out_path_graph,
                     !no_bubble_collapse,
                     !no_dead_end_removal,
@@ -293,17 +302,17 @@ pub fn main() {
                 );
 
                 // Save as fasta
-                save_functions::save_as_fasta::<u64>(&mut contigs, &thedict, *k, output);
+                save_functions::save_as_fasta::<u64, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
             // FASTA file(s)
             } else if *k <= 64 {
                 log::info!("k={}: using 128-bit representation", *k);
                 let thedict: HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>;
                 (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<u128>(
-                        &input_files,
+                    preprocessing::preprocessing_standalone::<u128, _>(
+                        &mut readers,
                         *k,
                         &quality,
-                        &mut timevec,
+                        &mut Some(&mut timevec),
                         &mut out_path_histo,
                         *chunk_size,
                         *do_bloom,
@@ -315,7 +324,7 @@ pub fn main() {
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
-                    &mut timevec,
+                    &mut Some(&mut timevec),
                     &mut out_path_graph,
                     !no_bubble_collapse,
                     !no_dead_end_removal,
@@ -323,18 +332,18 @@ pub fn main() {
                 );
 
                 // Save as fasta
-                save_functions::save_as_fasta::<u128>(&mut contigs, &thedict, *k, output);
+                save_functions::save_as_fasta::<u128, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
             // FASTA file(s)
             } else if *k <= 128 {
                 log::info!("k={}: using 256-bit representation", *k);
 
                 let thedict: HashMap<u64, U256, BuildHasherDefault<NoHashHasher<u64>>>;
                 (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<U256>(
-                        &input_files,
+                    preprocessing::preprocessing_standalone::<U256, _>(
+                        &mut readers,
                         *k,
                         &quality,
-                        &mut timevec,
+                        &mut Some(&mut timevec),
                         &mut out_path_histo,
                         *chunk_size,
                         *do_bloom,
@@ -346,7 +355,7 @@ pub fn main() {
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
-                    &mut timevec,
+                    &mut Some(&mut timevec),
                     &mut out_path_graph,
                     !no_bubble_collapse,
                     !no_dead_end_removal,
@@ -354,18 +363,18 @@ pub fn main() {
                 );
 
                 // Save as fasta
-                save_functions::save_as_fasta::<U256>(&mut contigs, &thedict, *k, output);
+                save_functions::save_as_fasta::<U256, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
             // FASTA file(s)
             } else if *k <= 256 {
                 log::info!("k={}: using 512-bit representation", *k);
 
                 let thedict: HashMap<u64, U512, BuildHasherDefault<NoHashHasher<u64>>>;
                 (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<U512>(
-                        &input_files,
+                    preprocessing::preprocessing_standalone::<U512, _>(
+                        &mut readers,
                         *k,
                         &quality,
-                        &mut timevec,
+                        &mut Some(&mut timevec),
                         &mut out_path_histo,
                         *chunk_size,
                         *do_bloom,
@@ -377,7 +386,7 @@ pub fn main() {
                     *k,
                     &mut preprocessed_data,
                     &mut maxmindict,
-                    &mut timevec,
+                    &mut Some(&mut timevec),
                     &mut out_path_graph,
                     !no_bubble_collapse,
                     !no_dead_end_removal,
@@ -385,7 +394,7 @@ pub fn main() {
                 );
 
                 // Save as fasta
-                save_functions::save_as_fasta::<U512>(&mut contigs, &thedict, *k, output);
+                save_functions::save_as_fasta::<U512, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
             // FASTA file(s)
             } else {
                 panic!("kmer length larger than 256 currently not supported.");
