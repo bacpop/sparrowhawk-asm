@@ -65,3 +65,35 @@ pub fn get_input_list(
         }
     }
 }
+
+/// Iterator for needletail records
+#[cfg(not(target_arch = "wasm32"))]
+pub struct NeedletailIterator {
+    reader: Box<dyn needletail::FastxReader>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NeedletailIterator {
+    /// Construct from needletail readers
+    pub fn new(
+        reader: Box<dyn needletail::FastxReader>,
+    ) -> Self {
+        Self {
+            reader,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Iterator for NeedletailIterator {
+    type Item = (Vec<u8>, Option<Vec<u8>>);
+
+    fn next(
+        &mut self,
+    ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let record = self.reader.next()?.expect("Invalid FASTA/Q record");
+        let seq = record.seq();
+        let qual = record.qual().map(|qual| qual.to_vec());
+        Some((seq.to_vec(), qual))
+    }
+}
