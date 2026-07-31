@@ -10,9 +10,6 @@ use std::{cell::*, cmp::Ordering, collections::HashMap, hash::BuildHasherDefault
 
 use rayon::prelude::*;
 
-#[cfg(not(feature = "wasm"))]
-use needletail::parse_fastx_file;
-
 // use std::process::exit;
 
 #[cfg(not(feature = "wasm"))]
@@ -114,8 +111,8 @@ const MAXSIZEHISTO: usize = 500;
 // }
 
 #[cfg(not(feature = "wasm"))]
-fn bulk_preprocessing_standalone<IntT>(
-    files: &[String],
+fn bulk_preprocessing_standalone<IntT, I>(
+    input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
     outvec: &mut Vec<(u64, u64, u8)>,
@@ -126,6 +123,7 @@ fn bulk_preprocessing_standalone<IntT>(
 )
 where
     IntT: for<'a> UInt<'a>,
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
     let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
@@ -143,24 +141,20 @@ where
     //     theseq.shrink_to(2 * lseq);
     // }
 
-    for file in files {
-        log::info!("Getting kmers from file {file}. Creating reader...");
-        let mut reader =
-            parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
-
+    for (idx, iter) in input_iters.iter_mut().enumerate() {
+        log::info!("Getting kmers from file number {idx}...");
         log::info!("Parsing...");
 
         //     let maxkmers = 200;
         //     let mut numkmers = 0;
-        while let Some(record) = reader.next() {
-            let seqrec = record.expect("Invalid FASTQ record");
+        for (seq, seq_qual) in iter {
             // put_these_nts_into_an_efficient_vector(&seqrec.seq(), &mut theseq, (itrecord % 32) as u8);
 
-            let rl = seqrec.num_bases();
+            let rl = seq.len();
             let kmer_opt = Kmer::<IntT>::new(
-                seqrec.seq(),
+                seq.into(),
                 rl,
-                seqrec.qual(),
+                seq_qual.as_deref(),
                 k,
                 qual.min_qual,
                 true,
@@ -202,7 +196,7 @@ where
             //         if numkmers >= maxkmers {itrecord += rl as u32;break};
             // itrecord += rl as u32;
         }
-        log::info!("Finished getting kmers from file {file}.");
+        log::info!("Finished getting kmers");
         //     numkmers = 0;
     }
 
@@ -213,7 +207,7 @@ where
     //         theseq.push(tmpu64);
     //     }
 
-    log::info!("Finished getting kmers from {} file(s)", files.len());
+    log::info!("Finished getting kmers from {} file(s)", input_iters.len());
     // log::debug!("Length of seq. vec.: {}, total length of both files: {}", theseq.len(), itrecord);
     // log::debug!("k | Number of collisions =+=+ {} {}", k, ncols);
 
@@ -825,8 +819,8 @@ where
 }
 
 #[cfg(not(feature = "wasm"))]
-fn bloom_filter_preprocessing_standalone<IntT>(
-    files: &[String],
+fn bloom_filter_preprocessing_standalone<IntT, I>(
+    input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
     do_fit: bool,
@@ -838,6 +832,7 @@ fn bloom_filter_preprocessing_standalone<IntT>(
 )
 where
     IntT: for<'a> UInt<'a>,
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Initialising variables and filter...");
 
@@ -851,19 +846,15 @@ where
     kmer_filter.init();
 
     // NOTE, potential TODO? : This could be slightly improved by filling outdict and minmaxdict only once, though it'd require saving also km, but it could be better
-    for file in files {
-        log::info!("Getting kmers from file {file}. Initialising reader...");
-
-        let mut reader =
-            parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+    for (idx, iter) in input_iters.iter_mut().enumerate() {
+        log::info!("Getting kmers from file number {idx}...");
 
         logw("Parsing...", Some("info"));
 
-        while let Some(record) = reader.next() {
-            let seqrec = record.expect("Invalid FASTQ record");
-            let rl = seqrec.seq().len();
+        for (seq, seq_qual) in iter {
+            let rl = seq.len();
             let kmer_opt =
-                Kmer::<IntT>::new(seqrec.seq(), rl, seqrec.qual(), k, qual.min_qual, true);
+                Kmer::<IntT>::new(seq.into(), rl, seq_qual.as_deref(), k, qual.min_qual, true);
             if let Some(mut kmer_it) = kmer_opt {
                 let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer(); // TODO: potential really small improvement, get only hash for the bloom filter, then get the rest.
                 if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
@@ -881,11 +872,11 @@ where
         }
 
         logw(
-            format!("Finished getting kmers from file {file}.").as_str(),
+            format!("Finished getting kmers.").as_str(),
             Some("info"),
         );
     }
-    log::info!("Finished getting kmers from {} file(s)", files.len());
+    log::info!("Finished getting kmers from {} file(s)", input_iters.len());
     log::info!("Finishing filtering...");
 
     // Now, get themap, histovec, and filter outdict and minmaxdict
@@ -1558,8 +1549,8 @@ fn update_countmap(
 }
 
 #[cfg(not(feature = "wasm"))]
-fn chunked_preprocessing_standalone<IntT>(
-    files: &[String],
+fn chunked_preprocessing_standalone<IntT, I>(
+    input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
     outvec: &mut Vec<(u64, u64, u8)>,
@@ -1573,6 +1564,7 @@ fn chunked_preprocessing_standalone<IntT>(
 )
 where
     IntT: for<'a> UInt<'a>,
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Getting kmers from files. Creating reader...");
 
@@ -1586,17 +1578,14 @@ where
     let mut i_record = 0;
     // let mut ncols : usize = 0;
 
-    for file in files {
-        log::info!("Getting kmers from file {file}. Creating reader...");
-        let mut reader =
-            parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+    for (idx, iter) in input_iters.iter_mut().enumerate() {
+        log::info!("Getting kmers from file number {idx}...");
 
-        log::info!("Entering while loop...");
-        while let Some(record) = reader.next() {
-            let seqrec = record.expect("Invalid FASTQ record");
-            let rl = seqrec.seq().len();
+        log::info!("Parsing input...");
+        for (seq, seq_qual) in iter {
+            let rl = seq.len();
             let kmer_opt =
-                Kmer::<IntT>::new(seqrec.seq(), rl, seqrec.qual(), k, qual.min_qual, true);
+                Kmer::<IntT>::new(seq.into(), rl, seq_qual.as_deref(), k, qual.min_qual, true);
             if let Some(mut kmer_it) = kmer_opt {
                 let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer();
                 outvec.push((hc, hnc, b));
@@ -1631,7 +1620,7 @@ where
                 i_record = 0;
             }
         }
-        log::info!("Finished getting kmers from file {file}.");
+        log::info!("Finished getting kmers.");
     }
 
     if i_record > 0 {
@@ -1821,11 +1810,11 @@ where
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
 #[cfg(not(feature = "wasm"))]
-pub fn preprocessing_standalone<IntT>(
-    input_files: &[InputFastx],
+pub fn preprocessing_standalone<IntT, I>(
+    input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
-    timevec: &mut Vec<Instant>,
+    timevec: &mut Option<&mut Vec<Instant>>,
     out_path: &mut Option<PathBuf>,
     csize: usize,
     do_bloom: bool,
@@ -1838,23 +1827,16 @@ pub fn preprocessing_standalone<IntT>(
 )
 where
     IntT: for<'a> UInt<'a>,
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Starting preprocessing_standalone with k = {k}");
-
-    // This is temporal, to be changed in the future.
-    let mut all_files: Vec<String> = input_files[0].1.clone();
-    if input_files.len() > 1 {
-        for ifile in input_files.iter().skip(1) {
-            all_files.extend(ifile.1.clone());
-        }
-    }
 
     if do_bloom {
         // Build indexes
         log::info!("Processing using a Bloom filter");
 
         let (thedict, maxmindict, themap) =
-            bloom_filter_preprocessing_standalone::<IntT>(&all_files, k, qual, do_fit, out_path);
+            bloom_filter_preprocessing_standalone::<IntT, _>(input_iters, k, qual, do_fit, out_path);
         (themap, Vec::new(), thedict, maxmindict)
     } else if csize == 0 {
         // First, we want to fill our mega-vector with all k-mers from both paired-end reads
@@ -1862,33 +1844,37 @@ where
 
         let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
         let (theseq, thedict, maxmindict) =
-            bulk_preprocessing_standalone::<IntT>(&all_files, k, qual, &mut tmpvec);
+            bulk_preprocessing_standalone::<IntT, _>(input_iters, k, qual, &mut tmpvec);
 
         //exit(0);
-        timevec.push(Instant::now());
-        log::info!(
-            "k-mers extracted in {} s",
-            timevec
-                .last()
-                .unwrap()
-                .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                .as_secs()
-        );
+        timevec.as_mut().map(|timevec| {
+            timevec.push(Instant::now());
+            log::info!(
+                "k-mers extracted in {} s",
+                timevec
+                    .last()
+                    .unwrap()
+                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                    .as_secs()
+            );
+        });
 
         // Then, we want to sort it according to the hash
         log::debug!("Number of kmers BEFORE cleaning: {:?}", tmpvec.len());
         log::info!("Sorting vector");
         tmpvec.par_sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        timevec.push(Instant::now());
-        log::info!(
-            "k-mers sorted in {} s",
-            timevec
-                .last()
-                .unwrap()
-                .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                .as_secs()
-        );
+        timevec.as_mut().map(|timevec| {
+            timevec.push(Instant::now());
+            log::info!(
+                "k-mers sorted in {} s",
+                timevec
+                    .last()
+                    .unwrap()
+                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                    .as_secs()
+            );
+        });
 
         // Then, do a counting of everything and save the results in a dictionary and return it
         log::info!("Counting and filtering k-mers");
@@ -1899,23 +1885,25 @@ where
         };
         drop(tmpvec);
 
-        timevec.push(Instant::now());
-        log::info!(
-            "k-mers counted and filtered in {} s",
-            timevec
-                .last()
-                .unwrap()
-                .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                .as_secs()
-        );
+        timevec.as_mut().map(|timevec| {
+            timevec.push(Instant::now());
+            log::info!(
+                "k-mers counted and filtered in {} s",
+                timevec
+                    .last()
+                    .unwrap()
+                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                    .as_secs()
+            );
+        });
 
         (themap, theseq, thedict, maxmindict)
     } else {
         log::info!("Processing in chunks of size {}", csize);
 
         let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
-        let (thedict, maxmindict, themap) = chunked_preprocessing_standalone::<IntT>(
-            &all_files,
+        let (thedict, maxmindict, themap) = chunked_preprocessing_standalone::<IntT, _>(
+            input_iters,
             k,
             qual,
             &mut tmpvec,
@@ -1925,15 +1913,17 @@ where
         );
         drop(tmpvec);
 
-        timevec.push(Instant::now());
-        log::info!(
-            "Chunked preprocessing done in {} s",
-            timevec
-                .last()
-                .unwrap()
-                .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                .as_secs()
-        );
+        timevec.as_mut().map(|timevec| {
+            timevec.push(Instant::now());
+            log::info!(
+                "Chunked preprocessing done in {} s",
+                timevec
+                    .last()
+                    .unwrap()
+                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                    .as_secs()
+            );
+        });
         (themap, Vec::new(), thedict, maxmindict)
     }
 }
