@@ -4,11 +4,6 @@ use core::panic;
 use nohash_hasher::NoHashHasher;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
-#[cfg(not(feature = "wasm"))]
-use std::path::PathBuf;
-
-#[cfg(not(feature = "wasm"))]
-use super::io_utils::*;
 // use std::process::exit;
 
 use crate::bit_encoding::UInt;
@@ -133,25 +128,21 @@ pub fn write_sequences_and_coverages<IntT>(
 
 /// Stores all the contigs as a fasta file
 #[cfg(not(feature = "wasm"))]
-pub fn save_as_fasta<IntT>(
+pub fn save_as_fasta<IntT, W>(
     ingraph: &mut Contigs,
     inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     k: usize,
-    outfile: PathBuf,
+    writer: &mut W,
 ) where
     IntT: for<'a> UInt<'a>,
+    W: std::io::Write,
 {
     // First, we write the sequences and the coverages
     write_sequences_and_coverages(ingraph, inmap, k);
 
     log::debug!("Starting to save");
-    log::debug!("{:?}", outfile);
-    // Now, we just write all the contigs. We get our writing buffer with this:
-    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
-    // And simply, contig per contig, we write the file
-
     log::debug!("\tLen.\tMean\tSD\tMedian");
-    ingraph.write_fasta(&mut wbuf);
+    ingraph.write_fasta(writer);
 }
 
 /// Stores all the contigs in fasta format, but exports it as JSON for javascript
