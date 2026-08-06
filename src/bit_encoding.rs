@@ -765,7 +765,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use sparrowhawk::bit_encoding::{encode_base, IUPAC};
+/// use sparrowhawk_asm::bit_encoding::{encode_base, IUPAC};
 ///
 /// // A + Y -> H
 /// let new_base = encode_base(b'A');
