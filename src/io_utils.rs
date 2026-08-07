@@ -67,12 +67,12 @@ pub fn get_input_list(
 }
 
 /// Iterator for needletail records
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub struct NeedletailIterator {
     reader: Box<dyn needletail::FastxReader>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl NeedletailIterator {
     /// Construct from needletail readers
     pub fn new(
@@ -84,7 +84,7 @@ impl NeedletailIterator {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl Iterator for NeedletailIterator {
     type Item = (Vec<u8>, Option<Vec<u8>>);
 
