@@ -1,21 +1,26 @@
 //! Corrects parts of the provided graph, if needed
-use crate::graphs::pt_graph::{
-    CarryType, EdgeIndex, EdgeType, EmptyEdge, NodeIndex, NodeStruct, PtGraph,
+use crate::logw;
+use sparrowhawk_graph::{
+    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId,
 };
-use crate::graphs::Graph;
-use crate::{logw, EdgeWeight};
 
-use petgraph::visit::EdgeRef;
-use petgraph::Direction::{Incoming, Outgoing};
+use crate::EdgeWeight;
+
 use std::{
     cmp::{max, min},
     collections::BTreeSet,
     vec::Drain,
 };
 
-// use std::process::exit;
+/// Minimum number of k-mers a path must exceed to be worth keeping in dead-end removal.
+pub(crate) fn short_path_limit(minnts: usize, k: usize) -> usize {
+    (minnts + 1).saturating_sub(k) // sat_sub is compulsory, becase as these are usize, going negative my change the path to an absurd value!!!
+}
 
-/// Mark graph as shrinkable.
+/// A branch carrying less than this fraction of the stronger branch's coverage is noise. SKESA-inspired.
+pub const DEFAULT_POP_RATIO: f32 = 0.1;
+
+/// Mark graph as correctable.
 pub trait Correctable {
     /// Edge index associated with collection.
     type EdgeIdx;
@@ -29,106 +34,36 @@ pub trait Correctable {
     /// Remove edges that are self-loops, i.e. those whose source and destination nodes are the same.
     fn remove_self_loops(&mut self);
 
-    /// Solve bubbles from the graph
-    fn correct_bubbles(&mut self) -> bool;
+    /// Solve bubbles from the graph, popping only where the coverage difference is big.
+    fn correct_bubbles(&mut self, pop_ratio: f32) -> bool;
 
     /// Remove all input and output dead paths
     fn remove_dead_paths(&mut self) -> bool;
-
-    /// Find and remove all links that are impossible in bi-directed de Bruijn graphs derived from DNA sequences.
-    fn remove_conflictive_links(&mut self) -> bool;
 }
 
-impl Correctable for PtGraph {
-    type EdgeIdx = EdgeIndex;
+impl Correctable for DbgGraph {
+    type EdgeIdx = EdgeId;
 
-    type NodeIdx = NodeIndex;
+    type NodeIdx = NodeId;
 
     fn remove_weak_nodes(&mut self, threshold: EdgeWeight) {
-        self.graph
-            .retain_nodes(|g, n| g.node_weight(n).unwrap().counts >= threshold);
+        self.retain_nodes_by_count(threshold);
     }
 
     fn remove_self_loops(&mut self) {
-        self.graph.retain_edges(|g, e| {
-            let (n1, n2) = g.edge_endpoints(e).unwrap();
-            n1 != n2
-        });
+        DbgGraph::remove_self_loops(self);
     }
 
-    fn correct_bubbles(&mut self) -> bool {
-        let mut dididoanything = false;
-
-        logw("Starting resolution of standard bubbles", Some("info"));
-        let bubbles = self
-            .graph
-            .node_indices()
-            .filter(|n| self.out_degree(*n) == 3)
-            .filter(|n| {
-                // We can directly check only once the bubbles (and not do it twice) by fixing
-                // the carrytype from which we want to continue
-                let mut vmin = Vec::with_capacity(2);
-
-                for e in self.graph.edges_directed(*n, Outgoing) {
-                    if e.weight().t.get_from_and_to().0 == CarryType::Min {
-                        if vmin.len() == 2 {
-                            return false;
-                        } else {
-                            vmin.push(e.id());
-                        }
-                    }
-                }
-
-                // We have two outgoing from min/max and one outgoing from max/min.
-                // We check whether this is actually a bubble or not.
-                if vmin.len() == 2 {
-                    check_bubble_structure(self, *n, vmin)
-                } else {
-                    false
-                }
-            })
-            .collect::<BTreeSet<NodeIndex>>();
-
-        if bubbles.is_empty() {
-            return false;
-        } else {
-            logw(
-                format!(
-                    "Found {:?} potential bubbles (they might be less). Starting to collapse them ",
-                    bubbles.len()
-                )
-                .as_str(),
-                Some("trace"),
-            );
-            for n in bubbles {
-                if self.graph.contains_node(n) {
-                    let tmpb = collapse_bubble(self, n);
-                    if tmpb {
-                        dididoanything = true;
-                    }
-                }
-            }
-        }
-
-        logw(
-            format!(
-                "Bubble correction ended. Corrected graph has {} nodes and {} edges",
-                self.graph.node_count(),
-                self.graph.edge_count()
-            )
-            .as_str(),
-            Some("info"),
-        );
-
-        dididoanything
+    fn correct_bubbles(&mut self, pop_ratio: f32) -> bool {
+        pop_bubbles_by_coverage(self, pop_ratio)
     }
 
     fn remove_dead_paths(&mut self) -> bool {
         logw(
             format!(
                 "Before pruning: {} nodes and {} edges",
-                self.graph.node_count(),
-                self.graph.edge_count()
+                self.node_count(),
+                self.edge_count()
             )
             .as_str(),
             Some("info"),
@@ -137,9 +72,9 @@ impl Correctable for PtGraph {
         let mut dididoanything = false;
         logw(format!("Starting graph pruning. Graph has {} externals, {} alone nodes, the remaining are internal.",
             self.externals_bi().len(),
-            self.graph.node_indices().filter(|n| self.out_degree(*n) == 0 && self.in_degree(*n) == 0).count()).as_str(), Some("info"));
+            self.node_indices().filter(|n| self.out_degree(*n) == 0 && self.in_degree(*n) == 0).count()).as_str(), Some("info"));
 
-        let mut to_remove: Vec<NodeIndex> = vec![];
+        let mut to_remove: Vec<NodeId> = vec![];
         loop {
             let mut path_check_vec = vec![];
             let externals: Vec<_> = self
@@ -148,26 +83,14 @@ impl Correctable for PtGraph {
                 .filter(|n| self.out_degree(*n) == 1)
                 .collect();
 
-            // TODO: go back to "Graph" alone, for speed
-
             logw(
                 format!("Detected {} externals", externals.len()).as_str(),
                 Some("trace"),
             );
 
             for v in externals {
-                check_dead_path(
-                    self,
-                    v,
-                    &mut path_check_vec,
-                    self.k,
-                    self.graph
-                        .edges_directed(v, petgraph::EdgeDirection::Outgoing)
-                        .next()
-                        .unwrap()
-                        .weight()
-                        .t,
-                );
+                let carryedge = self.first_outgoing_edge_type(v).unwrap();
+                check_dead_path(self, v, &mut path_check_vec, self.k(), carryedge);
                 if !path_check_vec.is_empty() {
                     dididoanything = true;
                     to_remove.append(&mut path_check_vec);
@@ -187,90 +110,72 @@ impl Correctable for PtGraph {
             remove_paths(self, to_remove.drain(..));
         }
     }
-
-    fn remove_conflictive_links(&mut self) -> bool {
-        // Conflicting links: k-mers connected to others with a relatively larger count
-        // TODO: apply
-        false
-
-        // OLD-correct bad links (only one edge instead of two, or bad types) BEGIN
-        // let mut dididoanything = false;
-        // log::info!("Starting removal of conflicting links. Graph has {} sources, {} sinks, {} alone nodes, the remaining are internal.",
-        //     self.graph.externals(EdgeDirection::Incoming).count(), self.graph.externals(EdgeDirection::Outgoing).count(),
-        //     self.graph.node_indices().filter(|n| self.out_degree(*n) == 0 && self.in_degree(*n) == 0).count());
-        //
-        // log::trace!("Detected {} sources and {} sinks", self.graph.externals(EdgeDirection::Incoming).count(), self.graph.externals(EdgeDirection::Outgoing).count());
-        //
-        // let susceptiblenodes : Vec<NodeIndex> = self.graph.node_indices().filter(|&n| {
-        //
-        //     self.graph.neighbors_directed(n, EdgeDirection::Incoming).count() > 1 || self.graph.neighbors_directed(n, EdgeDirection::Outgoing).count() > 1
-        //
-        // }).collect::<Vec<NodeIndex>>();
-        //
-        // for v in susceptiblenodes {
-        //     let incneigh = self.graph.neighbors_directed(v, EdgeDirection::Incoming).collect::<Vec<NodeIndex>>();
-        //     let outneigh = self.graph.neighbors_directed(v, EdgeDirection::Outgoing).collect::<Vec<NodeIndex>>();
-        //
-        //
-        //     let suscnodecs = self.graph.node_weight(v).unwrap().counts;
-        //     // println!("\nSusc. node counts: {}", suscnodecs);
-        //     for incn in incneigh.iter() {
-        //         let coc = self.graph.node_weight(*incn).unwrap().counts as f32/suscnodecs as f32;
-        //         // if coc < 0.1 {
-        //         //     println!("\tInc. node count: {}\t{:.2}", self.graph.node_weight(*incn).unwrap().counts, coc);
-        //         // }
-        //     }
-        //
-        //     for outn in outneigh.iter() {
-        //         let coc = self.graph.node_weight(*outn).unwrap().counts as f32/suscnodecs as f32;
-        //         // if coc < 0.1 {
-        //         //     println!("\tOut. node count: {}\t{:.2}", self.graph.node_weight(*outn).unwrap().counts, coc);
-        //         // }
-        //     }
-        // }
-        //
-        // return dididoanything
-
-        // OLD END
-
-        // TEST TEMP for creating function for removing conflictive links, but it is better to do it while shrinking the graph the first time
-        // let mut checkednodes : BTreeSet<NodeIndex> = BTreeSet::new();
-        // let mut dididoanything = false;
-        //
-        // for ni in self.ptgraph.node_indices() {
-        //     if check_connections_and_remove(&mut self.ptgraph, ni, self.in_neighbours_min(ni), self.out_neighbours_min(ni), &checkednodes) {
-        //         dididoanything = true;
-        //     }
-        //     checkednodes.insert(ni);
-        // }
-        //
-        // return dididoanything;
-    }
 }
 
-// TEST TEMP for creating function for removing conflictive links, but it is better to do it while shrinking the graph the first time
-// fn check_connections_and_remove(ptgraph: &mut PtGraph, ni : NodeIndex, inneighs : Vec<(NodeIndex, EdgeType)>, outneighs : Vec<(NodeIndex, EdgeType)>, nodeset : &BTreeSet<NodeIndex>) -> bool {
-//     let mut didierasedanything = false;
-//     let nodecounts = ptgraph.node_weight(ni).unwrap().counts as f32;
-//
-//     for (neigh, edge) in inneighs {
-//         if ptgraph.node_weight(neigh).unwrap().counts as f32 >
-//     }
-//
-//
-//
-//
-//     return didierasedanything;
-// }
+/// Collapse every bubble whose two branches differ significantly enough in coverage; leave the rest alone.
+pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32) -> bool {
+    let mut dididoanything = false;
+
+    logw("Starting resolution of standard bubbles", Some("info"));
+    let bubbles = g
+        .node_indices()
+        .filter(|n| g.out_degree(*n) == 3)
+        .filter(|n| {
+            let vmin = g.bubble_start_edges_by_carry(*n, CarryType::Min);
+            if vmin.len() > 2 {
+                return false;
+            }
+
+            if vmin.len() == 2 {
+                check_bubble_structure(g, *n, vmin)
+            } else {
+                false
+            }
+        })
+        .collect::<BTreeSet<NodeId>>();
+
+    if bubbles.is_empty() {
+        return false;
+    } else {
+        logw(
+            format!(
+                "Found {:?} potential bubbles (they might be less). Starting to collapse them ",
+                bubbles.len()
+            )
+            .as_str(),
+            Some("info"),
+        );
+        for n in bubbles {
+            if g.contains_node(n) {
+                let tmpb = collapse_bubble(g, n, pop_ratio);
+                if tmpb {
+                    dididoanything = true;
+                }
+            }
+        }
+    }
+
+    logw(
+        format!(
+            "Bubble correction ended. Corrected graph has {} nodes and {} edges",
+            g.node_count(),
+            g.edge_count()
+        )
+        .as_str(),
+        Some("info"),
+    );
+
+    dididoanything
+}
 
 /// Checks whether the candidate area can be a good bubble for error correction.
-fn check_bubble_structure(ptgraph: &PtGraph, startn: NodeIndex, invec: Vec<EdgeIndex>) -> bool {
+fn check_bubble_structure(ptgraph: &DbgGraph, startn: NodeId, invec: Vec<BubbleStartEdge>) -> bool {
     let mut midnodes = Vec::with_capacity(2);
     let mut midcts = Vec::with_capacity(2);
 
     for e in invec {
-        midnodes.push(ptgraph.graph.edge_endpoints(e).unwrap().1);
-        midcts.push(ptgraph.graph.edge_weight(e).unwrap().t.get_from_and_to().1);
+        midnodes.push(e.target);
+        midcts.push(e.edge_type.get_from_and_to().1);
     }
 
     // We need to check that the two intermediate nodes are different
@@ -278,8 +183,7 @@ fn check_bubble_structure(ptgraph: &PtGraph, startn: NodeIndex, invec: Vec<EdgeI
         return false;
     }
 
-    // Now, how many neighbours do we have from the middle nodes? It should be only one, and the same
-    // and also, only one incoming neighbour!
+    // Now, how many neighbours do we have from the middle nodes?
     let tmpv0 = ptgraph.out_neighbours_bi(midnodes[0], midcts[0]);
     if tmpv0.len() != 1 || ptgraph.in_neighbours_bi(midnodes[0], midcts[0]).len() != 1 {
         return false;
@@ -296,22 +200,84 @@ fn check_bubble_structure(ptgraph: &PtGraph, startn: NodeIndex, invec: Vec<EdgeI
         return false;
     }
 
-    // and now we check that we go to a new node that is different from outnode (i.e. no self-edges/loops)
     let tmpv3 = ptgraph.out_neighbours_bi(outnode, outct);
-    if tmpv3.len() != 1
-        || tmpv3[0].0 == startn
-        || ptgraph.in_neighbours_bi(outnode, outct).len() != 2
-    {
-        return false;
-    }
+    tmpv3.len() == 1 && tmpv3[0].0 != startn && ptgraph.in_neighbours_bi(outnode, outct).len() == 2
+}
 
+/// What the coverage heuristic decided to do with a bubble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BubbleChoice {
+    /// Collapse the bubble onto this branch, discarding the other.
+    Keep(usize),
+    /// Do nothing at all. The bubble stays exactly as it is, contig break and all.
+    Leave,
+}
+
+/// The coverage heuristic. It inspects the graph and decides, but changes nothing.
+fn choose_branch_by_counts(
+    ptgraph: &DbgGraph,
+    midconns: &[(NodeId, EdgeType)],
+    pop_ratio: f32,
+) -> BubbleChoice {
+    let c0 = ptgraph.node_weight(midconns[0].0).unwrap().counts;
+    let c1 = ptgraph.node_weight(midconns[1].0).unwrap().counts;
+    let hi = max(c0, c1);
+    let lo = min(c0, c1);
+
+    // Strict `<`, so equal coverages can never pop however the ratio is set.
+    if (lo as f32) < pop_ratio * hi as f32 {
+        BubbleChoice::Keep(if c0 > c1 { 0 } else { 1 })
+    } else {
+        BubbleChoice::Leave
+    }
+}
+
+/// Get the final graph with the chosen branch (if so) in it..
+pub fn apply_bubble_collapse(
+    ptgraph: &mut DbgGraph,
+    startn: NodeId,
+    midconns: &[(NodeId, EdgeType)],
+    winner: usize,
+) -> bool {
+    let savedmidw = ptgraph.node_weight(midconns[winner].0).unwrap().clone();
+
+    let midnodect = midconns[winner].1.get_from_and_to().1;
+    let midconn2 = ptgraph.out_neighbours_bi(midconns[winner].0, midnodect)[0];
+    let outct = midconn2.1.get_from_and_to().1;
+    let outconn = ptgraph.out_neighbours_bi(midconn2.0, outct)[0];
+    let savedoutw = ptgraph.node_weight(midconn2.0).unwrap().clone();
+
+    if ptgraph.node_weight(startn).unwrap().abs_ind.len() > 1
+        || ptgraph.node_weight(midconn2.0).unwrap().abs_ind.len() > 1
+    {
+        panic!("Trying to remove a bubble with a start or end node with more than one k-mer!");
+    };
+
+    ptgraph.remove_node(midconns[0].0); // intermediate node 0
+    ptgraph.remove_node(midconns[1].0); // intermediate node 1
+    ptgraph.remove_node(midconn2.0); // end node
+
+    let mutrefw = ptgraph.node_weight_mut(startn).unwrap();
+
+    mutrefw.merge(&savedmidw, midconns[winner].1);
+    mutrefw.set_internal_edge(EdgeType::MinToMin);
+    mutrefw.abs_ind.push(savedoutw.abs_ind[0]);
+    mutrefw.set_mean_counts(&[mutrefw.counts, savedmidw.counts, savedoutw.counts]);
+
+    match outct {
+        CarryType::Min => {
+            ptgraph.add_bi_edge(startn, outconn.0, outconn.1);
+        }
+        CarryType::Max => {
+            let tmptype = EdgeType::from_carrytypes(CarryType::Min, outconn.1.get_from_and_to().1);
+            ptgraph.add_bi_edge(startn, outconn.0, tmptype);
+        }
+    }
     true
 }
 
-/// This function collapses standard bubbles depending on the number of counts (very naive)
-fn collapse_bubble(ptgraph: &mut PtGraph, startn: NodeIndex) -> bool {
-    // Remember: we always start with the Min being the origin of the two outward edges
-    // let prevconn = ptgraph.in_neighbours_min(startn)[0];
+/// Collapse one standard bubble, if the coverage difference between its branches is big enough.
+fn collapse_bubble(ptgraph: &mut DbgGraph, startn: NodeId, pop_ratio: f32) -> bool {
     let midconns = ptgraph.out_neighbours_min(startn);
     if midconns.len() != 2
         || ptgraph
@@ -321,222 +287,34 @@ fn collapse_bubble(ptgraph: &mut PtGraph, startn: NodeIndex) -> bool {
     {
         return false;
     }
-    let chosennode: usize;
-    let node0w = ptgraph.graph.node_weight(midconns[0].0).unwrap();
-    let node1w = ptgraph.graph.node_weight(midconns[1].0).unwrap();
-    let savedmidw: NodeStruct;
 
-    let count_threshold = min(
-        (0.1 * max(node0w.counts, node1w.counts) as f32).round() as u16,
-        1,
-    ); // Inspired by Skesa
-
-    // println!("here1");
-
-    if node0w.counts < count_threshold {
-        chosennode = 1;
-        savedmidw = node1w.clone();
-        // println!("here3");
-    } else if node1w.counts < count_threshold {
-        chosennode = 0;
-        savedmidw = node0w.clone();
-        // println!("here4");
-    } else {
-        // println!("here2");
-        // We have not managed to exclude one of the two options. What do we do now?
-
-        if ((node0w.abs_ind.len() - node1w.abs_ind.len()) as i32).abs() as f32
-            / (max(node0w.abs_ind.len(), node1w.abs_ind.len()) as f32)
-            > 0.025
-        {
-            // There is a large difference in the number of k-mers between the options: this could be a coincidence link between
-            // two locations far away in the genome. Let's compare with the counts of the start and end nodes.
-            // println!("here5");
-
-            let startn_counts = ptgraph.graph.node_weight(startn).unwrap().counts;
-
-            // println!("preasdf");
-            let endn_counts = ptgraph
-                .graph
-                .node_weight(
-                    ptgraph.out_neighbours_bi(midconns[0].0, midconns[0].1.get_from_and_to().1)[0]
-                        .0,
-                )
-                .unwrap()
-                .counts;
-            // println!("asdfadsf");
-            let average_surrounding_counts =
-                ((startn_counts + endn_counts) as f32 / 2.0).round() as u16;
-
-            let rel_diff_0 = ((node0w.counts - average_surrounding_counts) as i32).abs() as f32
-                / (average_surrounding_counts as f32);
-            let rel_diff_1 = ((node1w.counts - average_surrounding_counts) as i32).abs() as f32
-                / (average_surrounding_counts as f32);
-
-            // NOTE: in the future, removing valid connections between nodes might not be desirable, as we might be able to resolve these
-            // unitigs with e.g. larger k-value graphs.
-            if rel_diff_0 > 0.2 && rel_diff_1 <= 0.2 {
-                // 1 has similar counts as the neighbours
-                // We remove the connections with 0
-                // println!("here6");
-                let tmpvec: Vec<EdgeIndex> = ptgraph
-                    .graph
-                    .edges_directed(midconns[0].0, Outgoing)
-                    .chain(ptgraph.graph.edges_directed(midconns[0].0, Incoming))
-                    .map(|er| er.id())
-                    .collect();
-                for e in tmpvec {
-                    ptgraph.graph.remove_edge(e);
-                }
-            } else if rel_diff_0 <= 0.2 && rel_diff_1 > 0.2 {
-                // 0 has similar counts as the neighbours
-                // We remove the connections with 1
-                // println!("here7");
-                let tmpvec: Vec<EdgeIndex> = ptgraph
-                    .graph
-                    .edges_directed(midconns[1].0, Outgoing)
-                    .chain(ptgraph.graph.edges_directed(midconns[1].0, Incoming))
-                    .map(|er| er.id())
-                    .collect();
-                for e in tmpvec {
-                    ptgraph.graph.remove_edge(e);
-                }
-            } else {
-                // println!("here8");
-                // Both have different counts as the neighbours
-                // Perhaps both connections are unlikely. We remove all the connections of the bubble (i.e. we create a contig break).
-                let tmpvec: Vec<EdgeIndex> = ptgraph
-                    .graph
-                    .edges_directed(midconns[0].0, Outgoing)
-                    .chain(ptgraph.graph.edges_directed(midconns[0].0, Incoming))
-                    .chain(
-                        ptgraph
-                            .graph
-                            .edges_directed(midconns[1].0, Outgoing)
-                            .chain(ptgraph.graph.edges_directed(midconns[1].0, Incoming)),
-                    )
-                    .map(|er| er.id())
-                    .collect();
-                for e in tmpvec {
-                    ptgraph.graph.remove_edge(e);
-                }
-            }
-            // In these cases we exit as there is nothing else to do
-            return true;
-        } else {
-            // println!("here9");
-            // The difference in the number of k-mers is very small, this could be a SNP. Let's pick up the highest count one.
-            if node0w.counts > node1w.counts {
-                // println!("here10");
-                chosennode = 0;
-                savedmidw = node0w.clone();
-            } else if node0w.counts < node1w.counts {
-                // println!("here11");
-                chosennode = 1;
-                savedmidw = node1w.clone();
-            } else if node0w.abs_ind.len() > node1w.abs_ind.len() {
-                // println!("here12");
-                chosennode = 0;
-                savedmidw = node0w.clone();
-            } else {
-                // println!("here13");
-                chosennode = 1;
-                savedmidw = node1w.clone();
-            }
-        }
+    match choose_branch_by_counts(ptgraph, &midconns, pop_ratio) {
+        BubbleChoice::Keep(w) => apply_bubble_collapse(ptgraph, startn, &midconns, w),
+        BubbleChoice::Leave => false,
     }
-
-    // // Decision time! (simple)
-    // if node0w.counts > node1w.counts {
-    //     chosennode = 0;
-    //     savedmidw = node0w.clone();
-    // } else if node0w.counts < node1w.counts {
-    //     chosennode = 1;
-    //     savedmidw = node1w.clone();
-    // } else if node0w.abs_ind.len() > node1w.abs_ind.len() {
-    //     chosennode = 0;
-    //     savedmidw = node0w.clone();
-    // } else {
-    //     chosennode = 1;
-    //     savedmidw = node1w.clone();
-    // }
-
-    // We need to know if we are arriving, at the exit node of the bubble, to the Max ct.
-    let midnodect = midconns[chosennode].1.get_from_and_to().1;
-    let midconn2 = ptgraph.out_neighbours_bi(midconns[chosennode].0, midnodect)[0];
-    let outct = midconn2.1.get_from_and_to().1;
-    let outconn = ptgraph.out_neighbours_bi(midconn2.0, outct)[0];
-    let savedoutw = ptgraph.graph.node_weight(midconn2.0).unwrap().clone();
-
-    // By construction, the start node and the end node MUST have only one k-mer. If not, something is wrong.
-    if ptgraph.graph.node_weight(startn).unwrap().abs_ind.len() > 1
-        || ptgraph.graph.node_weight(midconn2.0).unwrap().abs_ind.len() > 1
-    {
-        panic!("Trying to remove a bubble with a start or end node with more than one k-mer!");
-    };
-
-    // We have copied the weights and have the information we need to continue, we can thus erase all the
-    // nodes except from the start node.
-    ptgraph.graph.remove_node(midconns[0].0); // intermediate node 0
-    ptgraph.graph.remove_node(midconns[1].0); // intermediate node 1
-    ptgraph.graph.remove_node(midconn2.0); // end node
-                                           // At the end, the final node (the original start node) will have an internal node with and edge
-                                           // MinToMin, as we are starting from the Min ct in any case. However, we might need to adjust the
-                                           // following edges from the end node if we exit through the Max one.
-
-    let mutrefw = ptgraph.graph.node_weight_mut(startn).unwrap();
-
-    mutrefw.merge(&savedmidw, midconns[chosennode].1); // Intermediate node k-mer(s)
-    mutrefw.set_internal_edge(EdgeType::MinToMin); // Inner edge
-    mutrefw.abs_ind.push(savedoutw.abs_ind[0]); // Out node k-mer
-    mutrefw.set_mean_counts(&[mutrefw.counts, savedmidw.counts, savedoutw.counts]);
-
-    match outct {
-        CarryType::Min => {
-            // Now, we must link the start node with the following node to whatever node the end
-            // node was connected.
-            ptgraph
-                .graph
-                .add_edge(startn, outconn.0, EmptyEdge { t: outconn.1 });
-            ptgraph
-                .graph
-                .add_edge(outconn.0, startn, EmptyEdge { t: outconn.1.rev() });
-        }
-        CarryType::Max => {
-            // We must check what edges we had
-            let tmptype = EdgeType::from_carrytypes(CarryType::Min, outconn.1.get_from_and_to().1);
-            ptgraph
-                .graph
-                .add_edge(startn, outconn.0, EmptyEdge { t: tmptype });
-            ptgraph
-                .graph
-                .add_edge(outconn.0, startn, EmptyEdge { t: tmptype.rev() });
-        }
-    }
-    true
 }
 
 /// Remove dead input path.
 #[inline]
-fn remove_paths(ptgraph: &mut PtGraph, to_remove: Drain<NodeIndex>) {
+fn remove_paths(ptgraph: &mut DbgGraph, to_remove: Drain<NodeId>) {
     log::trace!("Removing {} dead paths", to_remove.len());
     for n in to_remove {
-        ptgraph.graph.remove_node(n);
+        ptgraph.remove_node(n);
     }
 }
 
 /// Check if vertex initializes a dead path.
 #[inline]
 fn check_dead_path(
-    ptgraph: &PtGraph,
-    vertex: NodeIndex,
-    output_vec: &mut Vec<NodeIndex>,
+    ptgraph: &DbgGraph,
+    vertex: NodeId,
+    output_vec: &mut Vec<NodeId>,
     k: usize,
     carryedge: EdgeType,
 ) {
     let mut current_vertex = vertex;
     output_vec.push(current_vertex);
-    let cntopt = ptgraph.graph.node_weight(current_vertex);
+    let cntopt = ptgraph.node_weight(current_vertex);
     let mut cnt: usize;
     if let Some(thecntopt) = cntopt {
         cnt = thecntopt.abs_ind.len();
@@ -545,31 +323,15 @@ fn check_dead_path(
     }
 
     let (mut ty, _) = carryedge.get_from_and_to();
-    //     println!("> Checking tip from vertex {:?} with in_deg. {}, out_deg {}, and in the direction {:?}; k = {}",
-    //         current_vertex, ptgraph.in_degree(current_vertex), ptgraph.out_degree(current_vertex),
-    //         second_direction, k);
-    let minnts = 100; // independent of this value, the minimum number of nts will be always k
-    let limit = max(0, minnts - k + 1);
-    // println!("\n START");
+    let limit = short_path_limit(100, k);
+
     loop {
-        //         println!("\t- Iteration: curr_vertex {:?}, cnt {}", current_vertex, cnt);
         if cnt >= limit {
-            // this path is not dead
-            // println!("\t\t# Path deemed NOT dead! Count {}", cnt);
             output_vec.clear();
             return;
         }
 
-        // This, when we change back to standard graphs surely will be more optimised. Now,
-        // I don't know if we can do much better...
-        let fwdneigh = ptgraph.out_neighbours_bi(current_vertex, ty); // NOTE: as all shrunk nodes have straight
-                                                                      // internal edges, we don't need to check them,
-                                                                      // because the entry and exit types will
-                                                                      // always be the same.
-
-        // if let Some(id) = ptgraph.graph.node_weight(current_vertex).unwrap().innerdir {
-        //     println!("{:?}", id);
-        // }
+        let fwdneigh = ptgraph.out_neighbours_bi(current_vertex, ty);
         let nfwdn = fwdneigh.len();
 
         if nfwdn != 1 {
@@ -586,16 +348,13 @@ fn check_dead_path(
         if nbkgn_c == 0 {
             panic!("Not expected! 2");
         } else if nbkgn_c != 1 {
-            // We want to check before removing this tip that is the best one that could be removed.
-            let mut altpath: Vec<Vec<NodeIndex>> = Vec::with_capacity(nbkgn_c - 1);
+            let mut altpath: Vec<Vec<NodeId>> = Vec::with_capacity(nbkgn_c - 1);
             let mut maxlen = 0;
-            // println!("Last: {:?}, Vector: {:?}", *output_vec.last().unwrap(), bkgneigh_c);
             for n in bkgneigh_c.iter() {
                 if n.0 == *output_vec.last().unwrap() {
-                    // println!("This happens!");
                     continue;
                 } else {
-                    let mut tmppath: Vec<NodeIndex> = Vec::new();
+                    let mut tmppath: Vec<NodeId> = Vec::new();
                     check_backwards_path(
                         ptgraph,
                         n.0,
@@ -613,13 +372,7 @@ fn check_dead_path(
                 }
             }
 
-            // TODO/NOTE: perhaps add count critera instead of just length?
-            // TODO: if the following if is not true, remove the correspondent tips and don't let that work for
-            //       a different iteration.
-
             if maxlen != 0 && cnt > maxlen {
-                // println!("Erasing other tip(s)! Count: {}, maxlen: {}", cnt, maxlen);
-                // This means that we should NOT erase this tip, but the other(s), because they are shorter.
                 output_vec.clear();
                 for iv in altpath.iter_mut() {
                     output_vec.append(iv);
@@ -628,24 +381,11 @@ fn check_dead_path(
             return;
         }
 
-        // Now we check the following neighbours
         if nfwdn_c == 0 {
-            // Nowhere to continue after the candidate!
-            // This is the situation (perfect sequence of kmers, no previous nor more forward neighbours in thec
-            // candidate node) where we can just try to end this sequence of kmers and see whether we make the
-            // minimum or not.
-
             output_vec.push(candidate_node);
-            cnt += ptgraph
-                .graph
-                .node_weight(candidate_node)
-                .unwrap()
-                .abs_ind
-                .len();
+            cnt += ptgraph.node_weight(candidate_node).unwrap().abs_ind.len();
 
             if cnt >= limit {
-                // this path is not dead
-                // println!("\t\t# Path deemed NOT dead! Count {}", cnt);
                 output_vec.clear();
             }
             return;
@@ -653,40 +393,275 @@ fn check_dead_path(
             current_vertex = candidate_node;
             ty = candidate_ty;
             output_vec.push(current_vertex);
-            cnt += ptgraph
-                .graph
-                .node_weight(current_vertex)
-                .unwrap()
-                .abs_ind
-                .len();
+            cnt += ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
         } else {
-            // We don't want to remove anything in this case
-            // println!("ALTERNATE ENDING");
             output_vec.clear();
             return;
         }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparrowhawk_graph::{DbgGraph, NodeStruct};
+
+    fn make_node() -> NodeStruct {
+        NodeStruct {
+            counts: 10,
+            abs_ind: vec![0u64],
+            innerdir: None,
+        }
+    }
+
+    // ── dead-path limit formula ──────────────────────────────────────────────
+
+    // These used to re-implement the formula inline instead of calling it, which is precisely why an
+    // integer underflow above k = 100 survived: every case they covered was under the boundary, and a
+    // copy of the code cannot disagree with itself.
+
+    #[test]
+    fn dead_path_limit_k3() {
+        assert_eq!(short_path_limit(100, 3), 98);
+    }
+
+    #[test]
+    fn dead_path_limit_k31() {
+        assert_eq!(short_path_limit(100, 31), 70);
+    }
+
+    #[test]
+    fn dead_path_limit_k100() {
+        assert_eq!(short_path_limit(100, 100), 1);
+    }
+
+    /// The first k that underflowed. `100 - 101 + 1` on `usize` wraps to ~1.8e19, after which every
+    /// contig is dropped and every path is judged dead — a k > 100 assembly came out entirely empty.
+    #[test]
+    fn dead_path_limit_does_not_underflow_above_minnts() {
+        assert_eq!(short_path_limit(100, 101), 0);
+        assert_eq!(short_path_limit(100, 139), 0);
+        assert_eq!(short_path_limit(100, 255), 0);
+    }
+
+    /// A single k-mer already spans k bases, so above the threshold nothing may be filtered for length.
+    #[test]
+    fn a_single_kmer_contig_survives_when_k_exceeds_the_floor() {
+        for k in [101usize, 139, 255] {
+            assert!(
+                1 > short_path_limit(100, k),
+                "one k-mer spans {k} bases, which is over the 100 nt floor"
+            );
+        }
+    }
+
+    // ── check_bubble_structure ───────────────────────────────────────────────
+
+    /// Build a valid 5-node diamond: S → M1 → E → F
+    ///                                S → M2 → E
+    fn make_valid_bubble() -> (DbgGraph, NodeId, Vec<BubbleStartEdge>) {
+        let mut g = DbgGraph::new(3);
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(make_node());
+        let m2 = g.add_node(make_node());
+        let e = g.add_node(make_node());
+        let f = g.add_node(make_node());
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        g.add_bi_edge(s, m2, EdgeType::MinToMin);
+        g.add_bi_edge(m1, e, EdgeType::MinToMin);
+        g.add_bi_edge(m2, e, EdgeType::MinToMin);
+        g.add_bi_edge(e, f, EdgeType::MinToMin);
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
+        (g, s, edges)
+    }
+
+    // ── the pop rule ─────────────────────────────────────────────────────────
+
+    /// The same diamond, with the two branches given explicit coverages and an **upstream flank**.
+    ///
+    /// The flank matters: `pop_bubbles_by_coverage` filters candidates on `out_degree(start) == 3`,
+    /// which decomposes as the two outgoing `Min` branches plus the one outgoing `Max` back-link that
+    /// `add_bi_edge` installs for the incoming flank edge. Without `f0 -> s` the degree is 2 and the
+    /// bubble is never even offered to the heuristic.
+    fn bubble_with_counts(c0: u32, c1: u32) -> (DbgGraph, NodeId, Vec<(NodeId, EdgeType)>) {
+        let mut g = DbgGraph::new(3);
+        let f0 = g.add_node(make_node());
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(NodeStruct { counts: c0, ..make_node() });
+        let m2 = g.add_node(NodeStruct { counts: c1, ..make_node() });
+        let e = g.add_node(make_node());
+        let f = g.add_node(make_node());
+        g.add_bi_edge(f0, s, EdgeType::MinToMin);
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        g.add_bi_edge(s, m2, EdgeType::MinToMin);
+        g.add_bi_edge(m1, e, EdgeType::MinToMin);
+        g.add_bi_edge(m2, e, EdgeType::MinToMin);
+        g.add_bi_edge(e, f, EdgeType::MinToMin);
+        assert_eq!(g.out_degree(s), 3, "fixture must be a candidate for the popper");
+        let mids = g.out_neighbours_min(s);
+        (g, s, mids)
+    }
+
+    /// Index in `mids` of the branch with the higher count.
+    ///
+    /// `out_neighbours_min` does not promise insertion order, so a test that assumed `mids[0]` is the
+    /// first node it added would be asserting on an artefact of `petgraph`'s edge storage rather than
+    /// on the rule. Ask the graph instead.
+    fn stronger(g: &DbgGraph, mids: &[(NodeId, EdgeType)]) -> usize {
+        let c0 = g.node_weight(mids[0].0).unwrap().counts;
+        let c1 = g.node_weight(mids[1].0).unwrap().counts;
+        if c0 >= c1 {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// **The regression this whole rule exists to prevent.** A collapsed two-copy repeat has branches
+    /// of equal length and equal coverage; the old heuristic fell through to an arbitrary `Keep(1)` and
+    /// deleted one real copy. Nothing may be touched here, however the ratio is set.
+    #[test]
+    fn equal_coverage_bubble_is_left_alone() {
+        let (g, _s, mids) = bubble_with_counts(40, 40);
+        for ratio in [0.01_f32, 0.1, 0.5, 0.99] {
+            assert_eq!(
+                choose_branch_by_counts(&g, &mids, ratio),
+                BubbleChoice::Leave,
+                "equal coverage must never pop, ratio {ratio}"
+            );
+        }
+
+        let (mut g, _s, _) = bubble_with_counts(40, 40);
+        let before = g.node_count();
+        assert!(!pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO));
+        assert_eq!(g.node_count(), before, "the graph must be untouched");
+    }
+
+    /// A branch carrying a twentieth of the other is noise, and is popped — whichever way round the
+    /// two are stored.
+    #[test]
+    fn a_noise_branch_is_popped() {
+        for (c0, c1) in [(100u32, 5u32), (5, 100)] {
+            let (g, _s, mids) = bubble_with_counts(c0, c1);
+            assert_eq!(
+                choose_branch_by_counts(&g, &mids, 0.1),
+                BubbleChoice::Keep(stronger(&g, &mids)),
+                "must keep the stronger branch for ({c0}, {c1})"
+            );
+        }
+
+        let (mut g, _s, _) = bubble_with_counts(100, 5);
+        let before = g.node_count();
+        assert!(pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO));
+        assert!(g.node_count() < before, "the popped branch and end node are gone");
+    }
+
+    /// Pins the boundary: the comparison is a strict `<`, so a branch sitting exactly on the ratio
+    /// survives. Getting this backwards would pop bubbles at exactly 10 %, which is the side of the
+    /// line where two real things start to look alike.
+    #[test]
+    fn a_branch_exactly_on_the_ratio_survives() {
+        let (g, _s, mids) = bubble_with_counts(100, 10);
+        assert_eq!(choose_branch_by_counts(&g, &mids, 0.1), BubbleChoice::Leave);
+
+        let (g, _s, mids) = bubble_with_counts(100, 9);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, 0.1),
+            BubbleChoice::Keep(stronger(&g, &mids))
+        );
+    }
+
+    /// A `0/0` bubble decides nothing and is left alone — the old code had a floor of 1 on the
+    /// threshold specifically to force a drop here, and that floor is gone.
+    #[test]
+    fn a_zero_coverage_bubble_is_left_alone() {
+        let (g, _s, mids) = bubble_with_counts(0, 0);
+        assert_eq!(choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO), BubbleChoice::Leave);
+
+        // But zero beside anything real is still noise.
+        let (g, _s, mids) = bubble_with_counts(50, 0);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO),
+            BubbleChoice::Keep(stronger(&g, &mids))
+        );
+    }
+
+    #[test]
+    fn valid_bubble_returns_true() {
+        let (g, s, edges) = make_valid_bubble();
+        assert!(check_bubble_structure(&g, s, edges));
+    }
+
+    #[test]
+    fn invalid_midnodes_equal() {
+        // Two edges from S to the same node M1 → midnodes[0] == midnodes[1]
+        let mut g = DbgGraph::new(3);
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(make_node());
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        g.add_edge(s, m1, EdgeType::MinToMax); // second edge to same node
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
+        assert_eq!(edges.len(), 2);
+        assert!(!check_bubble_structure(&g, s, edges));
+    }
+
+    #[test]
+    fn invalid_midnode_is_startn() {
+        // One invec edge is a self-loop on S → midnodes[0] == startn
+        let mut g = DbgGraph::new(3);
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(make_node());
+        g.add_edge(s, s, EdgeType::MinToMin); // self-loop
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
+        assert_eq!(edges.len(), 2);
+        assert!(!check_bubble_structure(&g, s, edges));
+    }
+
+    #[test]
+    fn invalid_wrong_in_degree_of_middle() {
+        // Add an extra incoming Min edge to M1 → in_degree check fails
+        let (mut g, s, edges) = make_valid_bubble();
+        let extra = g.add_node(make_node());
+        let m1 = edges[0].target;
+        g.add_bi_edge(extra, m1, EdgeType::MinToMin);
+        // Now in_neighbours_bi(M1, Min).len() == 2 != 1, so the structure is invalid.
+        assert!(!check_bubble_structure(&g, s, edges));
+    }
+
+    #[test]
+    fn invalid_paths_diverge() {
+        // M1 → E1, M2 → E2 (different end nodes) → false
+        let mut g = DbgGraph::new(3);
+        let s = g.add_node(make_node());
+        let m1 = g.add_node(make_node());
+        let m2 = g.add_node(make_node());
+        let e1 = g.add_node(make_node());
+        let e2 = g.add_node(make_node());
+        let f = g.add_node(make_node());
+        g.add_bi_edge(s, m1, EdgeType::MinToMin);
+        g.add_bi_edge(s, m2, EdgeType::MinToMin);
+        g.add_bi_edge(m1, e1, EdgeType::MinToMin);
+        g.add_bi_edge(m2, e2, EdgeType::MinToMin); // different end
+        g.add_bi_edge(e1, f, EdgeType::MinToMin);
+        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
+        assert!(!check_bubble_structure(&g, s, edges));
+    }
+}
+
 fn check_backwards_path(
-    ptgraph: &PtGraph,
-    vertex: NodeIndex,
+    ptgraph: &DbgGraph,
+    vertex: NodeId,
     mut ty: CarryType,
-    output_vec: &mut Vec<NodeIndex>,
+    output_vec: &mut Vec<NodeId>,
     kmerlimit: usize,
 ) {
     let mut current_vertex = vertex;
     output_vec.push(current_vertex);
-    let mut cnt = ptgraph
-        .graph
-        .node_weight(current_vertex)
-        .unwrap()
-        .abs_ind
-        .len();
-    // println!("Starting search backwards from node {:?} and ty {:?}", vertex, ty);
+    let mut cnt = ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
+
     loop {
         if cnt >= kmerlimit {
-            // this path is not dead
             output_vec.clear();
             return;
         }
@@ -694,21 +669,12 @@ fn check_backwards_path(
         let bkgneigh = ptgraph.in_neighbours_bi(current_vertex, ty);
         let bkgneighlen = bkgneigh.len();
         if bkgneighlen == 0 {
-            // Before just returning, let's check the outward neighbours:
             if ptgraph.out_neighbours_bi(current_vertex, ty).len() != 1 {
-                // This is not another tip
                 output_vec.clear();
             }
             return;
         } else if bkgneighlen == 1 {
-            // BUG =================================
-            // current_vertex = bkgneigh[0].0;
-            // BUG =================================
-
-            // Before confirming this new node, check if it is clearly member of a tip
-            // if ptgraph.in_degree(current_vertex) > 1 || ptgraph.out_degree(current_vertex) > 1 {
             if ptgraph.out_neighbours_bi(current_vertex, ty).len() != 1 {
-                // This is not another tip
                 output_vec.clear();
                 return;
             }
@@ -716,14 +682,8 @@ fn check_backwards_path(
             current_vertex = bkgneigh[0].0;
             ty = bkgneigh[0].1.get_from_and_to().0;
             output_vec.push(current_vertex);
-            cnt += ptgraph
-                .graph
-                .node_weight(current_vertex)
-                .unwrap()
-                .abs_ind
-                .len();
+            cnt += ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
         } else {
-            // This is not another tip
             output_vec.clear();
             return;
         }

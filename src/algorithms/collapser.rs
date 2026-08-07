@@ -1,31 +1,17 @@
-//! Create string representation of contigs out of `Graph`.
+//! Create string representation of contigs out of `DbgGraph`.
 
-use super::corrector::Correctable;
 use super::shrinker::Shrinkable;
-use crate::graphs::pt_graph::{CarryType, NodeIndex, NodeStruct, PtGraph};
-use crate::graphs::Graph;
-use std::cmp::max;
-// use std::process::exit;
+use sparrowhawk_graph::{
+    get_nodelist_kmer_length, CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs,
+};
 
-// use rayon::prelude::*;
-use petgraph;
-use petgraph::algo::{connected_components, tarjan_scc};
-use petgraph::visit::EdgeRef;
-use petgraph::EdgeDirection;
-
-/// Collapse `Graph` into `SerializedContigs`.
+/// Collapse `DbgGraph` into `SerializedContigs`.
 pub trait Collapsable: Shrinkable {
-    /// Collapses `Graph` into `SerializedContigs`.
+    /// Collapses into `SerializedContigs`.
     fn collapse(self) -> SerializedContigs;
 }
 
-/// Representation of serialized contig.
-pub type SerializedContig = Vec<NodeStruct>;
-
-/// Collection of serialized contigs.
-pub type SerializedContigs = Vec<Vec<NodeStruct>>;
-
-impl Collapsable for PtGraph {
+impl Collapsable for DbgGraph {
     fn collapse(mut self) -> SerializedContigs {
         let mut contigs: SerializedContigs = vec![];
 
@@ -34,25 +20,13 @@ impl Collapsable for PtGraph {
 
         log::info!(
             "Graph has {} weakly connected component(s), among which {} are single nodes.",
-            connected_components(&petgraph::graph::Graph::from(self.graph.clone())),
-            self.graph
-                .node_indices()
-                .filter(|n| self
-                    .graph
-                    .neighbors_directed(*n, EdgeDirection::Outgoing)
-                    .count()
-                    == 0
-                    && self
-                        .graph
-                        .neighbors_directed(*n, EdgeDirection::Incoming)
-                        .count()
-                        == 0)
-                .count()
+            self.connected_components(),
+            self.isolated_node_count()
         );
 
         log::info!("Starting collapse loop.");
-        let minnts = 100; // independent of this value, the minimum number of nts will be always k
-        let limit = max(0, minnts - self.k + 1);
+        // 100 nt, though independent of this value the minimum is always at least k.
+        let limit = crate::algorithms::corrector::short_path_limit(100, self.k());
 
         loop {
             loop {
@@ -66,24 +40,21 @@ impl Collapsable for PtGraph {
                 for n in externals {
                     // We need first to take care of perfect contigs, almost-already provided as such. These
                     // are seen as nodes with no incoming/outcoming edges.
-                    if self.graph.contains_node(n) {
+                    if self.contains_node(n) {
                         if self.get_good_connections_degree(n) == 0 {
                             log::debug!("\t\t# Isolated node.");
-                            let thecont = vec![self.graph.node_weight(n).unwrap().clone()];
-                            if get_contig_length(&thecont) > limit {
+                            let thecont = vec![self.node_weight(n).unwrap().clone()];
+                            if get_nodelist_kmer_length(&thecont) > limit {
                                 contigs.push(thecont);
                             }
-                            // contigs.push(thecont);
-                            self.graph.remove_node(n);
-                        //                         tobreak = false;
+                            self.remove_node(n);
                         } else {
-                            // log::debug!("\t\t# Non-isolated node: creating contig.");
                             stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
                                 let contigs_ = contigs_from_vertex(&mut self, n);
                                 contigs.extend(
                                     contigs_
                                         .into_iter()
-                                        .filter(|c| get_contig_length(c) > limit)
+                                        .filter(|c| get_nodelist_kmer_length(c) > limit)
                                         .collect::<Vec<_>>(),
                                 );
                             });
@@ -91,33 +62,21 @@ impl Collapsable for PtGraph {
                     }
                 }
             }
-            //                 if tobreak {break};
             log::debug!("\t- Loops over external nodes finished.");
 
-            // break;
-
-            let tmpc = self.graph.node_count();
+            let tmpc = self.node_count();
             if tmpc != 0 {
                 // we guarantee that there's at least one node to unwrap here
                 log::debug!(
                     "\t\t# {} nodes remain. Starting to build from middle node.",
                     tmpc
                 );
-                //                 break;
-                //                 log::debug!("\t\t# Getting strongly-connected components");
-
-                // log::info!("Saving remaining graph with loops/bubbles/circumferences/whatever as DOT file...");
-                // if path_.is_some() && dosave {
-                //     let mut wbuf = set_ostream(&Some(path_.unwrap().clone().replace(".dot", "_beforeattackingtheremains.dot")));
-                //     self.write_to_dot(&mut wbuf);
-                //     dosave = false;
-                // }
 
                 // This call to stacker::grow here is needed because of the algorithm that is run to obtain the
                 // strongly-connected components. It is recursive, so in very entangled graphs (and/or when k is
                 // low, i.e. k ~< 15), it might lead to a stack overflow.
                 stacker::grow(100 * 1024 * 1024, || {
-                    let sccvec: Vec<Vec<NodeIndex>> = tarjan_scc(&self.graph);
+                    let sccvec: Vec<Vec<NodeId>> = self.strongly_connected_components();
                     let node_in_cycle = sccvec[0].last().unwrap();
 
                     log::debug!(
@@ -132,7 +91,7 @@ impl Collapsable for PtGraph {
                     contigs.extend(
                         thecontigs
                             .into_iter()
-                            .filter(|c| get_contig_length(c) > limit)
+                            .filter(|c| get_nodelist_kmer_length(c) > limit)
                             .collect::<Vec<_>>(),
                     );
                 });
@@ -144,7 +103,7 @@ impl Collapsable for PtGraph {
 
         log::trace!(
             "{} nodes left in the graph after collapse",
-            self.graph.node_count()
+            self.node_count()
         );
         log::info!("Collapse ended. Created {} contigs", contigs.len());
 
@@ -152,51 +111,28 @@ impl Collapsable for PtGraph {
     }
 }
 
-fn get_contig_length(vec: &[NodeStruct]) -> usize {
-    let mut outnum = 0;
-    for ns in vec.iter() {
-        outnum += ns.abs_ind.len();
-    }
-    outnum
-}
-
 // Main collapse function/method
 #[inline]
-fn contigs_from_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> SerializedContigs {
+fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
     let mut contigs: SerializedContigs = vec![];
-    let mut contig: SerializedContig = vec![];
+    let mut contig: Vec<NodeStruct> = vec![];
     let mut current_vertex = v;
-    // let mut current_edge_index;
     let mut target;
-    let outeds: Vec<_> = ptgraph
-        .graph
-        .edges_directed(v, EdgeDirection::Outgoing)
-        .map(|e| e.id())
-        .collect();
     let mut current_type = ptgraph
-        .graph
-        .edge_weight(outeds[0])
+        .first_outgoing_edge_type(v)
         .unwrap()
-        .t
         .get_from_and_to()
         .0;
     let mut outneighs = ptgraph.out_neighbours_bi(v, current_type);
     let mut num_following = outneighs.len();
     let mut num_preceding = 0;
 
-    // log::debug!("\t\t\t% START! From vertex {:?}", current_vertex);
     loop {
-        // log::debug!("\t\t\t% Iteration start: vertex {:?} num_preceding {} num_following {}", current_vertex, num_preceding, num_following);
-
         if num_following == 1 && num_preceding == 0 {
             // Ok, so we can continue, let's go!
-            // current_edge_index = outneighs[0].1;
-            // log::debug!("\t # Cont!");
         } else if num_following == 0 && num_preceding == 0 {
             // We're finishing!!
-            //             log::debug!("{:?}", current_vertex);
-
-            let mut nwtocopy = ptgraph.graph.node_weight(current_vertex).unwrap().clone();
+            let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
             if let Some(innvtx) = nwtocopy.innerdir {
                 if current_type != innvtx.get_from_and_to().0 {
                     nwtocopy.abs_ind.reverse();
@@ -204,14 +140,9 @@ fn contigs_from_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> SerializedContigs
             }
 
             contig.push(nwtocopy);
-            // contig.push(ptgraph.graph.node_weight(current_vertex).expect(&format!("Not found vertex {:?}, that should have num_following {} and num_preceding {}", current_vertex, num_following, num_preceding)).clone());
-
-            //             log::debug!("We are stopping. This is the last contig: {:?}", contig);
             contigs.push(contig.clone());
             contig.clear();
-            //             decrease_weight(ptgraph, current_vertex);
-            ptgraph.graph.remove_node(current_vertex);
-            // log::debug!("\t # Ending without possible continuation!");
+            ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
             // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
@@ -221,19 +152,12 @@ fn contigs_from_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> SerializedContigs
             // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
             if num_following == 0 {
                 // We cannot continue.
-                // log::debug!("\t # Ending because we reach an ambiguous node that is a sink!");
-
-                // TEST BEGIN
-                ptgraph.graph.remove_node(current_vertex);
-                // TEST END
-
+                ptgraph.remove_node(current_vertex);
                 return contigs;
             }
 
-            // TEST BEGIN
-            ptgraph.graph.remove_node(current_vertex);
+            ptgraph.remove_node(current_vertex);
             return contigs;
-            // TEST END
         }
 
         // If we arrived here, current_vertex is either considered good to be added to the current
@@ -242,7 +166,7 @@ fn contigs_from_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> SerializedContigs
         // journey, or we have either a simple loop or a circumference to deal with
 
         // We add the current_vertex to the contig
-        let mut nwtocopy = ptgraph.graph.node_weight(current_vertex).unwrap().clone();
+        let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
         if let Some(innvtx) = nwtocopy.innerdir {
             if current_type != innvtx.get_from_and_to().0 {
                 nwtocopy.abs_ind.reverse();
@@ -252,47 +176,34 @@ fn contigs_from_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> SerializedContigs
         contig.push(nwtocopy);
 
         // We get our next soon-to-be current_vertex (now named "target")
-        // (_, target) = ptgraph.graph.edge_endpoints(current_edge_index).unwrap();
         target = outneighs[0].0;
 
-        //         log::debug!("\t\t\t% Current vertex: {:?}, Target: {:?}", current_vertex, target);
         if current_vertex == target {
             panic!("FATAL: continuing to the same vertex!")
         };
 
         // We update the variables and get ready to do another iteration!
         current_type = outneighs[0].1.get_from_and_to().1;
-        ptgraph.graph.remove_node(current_vertex);
+        ptgraph.remove_node(current_vertex);
         current_vertex = target;
         num_preceding = ptgraph.in_degree_bi(current_vertex, current_type);
         outneighs = ptgraph.out_neighbours_bi(current_vertex, current_type);
         num_following = outneighs.len();
-        //         log::debug!("{} {} {:?}", num_preceding, num_following, target);
     }
 }
 
 #[inline]
-fn contigs_from_intermediate_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> SerializedContigs {
+fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
     let mut contigs: SerializedContigs = vec![];
-    let mut contig: SerializedContig = vec![];
+    let mut contig: Vec<NodeStruct> = vec![];
     let mut current_vertex = v;
-    // let mut current_edge_index;
     let mut target;
 
     // We need to get the carrytype, the edges, and so on before we can begin. We'll try to set them to get a forward
     // direction with only one neighbour, if possible.
     let outeds;
-    let mut outmin = Vec::new();
-    let mut outmax = Vec::new();
-    // let mut started = false;
-
-    for e in ptgraph.graph.edges_directed(v, EdgeDirection::Outgoing) {
-        if e.weight().t.get_from_and_to().0 == CarryType::Min {
-            outmin.push(e.id());
-        } else {
-            outmax.push(e.id());
-        }
-    }
+    let outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
+    let outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
     let outminlen = outmin.len();
     let outmaxlen = outmax.len();
     match (outminlen, outmaxlen) {
@@ -309,31 +220,17 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> Seri
         }
     }
 
-    let mut current_type = ptgraph
-        .graph
-        .edge_weight(outeds[0])
-        .unwrap()
-        .t
-        .get_from_and_to()
-        .0;
+    let mut current_type = outeds[0].2.get_from_and_to().0;
     let mut outneighs = ptgraph.out_neighbours_bi(v, current_type);
     let mut num_following = outneighs.len();
     let mut num_preceding = 0; /////// This is strictly speaking always false here, but it is only for the first iteration.
                                // Afterwards, we respect its true value to decide whether we stop or not the contig formation.
 
-    // log::debug!("\t\t\t% START! From vertex {:?}", current_vertex);
     loop {
-        // log::debug!("\t\t\t% Iteration start: vertex {:?} num_preceding {} num_following {}", current_vertex, num_preceding, num_following);
-
         if num_following == 1 && num_preceding == 0 {
             // Ok, so we can continue, let's go!
-            // current_edge_index = outneighs[0].1;
-            // log::debug!("\t # Cont!");
         } else if num_following == 0 && num_preceding == 0 {
-            // We're finishing!!
-            //             log::debug!("{:?}", current_vertex);
-
-            let mut nwtocopy = ptgraph.graph.node_weight(current_vertex).unwrap().clone();
+            let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
             if let Some(innvtx) = nwtocopy.innerdir {
                 if current_type != innvtx.get_from_and_to().0 {
                     nwtocopy.abs_ind.reverse();
@@ -341,14 +238,9 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> Seri
             }
 
             contig.push(nwtocopy);
-            // contig.push(ptgraph.graph.node_weight(current_vertex).expect(&format!("Not found vertex {:?}, that should have num_following {} and num_preceding {}", current_vertex, num_following, num_preceding)).clone());
-
-            //             log::debug!("We are stopping. This is the last contig: {:?}", contig);
             contigs.push(contig.clone());
             contig.clear();
-            //             decrease_weight(ptgraph, current_vertex);
-            ptgraph.graph.remove_node(current_vertex);
-            // log::debug!("\t # Ending without possible continuation!");
+            ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
             // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
@@ -358,7 +250,6 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> Seri
             // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
             if num_following == 0 {
                 // We cannot continue.
-                // log::debug!("\t # Ending because we reach an ambiguous node that is a sink!");
                 return contigs;
             }
         }
@@ -369,7 +260,7 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> Seri
         // journey, or we have either a simple loop or a circumference to deal with
 
         // We add the current_vertex to the contig
-        let mut nwtocopy = ptgraph.graph.node_weight(current_vertex).unwrap().clone();
+        let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
         if let Some(innvtx) = nwtocopy.innerdir {
             if current_type != innvtx.get_from_and_to().0 {
                 nwtocopy.abs_ind.reverse();
@@ -379,21 +270,18 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut PtGraph, v: NodeIndex) -> Seri
         contig.push(nwtocopy);
 
         // We get our next soon-to-be current_vertex (now named "target")
-        // (_, target) = ptgraph.graph.edge_endpoints(current_edge_index).unwrap();
         target = outneighs[0].0;
 
-        //         log::debug!("\t\t\t% Current vertex: {:?}, Target: {:?}", current_vertex, target);
         if current_vertex == target {
             panic!("FATAL: continuing to the same vertex!")
         };
 
         // We update the variables and get ready to do another iteration!
         current_type = outneighs[0].1.get_from_and_to().1;
-        ptgraph.graph.remove_node(current_vertex);
+        ptgraph.remove_node(current_vertex);
         current_vertex = target;
         num_preceding = ptgraph.in_degree_bi(current_vertex, current_type);
         outneighs = ptgraph.out_neighbours_bi(current_vertex, current_type);
         num_following = outneighs.len();
-        //         log::debug!("{} {} {:?}", num_preceding, num_following, target);
     }
 }

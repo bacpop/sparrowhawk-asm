@@ -1,3 +1,3 @@
 fn main() {
-    sparrowhawk::main();
+    sparrowhawk_asm::main();
 }

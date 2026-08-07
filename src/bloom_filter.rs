@@ -36,7 +36,7 @@ pub struct KmerFilter {
     /// Buffer for the bloom filter
     buffer: Vec<u64>,
     /// Table of counts
-    counts: HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    counts: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     /// Minimum count to pass filter
     min_count: u16,
 }
@@ -86,8 +86,6 @@ impl KmerFilter {
     /// Creates a new filter with given threshold
     ///
     /// Note:
-    /// - Maximum count is [`u16::MAX`] i.e. 65535
-    /// - Must call [`KmerFilter::init()`] before using.
     pub fn new(min_count: u16) -> Self {
         let buf_size =
             f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64 / 8.0) / (u64::BITS as f64))
@@ -128,7 +126,7 @@ impl KmerFilter {
             // Bloom filter then hash table
             _ => {
                 if self.bloom_add_and_check(kmer_hash) {
-                    let mut count: u16 = 2;
+                    let mut count: u32 = 2;
                     self.counts
                         .entry(kmer_hash)
                         .and_modify(|tuple| {
@@ -136,7 +134,7 @@ impl KmerFilter {
                             tuple.0 = count;
                         })
                         .or_insert((count, kmer_nc_hash, bases));
-                    self.min_count.cmp(&count)
+                    (self.min_count as u32).cmp(&count)
                 } else {
                     Ordering::Less
                 }
@@ -147,7 +145,82 @@ impl KmerFilter {
     /// Get method to retrieve the count map
     pub fn get_counts_map(
         &mut self,
-    ) -> &mut HashMap<u64, (u16, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
+    ) -> &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
         &mut self.counts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_filter(min_count: u16) -> KmerFilter {
+        let mut f = KmerFilter::new(min_count);
+        f.init();
+        f
+    }
+
+    #[test]
+    fn min_count_zero_always_equal() {
+        let mut f = make_filter(0);
+        assert_eq!(f.filter(42, 99, 0), Ordering::Equal);
+        assert_eq!(f.filter(42, 99, 0), Ordering::Equal);
+    }
+
+    #[test]
+    fn min_count_one_always_equal() {
+        let mut f = make_filter(1);
+        assert_eq!(f.filter(42, 99, 0), Ordering::Equal);
+        assert_eq!(f.filter(42, 99, 0), Ordering::Equal);
+    }
+
+    #[test]
+    fn min_count_two_reaches_threshold() {
+        let mut f = make_filter(2);
+        // First pass: not yet in bloom filter
+        assert_eq!(f.filter(1234567890, 9876543210, 0b01), Ordering::Less);
+        // Second pass: bloom filter has it → threshold reached
+        assert_eq!(f.filter(1234567890, 9876543210, 0b01), Ordering::Equal);
+    }
+
+    #[test]
+    fn min_count_three_reaches_threshold_on_third_call() {
+        let mut f = make_filter(3);
+        let h = 0xDEADBEEF_CAFEBABEu64;
+        assert_eq!(f.filter(h, 0, 0), Ordering::Less); // singleton (not in bloom)
+        assert_eq!(f.filter(h, 0, 0), Ordering::Greater); // in bloom, count=2 < 3
+        assert_eq!(f.filter(h, 0, 0), Ordering::Equal); // count=3 == min_count
+    }
+
+    #[test]
+    fn independent_counters() {
+        let mut f = make_filter(2);
+        let h1 = 0x0001_0000_0000_0001u64;
+        let h2 = 0x0002_0000_0000_0002u64;
+        // h1 first seen: Less
+        assert_eq!(f.filter(h1, 0, 0), Ordering::Less);
+        // h2 first seen: Less (independent)
+        assert_eq!(f.filter(h2, 0, 0), Ordering::Less);
+        // h1 second time: Equal
+        assert_eq!(f.filter(h1, 0, 0), Ordering::Equal);
+        // h2 second time: Equal (independent)
+        assert_eq!(f.filter(h2, 0, 0), Ordering::Equal);
+    }
+
+    #[test]
+    fn get_counts_map_has_entry_after_threshold() {
+        let mut f = make_filter(3);
+        let h = 0x1234_5678_9ABC_DEF0u64;
+        let nc = 0xFEDC_BA98_7654_3210u64;
+        let bases = 0b1001u8;
+        f.filter(h, nc, bases); // singleton
+        f.filter(h, nc, bases); // count=2 inserted into map
+        f.filter(h, nc, bases); // count=3 reached
+        let map = f.get_counts_map();
+        assert!(map.contains_key(&h));
+        let (count, stored_nc, stored_bases) = map[&h];
+        assert_eq!(count, 3);
+        assert_eq!(stored_nc, nc);
+        assert_eq!(stored_bases, bases);
     }
 }

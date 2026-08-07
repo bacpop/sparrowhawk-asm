@@ -60,7 +60,8 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         // rec_ind: &'a u32,
     ) -> Option<(IntT, NtHashIterator)> {
         // log::info!("Building kmer");
-        if *idx + k >= seq_len {
+        // A k-mer starting at `idx` spans [idx, idx + k - 1], so it exists iff idx + k <= seq_len.
+        if *idx + k > seq_len {
             return None;
         }
         let mut kmer = IntT::zero_init();
@@ -77,7 +78,7 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
                 // Start again, skipping over N
                 // println!("Bad base found, restarting!");
                 *idx += i + 1;
-                if *idx + k >= seq_len {
+                if *idx + k > seq_len {
                     return None;
                 }
                 kmer = IntT::zero_init();
@@ -224,6 +225,41 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         (canhash, notcanhash, thebases, thekmer)
     }
 
+    /// Returns (canonical_hash, non_canonical_hash, bases_byte) without computing
+    /// the full k-mer bits. Use in hot loops where the k-mer value itself is not needed.
+    pub fn get_curr_hash_and_bases(&self) -> (u64, u64, u8) {
+        let (canhash, notcanhash, isittherevcomp) =
+            self.hash_gen.curr_hash_and_whether_it_is_the_inverse();
+        let thebases = if isittherevcomp {
+            (rc_base((self.kmer >> ((self.k - 1) * 2)).as_u8()) & 3)
+                | (rc_base((self.kmer).as_u8() & 3) << 2)
+        } else {
+            ((self.kmer >> ((self.k - 1) * 2)) << 2).as_u8() | ((self.kmer).as_u8() & 3)
+        };
+        (canhash, notcanhash, thebases)
+    }
+
+    /// Returns the current k-mer bits in canonical orientation.
+    /// Call after `get_curr_hash_and_bases()` when the k-mer value is also needed.
+    pub fn get_kmer(&self) -> IntT {
+        let (_, _, isittherevcomp) = self.hash_gen.curr_hash_and_whether_it_is_the_inverse();
+        if isittherevcomp {
+            self.kmer.rev_comp(self.k)
+        } else {
+            self.kmer
+        }
+    }
+
+    /// Advance and return (canonical_hash, non_canonical_hash, bases_byte), or None.
+    /// Lighter than `get_next_kmer_and_give_us_things` — skips computing the k-mer bits.
+    pub fn get_next_hash_and_bases(&mut self) -> Option<(u64, u64, u8)> {
+        if self.roll_fwd() {
+            Some(self.get_curr_hash_and_bases())
+        } else {
+            None
+        }
+    }
+
     /// Get a `u64` hash of the current k-mer using [`NtHashIterator`]
     ///
     /// # Panics
@@ -275,3 +311,117 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
 //
 //     outind | ((*seq_ind as u64) & 33u64)
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn count_kmers(seq: &[u8], k: usize) -> usize {
+        match Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true) {
+            None => 0,
+            Some(mut it) => {
+                let mut c = 1;
+                while it.get_next_kmer_and_give_us_things().is_some() {
+                    c += 1;
+                }
+                c
+            }
+        }
+    }
+
+    #[test]
+    fn kmer_count_basic() {
+        // 8-mer sequence with k=3 → 8-3+1 = 6 k-mers
+        assert_eq!(count_kmers(b"ACGTACGT", 3), 6);
+    }
+
+    #[test]
+    fn kmer_short_seq_returns_none() {
+        assert!(Kmer::<u64>::new(Cow::Borrowed(b"AC"), 2, None, 3, 0, true).is_none());
+    }
+
+    #[test]
+    fn kmer_exact_length_yields_one() {
+        // seq_len == k: the whole sequence is the single k-mer (seq_len - k + 1 = 1)
+        assert_eq!(count_kmers(b"ACG", 3), 1);
+    }
+
+    #[test]
+    fn kmer_exact_length_suffix_after_n() {
+        // "ANACG" k=3: the N restarts the window at idx=2, leaving a suffix of exactly k.
+        // That suffix is a valid k-mer ("ACG") and must not be dropped.
+        assert_eq!(count_kmers(b"ANACG", 3), 1);
+    }
+
+    #[test]
+    fn kmer_minimum_valid_length() {
+        // seq_len = k+1: exactly two k-mers (initial + one roll)
+        assert_eq!(count_kmers(b"ACGT", 3), 2);
+    }
+
+    #[test]
+    fn kmer_n_invalidates_window() {
+        // "ACNGT" k=3: N at pos 2, restart skips to idx=3, leaving only "GT" (< k) → None
+        assert_eq!(count_kmers(b"ACNGT", 3), 0);
+    }
+
+    #[test]
+    fn kmer_n_at_start_skipped() {
+        // "NNNACGT" k=3: three leading Ns skipped, yields "ACG" + "CGT" = 2
+        assert_eq!(count_kmers(b"NNNACGT", 3), 2);
+    }
+
+    #[test]
+    fn kmer_n_in_middle_splits() {
+        // "ACGTNACGT" k=3: "ACG"+"CGT" before N, "ACG"+"CGT" after N = 4
+        assert_eq!(count_kmers(b"ACGTNACGT", 3), 4);
+    }
+
+    #[test]
+    fn kmer_deterministic() {
+        let seq = b"ACGTACGT";
+        let h1 = Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, 3, 0, true)
+            .unwrap()
+            .get_hash();
+        let h2 = Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, 3, 0, true)
+            .unwrap()
+            .get_hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn kmer_quality_filter_reduces_count() {
+        let seq = b"ACGTACGT";
+        // All-passing quality: b'I'=73, (73-33)=40 > 30 ✓
+        let good_qual = vec![b'I'; seq.len()];
+        // Bad quality at position 1 (C): b'!'=33, (33-33)=0 ≤ 30 → fails
+        let mut bad_qual = good_qual.clone();
+        bad_qual[1] = b'!';
+
+        let good_count = count_kmers(seq, 3); // no quality filter → 6
+
+        let bad_count = match Kmer::<u64>::new(
+            Cow::Borrowed(seq.as_slice()),
+            seq.len(),
+            Some(&bad_qual),
+            3,
+            30,
+            true,
+        ) {
+            None => 0,
+            Some(mut it) => {
+                let mut c = 1;
+                while it.get_next_kmer_and_give_us_things().is_some() {
+                    c += 1;
+                }
+                c
+            }
+        };
+
+        assert!(
+            bad_count < good_count,
+            "bad_count={bad_count} good_count={good_count}"
+        );
+    }
+}

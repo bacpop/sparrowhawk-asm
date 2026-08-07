@@ -1,15 +1,16 @@
 //! Efficient genome assembler for small genomes in Rust
 #![warn(missing_docs)]
-use std::{
-    cell::*,
-    // process::exit,
-    collections::HashMap,
-    fmt,
-    hash::BuildHasherDefault,
-};
+use std::fmt;
 
-#[cfg(not(feature = "wasm"))]
-use std::{path::PathBuf, time::Instant, time::SystemTime};
+#[cfg(target_family = "wasm")]
+use std::{collections::HashMap, hash::BuildHasherDefault};
+
+#[cfg(not(target_family = "wasm"))]
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+    time::SystemTime,
+};
 
 extern crate num_cpus;
 
@@ -31,9 +32,6 @@ pub mod nthash;
 /// Contains functions to store the output of the program
 pub mod save_functions;
 
-/// Contains the graph definitions
-pub mod graphs;
-
 /// Contains different traits that implement various algorithms
 pub mod algorithms;
 
@@ -43,36 +41,43 @@ pub mod bloom_filter;
 /// Fits the k-mer spectrum to automatically get a min_count (taken from ska.rust!)
 pub mod spectrum_fitter;
 
-use crate::graphs::pt_graph::EdgeType;
+#[cfg(target_family = "wasm")]
 use nohash_hasher::NoHashHasher;
 
 use crate::graph_works::Assemble;
-use crate::graphs::pt_graph::PtGraph;
 use bit_encoding::{U256, U512};
+
+#[cfg(not(target_family = "wasm"))]
+use crate::bit_encoding::UInt;
+#[cfg(not(target_family = "wasm"))]
+use crate::preprocessing::InputFastx;
+
+// Re-export core graph types so callers do not need to depend on sparrowhawk-graph directly.
+pub use sparrowhawk_graph::{EdgeType, EdgeWeight, HashInfoSimple, Idx};
 
 pub mod cli;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::cli::*;
 
 pub mod io_utils;
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 use crate::io_utils::*;
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 use wasm_bindgen::prelude::*;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 use wasm_bindgen_file_reader::WebSysFile;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 extern crate console_error_panic_hook;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 pub mod fastx_wasm;
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 use crate::graph_works::Contigs;
 
 /// Logging wrapper function for the WebAssembly version
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 pub fn logw(text: &str, typ: Option<&str>) {
     if let Some(thetyp) = typ {
         log((String::from("Sparrowhawk::") + thetyp + "::" + text).as_str());
@@ -82,7 +87,7 @@ pub fn logw(text: &str, typ: Option<&str>) {
 }
 
 /// Logging wrapper function for the standalone version
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn logw(text: &str, typ: Option<&str>) {
     if let Some(realtyp) = typ {
         if realtyp == "info" {
@@ -101,26 +106,6 @@ pub fn logw(text: &str, typ: Option<&str>) {
     } else {
         println!("{}", text);
     }
-}
-
-/// Index type for both nodes and edges in the graph/gir.
-pub type Idx = usize;
-
-/// Type for representing weight of the `Edge`.
-pub type EdgeWeight = u16;
-
-/// Struct that contains the basic information for one k-mer
-pub struct HashInfoSimple {
-    /// maximum hash
-    pub hnc: u64,
-    /// First and last bases
-    pub b: u8,
-    /// found neighbours, if any, previous to this kmer
-    pub pre: Vec<(u64, EdgeType)>,
-    /// found neighbours, if any, posterior to this kmer
-    pub post: Vec<(u64, EdgeType)>,
-    /// Counts associated to this kmer
-    pub counts: u16,
 }
 
 /// Quality filtering options for FASTQ files
@@ -143,7 +128,7 @@ impl fmt::Display for QualOpts {
     }
 }
 
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 /// Sets up logging
 pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
     fern::Dispatch::new()
@@ -163,8 +148,76 @@ pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
         .unwrap();
 }
 
+/// Everything the `build` pipeline needs, once `IntT` has been chosen.
+///
+/// The four k-width branches used to be four verbatim copies of the same fifteen-line body, differing
+/// only in the integer type. Collapsing them into one generic function means a change to the pipeline
+/// is made once instead of four times.
+#[cfg(not(target_family = "wasm"))]
+struct BuildOpts<'a> {
+    input_files: &'a [InputFastx],
+    k: usize,
+    quality: &'a QualOpts,
+    chunk_size: usize,
+    do_bloom: bool,
+    /// Fit `min_count` from the k-mer spectrum rather than using `quality.min_count`.
+    do_fit: bool,
+    do_bubble_collapse: bool,
+    do_dead_end_removal: bool,
+    /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is popped.
+    pop_ratio: f32,
+    output: PathBuf,
+}
+
+/// Run the whole `build` pipeline, monomorphised on the packed-k-mer width.
+#[cfg(not(target_family = "wasm"))]
+fn run_build<IntT>(
+    opts: BuildOpts,
+    timevec: &mut Vec<Instant>,
+    out_paths_histo: &mut [Option<PathBuf>],
+    out_path_graph: &mut Option<PathBuf>,
+) where
+    IntT: for<'a> UInt<'a>,
+{
+    let mut estimated_kmers: u64 = 0;
+    let mut readers = opts.input_files.iter().flat_map(|(_, files)| {
+        files.iter().map(|file| {
+            estimated_kmers += std::fs::metadata(file).map_or(0, |m| m.len());
+            let reader = needletail::parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+            NeedletailIterator::new(reader)
+        }).collect::<Vec<NeedletailIterator>>()
+    }).collect::<Vec<NeedletailIterator>>();
+    estimated_kmers /= 5;
+    let estimated_kmers: usize = estimated_kmers.try_into().unwrap_or(usize::MAX);
+
+    let mut assembly = preprocessing::preprocessing_standalone::<IntT, _>(
+        &mut readers,
+        opts.k,
+        opts.quality,
+        &mut Some(timevec),
+        &mut out_paths_histo[0],
+        opts.chunk_size,
+        opts.do_bloom,
+        opts.do_fit,
+        Some(estimated_kmers),
+    );
+
+    let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
+        opts.k,
+        &mut assembly.themap,
+        &mut assembly.maxmindict,
+        &mut Some(timevec),
+        out_path_graph,
+        opts.do_bubble_collapse,
+        opts.do_dead_end_removal,
+        opts.pop_ratio,
+    );
+
+    save_functions::save_as_fasta::<IntT>(&mut contigs, &assembly.thedict, opts.k, opts.output);
+}
+
 #[doc(hidden)]
-#[cfg(not(feature = "wasm"))]
+#[cfg(not(target_family = "wasm"))]
 pub fn main() {
     let args = cli_args();
 
@@ -182,18 +235,21 @@ pub fn main() {
             min_count,
             min_qual,
             threads,
-            auto_min_count,
             do_bloom,
             chunk_size,
+            bubble_pop_ratio,
             no_histo,
             no_graphs,
             no_bubble_collapse,
             no_dead_end_removal,
-            // no_conflictive_links_removal,
         } => {
-            let mut outputlogfile: PathBuf = output_dir.into();
-            outputlogfile.set_file_name(output_prefix.to_string() + "_log");
-            outputlogfile.set_extension("txt");
+            // Create the output directory if it does not exist, so every write below can assume it is
+            // there.
+            std::fs::create_dir_all(output_dir)
+                .unwrap_or_else(|e| panic!("cannot create output directory {output_dir:?}: {e}"));
+
+            let outputlogfile: PathBuf =
+                Path::new(output_dir).join(format!("{output_prefix}_log.txt"));
             if args.verbose {
                 // set_up_logging(log::LevelFilter::Trace, outputlogfile);
                 set_up_logging(log::LevelFilter::Info, outputlogfile);
@@ -206,17 +262,14 @@ pub fn main() {
             // Read input
             let input_files = get_input_list(file_list, seq_files);
             // let input_files = get_input_list(file_list);
+
+            // Fit the min_count from the spectrum unless an explicit value was given.
+            let do_fit = min_count.is_none();
             let quality = QualOpts {
-                min_count: *min_count,
+                // Only used when do_fit is false; the fit ignores it.
+                min_count: min_count.unwrap_or(DEFAULT_MINCOUNT),
                 min_qual: *min_qual,
             };
-
-            let mut readers = input_files.iter().flat_map(|(_, files)| {
-                files.iter().map(|file| {
-                    let reader = needletail::parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
-                    NeedletailIterator::new(reader)
-                }).collect::<Vec<NeedletailIterator>>()
-            }).collect::<Vec<NeedletailIterator>>();
 
             // Build, merge
             // let rc = !*single_strand;
@@ -229,175 +282,77 @@ pub fn main() {
             log::info!("Beginning processing");
             timevec.push(Instant::now());
 
-            if *auto_min_count {
-                log::info!("Automatic fitting to extract minimum counts per k-mer will be done.");
+            if do_fit {
+                log::info!("Minimum count per k-mer will be fitted from the spectrum, per k.");
             } else {
-                log::info!("Minimum count per k-mer to be considered is {}", min_count);
+                log::info!(
+                    "Minimum count per k-mer to be considered is {}",
+                    quality.min_count
+                );
             }
 
-            let mut preprocessed_data: HashMap<
-                u64,
-                RefCell<HashInfoSimple>,
-                BuildHasherDefault<NoHashHasher<u64>>,
-            >;
-            let theseq: Vec<u64>;
-            let mut maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
-
-            let mut out_path_histo: Option<PathBuf>;
-            if *no_histo {
-                out_path_histo = None;
+            let mut out_paths_histo: Vec<Option<PathBuf>> = vec![if *no_histo {
+                None
             } else {
-                out_path_histo = Some(output_dir.into());
-                out_path_histo
-                    .as_mut()
-                    .unwrap()
-                    .set_file_name(output_prefix.to_owned() + "_kmerspectrum");
-                out_path_histo.as_mut().unwrap().set_extension("png");
-            }
-            let mut out_path_graph: Option<PathBuf>;
-            if *no_graphs {
-                out_path_graph = None;
+                Some(Path::new(output_dir).join(format!("{output_prefix}_kmerspectrum.png")))
+            }];
+
+            // No extension here: `assemble` sets .dot/.gfa/.gfa2 on this base path later (hence `mut`).
+            let mut out_path_graph: Option<PathBuf> = if *no_graphs {
+                None
             } else {
-                out_path_graph = Some(output_dir.into());
-                out_path_graph
-                    .as_mut()
-                    .unwrap()
-                    .set_file_name(output_prefix.to_owned() + "_graph");
+                Some(Path::new(output_dir).join(format!("{output_prefix}_graph")))
+            };
+
+            let output: PathBuf =
+                Path::new(output_dir).join(format!("{output_prefix}_contigs.fasta"));
+
+            if !(*bubble_pop_ratio > 0.0 && *bubble_pop_ratio < 1.0) {
+                eprintln!(
+                    "error: --bubble-pop-ratio must be strictly between 0 and 1 (got \
+                     {bubble_pop_ratio}). It is the fraction of the stronger branch's coverage below \
+                     which the weaker branch counts as an error; 1.0 or more pops every bubble, 0.0 or \
+                     less pops none."
+                );
+                std::process::exit(2);
             }
+            let opts = BuildOpts {
+                input_files: &input_files,
+                k: *k,
+                quality: &quality,
+                chunk_size: *chunk_size,
+                do_bloom: *do_bloom,
+                do_fit,
+                do_bubble_collapse: !no_bubble_collapse,
+                do_dead_end_removal: !no_dead_end_removal,
+                pop_ratio: *bubble_pop_ratio,
+                output,
+            };
 
-            let mut output: PathBuf = output_dir.into();
-            output.set_file_name(output_prefix.to_string() + "_contigs");
-            output.set_extension("fasta");
-
-            let mut fasta_writer = set_ostream(&Some(output.into_os_string().into_string().unwrap()));
-
-            if *k % 2 == 0 {
+            // The packed k-mer must fit in 2*k bits, so k picks the integer width.
+            if k % 2 == 0 {
                 panic!("Support for even k-mer lengths not implemented");
-            } else if *k < 3 {
-                panic!("kmer length too small (min. 3)");
-            } else if *k <= 32 {
-                log::info!("k={}: using 64-bit representation", *k);
-                let thedict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<u64, _>(
-                        &mut readers,
-                        *k,
-                        &quality,
-                        &mut Some(&mut timevec),
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-                drop(theseq);
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut Some(&mut timevec),
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<u64, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
-            // FASTA file(s)
-            } else if *k <= 64 {
-                log::info!("k={}: using 128-bit representation", *k);
-                let thedict: HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<u128, _>(
-                        &mut readers,
-                        *k,
-                        &quality,
-                        &mut Some(&mut timevec),
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-                drop(theseq);
-
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut Some(&mut timevec),
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<u128, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
-            // FASTA file(s)
-            } else if *k <= 128 {
-                log::info!("k={}: using 256-bit representation", *k);
-
-                let thedict: HashMap<u64, U256, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<U256, _>(
-                        &mut readers,
-                        *k,
-                        &quality,
-                        &mut Some(&mut timevec),
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-                drop(theseq);
-
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut Some(&mut timevec),
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<U256, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
-            // FASTA file(s)
-            } else if *k <= 256 {
-                log::info!("k={}: using 512-bit representation", *k);
-
-                let thedict: HashMap<u64, U512, BuildHasherDefault<NoHashHasher<u64>>>;
-                (preprocessed_data, theseq, thedict, maxmindict) =
-                    preprocessing::preprocessing_standalone::<U512, _>(
-                        &mut readers,
-                        *k,
-                        &quality,
-                        &mut Some(&mut timevec),
-                        &mut out_path_histo,
-                        *chunk_size,
-                        *do_bloom,
-                        *auto_min_count,
-                    );
-                drop(theseq);
-
-                let mut contigs = graph_works::BasicAsm::assemble::<PtGraph>(
-                    *k,
-                    &mut preprocessed_data,
-                    &mut maxmindict,
-                    &mut Some(&mut timevec),
-                    &mut out_path_graph,
-                    !no_bubble_collapse,
-                    !no_dead_end_removal,
-                    false,
-                );
-
-                // Save as fasta
-                save_functions::save_as_fasta::<U512, _>(&mut contigs, &thedict, *k, &mut fasta_writer);
-            // FASTA file(s)
-            } else {
-                panic!("kmer length larger than 256 currently not supported.");
+            }
+            let width_k = *k;
+            match width_k {
+                0..=2 => panic!("kmer length too small (min. 3)"),
+                3..=32 => {
+                    log::info!("k={width_k}: using 64-bit representation");
+                    run_build::<u64>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                33..=64 => {
+                    log::info!("k={width_k}: using 128-bit representation");
+                    run_build::<u128>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                65..=128 => {
+                    log::info!("k={width_k}: using 256-bit representation");
+                    run_build::<U256>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                129..=256 => {
+                    log::info!("k={width_k}: using 512-bit representation");
+                    run_build::<U512>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                }
+                _ => panic!("kmer length larger than 256 currently not supported."),
             }
         }
     }
@@ -416,13 +371,13 @@ pub fn main() {
 }
 
 // ===================================== WebAssembly stuff follows
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 /// Binary dummy function. In the future, we need to completely remove it whenever compilating with the feature "wasm"
 pub fn main() {
     panic!("You've compiled Sparrowhawk for WebAssembly support, you cannot use it as a normal binary anymore!");
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console)]
@@ -432,7 +387,7 @@ extern "C" {
     fn post_message(data: &JsValue);
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 /// Posts a state update message to the main thread via postMessage
 pub fn post_state(state: &str) {
     let obj = js_sys::Object::new();
@@ -444,14 +399,14 @@ pub fn post_state(state: &str) {
     post_message(&obj.into());
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 /// Function that allows to propagate panic error messages when compiling to wasm, see https://github.com/rustwasm/console_error_panic_hook
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 /// Main struct that acts as wrapper of the assembler when compiling to wasm
 pub struct AssemblyHelper {
@@ -464,8 +419,10 @@ pub struct AssemblyHelper {
     do_fit: bool,
     no_bubble_collapse: bool,
     no_dead_end_removal: bool,
-    preprocessed_data:
-        Option<HashMap<u64, RefCell<HashInfoSimple>, BuildHasherDefault<NoHashHasher<u64>>>>,
+    /// The CLI's `--bubble-pop-ratio`. Set through `set_bubble_pop_ratio`, not the constructor, so that
+    /// existing JS callers keep working and get the same default the CLI does.
+    bubble_pop_ratio: f32,
+    preprocessed_data: Option<HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>>,
     maxmindict: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict64: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict128: Option<HashMap<u64, u128, BuildHasherDefault<NoHashHasher<u64>>>>,
@@ -480,21 +437,24 @@ pub struct AssemblyHelper {
     outgfav2: String,
 }
 
-#[cfg(feature = "wasm")]
+#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 impl AssemblyHelper {
     /// Constructor/initialiser of the wasm assembler. It also performs the preprocessing.
     pub fn new(
-        k: usize,
+        k: u32,
         verbose: bool,
         min_count: u16,
         min_qual: u8,
-        chunk_size: usize,
+        chunk_size: u32,
         do_bloom: bool,
         do_fit: bool,
         no_bubble_collapse: bool,
         no_dead_end_removal: bool,
     ) -> Self {
+        let k = k as usize;
+        let chunk_size = chunk_size as usize;
+
         if cfg!(debug_assertions) {
             init_panic_hook();
         }
@@ -514,6 +474,7 @@ impl AssemblyHelper {
             do_fit,
             no_bubble_collapse,
             no_dead_end_removal,
+            bubble_pop_ratio: algorithms::corrector::DEFAULT_POP_RATIO,
             preprocessed_data: None,
             maxmindict: None,
             seqdict64: None,
@@ -545,11 +506,7 @@ impl AssemblyHelper {
 
         logw("Beginning processing", Some("info"));
 
-        let preprocessed_data: HashMap<
-            u64,
-            RefCell<HashInfoSimple>,
-            BuildHasherDefault<NoHashHasher<u64>>,
-        >;
+        let preprocessed_data: HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>;
         let maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
         let histovalues: Vec<u32>;
         let used_min_count: u16;
@@ -575,7 +532,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<u64>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -592,7 +555,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<u128>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -609,7 +578,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<U256>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -626,7 +601,13 @@ impl AssemblyHelper {
                 histovalues,
                 used_min_count,
             ) = preprocessing::preprocessing_wasm::<U512>(
-                &mut wf1, wf2.as_mut(), self.k, &quality, self.chunk_size, self.do_bloom, self.do_fit,
+                &mut wf1,
+                wf2.as_mut(),
+                self.k,
+                &quality,
+                self.chunk_size,
+                self.do_bloom,
+                self.do_fit,
             );
 
             logw("Preprocessing done!", Some("info"));
@@ -648,18 +629,34 @@ impl AssemblyHelper {
         post_state("preprocess:end");
     }
 
+    /// Fraction of counts needed for popping bubble
+    pub fn set_bubble_pop_ratio(&mut self, ratio: f32) {
+        if ratio > 0.0 && ratio < 1.0 {
+            self.bubble_pop_ratio = ratio;
+        } else {
+            logw(
+                format!(
+                    "Ignoring --bubble-pop-ratio {ratio}: it must be strictly between 0 and 1. \
+                     Keeping {}.",
+                    self.bubble_pop_ratio
+                )
+                .as_str(),
+                Some("warn"),
+            );
+        }
+    }
+
     /// Assemble method of the wasm version
     pub fn assemble(&mut self) {
         logw("Starting assembly...", Some("info"));
-        let (mut outcontigs, outdot, outgfa, outgfav2) =
-            graph_works::BasicAsm::assemble_wasm::<PtGraph>(
-                self.k,
-                self.preprocessed_data.as_mut().unwrap(),
-                self.maxmindict.as_mut().unwrap(),
-                !self.no_bubble_collapse,
-                !self.no_dead_end_removal,
-                false,
-            );
+        let (mut outcontigs, outdot, outgfa, outgfav2) = graph_works::BasicAsm::assemble_wasm(
+            self.k,
+            self.preprocessed_data.as_mut().unwrap(),
+            self.maxmindict.as_mut().unwrap(),
+            !self.no_bubble_collapse,
+            !self.no_dead_end_removal,
+            self.bubble_pop_ratio,
+        );
 
         post_state("assembly:saving");
         logw("Assembly done!", Some("info"));
