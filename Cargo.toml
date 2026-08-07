@@ -9,6 +9,11 @@ repository = "https://github.com/bacpop/sparrowhawk-asm"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["xz2", "zstd"]
+xz2 = ["needletail/xz2"]
+zstd = ["needletail/zstd"]
+
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
 ahash = { version = "=0.8.11" }
@@ -30,7 +35,7 @@ argmin-observer-slog = { version = "0.1.0" }
 libm = { version = "0.2" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-needletail = { version = "0.6.3", default-features = false, features = ["flate2", "xz2", "zstd"] }
+needletail = { version = "0.6.3", default-features = false, features = ["flate2"] }
 indicatif = { version = "0.17.11", features = ["rayon"] }
 plotters = { version = "0.3.7", features = ["ab_glyph"] }
 fern = { version = "0.7.1" }
