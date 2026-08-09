@@ -112,6 +112,45 @@ impl Correctable for DbgGraph {
     }
 }
 
+/// Remove incident directed edges lacking their reverse partner (the signature of a hash
+/// collision). Returns how many were removed; afterwards the node is balanced again.
+pub(crate) fn prune_unpaired_edges(g: &mut DbgGraph, n: NodeId) -> usize {
+    let mut to_remove: BTreeSet<EdgeId> = BTreeSet::new();
+    for carry in [CarryType::Min, CarryType::Max] {
+        for (eid, m, t) in g.outgoing_edges_by_carry(n, carry) {
+            let paired = g
+                .edges_between(m, n)
+                .iter()
+                .any(|&e| g.edge_weight(e).unwrap().t == t.rev());
+            if !paired {
+                log::warn!("Removing unpaired edge {n:?} -{t:?}-> {m:?} — probable hash collision");
+                to_remove.insert(eid);
+            }
+        }
+    }
+    for (s, t) in g.incoming_edges(n) {
+        let paired = g
+            .edges_between(n, s)
+            .iter()
+            .any(|&e| g.edge_weight(e).unwrap().t == t.rev());
+        if !paired {
+            if let Some(&eid) = g
+                .edges_between(s, n)
+                .iter()
+                .find(|&&e| g.edge_weight(e).unwrap().t == t)
+            {
+                log::warn!("Removing unpaired edge {s:?} -{t:?}-> {n:?} — probable hash collision");
+                to_remove.insert(eid);
+            }
+        }
+    }
+    let n_removed = to_remove.len();
+    for e in to_remove {
+        g.remove_edge(e);
+    }
+    n_removed
+}
+
 /// Collapse every bubble whose two branches differ significantly enough in coverage; leave the rest alone.
 pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32) -> bool {
     let mut dididoanything = false;
@@ -242,9 +281,20 @@ pub fn apply_bubble_collapse(
     let savedmidw = ptgraph.node_weight(midconns[winner].0).unwrap().clone();
 
     let midnodect = midconns[winner].1.get_from_and_to().1;
-    let midconn2 = ptgraph.out_neighbours_bi(midconns[winner].0, midnodect)[0];
+    // Re-validate: earlier collapses in this pass (or a collision) may have changed the shape.
+    let midouts = ptgraph.out_neighbours_bi(midconns[winner].0, midnodect);
+    if midouts.len() != 1 {
+        log::debug!("Bubble at {:?} no longer matches its detected shape; skipping", startn);
+        return false;
+    }
+    let midconn2 = midouts[0];
     let outct = midconn2.1.get_from_and_to().1;
-    let outconn = ptgraph.out_neighbours_bi(midconn2.0, outct)[0];
+    let endouts = ptgraph.out_neighbours_bi(midconn2.0, outct);
+    if endouts.len() != 1 {
+        log::debug!("Bubble at {:?} no longer matches its detected shape; skipping", startn);
+        return false;
+    }
+    let outconn = endouts[0];
     let savedoutw = ptgraph.node_weight(midconn2.0).unwrap().clone();
 
     if ptgraph.node_weight(startn).unwrap().abs_ind.len() > 1
@@ -584,6 +634,47 @@ mod tests {
             choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO),
             BubbleChoice::Keep(stronger(&g, &mids))
         );
+    }
+
+    // ── prune_unpaired_edges ─────────────────────────────────────────────────
+
+    #[test]
+    fn prune_unpaired_edges_removes_exactly_the_phantom() {
+        let mut g = DbgGraph::new(3);
+        let a = g.add_node(make_node());
+        let b = g.add_node(make_node());
+        let c = g.add_node(make_node());
+        g.add_bi_edge(a, b, EdgeType::MinToMin);
+        g.add_edge(c, b, EdgeType::MinToMin); // phantom: no reverse partner
+
+        assert_eq!(prune_unpaired_edges(&mut g, b), 1);
+        assert_eq!(g.edge_count(), 2); // the paired a<->b couple is intact
+        assert_eq!(prune_unpaired_edges(&mut g, b), 0);
+    }
+
+    /// The apply-time re-validation: a bubble corrupted between detection and collapse
+    /// must be skipped instead of panicking on `[0]`.
+    #[test]
+    fn a_bubble_that_lost_its_shape_is_skipped() {
+        let (mut g, s, mids) = bubble_with_counts(100, 5);
+        let w = stronger(&g, &mids);
+        let midct = mids[w].1.get_from_and_to().1;
+        let (e, ety) = {
+            let v = g.out_neighbours_bi(mids[w].0, midct);
+            (v[0].0, v[0].1)
+        };
+        let outct = ety.get_from_and_to().1;
+        let f = g.out_neighbours_bi(e, outct)[0].0;
+        for eid in g.edges_between(e, f) {
+            g.remove_edge(eid);
+        }
+        for eid in g.edges_between(f, e) {
+            g.remove_edge(eid);
+        }
+
+        let before = g.node_count();
+        assert!(!apply_bubble_collapse(&mut g, s, &mids, w));
+        assert_eq!(g.node_count(), before);
     }
 
     #[test]

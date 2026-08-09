@@ -1,5 +1,6 @@
 //! Create string representation of contigs out of `DbgGraph`.
 
+use super::corrector::prune_unpaired_edges;
 use super::shrinker::Shrinkable;
 use sparrowhawk_graph::{
     get_nodelist_kmer_length, CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs,
@@ -201,24 +202,37 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> Serial
 
     // We need to get the carrytype, the edges, and so on before we can begin. We'll try to set them to get a forward
     // direction with only one neighbour, if possible.
-    let outeds;
-    let outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
-    let outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
+    // Pairing forbids one-sided patterns here: prune collision leftovers and re-read.
+    let mut outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
+    let mut outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
+    if outmin.is_empty() || outmax.is_empty() {
+        prune_unpaired_edges(ptgraph, v);
+        outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
+        outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
+    }
     let outminlen = outmin.len();
     let outmaxlen = outmax.len();
-    match (outminlen, outmaxlen) {
-        (0, 0) | (0, 1) | (1, 0) => panic!("External node!!!"),
-        (1, 1) | (1, _) => outeds = outmin, // We select the minimum outgoing edges
-        (_, 1) => outeds = outmax,          // We select the maximum outgoing edges
+    let outeds = match (outminlen, outmaxlen) {
+        (0, 0) => {
+            // Nothing left after the repair: emit the node as its own contig.
+            contig.push(ptgraph.node_weight(v).unwrap().clone());
+            contigs.push(contig);
+            ptgraph.remove_node(v);
+            return contigs;
+        }
+        (_, 0) => outmin,
+        (0, _) => outmax,
+        (1, _) => outmin, // We select the minimum outgoing edges
+        (_, 1) => outmax, // We select the maximum outgoing edges
         (_, _) => {
             // We check whether they are the same and, if not, we select the first id from the minimum (this is clearly improvable)
             if outminlen <= outmaxlen {
-                outeds = outmin;
+                outmin
             } else {
-                outeds = outmax;
+                outmax
             }
         }
-    }
+    };
 
     let mut current_type = outeds[0].2.get_from_and_to().0;
     let mut outneighs = ptgraph.out_neighbours_bi(v, current_type);
@@ -283,5 +297,51 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> Serial
         num_preceding = ptgraph.in_degree_bi(current_vertex, current_type);
         outneighs = ptgraph.out_neighbours_bi(current_vertex, current_type);
         num_following = outneighs.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparrowhawk_graph::EdgeType;
+
+    fn node(h: u64) -> NodeStruct {
+        NodeStruct {
+            counts: 10,
+            abs_ind: vec![h],
+            innerdir: None,
+        }
+    }
+
+    /// A one-sided start (which used to panic as "External node!!!") is repaired and
+    /// walks its available side.
+    #[test]
+    fn collapse_walks_a_one_sided_start_instead_of_panicking() {
+        let mut g = DbgGraph::new(3);
+        let v = g.add_node(node(0));
+        let w = g.add_node(node(1));
+        let u = g.add_node(node(2));
+        g.add_bi_edge(v, w, EdgeType::MinToMin);
+        g.add_edge(u, v, EdgeType::MinToMax); // phantom: no reverse partner
+
+        let contigs = contigs_from_intermediate_vertex(&mut g, v);
+
+        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs[0].len(), 2);
+        assert_eq!(g.node_count(), 1); // only `u` is left...
+        assert_eq!(g.out_degree(u), 0); // ...and its phantom edge was pruned
+    }
+
+    /// A start left with no edges at all becomes its own single-node contig.
+    #[test]
+    fn a_disconnected_start_becomes_its_own_contig() {
+        let mut g = DbgGraph::new(3);
+        let v = g.add_node(node(0));
+
+        let contigs = contigs_from_intermediate_vertex(&mut g, v);
+
+        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs[0].len(), 1);
+        assert_eq!(g.node_count(), 0);
     }
 }
