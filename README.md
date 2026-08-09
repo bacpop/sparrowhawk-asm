@@ -1,4 +1,4 @@
-# sparrowhawk-asm <img src='sparrowhawk_logo.png' align="right" height="250" />
+# sparrowhawk-asm 
 Short-read assembler for bacterial genomics based on a de Bruijn graph written in Rust.
 
 
