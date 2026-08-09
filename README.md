@@ -31,7 +31,7 @@ Also, the [sparrowhawk](https://en.wikipedia.org/wiki/Eurasian_sparrowhawk) (*Ac
 
 **Note:** this repository is for the Rust-based genomic assembler. If you are looking for its web implementation, see [sparrowhawk](https://github.com/bacpop/sparrowhawk).
 
-sparrowhawk aims to be a fast short-read assembler for bacterial genomics. It has been developed taking advantage/inspiration of other Rust-based tools developed by our group (such as [ska.rust](https://github.com/bacpop/ska.rust)), as well as others (such as [Katome](https://github.com/fuine/katome) or [SKESA](https://github.com/ncbi/SKESA)).
+sparrowhawk aims to be a fast short-read assembler for bacterial genomics that can run in a browser. It has been developed taking advantage/inspiration of other Rust-based tools developed by our group (such as [ska.rust](https://github.com/bacpop/ska.rust)), as well as others (such as [Katome](https://github.com/fuine/katome) or [SKESA](https://github.com/ncbi/SKESA)).
 
 Current **main features**:
 - Currently only support for Illumina paired short reads.
