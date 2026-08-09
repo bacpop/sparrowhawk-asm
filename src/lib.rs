@@ -194,6 +194,7 @@ fn run_build<IntT>(
         opts.k,
         &mut assembly.themap,
         &mut assembly.maxmindict,
+        &assembly.thedict,
         timevec,
         out_path_graph,
         opts.do_bubble_collapse,

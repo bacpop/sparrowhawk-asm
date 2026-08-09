@@ -20,12 +20,17 @@ pub trait Shrinkable {
     /// Shrink one single path. This method assumes that `base_edge` argument points
     /// to a valid edge, which target has a single outgoing edge.
     /// Returns index of the shrinked path represented by edge.
+    ///
+    /// `diag` is `(pass, shrinks_this_pass)`, diagnostic-only context printed on the
+    /// invariant panics: a panic with `shrinks_this_pass == 0` on pass 1 means the graph
+    /// was already corrupt before any shrink mutated it.
     fn shrink_single_path(
         &mut self,
         start_node: Self::NodeIdx,
         mid_node: Self::NodeIdx,
         ambnodes: &BTreeSet<NodeId>,
         currtype: EdgeType,
+        diag: (usize, usize),
     );
 }
 
@@ -37,8 +42,11 @@ impl Shrinkable for DbgGraph {
         // Shrinkage here means to only find consecutive nodes, w/o bifurcations
 
         let mut dididoanything = false;
+        let mut pass = 0usize;
         loop {
             let mut dididoanythingnow = false;
+            pass += 1;
+            let mut shrinks_this_pass = 0usize;
             let ambnodes = self.get_ambiguous_nodes_bi(); // Just in case we hadn't got them yet
             logw(format!("Starting shrinking the graph with {} nodes and {} edges, beginning from {} ambiguous nodes",
                   self.node_count(),
@@ -65,12 +73,43 @@ impl Shrinkable for DbgGraph {
                         continue;
                     } else if outn.len() <= 1 && self.in_neighbours_bi(neigh[0].0, tmpty).len() == 1
                     {
-                        self.shrink_single_path(*an, neigh[0].0, &ambnodes, neigh[0].1);
+                        self.shrink_single_path(
+                            *an,
+                            neigh[0].0,
+                            &ambnodes,
+                            neigh[0].1,
+                            (pass, shrinks_this_pass),
+                        );
+                        shrinks_this_pass += 1;
                         dididoanything = true;
                         dididoanythingnow = true;
                     }
                 } else {
                     for n in neigh {
+                        // =================== DEBUG: passive staleness detection. `neigh` was
+                        // computed before this loop, but earlier shrinks in the same iteration
+                        // mutate the graph; log (without changing the flow) when a cached entry
+                        // no longer matches reality.
+                        if !self.contains_node(n.0) {
+                            log::warn!(
+                                "[audit] stale neighbour: {:?} of ambiguous {:?} no longer exists (pass {pass}, shrinks {shrinks_this_pass})",
+                                n.0,
+                                an
+                            );
+                        } else if !self
+                            .outgoing_edges(*an)
+                            .iter()
+                            .any(|&(m, t)| m == n.0 && t == n.1)
+                        {
+                            log::warn!(
+                                "[audit] stale edge: cached {:?} -{:?}-> {:?} is gone or retyped (pass {pass}, shrinks {shrinks_this_pass})",
+                                an,
+                                n.1,
+                                n.0
+                            );
+                        }
+                        // =================== DEBUG
+
                         if ambnodes.contains(&n.0) || n.0 == *an {
                             continue;
                         } else {
@@ -89,7 +128,23 @@ impl Shrinkable for DbgGraph {
                             {
                                 let incn = self.in_neighbours_bi(n.0, tmpty);
                                 if incn.len() == 1 {
-                                    self.shrink_single_path(n.0, outn[0].0, &ambnodes, outn[0].1);
+                                    // =================== DEBUG
+                                    if ambnodes.contains(&outn[0].0) {
+                                        log::warn!(
+                                            "[audit] escape clause: shrinking into stale-ambiguous {:?} (an {:?} now has 1 good neighbour; pass {pass}, shrinks {shrinks_this_pass})",
+                                            outn[0].0,
+                                            an
+                                        );
+                                    }
+                                    // =================== DEBUG
+                                    self.shrink_single_path(
+                                        n.0,
+                                        outn[0].0,
+                                        &ambnodes,
+                                        outn[0].1,
+                                        (pass, shrinks_this_pass),
+                                    );
+                                    shrinks_this_pass += 1;
                                     dididoanything = true;
                                     dididoanythingnow = true;
                                 }
@@ -119,6 +174,7 @@ impl Shrinkable for DbgGraph {
         mut next_node: NodeId,
         ambnodes: &BTreeSet<NodeId>,
         mut curredge: EdgeType,
+        diag: (usize, usize),
     ) {
         let mut countsformean: Vec<u32> = vec![self.node_weight(base_node).unwrap().counts];
 
@@ -173,7 +229,32 @@ impl Shrinkable for DbgGraph {
 
             // =================== DEBUG
             if self.in_degree(base_node) != 0 || self.out_degree(base_node) != 0 {
-                panic!("Nope! 1");
+                panic!(
+                    "Invariant broken after dead-end merge (pass {}, shrinks so far {}): \
+                     base_node {:?} should be isolated but has in/out {}/{} \
+                     (min-out {}, max-out {}, min-in {}, max-in {}). \
+                     incoming {:?}, outgoing {:?}, kmers {:?}. \
+                     removed next_node {:?} (in stale ambnodes: {}), \
+                     curredge {:?}, initty {:?}, currtype {:?}, ind {:?}",
+                    diag.0,
+                    diag.1,
+                    base_node,
+                    self.in_degree(base_node),
+                    self.out_degree(base_node),
+                    self.out_degree_min(base_node),
+                    self.out_degree_max(base_node),
+                    self.in_degree_min(base_node),
+                    self.in_degree_max(base_node),
+                    self.incoming_edges(base_node),
+                    self.outgoing_edges(base_node),
+                    self.node_weight(base_node).map(|w| &w.abs_ind),
+                    next_node,
+                    ambnodes.contains(&next_node),
+                    curredge,
+                    initty,
+                    currtype,
+                    ind,
+                );
             }
             // =================== DEBUG
 
@@ -183,7 +264,34 @@ impl Shrinkable for DbgGraph {
         // As next_node has exactly one outgoing neighbour, we can start the main loop
         // =================== DEBUG
         if self.in_degree(next_node) != 2 || self.out_degree(next_node) != 2 {
-            panic!("Nope!");
+            panic!(
+                "Pairing invariant broken entering main shrink loop (pass {}, shrinks so far {}): \
+                 next_node {:?} in/out {}/{} (expected 2/2; min-out {}, max-out {}, min-in {}, max-in {}), \
+                 in stale ambnodes: {}. incoming {:?}, outgoing {:?}, kmers {:?}. \
+                 base_node {:?} in/out {}/{}, in stale ambnodes: {}, kmers {:?}. \
+                 curredge {:?}, initty {:?}, currtype {:?}",
+                diag.0,
+                diag.1,
+                next_node,
+                self.in_degree(next_node),
+                self.out_degree(next_node),
+                self.out_degree_min(next_node),
+                self.out_degree_max(next_node),
+                self.in_degree_min(next_node),
+                self.in_degree_max(next_node),
+                ambnodes.contains(&next_node),
+                self.incoming_edges(next_node),
+                self.outgoing_edges(next_node),
+                self.node_weight(next_node).map(|w| &w.abs_ind),
+                base_node,
+                self.in_degree(base_node),
+                self.out_degree(base_node),
+                ambnodes.contains(&base_node),
+                self.node_weight(base_node).map(|w| &w.abs_ind),
+                curredge,
+                initty,
+                currtype,
+            );
         }
         // =================== DEBUG
 
@@ -192,7 +300,30 @@ impl Shrinkable for DbgGraph {
 
             // First, avoid self-loops.
             if prospective_node.0 == base_node {
-                panic!("This should not happen");
+                panic!(
+                    "Shrink walk looped back to its base (pass {}, shrinks so far {}): \
+                     prospective {:?} ({:?}) == base_node. base in/out {}/{}, \
+                     incoming {:?}, outgoing {:?}, kmers {:?}. \
+                     next_node {:?} in/out {}/{} (in stale ambnodes: {}), kmers {:?}. \
+                     curredge {:?}, initty {:?}, currtype {:?}",
+                    diag.0,
+                    diag.1,
+                    prospective_node.0,
+                    prospective_node.1,
+                    self.in_degree(base_node),
+                    self.out_degree(base_node),
+                    self.incoming_edges(base_node),
+                    self.outgoing_edges(base_node),
+                    self.node_weight(base_node).map(|w| &w.abs_ind),
+                    next_node,
+                    self.in_degree(next_node),
+                    self.out_degree(next_node),
+                    ambnodes.contains(&next_node),
+                    self.node_weight(next_node).map(|w| &w.abs_ind),
+                    curredge,
+                    initty,
+                    currtype,
+                );
             }
 
             countsformean.push(self.node_weight(next_node).unwrap().counts);
@@ -241,12 +372,32 @@ impl Shrinkable for DbgGraph {
 
                 // =================== DEBUG
                 if self.out_degree(base_node) != 1 && !ind.is_empty() {
-                    println!(
-                        "{:?} {:?}",
+                    panic!(
+                        "Invariant broken after merging an external terminus (EY2; pass {}, shrinks so far {}): \
+                         base_node {:?} out_degree {} != 1 (in_degree {}; min-out {}, max-out {}, min-in {}, max-in {}). \
+                         incoming {:?}, outgoing {:?}, kmers {:?}, internal edge {:?}. \
+                         merged external {:?} (in stale ambnodes: {}), \
+                         curredge {:?}, initty {:?}, currtype {:?}, ind {:?}",
+                        diag.0,
+                        diag.1,
+                        base_node,
                         self.out_degree(base_node),
-                        self.in_degree(base_node)
+                        self.in_degree(base_node),
+                        self.out_degree_min(base_node),
+                        self.out_degree_max(base_node),
+                        self.in_degree_min(base_node),
+                        self.in_degree_max(base_node),
+                        self.incoming_edges(base_node),
+                        self.outgoing_edges(base_node),
+                        self.node_weight(base_node).map(|w| &w.abs_ind),
+                        self.node_weight(base_node).and_then(|w| w.innerdir),
+                        prospective_node.0,
+                        ambnodes.contains(&prospective_node.0),
+                        curredge,
+                        initty,
+                        currtype,
+                        ind,
                     );
-                    panic!("EY2!");
                 }
                 // =================== DEBUG
 
@@ -309,25 +460,39 @@ impl Shrinkable for DbgGraph {
                 if self.out_degree_min(base_node) != 1 && !ind.is_empty()
                     || self.out_degree(base_node) != 1 && ind.is_empty()
                 {
-                    println!(
-                        "Base node: {:?}, internal type: {:?}",
+                    panic!(
+                        "Invariant broken after reconnecting to an ambiguous node (EY1; pass {}, shrinks so far {}): \
+                         base_node {:?} in/out {}/{} (min-out {}, max-out {}, min-in {}, max-in {}), \
+                         internal edge {:?}, kmers {:?}. incoming {:?}, outgoing {:?}. \
+                         incoming node from before: {:?} (ind {:?}). \
+                         prospective_node {:?} ({:?}) in/out {}/{} (in stale ambnodes: {}), kmers {:?}. \
+                         newoutedge {:?}, curredge {:?}, initty {:?}, currtype {:?}",
+                        diag.0,
+                        diag.1,
                         base_node,
-                        self.node_weight(base_node).unwrap().innerdir.unwrap()
+                        self.in_degree(base_node),
+                        self.out_degree(base_node),
+                        self.out_degree_min(base_node),
+                        self.out_degree_max(base_node),
+                        self.in_degree_min(base_node),
+                        self.in_degree_max(base_node),
+                        self.node_weight(base_node).and_then(|w| w.innerdir),
+                        self.node_weight(base_node).map(|w| &w.abs_ind),
+                        self.incoming_edges(base_node),
+                        self.outgoing_edges(base_node),
+                        ind.first().map(|e| e.0),
+                        ind,
+                        prospective_node.0,
+                        prospective_node.1,
+                        self.in_degree(prospective_node.0),
+                        self.out_degree(prospective_node.0),
+                        ambnodes.contains(&prospective_node.0),
+                        self.node_weight(prospective_node.0).map(|w| &w.abs_ind),
+                        newoutedge,
+                        curredge,
+                        initty,
+                        currtype,
                     );
-                    println!(
-                        "Incoming node to base_node from before: {:?}, prospective_node: {:?}",
-                        ind[0].0, prospective_node.0
-                    );
-                    println!("OUTGOING");
-                    for (target, edge_type) in self.outgoing_edges(base_node) {
-                        println!("- Target: {:?} Type: {:?}", target, edge_type);
-                    }
-                    println!("INCOMING");
-                    for (source, edge_type) in self.incoming_edges(base_node) {
-                        println!("- Source: {:?} Type: {:?}", source, edge_type);
-                    }
-
-                    panic!("EY1!");
                 }
                 // =================== DEBUG
 
@@ -338,12 +503,36 @@ impl Shrinkable for DbgGraph {
                 if self.in_degree(prospective_node.0) != 1
                     || self.out_degree(prospective_node.0) != 1
                 {
-                    println!(
-                        "{:?} {:?}",
+                    panic!(
+                        "Pairing invariant broken mid-walk (pass {}, shrinks so far {}): \
+                         prospective_node {:?} ({:?}) in/out {}/{} (expected 1/1 after removing its \
+                         predecessor; min-out {}, max-out {}, min-in {}, max-in {}), \
+                         in stale ambnodes: {}. incoming {:?}, outgoing {:?}, kmers {:?}. \
+                         base_node {:?} in/out {}/{}, kmers {:?}. removed next_node {:?}. \
+                         curredge {:?}, initty {:?}, currtype {:?}",
+                        diag.0,
+                        diag.1,
+                        prospective_node.0,
+                        prospective_node.1,
                         self.in_degree(prospective_node.0),
-                        self.out_degree(prospective_node.0)
+                        self.out_degree(prospective_node.0),
+                        self.out_degree_min(prospective_node.0),
+                        self.out_degree_max(prospective_node.0),
+                        self.in_degree_min(prospective_node.0),
+                        self.in_degree_max(prospective_node.0),
+                        ambnodes.contains(&prospective_node.0),
+                        self.incoming_edges(prospective_node.0),
+                        self.outgoing_edges(prospective_node.0),
+                        self.node_weight(prospective_node.0).map(|w| &w.abs_ind),
+                        base_node,
+                        self.in_degree(base_node),
+                        self.out_degree(base_node),
+                        self.node_weight(base_node).map(|w| &w.abs_ind),
+                        next_node,
+                        curredge,
+                        initty,
+                        currtype,
                     );
-                    panic!("Nope!");
                 }
                 // =================== DEBUG
 

@@ -2,3 +2,4 @@
 pub mod collapser;
 pub mod corrector;
 pub mod shrinker;
+pub mod validator;

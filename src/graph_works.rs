@@ -141,6 +141,75 @@ pub fn check_fwd(
     outvec
 }
 
+/// Audit: every adjacency must appear symmetrically — u.post contains (v, t)
+/// iff v.pre contains (u, t), and mirrored for pre→post. The four probes of
+/// `check_fwd`/`check_bkg` resolve one adjacency independently, so any violation
+/// means a hash resolved inconsistently on one side: a hash collision.
+pub(crate) fn audit_neighbour_symmetry<IntT>(
+    map: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+    thedict: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    k: usize,
+) -> usize
+where
+    IntT: for<'a> UInt<'a>,
+{
+    let spell = |h: &u64| -> String {
+        thedict
+            .get(h)
+            .map(|km| {
+                (0..k)
+                    .map(|i| km.get_one_nucleotide(k - 1 - i) as char)
+                    .collect()
+            })
+            .unwrap_or_else(|| "<hash not in packed dict>".into())
+    };
+    let mut violations = 0usize;
+    let report = |violations: usize, side: &str, h: &u64, hi: &HashInfoSimple, nb: &u64, t: &EdgeType| {
+        if violations <= 50 {
+            log::error!(
+                "[audit] asymmetric adjacency: {h}.{side} contains ({nb}, {t:?}) with no mirror \
+                 entry. hnc {} / {:?}, counts {} / {:?}, kmer {} / {}",
+                hi.hnc,
+                map.get(nb).map(|o| o.hnc),
+                hi.counts,
+                map.get(nb).map(|o| o.counts),
+                spell(h),
+                spell(nb),
+            );
+        }
+    };
+    for (h, hi) in map.iter() {
+        for (nb, t) in hi.post.iter() {
+            if !map
+                .get(nb)
+                .is_some_and(|o| o.pre.iter().any(|(bh, bt)| bh == h && bt == t))
+            {
+                violations += 1;
+                report(violations, "post", h, hi, nb, t);
+            }
+        }
+        for (nb, t) in hi.pre.iter() {
+            if !map
+                .get(nb)
+                .is_some_and(|o| o.post.iter().any(|(bh, bt)| bh == h && bt == t))
+            {
+                violations += 1;
+                report(violations, "pre", h, hi, nb, t);
+            }
+        }
+    }
+    if violations == 0 {
+        log::info!(
+            "[audit] neighbour lists fully symmetric: no phantom/mistyped adjacencies (H1 not supported)"
+        );
+    } else {
+        log::error!(
+            "[audit] {violations} asymmetric adjacency entries — hash-collision hypothesis (H1) CONFIRMED"
+        );
+    }
+    violations
+}
+
 pub(crate) fn populate_neighbours(
     k: usize,
     indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -799,10 +868,13 @@ mod tests {
 pub trait Assemble {
     #[cfg(not(target_family = "wasm"))]
     /// Assembles given data and writes results into the output file.
+    /// `thedict` (canonical hash → packed k-mer) is only read by the diagnostic
+    /// audits, to spell the k-mers involved in any violation.
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        thedict: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
         timevec: &mut Vec<Instant>,
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
@@ -832,6 +904,7 @@ impl Assemble for BasicAsm {
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        thedict: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
         timevec: &mut Vec<Instant>,
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
@@ -845,6 +918,9 @@ impl Assemble for BasicAsm {
         timevec.push(Instant::now());
 
         populate_neighbours(k, indict, maxmindict);
+
+        logw("[audit] checking neighbour-list symmetry...", Some("info"));
+        audit_neighbour_symmetry::<IntT>(indict, thedict, k);
 
         timevec.push(Instant::now());
         logw(
@@ -880,6 +956,9 @@ impl Assemble for BasicAsm {
 
         logw("Removing self-loops", Some("info"));
         ptgraph.remove_self_loops();
+
+        logw("[audit] checking bidirected edge pairing...", Some("info"));
+        crate::algorithms::validator::audit_bidirected_pairing(&ptgraph);
 
         let t_phase1 = Instant::now();
         loop {
