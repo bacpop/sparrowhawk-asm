@@ -7,10 +7,6 @@ use nohash_hasher::NoHashHasher;
 use std::{cmp::Ordering, collections::HashMap, hash::BuildHasherDefault};
 
 use rayon::prelude::*;
-
-#[cfg(not(target_family = "wasm"))]
-use needletail::parse_fastx_file;
-
 // use std::process::exit;
 
 #[cfg(not(target_family = "wasm"))]
@@ -168,22 +164,25 @@ fn drain_countmap_into_themap<IntT>(
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn extract_kmers_from_files<F>(files: &[String], mut on_record: F)
+fn extract_kmers_from_files<F, I>(
+    input_iters: &mut [I],
+    mut on_record: F
+)
 where
     F: FnMut(std::borrow::Cow<'_, [u8]>, usize, Option<&[u8]>),
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
-    for file in files {
-        log::info!("Getting kmers from file {file}. Creating reader...");
-        let mut reader =
-            parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
-        log::info!("Parsing...");
-        while let Some(record) = reader.next() {
-            let seqrec = record.expect("Invalid FASTQ record");
-            on_record(seqrec.seq(), seqrec.num_bases(), seqrec.qual());
+    for (idx, records) in input_iters.iter_mut().enumerate() {
+        log::info!("Getting kmers from file number {idx}.");
+        for record in records {
+            let seq: Vec<u8> = record.0;
+            let qual: Option<Vec<u8>> = record.1;
+            let num_bases = seq.len();
+            on_record(seq.into(), num_bases, qual.as_deref());
         }
-        log::info!("Finished getting kmers from file {file}.");
+        log::info!("Finished getting kmers from file number {idx}.");
     }
-    log::info!("Finished getting kmers from {} file(s)", files.len());
+    log::info!("Finished getting kmers from {} file(s)", input_iters.len());
 }
 
 /// One FASTQ record, owned: needletail's `Cow` borrows a reader buffer invalidated on the next
@@ -199,30 +198,33 @@ const BATCH_RECORDS: usize = 8192;
 /// Parse `files` into owned batches of records, handing each batch to `on_batch`. The parse stays
 /// serial but overlaps with the workers processing the previous batch.
 #[cfg(not(target_family = "wasm"))]
-fn extract_kmers_from_files_batched<F>(files: &[String], batch_records: usize, mut on_batch: F)
+fn extract_kmers_from_files_batched<F, I>(
+    input_iters: &mut [I],
+    batch_records: usize,
+    mut on_batch: F
+)
 where
     F: FnMut(&[OwnedRecord]),
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     let mut batch: Vec<OwnedRecord> = Vec::with_capacity(batch_records);
-    for file in files {
-        log::info!("Getting kmers from file {file}. Creating reader...");
-        let mut reader =
-            parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
-        log::info!("Parsing...");
-        while let Some(record) = reader.next() {
-            let seqrec = record.expect("Invalid FASTQ record");
-            batch.push((seqrec.seq().into_owned(), seqrec.qual().map(|q| q.to_vec())));
+    for (idx, records) in input_iters.iter_mut().enumerate() {
+        log::info!("Getting kmers from file number {idx}.");
+        for record in records {
+            let seq: Vec<u8> = record.0;
+            let qual: Option<Vec<u8>> = record.1;
+            batch.push((seq, qual));
             if batch.len() == batch_records {
                 on_batch(&batch);
                 batch.clear();
             }
         }
-        log::info!("Finished getting kmers from file {file}.");
+        log::info!("Finished getting kmers from file number {idx}.");
     }
     if !batch.is_empty() {
         on_batch(&batch);
     }
-    log::info!("Finished getting kmers from {} file(s)", files.len());
+    log::info!("Finished getting kmers from {} file(s)", input_iters.len());
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -716,8 +718,8 @@ where
 /// Bloom-filter preprocessing. Its spectrum is **not** comparable to the exact counter's: there is no
 /// count-1 bin, and false positives inflate the rest.
 #[cfg(not(target_family = "wasm"))]
-fn bloom_filter_preprocessing_standalone<IntT>(
-    files: &[String],
+fn bloom_filter_preprocessing_standalone<IntT, I>(
+    input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
     do_fit: bool,
@@ -731,6 +733,7 @@ fn bloom_filter_preprocessing_standalone<IntT>(
 )
 where
     IntT: for<'a> UInt<'a>,
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Initialising variables and filter...");
 
@@ -744,7 +747,7 @@ where
     kmer_filter.init();
 
     // NOTE, potential TODO? : This could be slightly improved by filling outdict and minmaxdict only once, though it'd require saving also km, but it could be better
-    extract_kmers_from_files(files, |seq, num_bases, qual_bytes| {
+    extract_kmers_from_files(input_iters, |seq, num_bases, qual_bytes| {
         let kmer_opt = Kmer::<IntT>::new(seq, num_bases, qual_bytes, k, qual.min_qual, true);
         if let Some(mut kmer_it) = kmer_opt {
             let (hc, hnc, b) = kmer_it.get_curr_hash_and_bases();
@@ -877,8 +880,8 @@ where
 /// `csize` is the memory knob: records buffered before a flush, with `usize::MAX` meaning no chunking.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
-fn chunked_preprocessing_standalone<IntT>(
-    files: &[String],
+fn chunked_preprocessing_standalone<IntT, I>(
+    input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
     outvec: &mut Vec<(u64, u64, u8)>,
@@ -894,6 +897,7 @@ fn chunked_preprocessing_standalone<IntT>(
 )
 where
     IntT: for<'a> UInt<'a>,
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Getting kmers from files. Creating reader...");
 
@@ -908,7 +912,7 @@ where
 
     // The k-mer work runs in parallel per batch, with the dictionary probes kept out of the hot loop.
     // A chunk therefore closes at the first batch boundary at or past `csize`: a hint, not a contract.
-    extract_kmers_from_files_batched(files, BATCH_RECORDS, |batch| {
+    extract_kmers_from_files_batched(input_iters, BATCH_RECORDS, |batch| {
         let items: Vec<(u64, u64, u8, IntT)> = hash_batch::<IntT>(batch, k, qual.min_qual);
 
         outvec.extend(items.iter().map(|&(hc, hnc, b, _)| (hc, hnc, b)));
@@ -1022,33 +1026,26 @@ where
 }
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
-#[cfg(not(target_family = "wasm"))]
-pub fn preprocessing_standalone<IntT>(
-    input_files: &[InputFastx],
+pub fn preprocessing_standalone<IntT, I>(
+    input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
-    timevec: &mut Vec<Instant>,
+    timevec: &mut Option<&mut Vec<Instant>>,
     out_path: &mut Option<PathBuf>,
     csize: usize,
     do_bloom: bool,
     do_fit: bool,
+    estimated_kmers: Option<usize>,
 ) -> PreprocessedK<IntT>
 where
     IntT: for<'a> UInt<'a>,
+    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Starting preprocessing_standalone with k = {k}");
 
-    // This is temporal, to be changed in the future.
-    let mut all_files: Vec<String> = input_files[0].1.clone();
-    if input_files.len() > 1 {
-        for ifile in input_files.iter().skip(1) {
-            all_files.extend(ifile.1.clone());
-        }
-    }
-
     let (thedict, maxmindict, themap, histovec, used_min_count) = if do_bloom {
         log::info!("Processing using a Bloom filter");
-        bloom_filter_preprocessing_standalone::<IntT>(&all_files, k, qual, do_fit, out_path)
+        bloom_filter_preprocessing_standalone::<IntT, _>(input_iters, k, qual, do_fit, out_path)
     } else {
         // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
         // record, so passing 0 through would sort and count after every single read.
@@ -1059,28 +1056,25 @@ where
             log::info!("Counting k-mers by sorting, in chunks of {csize} records");
         }
 
-        let estimated_kmers = all_files
-            .iter()
-            .map(|f| std::fs::metadata(f).map_or(0, |m| m.len()))
-            .sum::<u64>() as usize
-            / 5;
-        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers);
-        let out = chunked_preprocessing_standalone::<IntT>(
-            &all_files, k, qual, &mut tmpvec, csize, do_fit, out_path,
+        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers.unwrap_or(200000_usize));
+        let out = chunked_preprocessing_standalone::<IntT, _>(
+            input_iters, k, qual, &mut tmpvec, csize, do_fit, out_path,
         );
         drop(tmpvec);
         out
     };
 
-    timevec.push(Instant::now());
-    log::info!(
-        "k-mers extracted, counted and filtered in {} s",
-        timevec
-            .last()
-            .unwrap()
-            .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-            .as_secs()
-    );
+    if let Some(timevec) = timevec.as_mut() {
+        timevec.push(Instant::now());
+        log::info!(
+            "k-mers extracted, counted and filtered in {} s",
+            timevec
+                .last()
+                .unwrap()
+                .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                .as_secs()
+        );
+    }
     log::info!("Minimum count per k-mer used: {used_min_count}");
 
     PreprocessedK {
