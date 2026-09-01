@@ -53,6 +53,7 @@ pub fn write_sequences_and_coverages<IntT>(
     }
 }
 
+
 /// Stores all the contigs as a fasta file
 #[cfg(not(target_family = "wasm"))]
 pub fn save_as_fasta<IntT>(
@@ -74,6 +75,22 @@ pub fn save_as_fasta<IntT>(
 
     log::debug!("\tLen.\tMean\tSD\tMedian");
     ingraph.write_fasta(&mut wbuf);
+}
+
+
+/// Writes all the contigs as a fasta file
+#[cfg(not(target_family = "wasm"))]
+pub fn write_as_fasta<IntT, W>(
+    ingraph: &mut Contigs,
+    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    k: usize,
+    writer: &mut W,
+) where
+    IntT: for<'a> UInt<'a>,
+    W: std::io::Write,
+{
+    write_sequences_and_coverages(ingraph, inmap, k);
+    ingraph.write_fasta(writer);
 }
 
 /// Stores all the contigs in fasta format, but exports it as JSON for javascript

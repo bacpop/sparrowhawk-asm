@@ -803,7 +803,7 @@ pub trait Assemble {
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        timevec: &mut Vec<Instant>,
+        timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
@@ -832,7 +832,7 @@ impl Assemble for BasicAsm {
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        timevec: &mut Vec<Instant>,
+        timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
@@ -842,39 +842,45 @@ impl Assemble for BasicAsm {
             "Constructing graph. Searching for neighbours...",
             Some("info"),
         );
-        timevec.push(Instant::now());
+        if let Some(timevec) = timevec.as_mut() {
+            timevec.push(Instant::now());
+        }
 
         populate_neighbours(k, indict, maxmindict);
 
-        timevec.push(Instant::now());
-        logw(
-            format!(
-                "Neighbours searched for in {} s. Creating graph...",
-                timevec
-                    .last()
-                    .unwrap()
-                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                    .as_secs()
-            )
-            .as_str(),
-            Some("info"),
-        );
+        if let Some(timevec) = timevec.as_mut() {
+            timevec.push(Instant::now());
+            logw(
+                format!(
+                    "Neighbours searched for in {} s. Creating graph...",
+                    timevec
+                        .last()
+                        .unwrap()
+                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                        .as_secs()
+                )
+                    .as_str(),
+                Some("info"),
+            );
+        }
 
         let mut ptgraph = DbgGraph::from_kmer_map(k, indict);
 
-        timevec.push(Instant::now());
-        logw(
-            format!(
-                "Graph created in {} s.",
-                timevec
-                    .last()
-                    .unwrap()
-                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                    .as_secs()
+        if let Some(timevec) = timevec.as_mut() {
+            timevec.push(Instant::now());
+            logw(
+                format!(
+                    "Graph created in {} s.",
+                    timevec
+                        .last()
+                        .unwrap()
+                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                        .as_secs()
+                )
+                    .as_str(),
+                Some("info"),
             )
-            .as_str(),
-            Some("info"),
-        );
+        }
 
         logw("Starting graph correction", Some("info"));
 
@@ -917,19 +923,21 @@ impl Assemble for BasicAsm {
             t_phase3.elapsed().as_millis()
         );
 
-        timevec.push(Instant::now());
-        logw(
-            format!(
-                "Graph correction finished in {} s.",
-                timevec
-                    .last()
-                    .unwrap()
-                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                    .as_secs()
-            )
-            .as_str(),
-            Some("info"),
-        );
+        if let Some(timevec) = timevec.as_mut() {
+            timevec.push(Instant::now());
+            logw(
+                format!(
+                    "Graph correction finished in {} s.",
+                    timevec
+                        .last()
+                        .unwrap()
+                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                        .as_secs()
+                )
+                    .as_str(),
+                Some("info"),
+            );
+        }
 
         if path.is_some() {
             logw("Saving graph (post-shrink, pre-collapse, w/o one-node contigs) as DOT, GFAv1.1, and GFAv2 files...", Some("info"));
@@ -954,25 +962,29 @@ impl Assemble for BasicAsm {
             logw("Done.", Some("info"));
         }
 
-        timevec.push(Instant::now());
+        if let Some(timevec) = timevec.as_mut() {
+            timevec.push(Instant::now());
+        }
         let serialized_contigs = ptgraph.collapse();
-        timevec.push(Instant::now());
-        logw(
-            format!(
-                "Graph collapse finished in {} s.",
-                timevec
-                    .last()
-                    .unwrap()
-                    .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                    .as_secs()
-            )
-            .as_str(),
-            Some("info"),
-        );
-        logw(
-            format!("I created {} contigs", serialized_contigs.len()).as_str(),
-            Some("info"),
-        );
+        if let Some(timevec) = timevec.as_mut() {
+            timevec.push(Instant::now());
+            logw(
+                format!(
+                    "Graph collapse finished in {} s.",
+                    timevec
+                        .last()
+                        .unwrap()
+                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
+                        .as_secs()
+                )
+                    .as_str(),
+                Some("info"),
+            );
+            logw(
+                format!("I created {} contigs", serialized_contigs.len()).as_str(),
+                Some("info"),
+            );
+        }
 
         let mut contigs = Contigs::new(serialized_contigs);
 

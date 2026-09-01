@@ -179,22 +179,34 @@ fn run_build<IntT>(
 ) where
     IntT: for<'a> UInt<'a>,
 {
-    let mut assembly = preprocessing::preprocessing_standalone::<IntT>(
-        opts.input_files,
+    let mut estimated_kmers: u64 = 0;
+    let mut readers = opts.input_files.iter().flat_map(|(_, files)| {
+        files.iter().map(|file| {
+            estimated_kmers += std::fs::metadata(file).map_or(0, |m| m.len());
+            let reader = needletail::parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+            NeedletailIterator::new(reader)
+        }).collect::<Vec<NeedletailIterator>>()
+    }).collect::<Vec<NeedletailIterator>>();
+    estimated_kmers /= 5;
+    let estimated_kmers: usize = estimated_kmers.try_into().unwrap_or(usize::MAX);
+
+    let mut assembly = preprocessing::preprocessing_standalone::<IntT, _>(
+        &mut readers,
         opts.k,
         opts.quality,
-        timevec,
+        &mut Some(timevec),
         &mut out_paths_histo[0],
         opts.chunk_size,
         opts.do_bloom,
         opts.do_fit,
+        Some(estimated_kmers),
     );
 
     let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
         opts.k,
         &mut assembly.themap,
         &mut assembly.maxmindict,
-        timevec,
+        &mut Some(timevec),
         out_path_graph,
         opts.do_bubble_collapse,
         opts.do_dead_end_removal,
