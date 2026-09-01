@@ -1026,6 +1026,7 @@ where
 }
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
+#[cfg(not(target_family = "wasm"))]
 pub fn preprocessing_standalone<IntT, I>(
     input_iters: &mut [I],
     k: usize,
