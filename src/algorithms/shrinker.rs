@@ -54,8 +54,8 @@ impl Shrinkable for DbgGraph {
                 let conns = neigh.len();
 
                 if conns == 1 {
-                    // This means that this is the outermost k-mer of a dead-end, that might also have self-loops.
-                    // Let's check for self-loops first:
+                    // Self-loop nodes are ambiguity boundaries. Their loop edges are excluded
+                    // from ordinary neighbours, so do not start a contraction from this node.
                     if self.node_has_self_loops(*an) {
                         continue;
                     }
