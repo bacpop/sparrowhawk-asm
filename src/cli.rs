@@ -22,8 +22,9 @@ pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 pub enum Counter {
     /// DEPRECATED, slated for removal. Buffer every k-mer occurrence, sort it, and run-length count.
     /// This is strictly more work than `Map`: it builds the *same* distinct-k-mer map, and on top of it
-    /// keeps an occurrence buffer (bounded by `--chunk-size`) that it then sorts. Measured 2.2-2.5x
-    /// slower than `Map` at equal or higher memory. Kept only to reproduce the old behaviour.
+    /// keeps an occurrence buffer (bounded by `--chunk-size`) that it then sorts. Measured 1.7-2.1x
+    /// slower than `Map`, at equal memory where the distinct-k-mer map dominates and ~20% more where it
+    /// does not. Kept only to reproduce the old behaviour.
     Sort,
     /// Count into a hash map keyed by the canonical hash: no occurrence buffer, no sort, so memory
     /// scales with the number of *distinct* k-mers. Validated on six real datasets (172x-862x): faster
@@ -222,9 +223,10 @@ pub enum Commands {
         /// How to count k-mers. `map` (default) counts into a hash map keyed by canonical hash. `sort`
         /// is the DEPRECATED older path: it buffers every occurrence, sorts it, and run-length counts —
         /// which is strictly more work and more memory than `map` (it keeps the same distinct-k-mer map
-        /// *plus* the occurrence buffer), and is slated for removal. Measured on real reads, `map` is
-        /// 2.2-2.5x faster at equal or lower memory, and both produce identical results. Use `sort` only
-        /// to reproduce the old behaviour.
+        /// *plus* the occurrence buffer), and is slated for removal. Measured at k=31, `map` is
+        /// 1.7-2.1x faster and never uses more memory (level where the distinct-k-mer map dominates,
+        /// ~20% leaner where it does not), and both produce identical results. Use `sort` only to
+        /// reproduce the old behaviour.
         #[arg(long, value_enum, default_value_t = Counter::Map)]
         counter: Counter,
 

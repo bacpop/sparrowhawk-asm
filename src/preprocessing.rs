@@ -249,6 +249,26 @@ type OwnedRecord = (Vec<u8>, Option<Vec<u8>>);
 #[cfg(not(target_family = "wasm"))]
 const BATCH_RECORDS: usize = 8192;
 
+/// Batch size actually used. `SPHK_BATCH_RECORDS` overrides [`BATCH_RECORDS`], so the effect of
+/// batching can be measured on this binary rather than by rebuilding an older commit. Read once.
+#[cfg(not(target_family = "wasm"))]
+fn batch_records() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        match std::env::var("SPHK_BATCH_RECORDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            Some(n) if n > 0 => {
+                log::info!("Batch size overridden by SPHK_BATCH_RECORDS: {n} records");
+                n
+            }
+            _ => BATCH_RECORDS,
+        }
+    })
+}
+
 /// Parse `files` into owned batches of records, handing each batch to `on_batch`.
 ///
 /// This is the batched twin of [`extract_kmers_from_files`]. Batching is what makes the per-record
@@ -405,7 +425,7 @@ where
     let mut buckets: Vec<Vec<(u64, u64, u8, IntT)>> =
         (0..COUNTMAP_SHARDS).map(|_| Vec::new()).collect();
 
-    extract_kmers_from_files_batched(files, BATCH_RECORDS, |batch| {
+    extract_kmers_from_files_batched(files, batch_records(), |batch| {
         // Parallel: hash the batch. `km` is materialised here because the counting stage below cannot
         // reach back into the k-mer iterator.
         let items: Vec<(u64, u64, u8, IntT)> = hash_batch::<IntT>(batch, k, qual.min_qual);
@@ -1163,7 +1183,7 @@ where
 
     // The k-mer work runs in parallel per batch, with the dictionary probes kept out of the hot loop.
     // A chunk therefore closes at the first batch boundary at or past `csize`: a hint, not a contract.
-    extract_kmers_from_files_batched(files, BATCH_RECORDS, |batch| {
+    extract_kmers_from_files_batched(files, batch_records(), |batch| {
         let items: Vec<(u64, u64, u8, IntT)> = hash_batch::<IntT>(batch, k, qual.min_qual);
 
         outvec.extend(items.iter().map(|&(hc, hnc, b, _)| (hc, hnc, b)));
@@ -1444,7 +1464,7 @@ where
             // One record counter for all k: they see the same batches, so their chunks close together.
             let mut i_record = 0usize;
 
-            extract_kmers_from_files_batched(&all_files, BATCH_RECORDS, |batch| {
+            extract_kmers_from_files_batched(&all_files, batch_records(), |batch| {
                 let per_k = hash_batch_multik::<IntT>(batch, ks, qual.min_qual);
 
                 for (ik, items) in per_k.into_iter().enumerate() {
@@ -1516,7 +1536,7 @@ where
             let mut buckets: Vec<Vec<(u64, u64, u8, IntT)>> =
                 (0..COUNTMAP_SHARDS).map(|_| Vec::new()).collect();
 
-            extract_kmers_from_files_batched(&all_files, BATCH_RECORDS, |batch| {
+            extract_kmers_from_files_batched(&all_files, batch_records(), |batch| {
                 let per_k = hash_batch_multik::<IntT>(batch, ks, qual.min_qual);
                 for (ik, items) in per_k.into_iter().enumerate() {
                     absorb_into_shards(items, &mut all_shards[ik], &mut buckets);
