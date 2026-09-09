@@ -17,6 +17,16 @@ pub(crate) fn short_path_limit(minnts: usize, k: usize) -> usize {
     (minnts + 1).saturating_sub(k) // sat_sub is compulsory, becase as these are usize, going negative my change the path to an absurd value!!!
 }
 
+/// Tip-removal threshold in bases: the larger of a flat floor and a multiple of k, as Minia sizes it
+/// (`-tip-len-topo-kmult`). A flat 100 nt is generous at k=31 and catches almost nothing at k=81.
+pub(crate) fn tip_length_nts(flat_nts: usize, kmult: f32, k: usize) -> usize {
+    if kmult <= 0.0 {
+        flat_nts
+    } else {
+        flat_nts.max((kmult * k as f32).round() as usize)
+    }
+}
+
 /// A branch carrying less than this fraction of the stronger branch's coverage is noise. SKESA-inspired.
 pub const DEFAULT_POP_RATIO: f32 = 0.1;
 
@@ -37,8 +47,8 @@ pub trait Correctable {
     /// Solve bubbles from the graph, popping only where the coverage difference is big.
     fn correct_bubbles(&mut self, pop_ratio: f32) -> bool;
 
-    /// Remove all input and output dead paths
-    fn remove_dead_paths(&mut self) -> bool;
+    /// Remove all input and output dead paths shorter than `tip_nts` bases.
+    fn remove_dead_paths(&mut self, tip_nts: usize) -> bool;
 }
 
 impl Correctable for DbgGraph {
@@ -58,7 +68,7 @@ impl Correctable for DbgGraph {
         pop_bubbles_by_coverage(self, pop_ratio)
     }
 
-    fn remove_dead_paths(&mut self) -> bool {
+    fn remove_dead_paths(&mut self, tip_nts: usize) -> bool {
         logw(
             format!(
                 "Before pruning: {} nodes and {} edges",
@@ -69,6 +79,8 @@ impl Correctable for DbgGraph {
             Some("info"),
         );
 
+        // Hoisted out of the walk: it only depends on k and the threshold, both fixed for this call.
+        let limit = short_path_limit(tip_nts, self.k());
         let mut dididoanything = false;
         logw(format!("Starting graph pruning. Graph has {} externals, {} alone nodes, the remaining are internal.",
             self.externals_bi().len(),
@@ -90,7 +102,7 @@ impl Correctable for DbgGraph {
 
             for v in externals {
                 let carryedge = self.first_outgoing_edge_type(v).unwrap();
-                check_dead_path(self, v, &mut path_check_vec, self.k(), carryedge);
+                check_dead_path(self, v, &mut path_check_vec, limit, carryedge);
                 if !path_check_vec.is_empty() {
                     dididoanything = true;
                     to_remove.append(&mut path_check_vec);
@@ -99,7 +111,10 @@ impl Correctable for DbgGraph {
 
             // if there are no dead paths left pruning is done
             if to_remove.is_empty() {
-                logw("Graph is pruned.", Some("info"));
+                logw(
+                    format!("Graph is pruned: tip threshold {tip_nts} nt ({limit} k-mers)").as_str(),
+                    Some("info"),
+                );
                 return dididoanything;
             }
 
@@ -359,7 +374,7 @@ fn check_dead_path(
     ptgraph: &DbgGraph,
     vertex: NodeId,
     output_vec: &mut Vec<NodeId>,
-    k: usize,
+    limit: usize,
     carryedge: EdgeType,
 ) {
     let mut current_vertex = vertex;
@@ -373,7 +388,6 @@ fn check_dead_path(
     }
 
     let (mut ty, _) = carryedge.get_from_and_to();
-    let limit = short_path_limit(100, k);
 
     loop {
         if cnt >= limit {

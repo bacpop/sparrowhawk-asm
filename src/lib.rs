@@ -166,6 +166,8 @@ struct BuildOpts<'a> {
     do_dead_end_removal: bool,
     /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is popped.
     pop_ratio: f32,
+    /// Dead-end paths shorter than this many bases are pruned. Already resolved against k.
+    tip_nts: usize,
     output: PathBuf,
 }
 
@@ -211,6 +213,7 @@ fn run_build<IntT>(
         opts.do_bubble_collapse,
         opts.do_dead_end_removal,
         opts.pop_ratio,
+        opts.tip_nts,
     );
 
     save_functions::save_as_fasta::<IntT>(&mut contigs, &assembly.thedict, opts.k, opts.output);
@@ -238,6 +241,8 @@ pub fn main() {
             do_bloom,
             chunk_size,
             bubble_pop_ratio,
+            tip_length,
+            tip_length_kmult,
             no_histo,
             no_graphs,
             no_bubble_collapse,
@@ -268,8 +273,9 @@ pub fn main() {
             let quality = QualOpts {
                 // Only used when do_fit is false; the fit ignores it.
                 min_count: min_count.unwrap_or(DEFAULT_MINCOUNT),
-                min_qual: *min_qual,
+                min_qual: min_qual.unwrap_or_else(|| min_qual_for_k(*k)),
             };
+            log::info!("k={k}: minimum base quality used: {}", quality.min_qual);
 
             // Build, merge
             // let rc = !*single_strand;
@@ -316,6 +322,14 @@ pub fn main() {
                 );
                 std::process::exit(2);
             }
+            if *tip_length_kmult < 0.0 {
+                eprintln!(
+                    "error: --tip-length-kmult must be >= 0 (got {tip_length_kmult}). Zero keeps the \
+                     flat --tip-length."
+                );
+                std::process::exit(2);
+            }
+            let tip_nts = algorithms::corrector::tip_length_nts(*tip_length, *tip_length_kmult, *k);
             let opts = BuildOpts {
                 input_files: &input_files,
                 k: *k,
@@ -326,6 +340,7 @@ pub fn main() {
                 do_bubble_collapse: !no_bubble_collapse,
                 do_dead_end_removal: !no_dead_end_removal,
                 pop_ratio: *bubble_pop_ratio,
+                tip_nts,
                 output,
             };
 
@@ -422,6 +437,8 @@ pub struct AssemblyHelper {
     /// The CLI's `--bubble-pop-ratio`. Set through `set_bubble_pop_ratio`, not the constructor, so that
     /// existing JS callers keep working and get the same default the CLI does.
     bubble_pop_ratio: f32,
+    /// The CLI's `--tip-length-kmult`. Set through `set_tip_length_kmult`, for the same reason.
+    tip_length_kmult: f32,
     preprocessed_data: Option<HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>>,
     maxmindict: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
     seqdict64: Option<HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>>,
@@ -475,6 +492,7 @@ impl AssemblyHelper {
             no_bubble_collapse,
             no_dead_end_removal,
             bubble_pop_ratio: algorithms::corrector::DEFAULT_POP_RATIO,
+            tip_length_kmult: cli::DEFAULT_TIP_LEN_KMULT,
             preprocessed_data: None,
             maxmindict: None,
             seqdict64: None,
@@ -646,6 +664,22 @@ impl AssemblyHelper {
         }
     }
 
+    /// Multiplier scaling the tip-removal threshold with k. Zero keeps the flat floor.
+    pub fn set_tip_length_kmult(&mut self, kmult: f32) {
+        if kmult >= 0.0 {
+            self.tip_length_kmult = kmult;
+        } else {
+            logw(
+                format!(
+                    "Ignoring --tip-length-kmult {kmult}: it must be >= 0. Keeping {}.",
+                    self.tip_length_kmult
+                )
+                .as_str(),
+                Some("warn"),
+            );
+        }
+    }
+
     /// Assemble method of the wasm version
     pub fn assemble(&mut self) {
         logw("Starting assembly...", Some("info"));
@@ -656,6 +690,11 @@ impl AssemblyHelper {
             !self.no_bubble_collapse,
             !self.no_dead_end_removal,
             self.bubble_pop_ratio,
+            algorithms::corrector::tip_length_nts(
+                cli::DEFAULT_TIP_LEN_NTS,
+                self.tip_length_kmult,
+                self.k,
+            ),
         );
 
         post_state("assembly:saving");

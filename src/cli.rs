@@ -9,10 +9,32 @@ pub const DEFAULT_KMER: usize = 31;
 pub const DEFAULT_MINCOUNT: u16 = 5;
 /// Default minimum base quality (PHRED score) for FASTQ files
 pub const DEFAULT_MINQUAL: u8 = 20;
+/// Default k at or below which the full quality floor applies
+pub const DEFAULT_MINQUAL_K_LO: usize = 31;
+/// Default k at or above which no quality floor is applied
+pub const DEFAULT_MINQUAL_K_HI: usize = 71;
+/// Default flat tip-removal threshold, in bases
+pub const DEFAULT_TIP_LEN_NTS: usize = 100;
+/// Default tip-removal k multiplier, matching Minia's `-tip-len-topo-kmult`
+pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
 /// Default output directory
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
+
+/// Base-quality floor for `k`: [`DEFAULT_MINQUAL`] at or below [`DEFAULT_MINQUAL_K_LO`], 0 at or above
+/// [`DEFAULT_MINQUAL_K_HI`], linear between. A k-mer needs all k of its bases to pass and the window
+/// restarts at the first that does not, so a fixed floor costs `(1-p)^k` of the k-mer set.
+pub fn min_qual_for_k(k: usize) -> u8 {
+    if k <= DEFAULT_MINQUAL_K_LO {
+        DEFAULT_MINQUAL
+    } else if k >= DEFAULT_MINQUAL_K_HI {
+        0
+    } else {
+        let span = (DEFAULT_MINQUAL_K_HI - DEFAULT_MINQUAL_K_LO) as f64;
+        ((DEFAULT_MINQUAL as f64) * ((DEFAULT_MINQUAL_K_HI - k) as f64) / span).round() as u8
+    }
+}
 
 
 #[doc(hidden)]
@@ -129,9 +151,10 @@ pub enum Commands {
         #[arg(long)]
         min_count: Option<u16>,
 
-        /// Minimum k-mer quality (with reads)
-        #[arg(long, default_value_t = DEFAULT_MINQUAL)]
-        min_qual: u8,
+        /// Minimum k-mer quality (with reads). If omitted, it is DERIVED from k: 20 at k<=31, falling
+        /// linearly to 0 at k>=71.
+        #[arg(long)]
+        min_qual: Option<u8>,
 
         /// Number of CPU threads
         #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
@@ -152,6 +175,16 @@ pub enum Commands {
         /// treated as an error and popped.
         #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
         bubble_pop_ratio: f32,
+
+        /// Tip removal: dead-end paths shorter than this many bases are pruned. The threshold actually
+        /// used is `max(--tip-length, --tip-length-kmult * k)`.
+        #[arg(long, default_value_t = DEFAULT_TIP_LEN_NTS)]
+        tip_length: usize,
+
+        /// Tip removal: scale that threshold with k, as Minia does. Zero keeps the flat `--tip-length`,
+        /// which is the historical behaviour.
+        #[arg(long, default_value_t = DEFAULT_TIP_LEN_KMULT)]
+        tip_length_kmult: f32,
 
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this

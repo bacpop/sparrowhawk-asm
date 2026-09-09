@@ -808,6 +808,7 @@ pub trait Assemble {
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
         pop_ratio: f32,
+        tip_nts: usize,
     ) -> Contigs;
 
     #[cfg(target_family = "wasm")]
@@ -819,6 +820,7 @@ pub trait Assemble {
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
         pop_ratio: f32,
+        tip_nts: usize,
     ) -> (Contigs, String, String, String);
 }
 
@@ -837,6 +839,7 @@ impl Assemble for BasicAsm {
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
         pop_ratio: f32,
+        tip_nts: usize,
     ) -> Contigs {
         logw(
             "Constructing graph. Searching for neighbours...",
@@ -891,7 +894,7 @@ impl Assemble for BasicAsm {
         loop {
             let compacted = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
-                ptgraph.remove_dead_paths()
+                ptgraph.remove_dead_paths(tip_nts)
             } else {
                 false
             };
@@ -912,7 +915,7 @@ impl Assemble for BasicAsm {
             }
             changed |= ptgraph.shrink();
             if do_dead_end_removal {
-                changed |= ptgraph.remove_dead_paths();
+                changed |= ptgraph.remove_dead_paths(tip_nts);
             }
             if !changed {
                 break;
@@ -1002,6 +1005,7 @@ impl Assemble for BasicAsm {
         do_bubble_collapse: bool,
         do_dead_end_removal: bool,
         pop_ratio: f32,
+        tip_nts: usize,
     ) -> (Contigs, String, String, String) {
         logw("Starting assembler!", Some("info"));
 
@@ -1034,7 +1038,7 @@ impl Assemble for BasicAsm {
         loop {
             let compacted = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
-                ptgraph.remove_dead_paths()
+                ptgraph.remove_dead_paths(tip_nts)
             } else {
                 false
             };
@@ -1050,7 +1054,7 @@ impl Assemble for BasicAsm {
             }
             changed |= ptgraph.shrink();
             if do_dead_end_removal {
-                changed |= ptgraph.remove_dead_paths();
+                changed |= ptgraph.remove_dead_paths(tip_nts);
             }
             if !changed {
                 break;
