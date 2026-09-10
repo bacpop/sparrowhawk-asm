@@ -3,6 +3,7 @@
 #[cfg(not(target_family = "wasm"))]
 use std::{path::PathBuf, time::Instant};
 
+use libm::lgamma;
 use nohash_hasher::NoHashHasher;
 use std::{cmp::Ordering, collections::HashMap, hash::BuildHasherDefault};
 
@@ -40,7 +41,7 @@ pub struct PreprocessedK<IntT> {
     pub thedict: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
     /// non-canonical hash -> canonical hash
     pub maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    /// 500-bin k-mer spectrum; index `c-1` holds the number of distinct k-mers seen `c` times
+    /// `MAXSIZEHISTO`-bin k-mer spectrum; index `c-1` holds the number of distinct k-mers seen `c` times
     pub histovec: Vec<u32>,
     /// the min-count actually applied (fitted, or taken from the CLI)
     pub used_min_count: u16,
@@ -58,7 +59,15 @@ use seq_io::fastq::Record;
 use wasm_bindgen_file_reader::WebSysFile;
 
 // For the fitting, we'll use actually MAXSIZEHISTO - 1
-const MAXSIZEHISTO: usize = 500;
+const MAXSIZEHISTO: usize = 8000;
+
+/// Bins the original fit, peak finder and plot see. Pinned at the historical `MAXSIZEHISTO` so that
+/// widening the histogram cannot move them: `add_to_histogram` writes count `c` to index `c-1`, so
+/// indices 0..498 are identical either way and every legacy reader stays inside that window.
+pub(crate) const LEGACY_HISTO_RANGE: usize = 500;
+
+/// The pinned window has to fit inside the histogram, or the legacy readers would index out of bounds.
+const _: () = assert!(LEGACY_HISTO_RANGE <= MAXSIZEHISTO);
 
 #[inline]
 fn add_to_histogram(histovec: &mut [u32], count: u32) {
@@ -72,12 +81,13 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
 
 /// Single-copy coverage estimate straight from the spectrum: the tallest bin above the error peak.
 ///
-/// Scans counts 3..=499 and returns a **count, not an index**; the saturating final bin is excluded, so
-/// above ~500x the true peak is invisible here.
+/// Scans counts 3..=499 and returns a **count, not an index**; the range is pinned to
+/// [`LEGACY_HISTO_RANGE`], so above ~500x the true peak is invisible here. It is also a *global* argmax,
+/// so on a deep library the error lobe outvotes the genome lobe — see [`peak_above`].
 fn coverage_peak(histovec: &[u32]) -> usize {
     let mut best_count = 2usize; // nothing above the error peak; the caller's floor of 2 then applies
     let mut best_n = 0u32;
-    for (i, &n) in histovec[2..(MAXSIZEHISTO - 1)].iter().enumerate() {
+    for (i, &n) in histovec[2..(LEGACY_HISTO_RANGE - 1)].iter().enumerate() {
         if n > best_n {
             // Strict, so ties keep the lowest count and the result is deterministic.
             best_n = n;
@@ -87,41 +97,260 @@ fn coverage_peak(histovec: &[u32]) -> usize {
     best_count
 }
 
+// =====================================================================================================
+// An alternative `min_count` estimator, running beside the fit and for now only logged. It assumes no
+// distribution at all: it walks up from the error lobe to the first trough and takes the peak above it.
+// =====================================================================================================
+
+/// Bins either side of a count in the smoothed spectrum, and the run of rising bins that confirms we
+/// have left the error lobe rather than hit noise.
+const SMOOTH: usize = 2;
+const RISE_RUN: usize = 3;
+/// Genome k-mers the cutoff may delete, and how far the genome lobe must stand above the trough.
+const MAX_GENOME_LOSS: f64 = 0.01;
+const MIN_LOBE_RATIO: u64 = 3;
+/// Used when the lobes cannot be separated. Not 1: at a peak of 3-4 every singleton error survives and
+/// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
+const UNRESOLVED_MINCOUNT: u16 = 2;
+
+/// What the trough estimator concluded. This is what actually filters; the fit is logged beside it.
+struct TroughEstimate {
+    trough: usize,
+    peak: usize,
+    min_count: u16,
+    /// Variance-to-mean ratio of the genome lobe, or NaN when there is no usable lobe.
+    dispersion: f64,
+    verdict: &'static str,
+}
+
+/// Smoothed spectrum height at `count` (a count, not an index).
+fn smoothed(histovec: &[u32], count: usize) -> u64 {
+    let lo = count.saturating_sub(SMOOTH).max(1);
+    let hi = (count + SMOOTH).min(histovec.len() - 1);
+    (lo..=hi).map(|c| histovec[c - 1] as u64).sum::<u64>() / (hi - lo + 1) as u64
+}
+
+/// First local minimum followed by [`RISE_RUN`] rising bins, as a **count**. `None` when the spectrum
+/// never turns back up. Strictly first: a non-strict test walks to the far side of a flat trough (398 at
+/// 500x in simulation), which would delete every half-coverage region.
+fn error_trough(histovec: &[u32]) -> Option<usize> {
+    let hi = histovec.len() - 1; // the saturating bin is not part of the shape
+    let mut best_count = 2usize;
+    let mut best_n = smoothed(histovec, 2);
+    let mut rising = 0usize;
+    for count in 3..hi {
+        let n = smoothed(histovec, count);
+        if n < best_n {
+            best_n = n;
+            best_count = count;
+            rising = 0;
+        } else {
+            rising += 1;
+            if rising >= RISE_RUN {
+                return Some(best_count);
+            }
+        }
+    }
+    None
+}
+
+/// The cutoff ceiling: the tighter of a measured bound and a Poisson one. Neither is trustworthy alone
+/// — each is conservative exactly where the other fails — so the guard is the smaller of the two.
+fn loss_guard(histovec: &[u32], trough: usize, peak: usize) -> u16 {
+    measured_guard(histovec, trough, peak).min(poisson_guard(peak))
+}
+
+/// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the trough.
+/// This is the binding one at depth, where the genome lobe measures 8-12x overdispersed and a Poisson
+/// tail would permit a cutoff about 35 % too high.
+fn measured_guard(histovec: &[u32], trough: usize, peak: usize) -> u16 {
+    let total: u128 = (trough..histovec.len())
+        .map(|c| histovec[c - 1] as u128)
+        .sum();
+    if total == 0 {
+        return UNRESOLVED_MINCOUNT;
+    }
+    let budget = (total as f64 * MAX_GENOME_LOSS) as u128;
+    // `spent` is what cutting at `m` already costs, so we step up only while the next bin still fits;
+    // the value returned is therefore the last cutoff inside the budget, never the first one outside.
+    let mut spent = 0u128;
+    let mut m = trough;
+    while m < peak {
+        let next = spent + histovec[m - 1] as u128;
+        if next > budget {
+            break;
+        }
+        spent = next;
+        m += 1;
+    }
+    (m as u16).max(2)
+}
+
+/// Largest cutoff deleting at most [`MAX_GENOME_LOSS`] of a Poisson(`peak`) genome. This is the binding
+/// one at low coverage, where the lobe really is near-Poisson and the measured bound is loosened by the
+/// error k-mers that still sit above the trough.
+fn poisson_guard(peak: usize) -> u16 {
+    let lam = peak as f64;
+    let mut cdf = (-lam).exp();
+    let mut m = 1usize;
+    while m < peak {
+        let next = cdf + (-lam + m as f64 * lam.ln() - lgamma(m as f64 + 1.0)).exp();
+        if next > MAX_GENOME_LOSS {
+            break;
+        }
+        cdf = next;
+        m += 1;
+    }
+    (m as u16).max(2)
+}
+
+/// Variance-to-mean ratio of the single-copy lobe; 1.0 is Poisson. Logged because it is what says
+/// whether a negative binomial in the mixture fit would be worth the work.
+///
+/// Stops at twice the peak: beyond that lie the repeat copies and the saturating bin, and including
+/// them measures the spread of the whole spectrum rather than of the lobe the fit tries to model.
+fn dispersion_above(histovec: &[u32], trough: usize, peak: usize) -> f64 {
+    let top = (2 * peak).min(histovec.len() - 1);
+    let (mut n, mut sx, mut sxx) = (0f64, 0f64, 0f64);
+    for count in trough..top {
+        let w = histovec[count - 1] as f64;
+        let c = count as f64;
+        n += w;
+        sx += w * c;
+        sxx += w * c * c;
+    }
+    if n <= 0.0 || sx <= 0.0 {
+        return f64::NAN;
+    }
+    let mean = sx / n;
+    ((sxx / n - mean * mean).max(0.0)) / mean
+}
+
+/// Tallest bin at or above the trough, as a **count**. Unlike [`coverage_peak`] this cannot lock onto
+/// the error lobe, which is the whole difference between the two estimators.
+fn peak_above(histovec: &[u32], trough: usize) -> usize {
+    let hi = histovec.len() - 1;
+    let mut best_count = trough;
+    let mut best_n = 0u32;
+    for count in trough..hi {
+        if histovec[count - 1] > best_n {
+            // Strict, so ties keep the lowest count.
+            best_n = histovec[count - 1];
+            best_count = count;
+        }
+    }
+    best_count
+}
+
+/// The trough estimate for this spectrum. Falls back to [`UNRESOLVED_MINCOUNT`] with a stated verdict
+/// wherever the lobes are not separated — at 3-5x, trusting it blindly deleted 98-99 % of the genome.
+fn estimate_by_trough(histovec: &[u32]) -> TroughEstimate {
+    let bail = |trough, peak, verdict| TroughEstimate {
+        trough,
+        peak,
+        min_count: UNRESOLVED_MINCOUNT,
+        dispersion: f64::NAN,
+        verdict,
+    };
+    let Some(trough) = error_trough(histovec) else {
+        return bail(0, 0, "the spectrum never turns back up");
+    };
+    let peak = peak_above(histovec, trough);
+    if peak <= trough {
+        return bail(trough, peak, "no peak above the trough");
+    }
+    // k-mer INSTANCES, not distinct k-mers: at 500x the genome is under 1 % of distinct k-mers but most
+    // of the sequence, so a distinct-count test would reject a perfectly healthy deep library.
+    let instances_from = |from: usize| -> u128 {
+        (from..=histovec.len())
+            .map(|c| c as u128 * histovec[c - 1] as u128)
+            .sum()
+    };
+    let total = instances_from(1);
+    let above = instances_from(trough);
+    if total == 0 || above * 100 < total {
+        return bail(
+            trough,
+            peak,
+            "the lobe above the trough holds under 1 % of the sequence",
+        );
+    }
+    if (histovec[peak - 1] as u64) < MIN_LOBE_RATIO * (histovec[trough - 1].max(1) as u64) {
+        return bail(
+            trough,
+            peak,
+            "the lobe above the trough is not raised clear of it",
+        );
+    }
+    TroughEstimate {
+        trough,
+        peak,
+        // The trough removes the errors; the guard bounds what that costs in genome. The guard is the
+        // binding one at low coverage, where the two lobes crowd together; at depth it has slack spare.
+        min_count: (trough as u16).clamp(2, loss_guard(histovec, trough, peak)),
+        dispersion: dispersion_above(histovec, trough, peak),
+        verdict: "ok",
+    }
+}
+
+/// Run the Poisson mixture and log what it would have chosen, beside what the trough estimator did
+/// choose. Diagnostic only — the fit no longer decides anything.
+fn log_fit_comparison(histovec: &[u32], estimate: &TroughEstimate) {
+    // What the old path would have done: the fit if it can be trusted, else this floor off the peak.
+    let peak = coverage_peak(histovec);
+    let floor = ((peak as f64 / 8.0).round() as u16).max(2);
+
+    let mut fit = SpectrumFitter::new();
+    let would_be = match fit.fit_histogram(histovec[..(LEGACY_HISTO_RANGE - 1)].to_vec()) {
+        Ok(minc) if minc > TRUST_FIT_ABOVE => format!("{minc}"),
+        Ok(minc) => format!("{floor} (fit returned {minc}, too small to be trusted; peak {peak})"),
+        Err(e) => format!("{floor} (fit did not converge: {e}; peak {peak})"),
+    };
+    logw(
+        &format!(
+            "K-mer spectrum: trough at count {}, peak at count {}, lobe dispersion {:.1}x Poisson. \
+             Using min_count {} ({}). The Poisson mixture would have used {would_be}.{}",
+            estimate.trough,
+            estimate.peak,
+            estimate.dispersion,
+            estimate.min_count,
+            estimate.verdict,
+            if histovec[histovec.len() - 1] > 0 {
+                " NOTE: the spectrum saturates the histogram."
+            } else {
+                ""
+            }
+        ),
+        Some("info"),
+    );
+}
+
+// =====================================================================================================
+
 /// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
 /// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
 const TRUST_FIT_ABOVE: usize = 10;
 
 
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
-/// both filter sites keep k-mers with `count >= min_count`.
-fn apply_spectrum_fit(histovec: &[u32]) -> u16 {
-    // Used whenever the fit is not trusted. Scaling off the peak keeps a deep library from collapsing
-    // to a near-useless 2 or 3; the divisor errs low because a surviving error k-mer fragments a contig.
-    let peak = coverage_peak(histovec);
-    let floor = ((peak as f64 / 8.0).round() as u16).max(2);
-
-    let mut fit = SpectrumFitter::new();
-    match fit.fit_histogram(histovec[..(MAXSIZEHISTO - 1)].to_vec()) {
-        // A large cutoff means the fit separated the true-k-mer component cleanly, so trust it.
-        Ok(minc) if minc > TRUST_FIT_ABOVE => minc as u16,
-        // Below that, a fitted 5/6/7/8 costs up to 400 kb of assembly and halves N50, so use the floor.
-        outcome => {
-            let why = match &outcome {
-                Ok(minc) => format!("returned {minc}, too small to be reliable"),
-                Err(e) => format!("did not converge ({e})"),
-            };
-            logw(
-                &format!(
-                    "The k-mer spectrum fit {why}. Falling back to the histogram: its peak is at count \
-                     {peak}, so a minimum count of {floor} will be used This usually \
-                     means the spectrum is thin — low coverage, or a large k. Check the k-mer spectrum \
-                     histogram to confirm the value is appropriate."
-                ),
-                Some("warn"),
-            );
-            floor
-        }
+/// both filter sites keep k-mers with `count >= min_count`. The trough estimator decides; the Poisson
+/// mixture still runs and is logged beside it, so a run records what each would have chosen.
+fn choose_min_count(histovec: &[u32]) -> u16 {
+    let estimate = estimate_by_trough(histovec);
+    log_fit_comparison(histovec, &estimate);
+    if estimate.verdict != "ok" {
+        logw(
+            &format!(
+                "The k-mer spectrum's error and genome lobes are not separated ({}), so no reliable \
+                 minimum count exists and {} will be used — k-mers seen once are discarded and nothing \
+                 else is. Expect a fragmented assembly if this is a deep library. This usually means \
+                 the spectrum is thin: low coverage, or a large k. Check the k-mer spectrum histogram.",
+                estimate.verdict, estimate.min_count
+            ),
+            Some("warn"),
+        );
     }
+    estimate.min_count
 }
 
 fn build_histogram_from_countmap(
@@ -227,8 +456,12 @@ where
     log::info!("Finished getting kmers from {} file(s)", input_iters.len());
 }
 
+/// Draws the first [`LEGACY_HISTO_RANGE`] bins, so the PNG stays comparable with every earlier run. The
+/// final bin no longer piles up everything above it — that pile is now out at [`MAXSIZEHISTO`] — so the
+/// old spike at 500 is gone; the trough-estimator log line carries what lies beyond.
 #[cfg(not(target_family = "wasm"))]
 fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
+    let shown = &histovec[..LEGACY_HISTO_RANGE.min(histovec.len())];
     let backend = BitMapBackend::new(out_path, (1280, 960));
     let root = backend.into_drawing_area();
     let _ = root.fill(&WHITE);
@@ -238,7 +471,7 @@ fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
         .margin(5)
         .caption("k-mer spectrum", ("ibm-plex-sans", 30.0))
         .build_cartesian_2d(
-            (0u32..(MAXSIZEHISTO as u32)).into_segmented(),
+            (0u32..(LEGACY_HISTO_RANGE as u32)).into_segmented(),
             0u32..200000u32,
         )
         .unwrap();
@@ -255,7 +488,7 @@ fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
         .draw_series(
             Histogram::vertical(&chart)
                 .style(RED.filled())
-                .data(histovec.iter().enumerate().map(|(i, x)| (i as u32, *x))),
+                .data(shown.iter().enumerate().map(|(i, x)| (i as u32, *x))),
         )
         .unwrap();
     root.present()
@@ -506,11 +739,11 @@ where
 
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
-        logw("Counting finished. Starting fit...", Some("info"));
-        minc = apply_spectrum_fit(&histovec);
+        logw("Counting finished. Choosing the minimum count...", Some("info"));
+        minc = choose_min_count(&histovec);
         logw(
             format!(
-                "Fit done! Fitted min_count value: {}. Starting filtering...",
+                "Minimum count chosen: {}. Starting filtering...",
                 minc
             )
             .as_str(),
@@ -676,11 +909,11 @@ where
 
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
-        logw("Counting finished. Starting fit...", Some("info"));
-        minc = apply_spectrum_fit(&histovec);
+        logw("Counting finished. Choosing the minimum count...", Some("info"));
+        minc = choose_min_count(&histovec);
         logw(
             format!(
-                "Fit done! Fitted min_count value: {}. Starting filtering...",
+                "Minimum count chosen: {}. Starting filtering...",
                 minc
             )
             .as_str(),
@@ -777,10 +1010,10 @@ where
 
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
-        log::info!("Starting fit...");
-        minc = apply_spectrum_fit(&histovec);
+        log::info!("Choosing the minimum count...");
+        minc = choose_min_count(&histovec);
         log::info!(
-            "Fit done! Minimum count value to be used: {}. Filtering k-mers...",
+            "Minimum count chosen: {}. Filtering k-mers...",
             minc
         );
 
@@ -986,10 +1219,10 @@ where
     if do_fit {
         build_histogram_from_countmap(&countmap, &mut histovec);
 
-        log::info!("Counting finished. Starting fit...");
-        minc = apply_spectrum_fit(&histovec);
+        log::info!("Counting finished. Choosing the minimum count...");
+        minc = choose_min_count(&histovec);
         log::info!(
-            "Fit done! Fitted min_count value: {}. Starting filtering...",
+            "Minimum count chosen: {}. Starting filtering...",
             minc
         );
 
@@ -1251,7 +1484,7 @@ mod tests {
     }
 
     /// Ties keep the lowest count, and a spectrum with nothing above the error peak falls back to 2 —
-    /// so `apply_spectrum_fit`'s floor is well defined even for a degenerate histogram.
+    /// so the peak-derived floor stays well defined even for a degenerate histogram.
     #[test]
     fn coverage_peak_is_deterministic_and_has_a_floor() {
         let mut h = vec![0u32; MAXSIZEHISTO];
@@ -1266,14 +1499,249 @@ mod tests {
     }
 
 
-    /// The last bin saturates (it absorbs every count >= MAXSIZEHISTO), so it must not be mistaken for
-    /// a peak — `fit_histogram` excludes it for the same reason.
+    /// `coverage_peak` stops one bin short of [`LEGACY_HISTO_RANGE`], and `fit_histogram` is handed the
+    /// same window, so neither can be dragged by whatever sits at the edge of it.
     #[test]
-    fn coverage_peak_ignores_the_saturating_bin() {
+    fn coverage_peak_ignores_the_edge_of_its_pinned_window() {
         let mut h = vec![0u32; MAXSIZEHISTO];
-        h[MAXSIZEHISTO - 1] = 1_000_000; // everything >= 500 piled up here
+        h[LEGACY_HISTO_RANGE - 1] = 1_000_000;
         h[29] = 10;
         assert_eq!(coverage_peak(&h), 30);
+    }
+
+    /// Widening the histogram must not move the legacy readers: they see counts 1..=499, and
+    /// `add_to_histogram` puts count `c` at index `c-1` regardless of how long the vector is.
+    #[test]
+    fn widening_the_histogram_leaves_the_pinned_window_alone() {
+        let mut narrow = vec![0u32; LEGACY_HISTO_RANGE];
+        let mut wide = vec![0u32; MAXSIZEHISTO];
+        for c in [1u32, 2, 3, 47, 163, 499] {
+            add_to_histogram(&mut narrow[..], c);
+            add_to_histogram(&mut wide[..], c);
+        }
+        // Counts below the old ceiling land identically; only what used to saturate now moves.
+        assert_eq!(narrow[..LEGACY_HISTO_RANGE - 1], wide[..LEGACY_HISTO_RANGE - 1]);
+        assert_eq!(coverage_peak(&narrow), coverage_peak(&wide));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The trough estimator. Spectra are built from the same model the plan was simulated with: a
+    // genome lobe at Poisson(lambda) over 4.6 Mb, errors at Poisson(lambda * p / 3) over 3k slots.
+    // ---------------------------------------------------------------------------------------------
+
+    fn poisson(k: usize, lam: f64) -> f64 {
+        (-lam + k as f64 * lam.ln() - libm::lgamma(k as f64 + 1.0)).exp()
+    }
+
+    /// A synthetic spectrum at k-mer coverage `lam`, with a 1 % per-base error rate at k = 51.
+    fn synthetic_spectrum(lam: f64) -> Vec<u32> {
+        const GENOME: f64 = 4_600_000.0;
+        const K: f64 = 51.0;
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        let lam_err = lam * 0.01 / 3.0;
+        let err_slots = GENOME * 3.0 * K;
+        for c in 1..MAXSIZEHISTO {
+            let n = GENOME * poisson(c, lam) + if c < 60 { err_slots * poisson(c, lam_err) } else { 0.0 };
+            h[c - 1] = n as u32;
+        }
+        h
+    }
+
+    /// Fraction of a Poisson(`lam`) genome deleted by cutting below `min_count`.
+    fn genome_loss(lam: f64, min_count: u16) -> f64 {
+        (0..min_count as usize).map(|c| poisson(c, lam)).sum()
+    }
+
+    /// The case that breaks today: at 500x the error lobe outvotes the genome lobe, so the global
+    /// argmax returns ~3 and `peak/8` yields 2, while the trough finds the real peak out at ~500.
+    #[test]
+    fn trough_estimator_survives_a_deep_library() {
+        let h = synthetic_spectrum(500.0);
+        assert!(
+            coverage_peak(&h) < 10,
+            "the old argmax should be fooled here; that is the bug being fixed"
+        );
+        let e = estimate_by_trough(&h);
+        assert_eq!(e.verdict, "ok");
+        assert!((450..550).contains(&e.peak), "peak was {}", e.peak);
+        assert!((10..40).contains(&e.min_count), "min_count was {}", e.min_count);
+        assert!(genome_loss(500.0, e.min_count) < 1e-6);
+    }
+
+    /// A deep library is mostly error k-mers by *count* and mostly genome by *sequence*. Weighing
+    /// distinct k-mers instead of instances would reject this healthy spectrum.
+    #[test]
+    fn a_deep_library_is_not_rejected_for_being_mostly_errors() {
+        let h = synthetic_spectrum(500.0);
+        let distinct_total: u64 = h.iter().map(|&n| n as u64).sum();
+        let distinct_genome: u64 = h[100..].iter().map(|&n| n as u64).sum();
+        assert!(
+            distinct_genome * 50 < distinct_total,
+            "the genome should be a small minority of distinct k-mers here"
+        );
+        assert_eq!(estimate_by_trough(&h).verdict, "ok");
+    }
+
+    /// Where the lobes merge there is no honest answer, so it must say so rather than invent a trough
+    /// in the empty tail — which at 3-5x deleted almost the whole genome.
+    #[test]
+    fn trough_estimator_bails_out_when_the_lobes_merge() {
+        for lam in [3.0, 5.0, 8.0] {
+            let e = estimate_by_trough(&synthetic_spectrum(lam));
+            assert_ne!(e.verdict, "ok", "lambda {lam} should not be resolved");
+            assert_eq!(e.min_count, UNRESOLVED_MINCOUNT, "lambda {lam}");
+        }
+    }
+
+    /// Through the working range the cutoff must clear the errors without eating the genome.
+    #[test]
+    fn trough_estimator_is_safe_through_the_working_range() {
+        for lam in [10.0, 15.0, 20.0, 50.0, 100.0, 250.0] {
+            let e = estimate_by_trough(&synthetic_spectrum(lam));
+            assert_eq!(e.verdict, "ok", "lambda {lam}");
+            assert!(e.min_count >= 2, "lambda {lam}");
+            assert!(
+                genome_loss(lam, e.min_count) < 0.01,
+                "lambda {lam} lost {:.2} % of the genome at min_count {}",
+                genome_loss(lam, e.min_count) * 100.0,
+                e.min_count
+            );
+        }
+    }
+
+    /// The reason for widening the histogram: a peak past the old 500-bin ceiling must still be found.
+    #[test]
+    fn trough_estimator_finds_a_peak_beyond_the_old_ceiling() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        for c in 1..40 {
+            h[c - 1] = 1_000_000 / (c as u32 * c as u32); // a decaying error lobe
+        }
+        for c in 5500..6500 {
+            h[c - 1] = 20_000; // a genome lobe far outside LEGACY_HISTO_RANGE
+        }
+        let e = estimate_by_trough(&h);
+        assert_eq!(e.verdict, "ok");
+        assert!(e.peak >= LEGACY_HISTO_RANGE, "peak was {}", e.peak);
+        assert!(coverage_peak(&h) < LEGACY_HISTO_RANGE);
+    }
+
+    /// What cutting at `m` costs, as a fraction of the k-mers above `trough` — the quantity the guard
+    /// budgets, measured the same way from the same histogram.
+    fn measured_loss(histovec: &[u32], trough: usize, m: usize) -> f64 {
+        let total: f64 = (trough..histovec.len())
+            .map(|c| histovec[c - 1] as f64)
+            .sum();
+        let cut: f64 = (trough..m).map(|c| histovec[c - 1] as f64).sum();
+        if total > 0.0 {
+            cut / total
+        } else {
+            0.0
+        }
+    }
+
+    /// The measured half of the guard must spend its whole budget and no more: one bin higher has to
+    /// break it.
+    #[test]
+    fn measured_guard_spends_its_budget_and_stops() {
+        for lam in [20.0, 50.0, 100.0] {
+            let h = synthetic_spectrum(lam);
+            let trough = error_trough(&h).unwrap();
+            let peak = peak_above(&h, trough);
+            let m = measured_guard(&h, trough, peak) as usize;
+            assert!(m >= 2, "lambda {lam}");
+            assert!(
+                measured_loss(&h, trough, m) <= MAX_GENOME_LOSS,
+                "lambda {lam} guard {m} cost {:.4}",
+                measured_loss(&h, trough, m)
+            );
+            assert!(
+                m + 1 >= peak || measured_loss(&h, trough, m + 1) > MAX_GENOME_LOSS,
+                "lambda {lam} guard {m} could have gone higher"
+            );
+        }
+    }
+
+    /// Neither half is safe alone, so the guard takes the tighter: the Poisson bound binds at low
+    /// coverage, where errors above the trough loosen the measured one, and the measured bound binds at
+    /// depth, where the lobe is far too wide for a Poisson tail.
+    #[test]
+    fn loss_guard_takes_the_tighter_of_its_two_bounds() {
+        // Low coverage: the Poisson bound is the strict one.
+        let h = synthetic_spectrum(10.0);
+        let trough = error_trough(&h).unwrap();
+        let peak = peak_above(&h, trough);
+        assert!(poisson_guard(peak) < measured_guard(&h, trough, peak));
+        assert_eq!(loss_guard(&h, trough, peak), poisson_guard(peak));
+
+        // Depth, with a lobe as wide as the real libraries: the measured bound is the strict one.
+        let mut wide = vec![0u32; MAXSIZEHISTO];
+        for c in 1..MAXSIZEHISTO {
+            let z = (c as f64 - 200.0) / 45.0;
+            wide[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
+        }
+        assert!(measured_guard(&wide, 60, 200) < poisson_guard(200));
+        assert_eq!(loss_guard(&wide, 60, 200), measured_guard(&wide, 60, 200));
+    }
+
+    /// The reason the Poisson tail was dropped: on a lobe as wide as the real ones it permits a cutoff
+    /// far above what the data can afford. Mean 200, sd ~45, against a Poisson sd of 14.
+    #[test]
+    fn loss_guard_is_tighter_than_a_poisson_tail_on_an_overdispersed_lobe() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        let (mu, sd) = (200.0f64, 45.0f64);
+        for c in 1..MAXSIZEHISTO {
+            let z = (c as f64 - mu) / sd;
+            h[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
+        }
+        let trough = 60;
+        let m = loss_guard(&h, trough, 200) as usize;
+        // A Poisson(200) tail would allow ~168; the measured 1 % quantile of this lobe is far lower.
+        assert!(m < 150, "guard returned {m}, no tighter than a Poisson tail");
+        assert!(
+            measured_loss(&h, trough, m) <= MAX_GENOME_LOSS,
+            "guard {m} cost {:.4}",
+            measured_loss(&h, trough, m)
+        );
+    }
+
+    /// Dispersion is what tells us whether the mixture fit's Poisson genome component is defensible,
+    /// so it has to read ~1 on a Poisson lobe and clearly above it on a wide one.
+    #[test]
+    fn dispersion_reads_one_on_poisson_and_more_on_a_wide_lobe() {
+        let mut poisson_lobe = vec![0u32; MAXSIZEHISTO];
+        for c in 1..MAXSIZEHISTO {
+            poisson_lobe[c - 1] = (1e9 * poisson(c, 200.0)) as u32;
+        }
+        let d = dispersion_above(&poisson_lobe, 100, 200);
+        assert!((0.8..1.3).contains(&d), "Poisson lobe read {d:.2}");
+
+        let mut wide = vec![0u32; MAXSIZEHISTO];
+        for c in 1..MAXSIZEHISTO {
+            let z = (c as f64 - 200.0) / 45.0;
+            wide[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
+        }
+        assert!(
+            dispersion_above(&wide, 60, 200) > 5.0,
+            "wide lobe read {:.2}",
+            dispersion_above(&wide, 60, 200)
+        );
+    }
+
+    /// The swap: on a deep library the trough and the mixture fit disagree, and it is the trough that
+    /// must come out of `choose_min_count`.
+    #[test]
+    fn choose_min_count_returns_the_trough_not_the_fit() {
+        let h = synthetic_spectrum(500.0);
+        let e = estimate_by_trough(&h);
+        assert_eq!(e.verdict, "ok");
+        assert_eq!(choose_min_count(&h), e.min_count);
+        // ...and that is emphatically not what the old path would have produced.
+        let floor = ((coverage_peak(&h) as f64 / 8.0).round() as u16).max(2);
+        assert!(
+            e.min_count > floor,
+            "the old floor was {floor} and the trough {}; the swap changes nothing here",
+            e.min_count
+        );
     }
 }
 

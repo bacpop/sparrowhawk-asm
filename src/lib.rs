@@ -774,11 +774,14 @@ impl AssemblyHelper {
 
         results["nkmers"] =
             json::JsonValue::Number(self.preprocessed_data.as_ref().unwrap().len().into());
+        // Only the historical range: the histogram is now 16x wider, and the front-end plots whatever
+        // it is handed, so sending all of it would stretch the web spectrum over mostly empty bins.
         results["histo"] = json::JsonValue::Array(
             self.histovec
                 .as_ref()
                 .unwrap()
                 .iter()
+                .take(crate::preprocessing::LEGACY_HISTO_RANGE)
                 .map(|x| json::JsonValue::Number((*x).into()))
                 .collect(),
         );
