@@ -25,6 +25,9 @@ impl Collapsable for DbgGraph {
             self.isolated_node_count()
         );
 
+        let removed = erase_junction_nodes(&mut self);
+        log::info!("Removed {removed} branching junction nodes before collapse");
+
         log::info!("Starting collapse loop.");
         // 100 nt, though independent of this value the minimum is always at least k.
         let limit = crate::algorithms::corrector::short_path_limit(100, self.k());
@@ -110,6 +113,24 @@ impl Collapsable for DbgGraph {
 
         contigs
     }
+}
+
+/// Remove branching junction nodes before collapse walks begin.
+#[inline]
+fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> usize {
+    let junctions: Vec<NodeId> = ptgraph
+        .ambiguous_nodes()
+        .into_iter()
+        .filter(|&node| ptgraph.nonself_degree(node) > 1)
+        .collect();
+
+    let removed = junctions.len();
+
+    for node in junctions {
+        ptgraph.remove_node(node);
+    }
+
+    removed
 }
 
 // Main collapse function/method
@@ -371,5 +392,26 @@ mod tests {
         assert_eq!(contigs[0][0].abs_ind, vec![0]);
         assert!(!contigs.iter().flatten().any(|n| n.abs_ind == vec![1]));
         assert!(!g.contains_node(junction));
+    }
+
+    /// Pre-collapse junction erasure removes the junction and its incident edges only.
+    #[test]
+    fn erase_junction_nodes_removes_branching_node_and_edges() {
+        let mut g = DbgGraph::new(3);
+        let junction = g.add_node(node(0));
+        let branch_a = g.add_node(node(1));
+        let branch_b = g.add_node(node(2));
+
+        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
+
+        assert_eq!(erase_junction_nodes(&mut g), 1);
+        assert!(!g.contains_node(junction));
+        assert!(g.contains_node(branch_a));
+        assert!(g.contains_node(branch_b));
+        assert_eq!(g.out_degree(branch_a), 0);
+        assert_eq!(g.in_degree(branch_a), 0);
+        assert_eq!(g.out_degree(branch_b), 0);
+        assert_eq!(g.in_degree(branch_b), 0);
     }
 }
