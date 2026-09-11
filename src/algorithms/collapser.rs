@@ -146,25 +146,15 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
-            // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
+            // Junctions delimit contigs and are intentionally discarded.
             contigs.push(contig.clone());
             contig.clear();
-
-            // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
-            if num_following == 0 {
-                // We cannot continue.
-                ptgraph.remove_node(current_vertex);
-                return contigs;
-            }
-
             ptgraph.remove_node(current_vertex);
             return contigs;
         }
 
-        // If we arrived here, current_vertex is either considered good to be added to the current
-        // contig, or we have created a contig break and we are starting from this ambiguous node
-        // and also current_edge_index is the vertex through which we should continue our
-        // journey, or we have either a simple loop or a circumference to deal with
+        // If we arrive here, current_vertex has exactly one outgoing neighbour and no preceding
+        // neighbour, so it can be added to the current contig.
 
         // We add the current_vertex to the contig
         let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
@@ -257,21 +247,15 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> Serial
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
-            // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
+            // Junctions delimit contigs and are intentionally discarded.
             contigs.push(contig.clone());
             contig.clear();
-
-            // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
-            if num_following == 0 {
-                // We cannot continue.
-                return contigs;
-            }
+            ptgraph.remove_node(current_vertex);
+            return contigs;
         }
 
-        // If we arrived here, current_vertex is either considered good to be added to the current
-        // contig, or we have created a contig break and we are starting from this ambiguous node
-        // and also current_edge_index is the vertex through which we should continue our
-        // journey, or we have either a simple loop or a circumference to deal with
+        // If we arrive here, current_vertex has exactly one outgoing neighbour and no preceding
+        // neighbour, so it can be added to the current contig.
 
         // We add the current_vertex to the contig
         let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
@@ -343,5 +327,49 @@ mod tests {
         assert_eq!(contigs.len(), 1);
         assert_eq!(contigs[0].len(), 1);
         assert_eq!(g.node_count(), 0);
+    }
+
+    /// External walks discard a branching junction instead of emitting it.
+    #[test]
+    fn external_walk_discards_branching_junction() {
+        let mut g = DbgGraph::new(3);
+        let start = g.add_node(node(0));
+        let junction = g.add_node(node(1));
+        let branch_a = g.add_node(node(2));
+        let branch_b = g.add_node(node(3));
+
+        g.add_bi_edge(start, junction, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
+
+        let contigs = contigs_from_vertex(&mut g, start);
+
+        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs[0].len(), 1);
+        assert_eq!(contigs[0][0].abs_ind, vec![0]);
+        assert!(!contigs.iter().flatten().any(|n| n.abs_ind == vec![1]));
+        assert!(!g.contains_node(junction));
+    }
+
+    /// Intermediate walks apply the same junction-discarding rule as external walks.
+    #[test]
+    fn intermediate_walk_discards_branching_junction() {
+        let mut g = DbgGraph::new(3);
+        let start = g.add_node(node(0));
+        let junction = g.add_node(node(1));
+        let branch_a = g.add_node(node(2));
+        let branch_b = g.add_node(node(3));
+
+        g.add_bi_edge(start, junction, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
+
+        let contigs = contigs_from_intermediate_vertex(&mut g, start);
+
+        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs[0].len(), 1);
+        assert_eq!(contigs[0][0].abs_ind, vec![0]);
+        assert!(!contigs.iter().flatten().any(|n| n.abs_ind == vec![1]));
+        assert!(!g.contains_node(junction));
     }
 }
