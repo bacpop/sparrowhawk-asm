@@ -1,8 +1,6 @@
 //! Corrects parts of the provided graph, if needed
 use crate::logw;
-use sparrowhawk_graph::{
-    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId,
-};
+use sparrowhawk_graph::{BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId};
 
 use crate::EdgeWeight;
 
@@ -112,7 +110,8 @@ impl Correctable for DbgGraph {
             // if there are no dead paths left pruning is done
             if to_remove.is_empty() {
                 logw(
-                    format!("Graph is pruned: tip threshold {tip_nts} nt ({limit} k-mers)").as_str(),
+                    format!("Graph is pruned: tip threshold {tip_nts} nt ({limit} k-mers)")
+                        .as_str(),
                     Some("info"),
                 );
                 return dididoanything;
@@ -299,14 +298,20 @@ pub fn apply_bubble_collapse(
     // Re-validate: earlier collapses in this pass (or a collision) may have changed the shape.
     let midouts = ptgraph.out_neighbours_bi(midconns[winner].0, midnodect);
     if midouts.len() != 1 {
-        log::debug!("Bubble at {:?} no longer matches its detected shape; skipping", startn);
+        log::debug!(
+            "Bubble at {:?} no longer matches its detected shape; skipping",
+            startn
+        );
         return false;
     }
     let midconn2 = midouts[0];
     let outct = midconn2.1.get_from_and_to().1;
     let endouts = ptgraph.out_neighbours_bi(midconn2.0, outct);
     if endouts.len() != 1 {
-        log::debug!("Bubble at {:?} no longer matches its detected shape; skipping", startn);
+        log::debug!(
+            "Bubble at {:?} no longer matches its detected shape; skipping",
+            startn
+        );
         return false;
     }
     let outconn = endouts[0];
@@ -412,8 +417,8 @@ fn check_dead_path(
         if nbkgn_c == 0 {
             panic!("Not expected! 2");
         } else if nbkgn_c != 1 {
-            let mut altpath: Vec<Vec<NodeId>> = Vec::with_capacity(nbkgn_c - 1);
-            let mut maxlen = 0;
+            let mut altpath: Vec<(Vec<NodeId>, usize)> = Vec::with_capacity(nbkgn_c - 1);
+            let mut max_kmers = 0;
             for n in bkgneigh_c.iter() {
                 if n.0 == *output_vec.last().unwrap() {
                     continue;
@@ -426,20 +431,23 @@ fn check_dead_path(
                         &mut tmppath,
                         limit,
                     );
-                    let tmplen = tmppath.len();
+                    let tmplen = ptgraph
+                        .path_kmer_length(&tmppath)
+                        .expect("backward path contains a node removed from the graph");
                     if tmplen != 0 {
-                        altpath.push(tmppath);
-                        if tmplen > maxlen {
-                            maxlen = tmplen;
+                        altpath.push((tmppath, tmplen));
+                        if tmplen > max_kmers {
+                            max_kmers = tmplen;
                         }
                     }
                 }
             }
 
-            if maxlen != 0 && cnt > maxlen {
+            // Both values are totals of represented k-mers.
+            if max_kmers != 0 && cnt > max_kmers {
                 output_vec.clear();
-                for iv in altpath.iter_mut() {
-                    output_vec.append(iv);
+                for (path, _) in altpath.iter_mut() {
+                    output_vec.append(path);
                 }
             }
             return;
@@ -508,6 +516,52 @@ mod tests {
         assert_eq!(short_path_limit(100, 255), 0);
     }
 
+    #[test]
+    fn dead_path_arbitration_compares_kmer_totals() {
+        let mut graph = DbgGraph::new(3);
+        let tip_a = graph.add_node(NodeStruct {
+            counts: 1,
+            abs_ind: vec![0; 2],
+            innerdir: None,
+        });
+        let middle_a = graph.add_node(NodeStruct {
+            counts: 1,
+            abs_ind: vec![0; 2],
+            innerdir: None,
+        });
+        let tip_b = graph.add_node(NodeStruct {
+            counts: 1,
+            abs_ind: vec![0; 3],
+            innerdir: None,
+        });
+        let junction = graph.add_node(make_node());
+
+        graph.add_bi_edge(tip_a, middle_a, EdgeType::MinToMin);
+        graph.add_bi_edge(middle_a, junction, EdgeType::MinToMin);
+        graph.add_bi_edge(tip_b, junction, EdgeType::MinToMin);
+
+        let limit = 98;
+        let mut from_a = Vec::new();
+        check_dead_path(
+            &graph,
+            tip_a,
+            &mut from_a,
+            limit,
+            graph.first_outgoing_edge_type(tip_a).unwrap(),
+        );
+        assert_eq!(from_a, vec![tip_b]);
+
+        let mut from_b = Vec::new();
+        check_dead_path(
+            &graph,
+            tip_b,
+            &mut from_b,
+            limit,
+            graph.first_outgoing_edge_type(tip_b).unwrap(),
+        );
+        assert_eq!(from_b, vec![tip_b]);
+    }
+
     /// A single k-mer already spans k bases, so above the threshold nothing may be filtered for length.
     #[test]
     fn a_single_kmer_contig_survives_when_k_exceeds_the_floor() {
@@ -551,8 +605,14 @@ mod tests {
         let mut g = DbgGraph::new(3);
         let f0 = g.add_node(make_node());
         let s = g.add_node(make_node());
-        let m1 = g.add_node(NodeStruct { counts: c0, ..make_node() });
-        let m2 = g.add_node(NodeStruct { counts: c1, ..make_node() });
+        let m1 = g.add_node(NodeStruct {
+            counts: c0,
+            ..make_node()
+        });
+        let m2 = g.add_node(NodeStruct {
+            counts: c1,
+            ..make_node()
+        });
         let e = g.add_node(make_node());
         let f = g.add_node(make_node());
         g.add_bi_edge(f0, s, EdgeType::MinToMin);
@@ -561,7 +621,11 @@ mod tests {
         g.add_bi_edge(m1, e, EdgeType::MinToMin);
         g.add_bi_edge(m2, e, EdgeType::MinToMin);
         g.add_bi_edge(e, f, EdgeType::MinToMin);
-        assert_eq!(g.out_degree(s), 3, "fixture must be a candidate for the popper");
+        assert_eq!(
+            g.out_degree(s),
+            3,
+            "fixture must be a candidate for the popper"
+        );
         let mids = g.out_neighbours_min(s);
         (g, s, mids)
     }
@@ -617,7 +681,10 @@ mod tests {
         let (mut g, _s, _) = bubble_with_counts(100, 5);
         let before = g.node_count();
         assert!(pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO));
-        assert!(g.node_count() < before, "the popped branch and end node are gone");
+        assert!(
+            g.node_count() < before,
+            "the popped branch and end node are gone"
+        );
     }
 
     /// Pins the boundary: the comparison is a strict `<`, so a branch sitting exactly on the ratio
@@ -640,7 +707,10 @@ mod tests {
     #[test]
     fn a_zero_coverage_bubble_is_left_alone() {
         let (g, _s, mids) = bubble_with_counts(0, 0);
-        assert_eq!(choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO), BubbleChoice::Leave);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO),
+            BubbleChoice::Leave
+        );
 
         // But zero beside anything real is still noise.
         let (g, _s, mids) = bubble_with_counts(50, 0);

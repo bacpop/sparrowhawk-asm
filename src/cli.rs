@@ -36,7 +36,6 @@ pub fn min_qual_for_k(k: usize) -> u8 {
     }
 }
 
-
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
     let k: usize = s
@@ -168,8 +167,6 @@ pub enum Commands {
         /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
-
-
 
         /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
         /// treated as an error and popped.

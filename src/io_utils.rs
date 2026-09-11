@@ -75,12 +75,8 @@ pub struct NeedletailIterator {
 #[cfg(not(target_family = "wasm"))]
 impl NeedletailIterator {
     /// Construct from needletail readers
-    pub fn new(
-        reader: Box<dyn needletail::FastxReader>,
-    ) -> Self {
-        Self {
-            reader,
-        }
+    pub fn new(reader: Box<dyn needletail::FastxReader>) -> Self {
+        Self { reader }
     }
 }
 
@@ -88,9 +84,7 @@ impl NeedletailIterator {
 impl Iterator for NeedletailIterator {
     type Item = (Vec<u8>, Option<Vec<u8>>);
 
-    fn next(
-        &mut self,
-    ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    fn next(&mut self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
         let record = self.reader.next()?.expect("Invalid FASTA/Q record");
         let seq = record.seq();
         let qual = record.qual().map(|qual| qual.to_vec());

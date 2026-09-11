@@ -182,13 +182,21 @@ fn run_build<IntT>(
     IntT: for<'a> UInt<'a>,
 {
     let mut estimated_kmers: u64 = 0;
-    let mut readers = opts.input_files.iter().flat_map(|(_, files)| {
-        files.iter().map(|file| {
-            estimated_kmers += std::fs::metadata(file).map_or(0, |m| m.len());
-            let reader = needletail::parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
-            NeedletailIterator::new(reader)
-        }).collect::<Vec<NeedletailIterator>>()
-    }).collect::<Vec<NeedletailIterator>>();
+    let mut readers = opts
+        .input_files
+        .iter()
+        .flat_map(|(_, files)| {
+            files
+                .iter()
+                .map(|file| {
+                    estimated_kmers += std::fs::metadata(file).map_or(0, |m| m.len());
+                    let reader = needletail::parse_fastx_file(file)
+                        .unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+                    NeedletailIterator::new(reader)
+                })
+                .collect::<Vec<NeedletailIterator>>()
+        })
+        .collect::<Vec<NeedletailIterator>>();
     estimated_kmers /= 5;
     let estimated_kmers: usize = estimated_kmers.try_into().unwrap_or(usize::MAX);
 
@@ -353,19 +361,39 @@ pub fn main() {
                 0..=2 => panic!("kmer length too small (min. 3)"),
                 3..=32 => {
                     log::info!("k={width_k}: using 64-bit representation");
-                    run_build::<u64>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<u64>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 33..=64 => {
                     log::info!("k={width_k}: using 128-bit representation");
-                    run_build::<u128>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<u128>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 65..=128 => {
                     log::info!("k={width_k}: using 256-bit representation");
-                    run_build::<U256>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<U256>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 129..=256 => {
                     log::info!("k={width_k}: using 512-bit representation");
-                    run_build::<U512>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<U512>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 _ => panic!("kmer length larger than 256 currently not supported."),
             }

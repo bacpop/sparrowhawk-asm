@@ -12,10 +12,10 @@ use super::io_utils::*;
 // use std::process::exit;
 
 use crate::bit_encoding::UInt;
+use crate::graph_works::spell_path;
 use crate::graph_works::Contigs;
 #[cfg(target_family = "wasm")]
 use crate::logw;
-use crate::graph_works::spell_path;
 
 /// Writes the contig sequences and hopefully their average counts/coverage in the future
 ///
@@ -43,16 +43,11 @@ pub fn write_sequences_and_coverages<IntT>(
         if full.len() >= 2 * k - 1 {
             let body = &full[k - 1..full.len() - (k - 1)];
             if body.len() > 100 {
-                invec
-                    .contig_sequences
-                    .as_mut()
-                    .unwrap()
-                    .push(body.to_vec());
+                invec.contig_sequences.as_mut().unwrap().push(body.to_vec());
             }
         }
     }
 }
-
 
 /// Stores all the contigs as a fasta file
 #[cfg(not(target_family = "wasm"))]
@@ -76,7 +71,6 @@ pub fn save_as_fasta<IntT>(
     log::debug!("\tLen.\tMean\tSD\tMedian");
     ingraph.write_fasta(&mut wbuf);
 }
-
 
 /// Writes all the contigs as a fasta file
 #[cfg(not(target_family = "wasm"))]

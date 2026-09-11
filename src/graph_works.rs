@@ -13,9 +13,9 @@ use super::io_utils::*;
 use needletail::parser::write_fasta;
 
 use crate::algorithms::collapser::Collapsable;
-use crate::algorithms::corrector::Correctable;
 #[cfg(not(target_family = "wasm"))]
 use crate::algorithms::corrector::pop_bubbles_by_coverage;
+use crate::algorithms::corrector::Correctable;
 use crate::algorithms::shrinker::Shrinkable;
 use crate::bit_encoding::UInt;
 use crate::nthash;
@@ -568,8 +568,8 @@ mod tests {
     /// Every edge in a real graph joins two k-mers that genuinely overlap by `k-1`.
     #[test]
     fn every_edge_is_a_valid_k_minus_one_junction() {
-        use crate::algorithms::shrinker::Shrinkable;
         use super::spell_path;
+        use crate::algorithms::shrinker::Shrinkable;
 
         let k = 15;
         let seq = seq_with_repeat(k);
@@ -734,7 +734,10 @@ mod tests {
                 _ => b'A',
             })
             .collect();
-        assert!(spelled == seq || spelled == rc, "spelled an unrelated k-mer");
+        assert!(
+            spelled == seq || spelled == rc,
+            "spelled an unrelated k-mer"
+        );
     }
 
     #[test]
@@ -792,7 +795,6 @@ mod tests {
             Err(SpellError::NotAWalk { index: 10 })
         );
     }
-
 }
 
 /// Public API for assemblers.
@@ -862,7 +864,7 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                    .as_str(),
+                .as_str(),
                 Some("info"),
             );
         }
@@ -880,7 +882,7 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                    .as_str(),
+                .as_str(),
                 Some("info"),
             )
         }
@@ -937,7 +939,7 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                    .as_str(),
+                .as_str(),
                 Some("info"),
             );
         }
@@ -980,7 +982,7 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                    .as_str(),
+                .as_str(),
                 Some("info"),
             );
             logw(
