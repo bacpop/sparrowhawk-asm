@@ -736,6 +736,28 @@ mod tests {
         assert_eq!(prune_unpaired_edges(&mut g, b), 0);
     }
 
+    #[test]
+    fn prune_unpaired_edges_removes_balanced_unpaired_edges() {
+        let mut g = DbgGraph::new(3);
+        let left = g.add_node(make_node());
+        let node = g.add_node(make_node());
+        let right = g.add_node(make_node());
+        let phantom_in = g.add_node(make_node());
+        let phantom_out = g.add_node(make_node());
+
+        g.add_bi_edge(left, node, EdgeType::MinToMin);
+        g.add_bi_edge(node, right, EdgeType::MinToMin);
+
+        // One unpaired incoming and one unpaired outgoing edge keep the
+        // aggregate in-degree and out-degree equal.
+        g.add_edge(phantom_in, node, EdgeType::MinToMin);
+        g.add_edge(node, phantom_out, EdgeType::MinToMin);
+
+        assert_eq!(prune_unpaired_edges(&mut g, node), 2);
+        assert!(g.edges_between(phantom_in, node).is_empty());
+        assert!(g.edges_between(node, phantom_out).is_empty());
+    }
+
     /// The apply-time re-validation: a bubble corrupted between detection and collapse
     /// must be skipped instead of panicking on `[0]`.
     #[test]

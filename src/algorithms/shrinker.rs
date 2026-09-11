@@ -126,14 +126,9 @@ impl Shrinkable for DbgGraph {
     ) -> bool {
         let (initty, mut currtype) = curredge.get_from_and_to();
 
-        // Unbalanced degrees mean a one-sided edge (hash collision): prune and re-check.
-        let mut pruned = false;
-        if self.in_degree(base_node) != self.out_degree(base_node) {
-            pruned |= prune_unpaired_edges(self, base_node) > 0;
-        }
-        if self.in_degree(next_node) != self.out_degree(next_node) {
-            pruned |= prune_unpaired_edges(self, next_node) > 0;
-        }
+        // Pairing is checked by reciprocal edge type, not aggregate degree.
+        let mut pruned = prune_unpaired_edges(self, base_node) > 0;
+        pruned |= prune_unpaired_edges(self, next_node) > 0;
         // If the connecting edge was itself the phantom, there is nothing left to shrink here.
         if pruned
             && !self
@@ -236,13 +231,8 @@ impl Shrinkable for DbgGraph {
                 .unwrap()
                 .merge(&next_base_weight, curredge);
 
-            // A degree-anomalous prospective carries a one-sided edge (collision): prune it first.
-            if !ambnodes.contains(&prospective_node.0)
-                && (self.in_degree(prospective_node.0) != 1
-                    || self.out_degree(prospective_node.0) != 1)
-            {
-                prune_unpaired_edges(self, prospective_node.0);
-            }
+            // Remove any incident edge whose reciprocal edge has the wrong type or is absent.
+            prune_unpaired_edges(self, prospective_node.0);
 
             if self.out_degree_bi(prospective_node.0, prospfromandto.1) == 0
                 && self.in_degree_bi(prospective_node.0, prospfromandto.1) == 0
