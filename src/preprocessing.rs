@@ -23,6 +23,7 @@ use crate::bit_encoding::UInt;
 use crate::bloom_filter::KmerFilter;
 use crate::kmer::Kmer;
 use crate::logw;
+#[cfg(target_family = "wasm")]
 use crate::spectrum_fitter::SpectrumFitter;
 
 /// Tuple for name and list of input files
@@ -84,6 +85,10 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
 /// Scans counts 3..=499 and returns a **count, not an index**; the range is pinned to
 /// [`LEGACY_HISTO_RANGE`], so above ~500x the true peak is invisible here. It is also a *global* argmax,
 /// so on a deep library the error lobe outvotes the genome lobe — see [`peak_above`].
+///
+/// Natively this now has no callers outside the tests, which assert exactly that failure; the browser
+/// still reaches it through the mixture fit.
+#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
 fn coverage_peak(histovec: &[u32]) -> usize {
     let mut best_count = 2usize; // nothing above the error peak; the caller's floor of 2 then applies
     let mut best_n = 0u32;
@@ -131,8 +136,8 @@ fn smoothed(histovec: &[u32], count: usize) -> u64 {
 }
 
 /// First local minimum followed by [`RISE_RUN`] rising bins, as a **count**. `None` when the spectrum
-/// never turns back up. Strictly first: a non-strict test walks to the far side of a flat trough (398 at
-/// 500x in simulation), which would delete every half-coverage region.
+/// never turns back up. Only a *seed* for [`error_valley`]: on a deep library whose error lobe decays
+/// without a local minimum this walks into the genome lobe, which is harmless once bounded by the peak.
 fn error_trough(histovec: &[u32]) -> Option<usize> {
     let hi = histovec.len() - 1; // the saturating bin is not part of the shape
     let mut best_count = 2usize;
@@ -152,6 +157,21 @@ fn error_trough(histovec: &[u32]) -> Option<usize> {
         }
     }
     None
+}
+
+/// Lowest smoothed bin in `2..=peak`, as a **count**: the valley between the error lobe and the genome
+/// lobe. Bounded above by the peak, so unlike [`error_trough`] it cannot walk off into the lobe itself.
+fn error_valley(histovec: &[u32], peak: usize) -> usize {
+    let mut best_count = 2usize;
+    let mut best_n = smoothed(histovec, 2);
+    for count in 3..=peak.min(histovec.len() - 1) {
+        let n = smoothed(histovec, count);
+        if n < best_n {
+            best_n = n;
+            best_count = count;
+        }
+    }
+    best_count
 }
 
 /// The cutoff ceiling: the tighter of a measured bound and a Poisson one. Neither is trustworthy alone
@@ -252,10 +272,14 @@ fn estimate_by_trough(histovec: &[u32]) -> TroughEstimate {
         dispersion: f64::NAN,
         verdict,
     };
-    let Some(trough) = error_trough(histovec) else {
+    // The seed only has to land past the error head, not on the valley: the search below runs from 2,
+    // so an overshoot into the genome lobe still yields the right answer. That is what stopped 142 of
+    // the 195 bail-outs in the 2026-09-11 sweep, where the walk returned a count inside the lobe.
+    let Some(seed) = error_trough(histovec) else {
         return bail(0, 0, "the spectrum never turns back up");
     };
-    let peak = peak_above(histovec, trough);
+    let peak = peak_above(histovec, seed);
+    let trough = error_valley(histovec, peak);
     if peak <= trough {
         return bail(trough, peak, "no peak above the trough");
     }
@@ -293,23 +317,12 @@ fn estimate_by_trough(histovec: &[u32]) -> TroughEstimate {
     }
 }
 
-/// Run the Poisson mixture and log what it would have chosen, beside what the trough estimator did
-/// choose. Diagnostic only — the fit no longer decides anything.
-fn log_fit_comparison(histovec: &[u32], estimate: &TroughEstimate) {
-    // What the old path would have done: the fit if it can be trusted, else this floor off the peak.
-    let peak = coverage_peak(histovec);
-    let floor = ((peak as f64 / 8.0).round() as u16).max(2);
-
-    let mut fit = SpectrumFitter::new();
-    let would_be = match fit.fit_histogram(histovec[..(LEGACY_HISTO_RANGE - 1)].to_vec()) {
-        Ok(minc) if minc > TRUST_FIT_ABOVE => format!("{minc}"),
-        Ok(minc) => format!("{floor} (fit returned {minc}, too small to be trusted; peak {peak})"),
-        Err(e) => format!("{floor} (fit did not converge: {e}; peak {peak})"),
-    };
+/// What the estimator concluded, in one line.
+fn log_spectrum(histovec: &[u32], estimate: &TroughEstimate) {
     logw(
         &format!(
             "K-mer spectrum: trough at count {}, peak at count {}, lobe dispersion {:.1}x Poisson. \
-             Using min_count {} ({}). The Poisson mixture would have used {would_be}.{}",
+             Using min_count {} ({}).{}",
             estimate.trough,
             estimate.peak,
             estimate.dispersion,
@@ -325,19 +338,41 @@ fn log_fit_comparison(histovec: &[u32], estimate: &TroughEstimate) {
     );
 }
 
+/// What the Poisson mixture would have chosen. Kept for the browser, where there is no benchmark sweep
+/// to calibrate against; native runs do not fit at all, since the estimator beat it wherever they
+/// disagreed across 3780 sweep runs.
+#[cfg(target_family = "wasm")]
+fn log_fit_comparison(histovec: &[u32]) {
+    let peak = coverage_peak(histovec);
+    let floor = ((peak as f64 / 8.0).round() as u16).max(2);
+
+    let mut fit = SpectrumFitter::new();
+    let would_be = match fit.fit_histogram(histovec[..(LEGACY_HISTO_RANGE - 1)].to_vec()) {
+        Ok(minc) if minc > TRUST_FIT_ABOVE => format!("{minc}"),
+        Ok(minc) => format!("{floor} (fit returned {minc}, too small to be trusted; peak {peak})"),
+        Err(e) => format!("{floor} (fit did not converge: {e}; peak {peak})"),
+    };
+    logw(
+        &format!("The Poisson mixture would have used {would_be}."),
+        Some("info"),
+    );
+}
+
 // =====================================================================================================
 
 /// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
 /// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
+#[cfg(target_family = "wasm")]
 const TRUST_FIT_ABOVE: usize = 10;
 
 
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
-/// both filter sites keep k-mers with `count >= min_count`. The trough estimator decides; the Poisson
-/// mixture still runs and is logged beside it, so a run records what each would have chosen.
+/// both filter sites keep k-mers with `count >= min_count`.
 fn choose_min_count(histovec: &[u32]) -> u16 {
     let estimate = estimate_by_trough(histovec);
-    log_fit_comparison(histovec, &estimate);
+    log_spectrum(histovec, &estimate);
+    #[cfg(target_family = "wasm")]
+    log_fit_comparison(histovec);
     if estimate.verdict != "ok" {
         logw(
             &format!(
@@ -1566,6 +1601,46 @@ mod tests {
         assert!((450..550).contains(&e.peak), "peak was {}", e.peak);
         assert!((10..40).contains(&e.min_count), "min_count was {}", e.min_count);
         assert!(genome_loss(500.0, e.min_count) < 1e-6);
+    }
+
+    /// On a smooth spectrum the walk stops at the valley and widening the search cannot move it. This
+    /// does *not* hold on real data: where the error tail is noisy the walk stops at the first bump
+    /// and the spectrum keeps dipping afterwards, which is the case this change exists to correct.
+    #[test]
+    fn the_valley_equals_the_walk_on_a_clean_spectrum() {
+        for lam in [20.0, 60.0, 150.0, 500.0] {
+            let h = synthetic_spectrum(lam);
+            let seed = error_trough(&h).expect("a clean spectrum turns back up");
+            let peak = peak_above(&h, seed);
+            assert_eq!(
+                error_valley(&h, peak),
+                seed,
+                "lam {lam}: valley moved (seed {seed}, peak {peak})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_seed_past_the_genome_lobe_still_finds_the_valley() {
+        let h = synthetic_spectrum(500.0);
+        let truth = error_trough(&h).unwrap();
+        for overshoot in [700, 1500, 4000] {
+            assert_eq!(
+                error_valley(&h, overshoot),
+                truth,
+                "a peak of {overshoot} moved the valley away from {truth}"
+            );
+        }
+    }
+
+    /// A library with no separable lobe must still bail: widening the search must not manufacture a
+    /// valley where the spectrum is one monotone slide.
+    #[test]
+    fn a_flat_library_still_bails() {
+        let h = synthetic_spectrum(4.0);
+        let e = estimate_by_trough(&h);
+        assert_ne!(e.verdict, "ok", "min_count was {}", e.min_count);
+        assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
     }
 
     /// A deep library is mostly error k-mers by *count* and mostly genome by *sequence*. Weighing
