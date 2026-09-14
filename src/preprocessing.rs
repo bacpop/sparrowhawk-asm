@@ -85,14 +85,12 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
     histovec[idx] = histovec[idx].saturating_add(1);
 }
 
-/// Sampled hashes held before the threshold halves. 42 000 already reproduce a spectrum bin for bin,
-/// and the sketch is only ever read at the loose floors, whose samples are the larger ones.
+/// Sampled hashes held before the threshold halves
 #[cfg(not(target_family = "wasm"))]
 const SKETCH_BUDGET: usize = 250_000;
 
 /// Per-floor k-mer spectra from a fixed-size sample of hash space. Subsampling hash space does not move
-/// lambda — a k-mer's hash does not depend on how often it occurs — so the sampled k-mers keep their
-/// full-library counts and the trough sits where it sits in the whole table.
+/// lambda, as a k-mer's hash does not depend on how often it occurs.
 #[cfg(not(target_family = "wasm"))]
 pub struct SpectrumSketch {
     threshold: u64,
@@ -303,9 +301,6 @@ fn error_valley(histovec: &[u32], peak: usize) -> usize {
     }
     best_count
 }
-
-// The cutoff ceiling is the tighter of the two bounds below: neither is trustworthy alone, each being
-// conservative exactly where the other fails. `estimate_by_trough` takes the smaller and logs both.
 
 /// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the trough.
 /// This is the binding one at depth, where the genome lobe measures 8-12x overdispersed and a Poisson
@@ -538,6 +533,13 @@ fn warn_unresolved(estimate: &TroughEstimate) {
 /// still a healthy spectrum, and widening it only buys second passes nobody needs.
 #[cfg(not(target_family = "wasm"))]
 const COMFORTABLE_LOBE_RATIO: f64 = MIN_LOBE_RATIO + 0.5;
+/// Coverage below which a resolving spectrum is not taken at face value: the floor, rather than the
+/// library, may be what made it shallow.
+#[cfg(not(target_family = "wasm"))]
+const MIN_USEFUL_COVERAGE: usize = 25;
+/// A looser floor must lift the genome peak by at least this much to justify a second pass.
+#[cfg(not(target_family = "wasm"))]
+const MIN_COVERAGE_GAIN: f64 = 1.5;
 
 #[cfg(not(target_family = "wasm"))]
 fn resolves(estimate: &TroughEstimate) -> bool {
@@ -556,9 +558,16 @@ fn choose_min_count_and_floor(
     let strict_floor = floors[floors.len() - 1];
     let strict = estimate_by_trough(histovec);
     log_spectrum(histovec, &strict);
-    if resolves(&strict) {
+    // Resolving is not enough: a spectrum can separate cleanly at 7x and still assemble badly, because
+    // the floor rather than the library is what made it shallow.
+    if resolves(&strict) && strict.peak >= MIN_USEFUL_COVERAGE {
         return (strict.min_count, strict_floor);
     }
+
+    // The strictest floor that resolved but was too shallow to accept outright, as `(min_count, floor,
+    // peak)`. A looser rung has to beat its peak materially to be worth a second pass, and it is what
+    // the walk settles for when no rung reaches useful depth.
+    let mut best = resolves(&strict).then_some((strict.min_count, strict_floor, strict.peak));
 
     let spectra = sketch.spectra(floors.len());
     for g in (0..floors.len() - 1).rev() {
@@ -576,9 +585,26 @@ fn choose_min_count_and_floor(
             ),
             Some("info"),
         );
-        if resolves(&estimate) {
+        if !resolves(&estimate) {
+            continue;
+        }
+        // A looser rung is only worth a second pass if it is materially deeper than the best so far:
+        // depth, not the floor, may simply be the limit.
+        if best.is_some_and(|(_, _, p)| (estimate.peak as f64) < MIN_COVERAGE_GAIN * p as f64) {
+            continue;
+        }
+        // Deep enough to settle on; otherwise it becomes the new baseline and the walk keeps loosening,
+        // which is what a rung that resolves while still starved needs.
+        if estimate.peak >= MIN_USEFUL_COVERAGE {
             return (estimate.min_count, floors[g]);
         }
+        best = Some((estimate.min_count, floors[g], estimate.peak));
+    }
+
+    // Something separated the lobes, but nothing reached useful depth: take the strictest rung that
+    // did, rather than dropping the filter and admitting errors it cannot pay for in coverage.
+    if let Some((min_count, floor, _)) = best {
+        return (min_count, floor);
     }
 
     // Nothing resolved at any floor. Drop the quality filter entirely: it is the most depth available,
@@ -2319,6 +2345,87 @@ mod tests {
         let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &floors);
         assert_eq!(floor, 11, "should loosen to B, not all the way to C");
         assert!(minc > 2, "a resolving floor must yield a real cutoff, got {minc}");
+    }
+
+    /// Build a histogram from a `(count, distinct)` spectrum, as the main table would.
+    fn histo(spectrum: &[(u32, usize)]) -> Vec<u32> {
+        let mut out = vec![0u32; MAXSIZEHISTO];
+        for &(count, n) in spectrum {
+            for _ in 0..n {
+                add_to_histogram(&mut out, count);
+            }
+        }
+        out
+    }
+
+    /// A clean separation at a peak of 18 is still starvation: the floor, not the library, may be what
+    /// made it shallow, so a materially deeper floor wins even though the strict one resolved.
+    #[test]
+    fn a_shallow_resolving_spectrum_still_loosens() {
+        let shallow = histo(&bimodal(18));
+        let strict = estimate_by_trough(&shallow);
+        assert!(resolves(&strict), "the premise: the strict floor does resolve");
+        assert!(strict.peak < MIN_USEFUL_COVERAGE, "peak was {}", strict.peak);
+
+        let sketch = sketch_with(1, &bimodal(40));
+        let (_, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
+        assert_eq!(floor, 11, "a 2.2x deeper spectrum justifies the recount");
+    }
+
+    /// The same shallow spectrum, but loosening barely moves the peak: depth rather than the floor is
+    /// the limit, so the second pass is not worth paying for and the strict cutoff stands.
+    #[test]
+    fn a_shallow_spectrum_with_no_gain_keeps_the_strict_floor() {
+        let shallow = histo(&bimodal(18));
+        let strict = estimate_by_trough(&shallow);
+        let sketch = sketch_with(1, &bimodal(22));
+        let (minc, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
+        assert_eq!(floor, 25, "no material gain, so no recount");
+        assert_eq!(minc, strict.min_count, "and the strict cutoff is kept, not the fallback");
+        assert_ne!(minc, UNRESOLVED_MINCOUNT);
+    }
+
+    /// A sketch where the loose rung sees `extra` further occurrences of every k-mer, which is what
+    /// dropping the floor physically does: the same k-mers, seen more often.
+    fn sketch_deepening(spectrum: &[(u32, usize)], extra: u32) -> SpectrumSketch {
+        let mut s = SpectrumSketch::new();
+        let mut h = 1u64;
+        for &(count, n) in spectrum {
+            for _ in 0..n {
+                let mut c = [0u32; MAX_GROUPS];
+                c[1] = count;
+                c[0] = count * extra;
+                s.counts.insert(h, c);
+                h += 1;
+            }
+        }
+        s
+    }
+
+    /// The strict floor does not resolve at all and the middle rung does — but at a peak of 15 it is
+    /// still starved, so the walk must keep loosening instead of settling for the first rung that
+    /// merely separates. This is art at k=71/81, which stopped at its B rung and stayed fragmented.
+    #[test]
+    fn a_resolving_but_starved_rung_keeps_loosening() {
+        let flat = vec![1000u32; MAXSIZEHISTO];
+        let sketch = sketch_deepening(&bimodal(15), 2);
+        let (_, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        assert_eq!(floor, 0, "a 3x deeper rung is there and must be taken");
+    }
+
+    /// The same shape, but the loosest rung is barely deeper: no rung reaches useful depth, so the walk
+    /// settles for the strictest one that separated rather than dropping the filter for nothing.
+    #[test]
+    fn a_starved_ladder_settles_for_the_strictest_that_separated() {
+        let flat = vec![1000u32; MAXSIZEHISTO];
+        let mut sketch = sketch_deepening(&bimodal(15), 0);
+        // Group 0 sees a fifth again as many occurrences: real, but far under `MIN_COVERAGE_GAIN`.
+        for c in sketch.counts.values_mut() {
+            c[0] = c[1] / 5;
+        }
+        let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        assert_eq!(floor, 11, "no material gain below it, so the walk stops here");
+        assert_ne!(minc, UNRESOLVED_MINCOUNT, "and keeps the cutoff that rung measured");
     }
 
     /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an

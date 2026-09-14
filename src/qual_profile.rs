@@ -7,6 +7,9 @@ pub const PEEK_READS: usize = 5_000;
 pub const MAX_GROUPS: usize = 3;
 /// A "loose" floor at or below this is not a filter: on every RTA3 alphabet the bin below B is 2.
 pub const MIN_LOOSE_FLOOR: u8 = 10;
+/// A loose rung must sit at least this far below the strict one, or it admits the same bases under a
+/// different name. Binned alphabets clear this easily; near-continuous ones do not.
+pub const MIN_RUNG_GAP: u8 = 5;
 /// Tag for a window that clears no floor at all (fewer than k bases, or an N inside it).
 pub const NONE: u8 = u8::MAX;
 
@@ -46,7 +49,11 @@ pub fn floors_from(bins: &[u8], default_floor: u8) -> Vec<u8> {
         .iter()
         .find(|b| **b >= default_floor)
         .unwrap_or(&default_floor);
-    match bins.iter().rev().find(|b| **b < strict && **b > MIN_LOOSE_FLOOR) {
+    match bins
+        .iter()
+        .rev()
+        .find(|b| b.saturating_add(MIN_RUNG_GAP) <= strict && **b > MIN_LOOSE_FLOOR)
+    {
         Some(&loose) => vec![0, loose, strict],
         None => vec![0, strict],
     }
@@ -131,9 +138,14 @@ mod tests {
 
     #[test]
     fn floors_from_caps_the_loose_floor() {
+        // Gaps of 14, 12 and 7 all clear MIN_RUNG_GAP, so each keeps its middle rung.
         assert_eq!(floors_from(&[2, 11, 25, 37], 20), vec![0, 11, 25]);
         assert_eq!(floors_from(&[2, 12, 24, 40], 20), vec![0, 12, 24]);
         assert_eq!(floors_from(&[14, 21, 27, 32, 36], 20), vec![0, 14, 21]);
+        // Exactly MIN_RUNG_GAP is enough; one less is not. A default of 22 so that the bin under test
+        // is not itself picked as the strict floor.
+        assert_eq!(floors_from(&[2, 20, 25], 22), vec![0, 20, 25]);
+        assert_eq!(floors_from(&[2, 21, 25], 22), vec![0, 25]);
         // 2 is below MIN_LOOSE_FLOOR, so there is no usable B and the ladder is A -> C.
         assert_eq!(floors_from(&[2, 40], 20), vec![0, 40]);
         // No bin reaches the default, so A admits nothing and the strict pass comes back empty. B is
@@ -141,6 +153,9 @@ mod tests {
         assert_eq!(floors_from(&[2, 11], 20), vec![0, 11, 20]);
         // No alphabet at all (FASTA): nothing to loosen to.
         assert_eq!(floors_from(&[], 20), vec![0, 20]);
+        // A near-continuous alphabet: the bin below the strict floor is one PHRED unit away, so it is
+        // the same filter under another name and the ladder must skip it.
+        assert_eq!(floors_from(&[2, 19, 20], 20), vec![0, 20]);
     }
 
     /// An N breaks every run, so no window spanning it clears any floor, not even 0.
