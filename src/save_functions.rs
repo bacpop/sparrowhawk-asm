@@ -12,6 +12,7 @@ use super::io_utils::*;
 // use std::process::exit;
 
 use crate::bit_encoding::UInt;
+use crate::cli::DEFAULT_MIN_CONTIG_LENGTH_NTS;
 use crate::graph_works::spell_path;
 use crate::graph_works::Contigs;
 #[cfg(target_family = "wasm")]
@@ -27,8 +28,25 @@ pub fn write_sequences_and_coverages<IntT>(
 ) where
     IntT: for<'a> UInt<'a>,
 {
+    write_sequences_and_coverages_with_min_contig_length(
+        invec,
+        inmap,
+        k,
+        DEFAULT_MIN_CONTIG_LENGTH_NTS,
+    );
+}
+
+fn write_sequences_and_coverages_with_min_contig_length<IntT>(
+    invec: &mut Contigs,
+    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    k: usize,
+    min_contig_length: usize,
+) where
+    IntT: for<'a> UInt<'a>,
+{
     // TODO: implement coverages somehow...
     invec.contig_sequences = Some(Vec::with_capacity(invec.serialized_contigs.len()));
+    let mut omitted = 0;
 
     for (ipc, contig) in invec.serialized_contigs.iter().enumerate() {
         if contig.len() > 1 {
@@ -42,11 +60,24 @@ pub fn write_sequences_and_coverages<IntT>(
         // `full` is n + k - 1 bases for n k-mers; drop k-1 from each end, leaving n - k + 1.
         if full.len() >= 2 * k - 1 {
             let body = &full[k - 1..full.len() - (k - 1)];
-            if body.len() > 100 {
+            if body.len() >= min_contig_length {
                 invec.contig_sequences.as_mut().unwrap().push(body.to_vec());
+            } else {
+                omitted += 1;
             }
+        } else {
+            omitted += 1;
         }
     }
+
+    #[cfg(not(target_family = "wasm"))]
+    log::info!("Omitted {omitted} contigs shorter than {min_contig_length} nt from FASTA output");
+    #[cfg(target_family = "wasm")]
+    logw(
+        format!("Omitted {omitted} contigs shorter than {min_contig_length} nt from FASTA output")
+            .as_str(),
+        Some("info"),
+    );
 }
 
 /// Stores all the contigs as a fasta file
@@ -68,6 +99,26 @@ pub fn save_as_fasta<IntT>(
     let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
     // And simply, contig per contig, we write the file
 
+    log::debug!("\tLen.\tMean\tSD\tMedian");
+    ingraph.write_fasta(&mut wbuf);
+}
+
+/// Stores all contigs at a configurable minimum length as a FASTA file.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn save_as_fasta_with_min_contig_length<IntT>(
+    ingraph: &mut Contigs,
+    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    k: usize,
+    min_contig_length: usize,
+    outfile: PathBuf,
+) where
+    IntT: for<'a> UInt<'a>,
+{
+    write_sequences_and_coverages_with_min_contig_length(ingraph, inmap, k, min_contig_length);
+
+    log::debug!("Starting to save");
+    log::debug!("{:?}", outfile);
+    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
     log::debug!("\tLen.\tMean\tSD\tMedian");
     ingraph.write_fasta(&mut wbuf);
 }
@@ -191,7 +242,7 @@ mod tests {
             abs_ind: path,
             innerdir: None,
         }]]);
-        write_sequences_and_coverages(&mut contigs, &dict, k);
+        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 100);
 
         let got = &contigs.contig_sequences.as_ref().unwrap()[0];
         let want = &seq[k - 1..n];
@@ -215,7 +266,7 @@ mod tests {
             abs_ind: path,
             innerdir: None,
         }]]);
-        write_sequences_and_coverages(&mut contigs, &dict, k);
+        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 100);
 
         let got = &contigs.contig_sequences.as_ref().unwrap()[0];
         assert_eq!(
@@ -223,5 +274,29 @@ mod tests {
             seq[n - 1],
             "the last base must be S[n-1]; trimming k rather than k-1 would leave S[n-2]"
         );
+    }
+
+    #[test]
+    fn minimum_contig_length_is_inclusive_and_configurable() {
+        let k = 31;
+        let minimum = 500;
+
+        for (body_length, expected_contigs) in [(500, 1), (499, 0)] {
+            let seq = pseudo_seq(body_length + 2 * (k - 1));
+            let (dict, path) = dict_and_path(&seq, k);
+            let mut contigs = Contigs::new(vec![vec![NodeStruct {
+                counts: 1,
+                abs_ind: path,
+                innerdir: None,
+            }]]);
+
+            write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, minimum);
+
+            let sequences = contigs.contig_sequences.as_ref().unwrap();
+            assert_eq!(sequences.len(), expected_contigs);
+            if expected_contigs == 1 {
+                assert_eq!(sequences[0].len(), body_length);
+            }
+        }
     }
 }

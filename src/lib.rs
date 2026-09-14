@@ -169,6 +169,8 @@ struct BuildOpts<'a> {
     pop_ratio: f32,
     /// Dead-end paths shorter than this many bases are pruned. Already resolved against k.
     tip_nts: usize,
+    /// Minimum trimmed contig body length written to FASTA.
+    min_contig_length: usize,
     output: PathBuf,
 }
 
@@ -220,7 +222,13 @@ fn run_build<IntT>(
         opts.tip_nts,
     );
 
-    save_functions::save_as_fasta::<IntT>(&mut contigs, &assembly.thedict, opts.k, opts.output);
+    save_functions::save_as_fasta_with_min_contig_length::<IntT>(
+        &mut contigs,
+        &assembly.thedict,
+        opts.k,
+        opts.min_contig_length,
+        opts.output,
+    );
 }
 
 #[doc(hidden)]
@@ -247,6 +255,7 @@ pub fn main() {
             bubble_pop_ratio,
             tip_length,
             tip_length_kmult,
+            min_contig_length,
             no_histo,
             no_graphs,
             no_bubble_collapse,
@@ -345,6 +354,7 @@ pub fn main() {
                 do_dead_end_removal: !no_dead_end_removal,
                 pop_ratio: *bubble_pop_ratio,
                 tip_nts,
+                min_contig_length: *min_contig_length,
                 output,
             };
 

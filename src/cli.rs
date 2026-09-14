@@ -17,6 +17,8 @@ pub const DEFAULT_MINQUAL_K_HI: usize = 71;
 pub const DEFAULT_TIP_LEN_NTS: usize = 100;
 /// Default tip-removal k multiplier, matching Minia's `-tip-len-topo-kmult`
 pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
+/// Default minimum contig body length written to FASTA, in nucleotides
+pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 /// Default output directory
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
@@ -182,6 +184,11 @@ pub enum Commands {
         /// which is the historical behaviour.
         #[arg(long, default_value_t = DEFAULT_TIP_LEN_KMULT)]
         tip_length_kmult: f32,
+
+        /// Minimum contig body length written to FASTA, in nucleotides. Contigs with exactly this
+        /// length are retained.
+        #[arg(long, default_value_t = DEFAULT_MIN_CONTIG_LENGTH_NTS)]
+        min_contig_length: usize,
 
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this

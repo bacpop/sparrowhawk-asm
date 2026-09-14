@@ -104,6 +104,8 @@ An example execution could be the following:
 
 This will assemble your reads, with k=31 and using only one thread. The minimum repeats of one particular k-mer to be considered are 5 (which is also the default). The output contigs will be written in the current directory as a fasta file called `prefix_contigs.fasta`, given that we have indicated, using the `--output-prefix` argument the word "prefix" as prefix. The input files in this case are provided through a `reads.tsv` tab-separated file, that contains an identifier for your reads and the two file paths separated by a space, i.e. a file that contains this line
 
+By default, only contigs with a trimmed body of at least 500 nucleotides are written to FASTA. The threshold can be changed with `--min-contig-length`; it is inclusive, and applies after removing `k-1` bases from both ends.
+
 ```
 IDENTIFIER     /path/to/the/read_1.fastq /path/to/the/read_2.fastq
 ```
