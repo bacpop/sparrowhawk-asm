@@ -74,29 +74,30 @@ impl Shrinkable for DbgGraph {
                     }
                 } else {
                     for n in neigh {
-                        if ambnodes.contains(&n.0) || n.0 == *an {
+                        // An earlier contraction while processing this snapshot may have removed
+                        // the neighbour.
+                        if !self.contains_node(n.0) || ambnodes.contains(&n.0) || n.0 == *an {
                             continue;
-                        } else {
-                            let tmpty = n.1.get_from_and_to().1;
-                            let outn = self.out_neighbours_bi(n.0, tmpty);
+                        }
 
-                            if outn.is_empty() {
-                                continue;
-                            }
+                        let tmpty = n.1.get_from_and_to().1;
+                        let outn = self.out_neighbours_bi(n.0, tmpty);
 
-                            if outn.len() == 1
-                                && outn[0].0 != n.0
-                                && outn[0].0 != *an
-                                && (!ambnodes.contains(&outn[0].0)
-                                    || self.get_good_neighbours_bi(*an).len() == 1)
-                            {
-                                let incn = self.in_neighbours_bi(n.0, tmpty);
-                                if incn.len() == 1 {
-                                    if self.shrink_single_path(n.0, outn[0].0, &ambnodes, outn[0].1)
-                                    {
-                                        graph_changed = true;
-                                        pass_changed = true;
-                                    }
+                        if outn.is_empty() {
+                            continue;
+                        }
+
+                        if outn.len() == 1
+                            && outn[0].0 != n.0
+                            && outn[0].0 != *an
+                            && (!ambnodes.contains(&outn[0].0)
+                                || self.get_good_neighbours_bi(*an).len() == 1)
+                        {
+                            let incn = self.in_neighbours_bi(n.0, tmpty);
+                            if incn.len() == 1 {
+                                if self.shrink_single_path(n.0, outn[0].0, &ambnodes, outn[0].1) {
+                                    graph_changed = true;
+                                    pass_changed = true;
                                 }
                             }
                         }
