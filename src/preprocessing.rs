@@ -90,6 +90,16 @@ fn coverage_peak(histovec: &[u32]) -> usize {
 /// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
 /// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
 const TRUST_FIT_ABOVE: usize = 10;
+const AUTO_FIT_INITIAL_MIN_COUNT: u16 = 3;
+
+#[inline]
+fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
+    if do_fit {
+        AUTO_FIT_INITIAL_MIN_COUNT
+    } else {
+        qual.min_count
+    }
+}
 
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
 /// both filter sites keep k-mers with `count >= min_count`.
@@ -569,7 +579,7 @@ where
 
     let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
 
-    let mut kmer_filter = KmerFilter::new(if do_fit { 3 } else { qual.min_count });
+    let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
     kmer_filter.init();
 
     logw("Entering while loop for the first file...", Some("info"));
@@ -740,7 +750,7 @@ where
 
     let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
 
-    let mut kmer_filter = KmerFilter::new(qual.min_count);
+    let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
     kmer_filter.init();
 
     // NOTE, potential TODO? : This could be slightly improved by filling outdict and minmaxdict only once, though it'd require saving also km, but it could be better
@@ -1107,6 +1117,17 @@ mod tests {
 
     fn empty_dict() -> HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> {
         HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    #[test]
+    fn initial_bloom_min_count_is_shared_between_modes() {
+        let qual = QualOpts {
+            min_count: 7,
+            min_qual: 0,
+        };
+
+        assert_eq!(initial_bloom_min_count(&qual, true), 3);
+        assert_eq!(initial_bloom_min_count(&qual, false), 7);
     }
 
     #[test]
