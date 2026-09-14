@@ -6,7 +6,7 @@ use crate::EdgeWeight;
 
 use std::{
     cmp::{max, min},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     vec::Drain,
 };
 
@@ -126,43 +126,56 @@ impl Correctable for DbgGraph {
     }
 }
 
-/// Remove incident directed edges lacking their reverse partner (the signature of a hash
-/// collision). Returns how many were removed; afterwards the node is balanced again.
+/// Remove unpaired and duplicate incident edges.
+///
+/// At most one correctly typed reciprocal pair is retained for each connection.
+/// Returns the number of directed edges removed.
 pub(crate) fn prune_unpaired_edges(g: &mut DbgGraph, n: NodeId) -> usize {
-    let mut to_remove: BTreeSet<EdgeId> = BTreeSet::new();
+    type Connection = (NodeId, NodeId, EdgeType);
+
+    let mut incident: BTreeMap<Connection, BTreeSet<EdgeId>> = BTreeMap::new();
+
     for carry in [CarryType::Min, CarryType::Max] {
-        for (eid, m, t) in g.outgoing_edges_by_carry(n, carry) {
-            let paired = g
-                .edges_between(m, n)
-                .iter()
-                .any(|&e| g.edge_weight(e).unwrap().t == t.rev());
-            if !paired {
-                log::warn!("Removing unpaired edge {n:?} -{t:?}-> {m:?} — probable hash collision");
-                to_remove.insert(eid);
-            }
+        for (edge_id, target, edge_type) in g.outgoing_edges_by_carry(n, carry) {
+            incident
+                .entry((n, target, edge_type))
+                .or_default()
+                .insert(edge_id);
         }
     }
-    for (s, t) in g.incoming_edges(n) {
-        let paired = g
-            .edges_between(n, s)
-            .iter()
-            .any(|&e| g.edge_weight(e).unwrap().t == t.rev());
-        if !paired {
-            if let Some(&eid) = g
-                .edges_between(s, n)
-                .iter()
-                .find(|&&e| g.edge_weight(e).unwrap().t == t)
-            {
-                log::warn!("Removing unpaired edge {s:?} -{t:?}-> {n:?} — probable hash collision");
-                to_remove.insert(eid);
-            }
+
+    for (source, edge_type) in g.incoming_edges(n) {
+        let connection = (source, n, edge_type);
+        if incident.contains_key(&connection) {
+            continue;
+        }
+
+        let edge_ids = g
+            .edges_between(source, n)
+            .into_iter()
+            .filter(|&edge_id| g.edge_weight(edge_id).unwrap().t == edge_type)
+            .collect();
+
+        incident.insert(connection, edge_ids);
+    }
+
+    let mut to_remove: BTreeMap<EdgeId, Connection> = BTreeMap::new();
+
+    for (&(from, to, edge_type), edge_ids) in &incident {
+        let reverse = (to, from, edge_type.rev());
+        let retained = usize::from(incident.contains_key(&reverse));
+
+        for &edge_id in edge_ids.iter().skip(retained) {
+            to_remove.insert(edge_id, (from, to, edge_type));
         }
     }
-    let n_removed = to_remove.len();
-    for e in to_remove {
-        g.remove_edge(e);
+
+    for (&edge_id, &(from, to, edge_type)) in &to_remove {
+        log::warn!("Removing excess or unpaired edge {from:?} -{edge_type:?}-> {to:?}");
+        g.remove_edge(edge_id);
     }
-    n_removed
+
+    to_remove.len()
 }
 
 /// Collapse every bubble whose two branches differ significantly enough in coverage; leave the rest alone.
@@ -756,6 +769,48 @@ mod tests {
         assert_eq!(prune_unpaired_edges(&mut g, node), 2);
         assert!(g.edges_between(phantom_in, node).is_empty());
         assert!(g.edges_between(node, phantom_out).is_empty());
+    }
+
+    #[test]
+    fn prune_unpaired_edges_removes_excess_parallel_edge() {
+        let mut g = DbgGraph::new(3);
+        let a = g.add_node(make_node());
+        let b = g.add_node(make_node());
+
+        g.add_bi_edge(a, b, EdgeType::MinToMin);
+        g.add_edge(a, b, EdgeType::MinToMin);
+
+        assert_eq!(prune_unpaired_edges(&mut g, a), 1);
+        assert_eq!(g.edge_count(), 2);
+        assert_eq!(g.validate(), Ok(()));
+    }
+
+    #[test]
+    fn prune_unpaired_edges_removes_balanced_duplicate_pair() {
+        let mut g = DbgGraph::new(3);
+        let a = g.add_node(make_node());
+        let b = g.add_node(make_node());
+
+        g.add_bi_edge(a, b, EdgeType::MinToMin);
+        g.add_bi_edge(a, b, EdgeType::MinToMin);
+
+        assert_eq!(prune_unpaired_edges(&mut g, a), 2);
+        assert_eq!(g.edge_count(), 2);
+        assert_eq!(g.validate(), Ok(()));
+    }
+
+    #[test]
+    fn prune_unpaired_edges_removes_all_duplicate_incoming_phantoms() {
+        let mut g = DbgGraph::new(3);
+        let source = g.add_node(make_node());
+        let node = g.add_node(make_node());
+
+        g.add_edge(source, node, EdgeType::MinToMin);
+        g.add_edge(source, node, EdgeType::MinToMin);
+
+        assert_eq!(prune_unpaired_edges(&mut g, node), 2);
+        assert_eq!(g.edge_count(), 0);
+        assert_eq!(prune_unpaired_edges(&mut g, node), 0);
     }
 
     /// The apply-time re-validation: a bubble corrupted between detection and collapse
