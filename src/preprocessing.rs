@@ -1033,7 +1033,6 @@ pub fn preprocessing_standalone<IntT, I>(
     csize: usize,
     do_bloom: bool,
     do_fit: bool,
-    estimated_kmers: Option<usize>,
 ) -> PreprocessedK<IntT>
 where
     IntT: for<'a> UInt<'a>,
@@ -1054,8 +1053,7 @@ where
             log::info!("Counting k-mers by sorting, in chunks of {csize} records");
         }
 
-        let mut tmpvec: Vec<(u64, u64, u8)> =
-            Vec::with_capacity(estimated_kmers.unwrap_or(200000_usize));
+        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
         let out = chunked_preprocessing_standalone::<IntT, _>(
             input_iters,
             k,
