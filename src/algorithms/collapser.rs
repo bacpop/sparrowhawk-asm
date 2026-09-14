@@ -1,6 +1,5 @@
 //! Create string representation of contigs out of `DbgGraph`.
 
-use super::corrector::prune_unpaired_edges;
 use super::shrinker::Shrinkable;
 use sparrowhawk_graph::{
     get_nodelist_kmer_length, CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs,
@@ -213,19 +212,13 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> Serial
 
     // We need to get the carrytype, the edges, and so on before we can begin. We'll try to set them to get a forward
     // direction with only one neighbour, if possible.
-    // Pairing forbids one-sided patterns here: prune collision leftovers and re-read.
-    let mut outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
-    let mut outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
-    if outmin.is_empty() || outmax.is_empty() {
-        prune_unpaired_edges(ptgraph, v);
-        outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
-        outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
-    }
+    let outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
+    let outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
     let outminlen = outmin.len();
     let outmaxlen = outmax.len();
     let outeds = match (outminlen, outmaxlen) {
         (0, 0) => {
-            // Nothing left after the repair: emit the node as its own contig.
+            // An isolated node becomes its own contig.
             contig.push(ptgraph.node_weight(v).unwrap().clone());
             contigs.push(contig);
             ptgraph.remove_node(v);
@@ -318,23 +311,19 @@ mod tests {
         }
     }
 
-    /// A one-sided start (which used to panic as "External node!!!") is repaired and
-    /// walks its available side.
+    /// A legitimate one-carry start walks its available side.
     #[test]
-    fn collapse_walks_a_one_sided_start_instead_of_panicking() {
+    fn collapse_walks_a_legitimate_one_carry_start() {
         let mut g = DbgGraph::new(3);
         let v = g.add_node(node(0));
         let w = g.add_node(node(1));
-        let u = g.add_node(node(2));
         g.add_bi_edge(v, w, EdgeType::MinToMin);
-        g.add_edge(u, v, EdgeType::MinToMax); // phantom: no reverse partner
 
         let contigs = contigs_from_intermediate_vertex(&mut g, v);
 
         assert_eq!(contigs.len(), 1);
         assert_eq!(contigs[0].len(), 2);
-        assert_eq!(g.node_count(), 1); // only `u` is left...
-        assert_eq!(g.out_degree(u), 0); // ...and its phantom edge was pruned
+        assert_eq!(g.node_count(), 0);
     }
 
     /// A start left with no edges at all becomes its own single-node contig.
