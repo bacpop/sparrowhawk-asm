@@ -20,6 +20,10 @@ pub mod graph_works;
 /// Preprocessing functions of the reads & k-mers
 pub mod preprocessing;
 
+/// Candidate base-quality floors, and which of them each k-mer window clears
+#[cfg(not(target_family = "wasm"))]
+pub mod qual_profile;
+
 /// Declarations and definitions for encode our k-mers efficiently in memory
 pub mod bit_encoding;
 
@@ -172,14 +176,17 @@ struct BuildOpts<'a> {
     output: PathBuf,
 }
 
-/// Run the whole `build` pipeline, monomorphised on the packed-k-mer width.
+/// Open the inputs and count k-mers at one quality floor. Split out of [`run_build`] so the pipeline
+/// can run it a second time when the spectrum does not resolve at the default floor.
 #[cfg(not(target_family = "wasm"))]
-fn run_build<IntT>(
-    opts: BuildOpts,
+fn count_reads<IntT>(
+    opts: &BuildOpts,
+    quality: &QualOpts,
+    floors: Option<&[u8]>,
     timevec: &mut Vec<Instant>,
-    out_paths_histo: &mut [Option<PathBuf>],
-    out_path_graph: &mut Option<PathBuf>,
-) where
+    out_path_histo: &mut Option<PathBuf>,
+) -> preprocessing::PreprocessedK<IntT>
+where
     IntT: for<'a> UInt<'a>,
 {
     let mut estimated_kmers: u64 = 0;
@@ -193,17 +200,53 @@ fn run_build<IntT>(
     estimated_kmers /= 5;
     let estimated_kmers: usize = estimated_kmers.try_into().unwrap_or(usize::MAX);
 
-    let mut assembly = preprocessing::preprocessing_standalone::<IntT, _>(
+    preprocessing::preprocessing_standalone::<IntT, _>(
         &mut readers,
         opts.k,
-        opts.quality,
+        quality,
+        floors,
         &mut Some(timevec),
-        &mut out_paths_histo[0],
+        out_path_histo,
         opts.chunk_size,
         opts.do_bloom,
         opts.do_fit,
         Some(estimated_kmers),
+    )
+}
+
+/// Run the whole `build` pipeline, monomorphised on the packed-k-mer width.
+#[cfg(not(target_family = "wasm"))]
+fn run_build<IntT>(
+    opts: BuildOpts,
+    timevec: &mut Vec<Instant>,
+    out_paths_histo: &mut [Option<PathBuf>],
+    out_path_graph: &mut Option<PathBuf>,
+) where
+    IntT: for<'a> UInt<'a>,
+{
+    // The alphabet only, from the head of the first file: a few thousand reads show all 4-5 bins, and
+    // no spectrum is built from them, so the depth of the peek does not matter.
+    let ladder = qual_profile::floors_from(
+        &qual_profile::peek_alphabet(&opts.input_files[0].1[0], qual_profile::PEEK_READS),
+        opts.quality.min_qual,
     );
+    log::info!("Candidate base-quality floors: {ladder:?}");
+
+    let mut assembly =
+        count_reads::<IntT>(&opts, opts.quality, Some(&ladder), timevec, &mut out_paths_histo[0]);
+    let chosen = assembly.chosen_min_qual;
+    if chosen < opts.quality.min_qual {
+        // Why it loosened is logged by the estimator, which is the only place that knows.
+        log::warn!(
+            "Recounting at a base-quality floor of {chosen} instead of {} — this admits more error \
+             k-mers.",
+            opts.quality.min_qual
+        );
+        let loosened = QualOpts { min_count: opts.quality.min_count, min_qual: chosen };
+        // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
+        drop(assembly);
+        assembly = count_reads::<IntT>(&opts, &loosened, None, timevec, &mut out_paths_histo[0]);
+    }
 
     let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
         opts.k,
@@ -274,7 +317,7 @@ pub fn main() {
             let quality = QualOpts {
                 // Only used when do_fit is false; the fit ignores it.
                 min_count: min_count.unwrap_or(DEFAULT_MINCOUNT),
-                min_qual: min_qual.unwrap_or_else(|| min_qual_for_k(*k)),
+                min_qual: min_qual.unwrap_or(DEFAULT_MINQUAL),
             };
             log::info!("k={k}: minimum base quality used: {}", quality.min_qual);
 

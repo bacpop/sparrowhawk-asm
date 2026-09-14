@@ -37,11 +37,12 @@ pub struct Kmer<'a, IntT> {
 }
 
 impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
-    /// Quality score is at least minimum.
+    /// Quality score is at least minimum. Inclusive, so `--min-qual 20` keeps Q20; saturating because a
+    /// byte below b'!' = 33, where the ASCII encoding starts, would otherwise underflow.
     #[inline(always)]
     fn valid_qual(idx: usize, qual: Option<&'a [u8]>, min_qual: u8) -> bool {
         match qual {
-            Some(qual_seq) => (qual_seq[idx] - 33) > min_qual, // ASCII encoding starts from b'!' = 33
+            Some(qual_seq) => qual_seq[idx].saturating_sub(33) >= min_qual,
             None => true,
         }
     }
@@ -250,6 +251,11 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         }
     }
 
+    /// Index of the **last** base of the current k-mer, so `end_index() + 1 - k` is its first base.
+    pub fn end_index(&self) -> usize {
+        self.index
+    }
+
     /// Advance and return (canonical_hash, non_canonical_hash, bases_byte), or None.
     /// Lighter than `get_next_kmer_and_give_us_things` — skips computing the k-mer bits.
     pub fn get_next_hash_and_bases(&mut self) -> Option<(u64, u64, u8)> {
@@ -393,9 +399,9 @@ mod tests {
     #[test]
     fn kmer_quality_filter_reduces_count() {
         let seq = b"ACGTACGT";
-        // All-passing quality: b'I'=73, (73-33)=40 > 30 ✓
+        // All-passing quality: b'I'=73, (73-33)=40 >= 30 ✓
         let good_qual = vec![b'I'; seq.len()];
-        // Bad quality at position 1 (C): b'!'=33, (33-33)=0 ≤ 30 → fails
+        // Bad quality at position 1 (C): b'!'=33, (33-33)=0 < 30 → fails
         let mut bad_qual = good_qual.clone();
         bad_qual[1] = b'!';
 
@@ -423,5 +429,34 @@ mod tests {
             bad_count < good_count,
             "bad_count={bad_count} good_count={good_count}"
         );
+    }
+
+    /// The floor is inclusive, so a read sitting exactly on it keeps every k-mer. This is the
+    /// regression test for the `>` that used to reject Q20 under `--min-qual 20`.
+    #[test]
+    fn a_base_at_exactly_the_floor_is_kept() {
+        let seq = b"ACGTACGTACGT";
+        let k = 5;
+        let qual = vec![20 + 33; seq.len()];
+        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), Some(&qual), k, 20, true)
+            .expect("a read at exactly the floor still yields k-mers");
+        let mut n = 1;
+        while it.get_next_hash_and_bases().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, seq.len() - k + 1);
+    }
+
+    /// `end_index` must name the last base of the current window, since Step 2 uses it to index a
+    /// per-position array of floors.
+    #[test]
+    fn end_index_lines_up_with_the_window() {
+        let seq = b"ACGTACGTACGT";
+        let k = 5;
+        let mut it =
+            Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, k, 0, true).unwrap();
+        assert_eq!(it.end_index() + 1 - k, 0);
+        it.get_next_hash_and_bases().unwrap();
+        assert_eq!(it.end_index() + 1 - k, 1);
     }
 }

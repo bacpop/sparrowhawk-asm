@@ -9,10 +9,6 @@ pub const DEFAULT_KMER: usize = 31;
 pub const DEFAULT_MINCOUNT: u16 = 5;
 /// Default minimum base quality (PHRED score) for FASTQ files
 pub const DEFAULT_MINQUAL: u8 = 20;
-/// Default k at or below which the full quality floor applies
-pub const DEFAULT_MINQUAL_K_LO: usize = 31;
-/// Default k at or above which no quality floor is applied
-pub const DEFAULT_MINQUAL_K_HI: usize = 71;
 /// Default flat tip-removal threshold, in bases
 pub const DEFAULT_TIP_LEN_NTS: usize = 100;
 /// Default tip-removal k multiplier, matching Minia's `-tip-len-topo-kmult`
@@ -21,21 +17,6 @@ pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
-
-/// Base-quality floor for `k`: [`DEFAULT_MINQUAL`] at or below [`DEFAULT_MINQUAL_K_LO`], 0 at or above
-/// [`DEFAULT_MINQUAL_K_HI`], linear between. A k-mer needs all k of its bases to pass and the window
-/// restarts at the first that does not, so a fixed floor costs `(1-p)^k` of the k-mer set.
-pub fn min_qual_for_k(k: usize) -> u8 {
-    if k <= DEFAULT_MINQUAL_K_LO {
-        DEFAULT_MINQUAL
-    } else if k >= DEFAULT_MINQUAL_K_HI {
-        0
-    } else {
-        let span = (DEFAULT_MINQUAL_K_HI - DEFAULT_MINQUAL_K_LO) as f64;
-        ((DEFAULT_MINQUAL as f64) * ((DEFAULT_MINQUAL_K_HI - k) as f64) / span).round() as u8
-    }
-}
-
 
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
@@ -151,8 +132,7 @@ pub enum Commands {
         #[arg(long)]
         min_count: Option<u16>,
 
-        /// Minimum k-mer quality (with reads). If omitted, it is DERIVED from k: 20 at k<=31, falling
-        /// linearly to 0 at k>=71.
+        /// Minimum k-mer base quality, inclusive (with reads). Defaults to 20 at every k.
         #[arg(long)]
         min_qual: Option<u8>,
 

@@ -23,6 +23,8 @@ use crate::bit_encoding::UInt;
 use crate::bloom_filter::KmerFilter;
 use crate::kmer::Kmer;
 use crate::logw;
+#[cfg(not(target_family = "wasm"))]
+use crate::qual_profile::{window_groups, MAX_GROUPS, NONE};
 #[cfg(target_family = "wasm")]
 use crate::spectrum_fitter::SpectrumFitter;
 
@@ -46,6 +48,9 @@ pub struct PreprocessedK<IntT> {
     pub histovec: Vec<u32>,
     /// the min-count actually applied (fitted, or taken from the CLI)
     pub used_min_count: u16,
+    /// the base-quality floor the spectrum asked for. Below `QualOpts::min_qual` when the lobes only
+    /// separated at a looser floor, which is the caller's signal to recount.
+    pub chosen_min_qual: u8,
 }
 
 // #[cfg(target_family = "wasm")]
@@ -78,6 +83,77 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
         count as usize - 1
     };
     histovec[idx] = histovec[idx].saturating_add(1);
+}
+
+/// Sampled hashes held before the threshold halves. 42 000 already reproduce a spectrum bin for bin,
+/// and the sketch is only ever read at the loose floors, whose samples are the larger ones.
+#[cfg(not(target_family = "wasm"))]
+const SKETCH_BUDGET: usize = 250_000;
+
+/// Per-floor k-mer spectra from a fixed-size sample of hash space. Subsampling hash space does not move
+/// lambda — a k-mer's hash does not depend on how often it occurs — so the sampled k-mers keep their
+/// full-library counts and the trough sits where it sits in the whole table.
+#[cfg(not(target_family = "wasm"))]
+pub struct SpectrumSketch {
+    threshold: u64,
+    counts: HashMap<u64, [u32; MAX_GROUPS], BuildHasherDefault<NoHashHasher<u64>>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl SpectrumSketch {
+    /// Allocated once at full size: `shrink` frees entries but not the table, so the high-water mark is
+    /// reached anyway, and pre-allocating avoids holding the old and new tables during a resize.
+    fn new() -> Self {
+        Self {
+            threshold: u64::MAX,
+            counts: HashMap::with_capacity_and_hasher(SKETCH_BUDGET, BuildHasherDefault::default()),
+        }
+    }
+
+    /// One compare rejects most occurrences once the threshold has fallen, so this stays cheap in the
+    /// hot loop.
+    #[inline]
+    fn observe(&mut self, hash: u64, group: u8) {
+        if hash >= self.threshold || group == NONE {
+            return;
+        }
+        self.counts.entry(hash).or_insert([0; MAX_GROUPS])[group as usize] += 1;
+        if self.counts.len() > SKETCH_BUDGET {
+            self.shrink();
+        }
+    }
+
+    /// Survivors keep the counts they already had, so the sample stays exact for every k-mer still in
+    /// it — which is the whole reason the spectrum survives the subsampling.
+    fn shrink(&mut self) {
+        self.threshold /= 2;
+        let t = self.threshold;
+        self.counts.retain(|h, _| *h < t);
+    }
+
+    /// Fraction of k-mers retained, so a sampled spectrum can be rescaled to the whole library. The
+    /// hash kept is `min(forward, reverse)`, which is not uniform: `P(min < t) = 1 - (1 - t)^2`, about
+    /// twice `t` at the thresholds this reaches. Abundance does not enter it, so the shape is unbiased.
+    fn fraction(&self) -> f64 {
+        let p = self.threshold as f64 / u64::MAX as f64;
+        1.0 - (1.0 - p) * (1.0 - p)
+    }
+
+    /// One spectrum per floor. A k-mer tagged `g` survives floors `0..=g`, so its count at floor `f` is
+    /// the total of the groups at or above `f` — hence the reverse accumulation.
+    fn spectra(&self, n: usize) -> Vec<Vec<u32>> {
+        let mut out = vec![vec![0u32; MAXSIZEHISTO]; n];
+        for counts in self.counts.values() {
+            let mut acc = 0u32;
+            for g in (0..n).rev() {
+                acc += counts[g];
+                if acc > 0 {
+                    add_to_histogram(&mut out[g], acc);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Single-copy coverage estimate straight from the spectrum: the tallest bin above the error peak.
@@ -113,19 +189,73 @@ const SMOOTH: usize = 2;
 const RISE_RUN: usize = 3;
 /// Genome k-mers the cutoff may delete, and how far the genome lobe must stand above the trough.
 const MAX_GENOME_LOSS: f64 = 0.01;
-const MIN_LOBE_RATIO: u64 = 3;
+/// Spectra with a textbook valley and a broad lobe were being rejected at a ratio near 2.4, so a
+/// threshold of 3 cut into good data.
+const MIN_LOBE_RATIO: f64 = 1.75;
+/// Share of k-mer *instances* the lobe above the trough must hold. A handful of noise bins clears 1 %
+/// on repeats and adapters alone; a genuine lobe holds 0.75-0.95 of the sequence.
+const MIN_LOBE_INSTANCES: f64 = 0.20;
 /// Used when the lobes cannot be separated. Not 1: at a peak of 3-4 every singleton error survives and
 /// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
 const UNRESOLVED_MINCOUNT: u16 = 2;
 
-/// What the trough estimator concluded. This is what actually filters; the fit is logged beside it.
+/// What the trough estimator concluded, and every intermediate it passed through. The extra fields are
+/// carried so one log line can reproduce the decision.
+#[derive(Default)]
 struct TroughEstimate {
+    /// Where [`error_trough`]'s walk stopped, before [`error_valley`] refined it.
+    seed: usize,
     trough: usize,
     peak: usize,
+    /// Heights at those two counts, so the ratio below can be checked rather than trusted.
+    trough_n: u32,
+    peak_n: u32,
+    /// `peak_n / trough_n`, the quantity [`MIN_LOBE_RATIO`] guards.
+    lobe_ratio: f64,
+    /// `trough / peak` as counts. Logged, never gated on: near 1.0 usually means the valley search found
+    /// nothing and stopped under the peak, but a tight clean separation reads the same way.
+    trough_frac: f64,
+    /// Share of k-mer instances at or above the trough, the quantity [`MIN_LOBE_INSTANCES`] guards.
+    above_frac: f64,
+    /// The two cutoff ceilings, kept apart so that which one binds can be read off a run.
+    guard_measured: u16,
+    guard_poisson: u16,
     min_count: u16,
     /// Variance-to-mean ratio of the genome lobe, or NaN when there is no usable lobe.
     dispersion: f64,
-    verdict: &'static str,
+    verdict: Verdict,
+}
+
+/// Why the estimator accepted or refused a spectrum. The default is a *refusal* on purpose: every path
+/// through [`estimate_by_trough`] sets it, so the default is unreachable, and if one ever stops setting
+/// it the run should fail closed rather than silently report a resolved spectrum.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Verdict {
+    #[default]
+    NeverTurnsUp,
+    NoPeakAboveTrough,
+    LobeHoldsTooLittle,
+    LobeNotClearOfTrough,
+    Ok,
+}
+
+impl Verdict {
+    /// Whether the lobes separated. Everything else is a refusal.
+    fn is_ok(self) -> bool {
+        matches!(self, Verdict::Ok)
+    }
+
+    /// The clause naming this outcome in the terminal warning.
+    fn reason(self) -> &'static str {
+        match self {
+            Verdict::NeverTurnsUp => "the spectrum never turns back up",
+            Verdict::NoPeakAboveTrough => "no peak above the trough",
+            Verdict::LobeHoldsTooLittle => "the lobe above the trough holds too little of the sequence",
+            Verdict::LobeNotClearOfTrough => "the lobe above the trough is not raised clear of it",
+            // Reached when the lobes did separate but the loss guard pulled the cutoff to the floor.
+            Verdict::Ok => "the cutoff would have cost more genome than the guard allows",
+        }
+    }
 }
 
 /// Smoothed spectrum height at `count` (a count, not an index).
@@ -174,11 +304,8 @@ fn error_valley(histovec: &[u32], peak: usize) -> usize {
     best_count
 }
 
-/// The cutoff ceiling: the tighter of a measured bound and a Poisson one. Neither is trustworthy alone
-/// — each is conservative exactly where the other fails — so the guard is the smaller of the two.
-fn loss_guard(histovec: &[u32], trough: usize, peak: usize) -> u16 {
-    measured_guard(histovec, trough, peak).min(poisson_guard(peak))
-}
+// The cutoff ceiling is the tighter of the two bounds below: neither is trustworthy alone, each being
+// conservative exactly where the other fails. `estimate_by_trough` takes the smaller and logs both.
 
 /// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the trough.
 /// This is the binding one at depth, where the genome lobe measures 8-12x overdispersed and a Poisson
@@ -265,24 +392,25 @@ fn peak_above(histovec: &[u32], trough: usize) -> usize {
 /// The trough estimate for this spectrum. Falls back to [`UNRESOLVED_MINCOUNT`] with a stated verdict
 /// wherever the lobes are not separated — at 3-5x, trusting it blindly deleted 98-99 % of the genome.
 fn estimate_by_trough(histovec: &[u32]) -> TroughEstimate {
-    let bail = |trough, peak, verdict| TroughEstimate {
-        trough,
-        peak,
+    let mut est = TroughEstimate {
         min_count: UNRESOLVED_MINCOUNT,
         dispersion: f64::NAN,
-        verdict,
+        ..Default::default()
     };
     // The seed only has to land past the error head, not on the valley: the search below runs from 2,
-    // so an overshoot into the genome lobe still yields the right answer. That is what stopped 142 of
-    // the 195 bail-outs in the 2026-09-11 sweep, where the walk returned a count inside the lobe.
+    // so an overshoot into the genome lobe still yields the right answer.
     let Some(seed) = error_trough(histovec) else {
-        return bail(0, 0, "the spectrum never turns back up");
+        est.verdict = Verdict::NeverTurnsUp;
+        return est;
     };
-    let peak = peak_above(histovec, seed);
-    let trough = error_valley(histovec, peak);
-    if peak <= trough {
-        return bail(trough, peak, "no peak above the trough");
-    }
+    est.seed = seed;
+    est.peak = peak_above(histovec, seed);
+    est.trough = error_valley(histovec, est.peak);
+    est.peak_n = histovec[est.peak - 1];
+    est.trough_n = histovec[est.trough - 1];
+    est.lobe_ratio = est.peak_n as f64 / est.trough_n.max(1) as f64;
+    est.trough_frac = est.trough as f64 / est.peak as f64;
+
     // k-mer INSTANCES, not distinct k-mers: at 500x the genome is under 1 % of distinct k-mers but most
     // of the sequence, so a distinct-count test would reject a perfectly healthy deep library.
     let instances_from = |from: usize| -> u128 {
@@ -291,48 +419,57 @@ fn estimate_by_trough(histovec: &[u32]) -> TroughEstimate {
             .sum()
     };
     let total = instances_from(1);
-    let above = instances_from(trough);
-    if total == 0 || above * 100 < total {
-        return bail(
-            trough,
-            peak,
-            "the lobe above the trough holds under 1 % of the sequence",
-        );
+    est.above_frac = if total == 0 {
+        0.0
+    } else {
+        instances_from(est.trough) as f64 / total as f64
+    };
+
+    // Computed unconditionally so that a bail-out can still report what the guards would have allowed.
+    // Both are O(peak), once per k.
+    est.guard_measured = measured_guard(histovec, est.trough, est.peak);
+    est.guard_poisson = poisson_guard(est.peak);
+    est.dispersion = dispersion_above(histovec, est.trough, est.peak);
+
+    est.verdict = if est.peak <= est.trough {
+        Verdict::NoPeakAboveTrough
+    } else if est.above_frac < MIN_LOBE_INSTANCES {
+        Verdict::LobeHoldsTooLittle
+    } else if est.lobe_ratio < MIN_LOBE_RATIO {
+        Verdict::LobeNotClearOfTrough
+    } else {
+        Verdict::Ok
+    };
+    if est.verdict.is_ok() {
+        // The trough removes the errors; the guards bound what that costs in genome. The Poisson one
+        // binds at low coverage, where the two lobes crowd together; at depth it has slack spare.
+        est.min_count = (est.trough as u16).clamp(2, est.guard_measured.min(est.guard_poisson));
     }
-    if (histovec[peak - 1] as u64) < MIN_LOBE_RATIO * (histovec[trough - 1].max(1) as u64) {
-        return bail(
-            trough,
-            peak,
-            "the lobe above the trough is not raised clear of it",
-        );
-    }
-    TroughEstimate {
-        trough,
-        peak,
-        // The trough removes the errors; the guard bounds what that costs in genome. The guard is the
-        // binding one at low coverage, where the two lobes crowd together; at depth it has slack spare.
-        min_count: (trough as u16).clamp(2, loss_guard(histovec, trough, peak)),
-        dispersion: dispersion_above(histovec, trough, peak),
-        verdict: "ok",
-    }
+    est
 }
 
-/// What the estimator concluded, in one line.
+/// The whole derivation, as `key=value` pairs so a directory of logs parses into a table. The prose a
+/// user reads is the warning in [`choose_min_count`], not this.
 fn log_spectrum(histovec: &[u32], estimate: &TroughEstimate) {
     logw(
         &format!(
-            "K-mer spectrum: trough at count {}, peak at count {}, lobe dispersion {:.1}x Poisson. \
-             Using min_count {} ({}).{}",
+            "K-mer spectrum: seed={} trough={} peak={} trough_n={} peak_n={} lobe_ratio={:.2} \
+             trough_frac={:.3} above_frac={:.4} guard_measured={} guard_poisson={} dispersion={:.1} \
+             min_count={} saturates={} verdict={:?}",
+            estimate.seed,
             estimate.trough,
             estimate.peak,
+            estimate.trough_n,
+            estimate.peak_n,
+            estimate.lobe_ratio,
+            estimate.trough_frac,
+            estimate.above_frac,
+            estimate.guard_measured,
+            estimate.guard_poisson,
             estimate.dispersion,
             estimate.min_count,
-            estimate.verdict,
-            if histovec[histovec.len() - 1] > 0 {
-                " NOTE: the spectrum saturates the histogram."
-            } else {
-                ""
-            }
+            histovec[histovec.len() - 1] > 0,
+            estimate.verdict
         ),
         Some("info"),
     );
@@ -373,19 +510,109 @@ fn choose_min_count(histovec: &[u32]) -> u16 {
     log_spectrum(histovec, &estimate);
     #[cfg(target_family = "wasm")]
     log_fit_comparison(histovec);
-    if estimate.verdict != "ok" {
+    warn_unresolved(&estimate);
+    estimate.min_count
+}
+
+/// The warning for a spectrum that yielded no usable cutoff. Shared, so the one-pass and the sketch
+/// paths cannot drift apart in what they tell the user.
+fn warn_unresolved(estimate: &TroughEstimate) {
+    // Keyed on the outcome, not only the verdict: a spectrum can be called `ok` and still have the loss
+    // guard collapse the cutoff to `UNRESOLVED_MINCOUNT`, which is the same thin-spectrum situation.
+    if !estimate.verdict.is_ok() || estimate.min_count == UNRESOLVED_MINCOUNT {
         logw(
             &format!(
                 "The k-mer spectrum's error and genome lobes are not separated ({}), so no reliable \
                  minimum count exists and {} will be used — k-mers seen once are discarded and nothing \
                  else is. Expect a fragmented assembly if this is a deep library. This usually means \
                  the spectrum is thin: low coverage, or a large k. Check the k-mer spectrum histogram.",
-                estimate.verdict, estimate.min_count
+                estimate.verdict.reason(), estimate.min_count
             ),
             Some("warn"),
         );
     }
-    estimate.min_count
+}
+
+/// Resolved *and* with room to spare. A lobe only just clearing [`MIN_LOBE_RATIO`] is the marginal case
+/// worth a second opinion from the sketch; the band is narrow because a ratio not far above the guard is
+/// still a healthy spectrum, and widening it only buys second passes nobody needs.
+#[cfg(not(target_family = "wasm"))]
+const COMFORTABLE_LOBE_RATIO: f64 = MIN_LOBE_RATIO + 0.5;
+
+#[cfg(not(target_family = "wasm"))]
+fn resolves(estimate: &TroughEstimate) -> bool {
+    estimate.verdict.is_ok() && estimate.lobe_ratio >= COMFORTABLE_LOBE_RATIO
+}
+
+/// The min-count, and the floor it was read at. `floors` is ascending, so this tries the strict floor
+/// first and then loosens: the strictest that resolves wins. Preference rather than a walk, because
+/// resolution is not monotone in the floor — a library can resolve at 25 and at 0 but not at 11.
+#[cfg(not(target_family = "wasm"))]
+fn choose_min_count_and_floor(
+    histovec: &[u32],
+    sketch: &SpectrumSketch,
+    floors: &[u8],
+) -> (u16, u8) {
+    let strict_floor = floors[floors.len() - 1];
+    let strict = estimate_by_trough(histovec);
+    log_spectrum(histovec, &strict);
+    if resolves(&strict) {
+        return (strict.min_count, strict_floor);
+    }
+
+    let spectra = sketch.spectra(floors.len());
+    for g in (0..floors.len() - 1).rev() {
+        let estimate = estimate_by_trough(&spectra[g]);
+        logw(
+            &format!(
+                "Sketch at a base-quality floor of {}: trough={} peak={} lobe_ratio={:.2} \
+                 min_count={} verdict={:?}",
+                floors[g],
+                estimate.trough,
+                estimate.peak,
+                estimate.lobe_ratio,
+                estimate.min_count,
+                estimate.verdict
+            ),
+            Some("info"),
+        );
+        if resolves(&estimate) {
+            return (estimate.min_count, floors[g]);
+        }
+    }
+
+    // Nothing resolved at any floor. Drop the quality filter entirely: it is the most depth available,
+    // and the strict estimate cannot be trusted precisely because it did not resolve.
+    let loosest = floors[0];
+    logw(
+        &format!(
+            "The k-mer spectrum does not separate at any candidate base-quality floor ({floors:?}), so \
+             the floor will be dropped to {loosest} and {UNRESOLVED_MINCOUNT} used as the minimum \
+             count. Expect a fragmented assembly. Check the k-mer spectrum histogram.",
+        ),
+        Some("warn"),
+    );
+    (UNRESOLVED_MINCOUNT, loosest)
+}
+
+/// The sketch's own spectrum at the floor in force, rescaled, against the table built beside it. Free on
+/// every run and the strongest check available that the sampling is unbiased.
+#[cfg(not(target_family = "wasm"))]
+fn check_sketch_against_table(histovec: &[u32], sketch: &SpectrumSketch, keep: usize) {
+    let sampled = &sketch.spectra(keep + 1)[keep];
+    let (table, sample): (u64, u64) = (
+        histovec.iter().map(|&n| n as u64).sum(),
+        sampled.iter().map(|&n| n as u64).sum(),
+    );
+    let expected = table as f64 * sketch.fraction();
+    logw(
+        &format!(
+            "Sketch: {sample} distinct k-mers sampled from {table} at a hash fraction of {:.3e} \
+             (expected {expected:.0})",
+            sketch.fraction()
+        ),
+        Some("info"),
+    );
 }
 
 fn build_histogram_from_countmap(
@@ -1116,8 +1343,17 @@ fn update_countmap(
 
 /// Hash one batch of records at a single k, in parallel. The occurrence order fixes the dictionary
 /// insertion order and so the node numbering in the GFA/DOT dumps; contigs do not depend on it.
+///
+/// `floors = Some(ladder)` is pass 1: the iterator runs wide open and every k-mer is tagged with the
+/// strictest floor it clears. `floors = None` filters at the iterator and tags everything `keep`.
 #[cfg(not(target_family = "wasm"))]
-fn hash_batch<IntT>(batch: &[OwnedRecord], k: usize, min_qual: u8) -> Vec<(u64, u64, u8, IntT)>
+fn hash_batch<IntT>(
+    batch: &[OwnedRecord],
+    k: usize,
+    min_qual: u8,
+    floors: Option<&[u8]>,
+    keep: u8,
+) -> Vec<(u64, u64, u8, u8, Option<IntT>)>
 where
     IntT: for<'a> UInt<'a>,
 {
@@ -1125,18 +1361,35 @@ where
         .par_iter()
         .flat_map_iter(|(seq, qual_bytes)| {
             let mut local = Vec::new();
+            let mut groups: Vec<u8> = Vec::new();
+            if let (Some(floors), Some(qual)) = (floors, qual_bytes.as_deref()) {
+                window_groups(seq, qual, k, floors, &mut groups);
+            }
             let kmer_opt = Kmer::<IntT>::new(
                 std::borrow::Cow::Borrowed(seq),
                 seq.len(),
                 qual_bytes.as_deref(),
                 k,
-                min_qual,
+                // Filtering nothing at the iterator is what "never stop because of qualities" means.
+                if groups.is_empty() { min_qual } else { 0 },
                 true,
             );
             if let Some(mut kmer_it) = kmer_opt {
-                local.push(kmer_it.get_curr_kmerhash_and_bases_and_kmer());
-                while let Some(tup) = kmer_it.get_next_kmer_and_give_us_things() {
-                    local.push(tup);
+                let (mut hc, mut hnc, mut b) = kmer_it.get_curr_hash_and_bases();
+                loop {
+                    // A record with no qualities (FASTA) has nothing to classify: keep every k-mer.
+                    let g = if groups.is_empty() {
+                        keep
+                    } else {
+                        groups[kmer_it.end_index()]
+                    };
+                    debug_assert_ne!(g, NONE, "the iterator emitted a window no floor clears");
+                    // The packed k-mer is the costly half at k>=51, so build it only for what is kept.
+                    local.push((hc, hnc, b, g, (g >= keep).then(|| kmer_it.get_kmer())));
+                    match kmer_it.get_next_hash_and_bases() {
+                        Some(next) => (hc, hnc, b) = next,
+                        None => break,
+                    }
                 }
             }
             local
@@ -1152,6 +1405,7 @@ fn chunked_preprocessing_standalone<IntT, I>(
     input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
+    floors: Option<&[u8]>,
     outvec: &mut Vec<(u64, u64, u8)>,
     csize: usize,
     do_fit: bool,
@@ -1162,6 +1416,7 @@ fn chunked_preprocessing_standalone<IntT, I>(
     HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     Vec<u32>,
     u16,
+    u8,
 )
 where
     IntT: for<'a> UInt<'a>,
@@ -1178,17 +1433,39 @@ where
     let mut i_record = 0;
     // let mut ncols : usize = 0;
 
+    // The ladder is ascending, so the last group is the strict floor and `keep` is its index.
+    let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
+    let mut sketch = floors.map(|_| SpectrumSketch::new());
+
     // The k-mer work runs in parallel per batch, with the dictionary probes kept out of the hot loop.
     // A chunk therefore closes at the first batch boundary at or past `csize`: a hint, not a contract.
     extract_kmers_from_files_batched(input_iters, BATCH_RECORDS, |batch| {
-        let items: Vec<(u64, u64, u8, IntT)> = hash_batch::<IntT>(batch, k, qual.min_qual);
+        let items = hash_batch::<IntT>(batch, k, qual.min_qual, floors, keep);
 
-        outvec.extend(items.iter().map(|&(hc, hnc, b, _)| (hc, hnc, b)));
+        // The sketch sees every occurrence whatever its tag; the main table sees only those clearing the
+        // floor in force. This closure is the serial half of the extraction, so no lock is needed.
+        if let Some(sketch) = sketch.as_mut() {
+            for &(hc, _, _, g, _) in &items {
+                sketch.observe(hc, g);
+            }
+        }
+
+        outvec.extend(
+            items
+                .iter()
+                .filter(|it| it.3 >= keep)
+                .map(|&(hc, hnc, b, _, _)| (hc, hnc, b)),
+        );
 
         // `or_insert` keeps the first writer, but every occurrence of a given hash is the same k-mer,
         // so which one wins is immaterial — the batch order does not affect the result.
-        for (hc, hnc, _, km) in items {
-            outdict.entry(hc).or_insert(km);
+        for (hc, hnc, _, g, km) in items {
+            if g < keep {
+                continue;
+            }
+            outdict
+                .entry(hc)
+                .or_insert(km.expect("a kept k-mer carries its bits"));
             minmaxdict.entry(hnc).or_insert(hc);
         }
 
@@ -1215,7 +1492,7 @@ where
     }
 
     finish_sort_counter(
-        countmap, outdict, minmaxdict, histovec, qual, do_fit, out_path,
+        countmap, outdict, minmaxdict, histovec, qual, floors, sketch, do_fit, out_path,
     )
 }
 
@@ -1229,6 +1506,8 @@ fn finish_sort_counter<IntT>(
     mut minmaxdict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
     mut histovec: Vec<u32>,
     qual: &QualOpts,
+    floors: Option<&[u8]>,
+    sketch: Option<SpectrumSketch>,
     do_fit: bool,
     out_path: &mut Option<PathBuf>,
 ) -> (
@@ -1237,6 +1516,7 @@ fn finish_sort_counter<IntT>(
     HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     Vec<u32>,
     u16,
+    u8,
 )
 where
     IntT: for<'a> UInt<'a>,
@@ -1248,6 +1528,8 @@ where
     // Now, get themap, histovec, and filter outdict and minmaxdict
     countmap.shrink_to_fit();
     let minc;
+    // The floor the spectrum asks for. Only the fitting path can ask for a looser one.
+    let mut chosen_min_qual = qual.min_qual;
 
     // The two branches differ only in when the histogram is built: fitting needs it up front, so it is
     // built first and the drain then skips it; without a fit the drain builds it as it goes.
@@ -1255,7 +1537,22 @@ where
         build_histogram_from_countmap(&countmap, &mut histovec);
 
         log::info!("Counting finished. Choosing the minimum count...");
-        minc = choose_min_count(&histovec);
+        match (&sketch, floors) {
+            (Some(sketch), Some(floors)) => {
+                check_sketch_against_table(&histovec, sketch, floors.len() - 1);
+                (minc, chosen_min_qual) = choose_min_count_and_floor(&histovec, sketch, floors);
+            }
+            _ => minc = choose_min_count(&histovec),
+        }
+        if chosen_min_qual < qual.min_qual {
+            // The caller recounts at the looser floor, so draining, plotting and holding these maps is
+            // all wasted work and wasted memory. Hand back the decision and nothing else.
+            outdict.clear();
+            outdict.shrink_to_fit();
+            minmaxdict.clear();
+            minmaxdict.shrink_to_fit();
+            return (outdict, minmaxdict, themap, histovec, minc, chosen_min_qual);
+        }
         log::info!(
             "Minimum count chosen: {}. Starting filtering...",
             minc
@@ -1290,15 +1587,17 @@ where
     }
 
     histovec.shrink_to_fit();
-    (outdict, minmaxdict, themap, histovec, minc)
+    (outdict, minmaxdict, themap, histovec, minc, chosen_min_qual)
 }
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
 #[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
 pub fn preprocessing_standalone<IntT, I>(
     input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
+    floors: Option<&[u8]>,
     timevec: &mut Option<&mut Vec<Instant>>,
     out_path: &mut Option<PathBuf>,
     csize: usize,
@@ -1312,9 +1611,13 @@ where
 {
     log::info!("Starting preprocessing_standalone with k = {k}");
 
-    let (thedict, maxmindict, themap, histovec, used_min_count) = if do_bloom {
+    let (thedict, maxmindict, themap, histovec, used_min_count, chosen_min_qual) = if do_bloom {
         log::info!("Processing using a Bloom filter");
-        bloom_filter_preprocessing_standalone::<IntT, _>(input_iters, k, qual, do_fit, out_path)
+        // Approximate counting and an exact sketch would disagree by construction, so this path keeps
+        // the flat floor and never asks for a recount.
+        let (a, b, c, d, e) =
+            bloom_filter_preprocessing_standalone::<IntT, _>(input_iters, k, qual, do_fit, out_path);
+        (a, b, c, d, e, qual.min_qual)
     } else {
         // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
         // record, so passing 0 through would sort and count after every single read.
@@ -1327,7 +1630,7 @@ where
 
         let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers.unwrap_or(200000_usize));
         let out = chunked_preprocessing_standalone::<IntT, _>(
-            input_iters, k, qual, &mut tmpvec, csize, do_fit, out_path,
+            input_iters, k, qual, floors, &mut tmpvec, csize, do_fit, out_path,
         );
         drop(tmpvec);
         out
@@ -1353,6 +1656,7 @@ where
         maxmindict,
         histovec,
         used_min_count,
+        chosen_min_qual,
     }
 }
 
@@ -1597,7 +1901,7 @@ mod tests {
             "the old argmax should be fooled here; that is the bug being fixed"
         );
         let e = estimate_by_trough(&h);
-        assert_eq!(e.verdict, "ok");
+        assert_eq!(e.verdict, Verdict::Ok);
         assert!((450..550).contains(&e.peak), "peak was {}", e.peak);
         assert!((10..40).contains(&e.min_count), "min_count was {}", e.min_count);
         assert!(genome_loss(500.0, e.min_count) < 1e-6);
@@ -1639,7 +1943,7 @@ mod tests {
     fn a_flat_library_still_bails() {
         let h = synthetic_spectrum(4.0);
         let e = estimate_by_trough(&h);
-        assert_ne!(e.verdict, "ok", "min_count was {}", e.min_count);
+        assert_ne!(e.verdict, Verdict::Ok, "min_count was {}", e.min_count);
         assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
     }
 
@@ -1654,18 +1958,106 @@ mod tests {
             distinct_genome * 50 < distinct_total,
             "the genome should be a small minority of distinct k-mers here"
         );
-        assert_eq!(estimate_by_trough(&h).verdict, "ok");
+        assert_eq!(estimate_by_trough(&h).verdict, Verdict::Ok);
     }
 
-    /// Where the lobes merge there is no honest answer, so it must say so rather than invent a trough
-    /// in the empty tail — which at 3-5x deleted almost the whole genome.
+    /// Where the lobes merge the cutoff must not eat the genome, whether the refusal comes from a
+    /// verdict or from the loss guard clamping it. This is the invariant that matters.
     #[test]
-    fn trough_estimator_bails_out_when_the_lobes_merge() {
-        for lam in [3.0, 5.0, 8.0] {
+    fn trough_estimator_does_not_cut_when_the_lobes_merge() {
+        for lam in [3.0, 5.0, 8.0, 9.0] {
             let e = estimate_by_trough(&synthetic_spectrum(lam));
-            assert_ne!(e.verdict, "ok", "lambda {lam} should not be resolved");
-            assert_eq!(e.min_count, UNRESOLVED_MINCOUNT, "lambda {lam}");
+            assert_eq!(
+                e.min_count, UNRESOLVED_MINCOUNT,
+                "lambda {lam} cut at {} ({:?})",
+                e.min_count, e.verdict
+            );
         }
+    }
+
+    /// Every refusal must name itself, and the resolved case must still explain itself when the guard
+    /// is what collapsed the cutoff — that clause is the one the old string could not express.
+    #[test]
+    fn every_verdict_has_a_distinct_reason() {
+        let all = [
+            Verdict::NeverTurnsUp,
+            Verdict::NoPeakAboveTrough,
+            Verdict::LobeHoldsTooLittle,
+            Verdict::LobeNotClearOfTrough,
+            Verdict::Ok,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.reason().is_empty(), "{a:?} has no reason");
+            for b in &all[i + 1..] {
+                assert_ne!(a.reason(), b.reason(), "{a:?} and {b:?} share a reason");
+            }
+        }
+        assert_eq!(all.iter().filter(|v| v.is_ok()).count(), 1);
+        assert!(!Verdict::default().is_ok(), "the default must fail closed");
+    }
+
+    /// Each way the lobes can merge must be named accurately: at 3-5x no peak clears the trough at all,
+    /// and at 6-7x there is a peak but it does not stand clear of the valley.
+    #[test]
+    fn trough_estimator_names_the_reason_the_lobes_merged() {
+        for lam in [3.0, 4.0, 5.0] {
+            assert_eq!(
+                estimate_by_trough(&synthetic_spectrum(lam)).verdict,
+                Verdict::NoPeakAboveTrough,
+                "lambda {lam}"
+            );
+        }
+        for lam in [6.0, 7.0] {
+            assert_eq!(
+                estimate_by_trough(&synthetic_spectrum(lam)).verdict,
+                Verdict::LobeNotClearOfTrough,
+                "lambda {lam}"
+            );
+        }
+    }
+
+    /// A monotone spectrum has no genome lobe, so the walk runs off into the tail and locks onto a noise
+    /// fluctuation. The depth of the valley is what gives it away: the two bins are within ~2 % of each
+    /// other, nowhere near [`MIN_LOBE_RATIO`]. Position cannot be used for this — a clean pair of narrow
+    /// lobes a few counts apart is equally crowded and perfectly resolvable.
+    #[test]
+    fn a_monotone_spectrum_is_refused_for_having_no_lobe() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        for c in 1..MAXSIZEHISTO {
+            // Power-law decay with a deterministic ripple standing in for counting noise.
+            let ripple = 1.0 + 0.01 * ((c % 7) as f64 - 3.0) / 3.0;
+            h[c - 1] = (200_000_000.0 / (c as f64).powf(1.5) * ripple) as u32;
+        }
+        // Either refusal is right here — the walk may stop on the crest it locked onto, making peak and
+        // trough equal — but the depth is what rules it out either way.
+        let e = estimate_by_trough(&h);
+        assert_ne!(e.verdict, Verdict::Ok);
+        assert!(
+            e.lobe_ratio < MIN_LOBE_RATIO,
+            "trough {} ({}) peak {} ({}) gave lobe_ratio {:.3}",
+            e.trough,
+            e.trough_n,
+            e.peak,
+            e.peak_n,
+            e.lobe_ratio
+        );
+        assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
+    }
+
+    /// Two narrow lobes a few counts apart are crowded in position but perfectly separated in depth, so
+    /// they must resolve. This is the case a positional guard would have thrown away.
+    #[test]
+    fn a_tight_but_clean_separation_still_resolves() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        h[0] = 1_000_000; // error spike at count 1
+        h[5] = 100_000; // genome spike at count 6, empty valley between
+        let e = estimate_by_trough(&h);
+        assert_eq!(
+            e.verdict, Verdict::Ok,
+            "trough {} peak {} lobe_ratio {:.1} trough_frac {:.3}",
+            e.trough, e.peak, e.lobe_ratio, e.trough_frac
+        );
+        assert!(e.trough_frac > 0.6, "the point of the case is that it is crowded");
     }
 
     /// Through the working range the cutoff must clear the errors without eating the genome.
@@ -1673,7 +2065,7 @@ mod tests {
     fn trough_estimator_is_safe_through_the_working_range() {
         for lam in [10.0, 15.0, 20.0, 50.0, 100.0, 250.0] {
             let e = estimate_by_trough(&synthetic_spectrum(lam));
-            assert_eq!(e.verdict, "ok", "lambda {lam}");
+            assert_eq!(e.verdict, Verdict::Ok, "lambda {lam}");
             assert!(e.min_count >= 2, "lambda {lam}");
             assert!(
                 genome_loss(lam, e.min_count) < 0.01,
@@ -1695,7 +2087,7 @@ mod tests {
             h[c - 1] = 20_000; // a genome lobe far outside LEGACY_HISTO_RANGE
         }
         let e = estimate_by_trough(&h);
-        assert_eq!(e.verdict, "ok");
+        assert_eq!(e.verdict, Verdict::Ok);
         assert!(e.peak >= LEGACY_HISTO_RANGE, "peak was {}", e.peak);
         assert!(coverage_peak(&h) < LEGACY_HISTO_RANGE);
     }
@@ -1746,7 +2138,10 @@ mod tests {
         let trough = error_trough(&h).unwrap();
         let peak = peak_above(&h, trough);
         assert!(poisson_guard(peak) < measured_guard(&h, trough, peak));
-        assert_eq!(loss_guard(&h, trough, peak), poisson_guard(peak));
+        assert_eq!(
+            measured_guard(&h, trough, peak).min(poisson_guard(peak)),
+            poisson_guard(peak)
+        );
 
         // Depth, with a lobe as wide as the real libraries: the measured bound is the strict one.
         let mut wide = vec![0u32; MAXSIZEHISTO];
@@ -1755,7 +2150,10 @@ mod tests {
             wide[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
         }
         assert!(measured_guard(&wide, 60, 200) < poisson_guard(200));
-        assert_eq!(loss_guard(&wide, 60, 200), measured_guard(&wide, 60, 200));
+        assert_eq!(
+            measured_guard(&wide, 60, 200).min(poisson_guard(200)),
+            measured_guard(&wide, 60, 200)
+        );
     }
 
     /// The reason the Poisson tail was dropped: on a lobe as wide as the real ones it permits a cutoff
@@ -1769,7 +2167,7 @@ mod tests {
             h[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
         }
         let trough = 60;
-        let m = loss_guard(&h, trough, 200) as usize;
+        let m = measured_guard(&h, trough, 200).min(poisson_guard(200)) as usize;
         // A Poisson(200) tail would allow ~168; the measured 1 % quantile of this lobe is far lower.
         assert!(m < 150, "guard returned {m}, no tighter than a Poisson tail");
         assert!(
@@ -1808,7 +2206,7 @@ mod tests {
     fn choose_min_count_returns_the_trough_not_the_fit() {
         let h = synthetic_spectrum(500.0);
         let e = estimate_by_trough(&h);
-        assert_eq!(e.verdict, "ok");
+        assert_eq!(e.verdict, Verdict::Ok);
         assert_eq!(choose_min_count(&h), e.min_count);
         // ...and that is emphatically not what the old path would have produced.
         let floor = ((coverage_peak(&h) as f64 / 8.0).round() as u16).max(2);
@@ -1817,6 +2215,122 @@ mod tests {
             "the old floor was {floor} and the trough {}; the swap changes nothing here",
             e.min_count
         );
+    }
+
+    // ---- the sketch -------------------------------------------------------------------------------
+
+    /// A modest bimodal spectrum as (count, number of distinct k-mers) pairs: an error lobe decaying
+    /// from count 1 and a genome lobe around `peak`.
+    fn bimodal(peak: usize) -> Vec<(u32, usize)> {
+        let mut out: Vec<(u32, usize)> = (1..=5).map(|c| (c as u32, 4000 / c)).collect();
+        for c in (peak - 12)..=(peak + 12) {
+            let d = (c as f64 - peak as f64) / 5.0;
+            out.push((c as u32, (3000.0 * (-0.5 * d * d).exp()) as usize));
+        }
+        out
+    }
+
+    /// Put a spectrum into one group of a sketch, one hash per distinct k-mer.
+    fn sketch_with(group: usize, spectrum: &[(u32, usize)]) -> SpectrumSketch {
+        let mut s = SpectrumSketch::new();
+        let mut h = 1u64;
+        for &(count, n) in spectrum {
+            for _ in 0..n {
+                let mut c = [0u32; MAX_GROUPS];
+                c[group] = count;
+                s.counts.insert(h, c);
+                h += 1;
+            }
+        }
+        s
+    }
+
+    /// The core invariant: a sampled spectrum has the same shape as the full one, because subsampling
+    /// hash space does not touch the counts of the k-mers it keeps.
+    #[test]
+    fn sketch_matches_a_full_count() {
+        let mut full = vec![0u32; MAXSIZEHISTO];
+        let mut sketch = SpectrumSketch::new();
+        // Canonical hashes, i.e. min of a forward and a reverse value, so the test exercises the same
+        // non-uniform distribution `fraction` has to correct for.
+        for i in 0..60_000u64 {
+            let fwd = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let rev = (i ^ 0x5DEE_CE66_D1B7_1234).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            let hash = fwd.min(rev);
+            let count = 10 + (i % 40) as u32;
+            add_to_histogram(&mut full, count);
+            for _ in 0..count {
+                sketch.observe(hash, 0);
+            }
+        }
+        sketch.shrink();
+        sketch.shrink();
+        let sampled = &sketch.spectra(1)[0];
+        let (ft, st) = (full[9..60].iter().sum::<u32>(), sampled[9..60].iter().sum::<u32>());
+        assert!(st > 0, "the sample is empty");
+        // The whole spectrum lives in counts 10..49 in both, and the trough/peak structure is identical.
+        assert_eq!(ft, 60_000);
+        let rescaled = st as f64 / sketch.fraction();
+        assert!(
+            (rescaled / ft as f64 - 1.0).abs() < 0.1,
+            "rescaled {rescaled:.0} against {ft}"
+        );
+    }
+
+    #[test]
+    fn shrinking_keeps_survivors_exact() {
+        let mut s = SpectrumSketch::new();
+        let low = 1u64 << 40;
+        let high = u64::MAX / 2 + 7;
+        for _ in 0..5 {
+            s.observe(low, 0);
+        }
+        for _ in 0..9 {
+            s.observe(high, 0);
+        }
+        assert_eq!(s.counts[&low][0], 5);
+        s.shrink();
+        assert_eq!(s.counts[&low][0], 5, "a survivor must keep its count");
+        assert!(!s.counts.contains_key(&high), "a hash above the threshold must go");
+    }
+
+    /// A k-mer moves between count bins as the floor drops; it does not appear in two bins at once.
+    #[test]
+    fn a_kmer_moves_between_count_bins_when_the_floor_drops() {
+        let mut s = SpectrumSketch::new();
+        s.counts.insert(1, [10, 0, 40]);
+        let spectra = s.spectra(3);
+        assert_eq!(spectra[2][39], 1, "count 40 at the strict floor");
+        assert_eq!(spectra[2].iter().sum::<u32>(), 1);
+        assert_eq!(spectra[0][49], 1, "count 50 with no filter");
+        assert_eq!(spectra[0].iter().sum::<u32>(), 1);
+    }
+
+    // ---- the decision -----------------------------------------------------------------------------
+
+    /// The main table does not resolve but a looser floor does, so the looser floor is returned — and
+    /// the *strictest* of the ones that resolve, not the loosest.
+    #[test]
+    fn the_strictest_resolving_floor_wins() {
+        let flat = vec![1000u32; MAXSIZEHISTO];
+        // Mass in group 1 only, so floors 1 and 0 both see the bimodal spectrum and floor 2 sees nothing.
+        let sketch = sketch_with(1, &bimodal(40));
+        let floors = [0u8, 11, 25];
+        let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &floors);
+        assert_eq!(floor, 11, "should loosen to B, not all the way to C");
+        assert!(minc > 2, "a resolving floor must yield a real cutoff, got {minc}");
+    }
+
+    /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an
+    /// estimate that by definition did not resolve.
+    #[test]
+    fn nothing_resolving_drops_the_floor_to_zero() {
+        let flat = vec![1000u32; MAXSIZEHISTO];
+        let sketch = SpectrumSketch::new();
+        let floors = [0u8, 11, 25];
+        let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &floors);
+        assert_eq!(floor, 0, "nothing resolved, so the floor goes to the bottom");
+        assert_eq!(minc, UNRESOLVED_MINCOUNT);
     }
 }
 
