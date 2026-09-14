@@ -123,10 +123,11 @@ impl fmt::Display for QualOpts {
             "min count: {}; minimum quality {} ({});",
             self.min_count,
             self.min_qual,
-            (self.min_qual + 33) as char,
+            self.min_qual.saturating_add(33) as char,
         )
     }
 }
+
 
 #[cfg(not(target_family = "wasm"))]
 /// Sets up logging

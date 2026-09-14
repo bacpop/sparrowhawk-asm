@@ -65,7 +65,7 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
     let idx = if (count as usize) >= MAXSIZEHISTO {
         MAXSIZEHISTO - 1
     } else {
-        count as usize - 1
+        count.saturating_sub(1) as usize
     };
     histovec[idx] = histovec[idx].saturating_add(1);
 }
@@ -1107,6 +1107,13 @@ mod tests {
 
     fn empty_dict() -> HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> {
         HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    #[test]
+    fn histogram_zero_count_uses_first_bin() {
+        let mut histovec = vec![0u32; MAXSIZEHISTO];
+        add_to_histogram(&mut histovec, 0);
+        assert_eq!(histovec[0], 1);
     }
 
     #[test]

@@ -42,7 +42,7 @@ fn valid_kmer(s: &str) -> Result<usize, String> {
         .parse()
         .map_err(|_| format!("`{s}` isn't a valid k-mer"))?;
     if !(3..=256).contains(&k) || k.is_multiple_of(2) {
-        Err("K-mer must an odd number between 5 and 128 (inclusive)".to_string())
+        Err("K-mer must be an odd number between 3 and 255 (inclusive)".to_string())
     } else {
         Ok(k)
     }

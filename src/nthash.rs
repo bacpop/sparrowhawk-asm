@@ -622,7 +622,9 @@ impl NtHashIterator {
 
     /// Retrieve the current hash (minimum of forward and reverse complement hashes)
     pub fn curr_hash_and_whether_it_is_the_inverse(&self) -> (u64, u64, bool) {
-        let rev = self.rh.unwrap();
+        let rev = self
+            .rh
+            .expect("reverse-complement hash is required; construct the iterator with rc=true");
         (
             u64::min(self.fh, rev),
             u64::max(self.fh, rev),
@@ -635,6 +637,14 @@ impl NtHashIterator {
 mod tests {
     use super::*;
     use crate::bit_encoding::encode_base;
+
+    #[test]
+    #[should_panic(
+        expected = "reverse-complement hash is required; construct the iterator with rc=true"
+    )]
+    fn inverse_hash_requires_reverse_complement() {
+        NtHashIterator::new(b"ACG", 3, false).curr_hash_and_whether_it_is_the_inverse();
+    }
 
     #[test]
     fn swapbits033_known_value() {
