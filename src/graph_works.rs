@@ -894,13 +894,13 @@ impl Assemble for BasicAsm {
 
         let t_phase1 = Instant::now();
         loop {
-            let compacted = ptgraph.shrink();
+            let shrink_changed_graph = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
                 ptgraph.remove_dead_paths(tip_nts)
             } else {
                 false
             };
-            if !compacted && !pruned {
+            if !shrink_changed_graph && !pruned {
                 break;
             }
         }
@@ -1038,13 +1038,13 @@ impl Assemble for BasicAsm {
         ptgraph.remove_self_loops();
 
         loop {
-            let compacted = ptgraph.shrink();
+            let shrink_changed_graph = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
                 ptgraph.remove_dead_paths(tip_nts)
             } else {
                 false
             };
-            if !compacted && !pruned {
+            if !shrink_changed_graph && !pruned {
                 break;
             }
         }

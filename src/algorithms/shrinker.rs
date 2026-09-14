@@ -11,16 +11,17 @@ pub trait Shrinkable {
     type EdgeIdx;
     /// Node index associated with collection.
     type NodeIdx;
-    /// Shrink graph.
+    /// Shrink all straight paths.
     ///
-    /// This operation should shrink all straight paths
-    /// It is assumed that after shrinking graph will not have any nodes
-    /// connected in this way: s -> x -> ... -> t
+    /// Returns `true` if the graph changed, either through path contraction or removal of
+    /// unpaired edges. After shrinking, the graph should not have any nodes connected in this
+    /// way: s -> x -> ... -> t.
     fn shrink(&mut self) -> bool;
 
-    /// Shrink one single path. This method assumes that `base_edge` argument points
-    /// to a valid edge, which target has a single outgoing edge.
-    /// Returns whether anything was actually shrunk.
+    /// Attempt to shrink one path from the supplied candidate edge.
+    ///
+    /// Returns `true` if the graph changed, including when unpaired edges were removed without
+    /// contracting any nodes.
     fn shrink_single_path(
         &mut self,
         start_node: Self::NodeIdx,
@@ -37,9 +38,9 @@ impl Shrinkable for DbgGraph {
     fn shrink(&mut self) -> bool {
         // Shrinkage here means to only find consecutive nodes, w/o bifurcations
 
-        let mut dididoanything = false;
+        let mut graph_changed = false;
         loop {
-            let mut dididoanythingnow = false;
+            let mut pass_changed = false;
             let ambnodes = self.get_ambiguous_nodes_bi(); // Just in case we hadn't got them yet
             logw(format!("Starting shrinking the graph with {} nodes and {} edges, beginning from {} ambiguous nodes",
                   self.node_count(),
@@ -67,8 +68,8 @@ impl Shrinkable for DbgGraph {
                     } else if outn.len() <= 1 && self.in_neighbours_bi(neigh[0].0, tmpty).len() == 1
                     {
                         if self.shrink_single_path(*an, neigh[0].0, &ambnodes, neigh[0].1) {
-                            dididoanything = true;
-                            dididoanythingnow = true;
+                            graph_changed = true;
+                            pass_changed = true;
                         }
                     }
                 } else {
@@ -93,8 +94,8 @@ impl Shrinkable for DbgGraph {
                                 if incn.len() == 1 {
                                     if self.shrink_single_path(n.0, outn[0].0, &ambnodes, outn[0].1)
                                     {
-                                        dididoanything = true;
-                                        dididoanythingnow = true;
+                                        graph_changed = true;
+                                        pass_changed = true;
                                     }
                                 }
                             }
@@ -102,7 +103,7 @@ impl Shrinkable for DbgGraph {
                     }
                 }
             }
-            if !dididoanythingnow {
+            if !pass_changed {
                 break;
             }
         }
@@ -113,7 +114,7 @@ impl Shrinkable for DbgGraph {
             self.edge_count()
         );
 
-        dididoanything
+        graph_changed
     }
 
     #[inline]
@@ -136,7 +137,7 @@ impl Shrinkable for DbgGraph {
                 .iter()
                 .any(|&(m, t)| m == next_node && t == curredge)
         {
-            return false;
+            return true;
         }
 
         let mut countsformean: Vec<u32> = vec![self.node_weight(base_node).unwrap().counts];
@@ -154,7 +155,7 @@ impl Shrinkable for DbgGraph {
                     self.in_degree(next_node),
                     self.out_degree(next_node)
                 );
-                return false;
+                return pruned;
             }
 
             countsformean.push(self.node_weight(next_node).unwrap().counts);
@@ -211,7 +212,7 @@ impl Shrinkable for DbgGraph {
                 self.in_degree(next_node),
                 self.out_degree(next_node)
             );
-            return false;
+            return pruned;
         }
 
         loop {
@@ -374,5 +375,23 @@ mod tests {
         assert_eq!(g.edge_count(), 0); // the phantom is gone too
         assert_eq!(g.node_weight(an).unwrap().abs_ind.len(), 4);
         assert!(g.contains_node(extra));
+    }
+
+    #[test]
+    fn shrink_reports_pruning_only_as_a_graph_change() {
+        let mut g = DbgGraph::new(31);
+        let start = g.add_node(node(0));
+        let next = g.add_node(node(1));
+
+        // A phantom candidate edge with no reciprocal partner.
+        g.add_edge(start, next, EdgeType::MinToMin);
+
+        assert_eq!(g.edge_count(), 1);
+        assert!(g.shrink());
+        assert_eq!(g.node_count(), 2);
+        assert_eq!(g.edge_count(), 0);
+
+        // The repaired graph is now at a fixed point.
+        assert!(!g.shrink());
     }
 }
