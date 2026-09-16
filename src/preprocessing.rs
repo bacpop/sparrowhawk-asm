@@ -157,8 +157,8 @@ impl SpectrumSketch {
 /// Single-copy coverage estimate straight from the spectrum: the tallest bin above the error peak.
 ///
 /// Scans counts 3..=499 and returns a **count, not an index**; the range is pinned to
-/// [`LEGACY_HISTO_RANGE`], so above ~500x the true peak is invisible here. It is also a *global* argmax,
-/// so on a deep library the error lobe outvotes the genome lobe — see [`peak_above`].
+/// [`LEGACY_HISTO_RANGE`], so above ~500x the true genomic peak is invisible here. It is also a *global* argmax,
+/// so on a deep library the error lobe outvotes the genome lobe — see [`find_genomic_peak`].
 ///
 /// Natively this now has no callers outside the tests, which assert exactly that failure; the browser
 /// still reaches it through the mixture fit.
@@ -178,43 +178,46 @@ fn coverage_peak(histovec: &[u32]) -> usize {
 
 // =====================================================================================================
 // An alternative `min_count` estimator, running beside the fit and for now only logged. It assumes no
-// distribution at all: it walks up from the error lobe to the first trough and takes the peak above it.
+// distribution at all: it walks up from the error lobe to the first valley and takes the genomic peak above it.
 // =====================================================================================================
 
 /// Bins either side of a count in the smoothed spectrum, and the run of rising bins that confirms we
 /// have left the error lobe rather than hit noise.
 const SMOOTH: usize = 2;
 const RISE_RUN: usize = 3;
-/// Genome k-mers the cutoff may delete, and how far the genome lobe must stand above the trough.
+/// Genome k-mers the cutoff may delete, and how far the genome lobe must stand above the valley.
 const MAX_GENOME_LOSS: f64 = 0.01;
 /// Spectra with a textbook valley and a broad lobe were being rejected at a ratio near 2.4, so a
 /// threshold of 3 cut into good data.
-const MIN_LOBE_RATIO: f64 = 1.75;
-/// Share of k-mer *instances* the lobe above the trough must hold. A handful of noise bins clears 1 %
+const MIN_GP_TO_V_RATIO: f64 = 1.75;
+/// Share of k-mer *instances* the lobe above the valley must hold. A handful of noise bins clears 1 %
 /// on repeats and adapters alone; a genuine lobe holds 0.75-0.95 of the sequence.
-const MIN_LOBE_INSTANCES: f64 = 0.20;
-/// Used when the lobes cannot be separated. Not 1: at a peak of 3-4 every singleton error survives and
+const MIN_CAND_KMER_FRAC: f64 = 0.20;
+/// Used when the lobes cannot be separated. Not 1: at a genomic peak of 3-4 every singleton error survives and
 /// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
 const UNRESOLVED_MINCOUNT: u16 = 2;
 
-/// What the trough estimator concluded, and every intermediate it passed through. The extra fields are
+/// What the valley estimator concluded, and every intermediate it passed through. The extra fields are
 /// carried so one log line can reproduce the decision.
 #[derive(Default)]
-struct TroughEstimate {
-    /// Where [`error_trough`]'s walk stopped, before [`error_valley`] refined it.
-    seed: usize,
-    trough: usize,
-    peak: usize,
+struct SpectrumEstimate {
+    /// Where [`find_valley_seed`]'s walk stopped, before [`find_valley`] refined it.
+    valley_seed: usize,
+    valley: usize,
+    genomic_peak: usize,
     /// Heights at those two counts, so the ratio below can be checked rather than trusted.
-    trough_n: u32,
-    peak_n: u32,
-    /// `peak_n / trough_n`, the quantity [`MIN_LOBE_RATIO`] guards.
-    lobe_ratio: f64,
-    /// `trough / peak` as counts. Logged, never gated on: near 1.0 usually means the valley search found
-    /// nothing and stopped under the peak, but a tight clean separation reads the same way.
-    trough_frac: f64,
-    /// Share of k-mer instances at or above the trough, the quantity [`MIN_LOBE_INSTANCES`] guards.
-    above_frac: f64,
+    valley_n: u32,
+    genomic_peak_n: u32,
+    /// `genomic_peak_n / valley_n`, the quantity [`MIN_GP_TO_V_RATIO`] guards.
+    gp_to_v_ratio: f64,
+    /// `valley / genomic_peak` as counts. Logged, never gated on: near 1.0 usually means the valley search found
+    /// nothing and stopped under the genomic peak, but a tight clean separation reads the same way.
+    valley_to_peak_xratio: f64,
+    /// Share of k-mer instances at or above the valley, the quantity [`MIN_CAND_KMER_FRAC`] guards.
+    cand_kmer_frac: f64,
+    /// Distinct k-mers at or above the valley: the lobe's breadth, where `genomic_peak` is its depth.
+    /// Logged only for now; a floor's real cost is in breadth, and nothing yet reads it.
+    distinct_above: u64,
     /// The two cutoff ceilings, kept apart so that which one binds can be read off a run.
     guard_measured: u16,
     guard_poisson: u16,
@@ -225,15 +228,15 @@ struct TroughEstimate {
 }
 
 /// Why the estimator accepted or refused a spectrum. The default is a *refusal* on purpose: every path
-/// through [`estimate_by_trough`] sets it, so the default is unreachable, and if one ever stops setting
+/// through [`estimate_by_valley`] sets it, so the default is unreachable, and if one ever stops setting
 /// it the run should fail closed rather than silently report a resolved spectrum.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Verdict {
     #[default]
     NeverTurnsUp,
-    NoPeakAboveTrough,
-    LobeHoldsTooLittle,
-    LobeNotClearOfTrough,
+    NoPeakAboveValley,
+    TooFewCandidateKmers,
+    PeakNotClearOfValley,
     Ok,
 }
 
@@ -247,9 +250,9 @@ impl Verdict {
     fn reason(self) -> &'static str {
         match self {
             Verdict::NeverTurnsUp => "the spectrum never turns back up",
-            Verdict::NoPeakAboveTrough => "no peak above the trough",
-            Verdict::LobeHoldsTooLittle => "the lobe above the trough holds too little of the sequence",
-            Verdict::LobeNotClearOfTrough => "the lobe above the trough is not raised clear of it",
+            Verdict::NoPeakAboveValley => "no genomic_peak above the valley",
+            Verdict::TooFewCandidateKmers => "the lobe above the valley holds too little of the sequence",
+            Verdict::PeakNotClearOfValley => "the lobe above the valley is not raised clear of it",
             // Reached when the lobes did separate but the loss guard pulled the cutoff to the floor.
             Verdict::Ok => "the cutoff would have cost more genome than the guard allows",
         }
@@ -264,9 +267,9 @@ fn smoothed(histovec: &[u32], count: usize) -> u64 {
 }
 
 /// First local minimum followed by [`RISE_RUN`] rising bins, as a **count**. `None` when the spectrum
-/// never turns back up. Only a *seed* for [`error_valley`]: on a deep library whose error lobe decays
-/// without a local minimum this walks into the genome lobe, which is harmless once bounded by the peak.
-fn error_trough(histovec: &[u32]) -> Option<usize> {
+/// never turns back up. Only a *valley seed* for [`find_valley`]: on a deep library whose error lobe decays
+/// without a local minimum this walks into the genome lobe, which is harmless once bounded by the genomic peak.
+fn find_valley_seed(histovec: &[u32]) -> Option<usize> {
     let hi = histovec.len() - 1; // the saturating bin is not part of the shape
     let mut best_count = 2usize;
     let mut best_n = smoothed(histovec, 2);
@@ -287,12 +290,12 @@ fn error_trough(histovec: &[u32]) -> Option<usize> {
     None
 }
 
-/// Lowest smoothed bin in `2..=peak`, as a **count**: the valley between the error lobe and the genome
-/// lobe. Bounded above by the peak, so unlike [`error_trough`] it cannot walk off into the lobe itself.
-fn error_valley(histovec: &[u32], peak: usize) -> usize {
+/// Lowest smoothed bin in `2..=genomic_peak`, as a **count**: the valley between the error lobe and the genome
+/// lobe. Bounded above by the genomic peak, so unlike [`find_valley_seed`] it cannot walk off into the lobe itself.
+fn find_valley(histovec: &[u32], genomic_peak: usize) -> usize {
     let mut best_count = 2usize;
     let mut best_n = smoothed(histovec, 2);
-    for count in 3..=peak.min(histovec.len() - 1) {
+    for count in 3..=genomic_peak.min(histovec.len() - 1) {
         let n = smoothed(histovec, count);
         if n < best_n {
             best_n = n;
@@ -302,11 +305,11 @@ fn error_valley(histovec: &[u32], peak: usize) -> usize {
     best_count
 }
 
-/// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the trough.
+/// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the valley.
 /// This is the binding one at depth, where the genome lobe measures 8-12x overdispersed and a Poisson
 /// tail would permit a cutoff about 35 % too high.
-fn measured_guard(histovec: &[u32], trough: usize, peak: usize) -> u16 {
-    let total: u128 = (trough..histovec.len())
+fn measured_guard(histovec: &[u32], valley: usize, genomic_peak: usize) -> u16 {
+    let total: u128 = (valley..histovec.len())
         .map(|c| histovec[c - 1] as u128)
         .sum();
     if total == 0 {
@@ -316,8 +319,8 @@ fn measured_guard(histovec: &[u32], trough: usize, peak: usize) -> u16 {
     // `spent` is what cutting at `m` already costs, so we step up only while the next bin still fits;
     // the value returned is therefore the last cutoff inside the budget, never the first one outside.
     let mut spent = 0u128;
-    let mut m = trough;
-    while m < peak {
+    let mut m = valley;
+    while m < genomic_peak {
         let next = spent + histovec[m - 1] as u128;
         if next > budget {
             break;
@@ -328,14 +331,14 @@ fn measured_guard(histovec: &[u32], trough: usize, peak: usize) -> u16 {
     (m as u16).max(2)
 }
 
-/// Largest cutoff deleting at most [`MAX_GENOME_LOSS`] of a Poisson(`peak`) genome. This is the binding
+/// Largest cutoff deleting at most [`MAX_GENOME_LOSS`] of a Poisson(`genomic_peak`) genome. This is the binding
 /// one at low coverage, where the lobe really is near-Poisson and the measured bound is loosened by the
-/// error k-mers that still sit above the trough.
-fn poisson_guard(peak: usize) -> u16 {
-    let lam = peak as f64;
+/// error k-mers that still sit above the valley.
+fn poisson_guard(genomic_peak: usize) -> u16 {
+    let lam = genomic_peak as f64;
     let mut cdf = (-lam).exp();
     let mut m = 1usize;
-    while m < peak {
+    while m < genomic_peak {
         let next = cdf + (-lam + m as f64 * lam.ln() - lgamma(m as f64 + 1.0)).exp();
         if next > MAX_GENOME_LOSS {
             break;
@@ -349,12 +352,12 @@ fn poisson_guard(peak: usize) -> u16 {
 /// Variance-to-mean ratio of the single-copy lobe; 1.0 is Poisson. Logged because it is what says
 /// whether a negative binomial in the mixture fit would be worth the work.
 ///
-/// Stops at twice the peak: beyond that lie the repeat copies and the saturating bin, and including
+/// Stops at twice the genomic peak: beyond that lie the repeat copies and the saturating bin, and including
 /// them measures the spread of the whole spectrum rather than of the lobe the fit tries to model.
-fn dispersion_above(histovec: &[u32], trough: usize, peak: usize) -> f64 {
-    let top = (2 * peak).min(histovec.len() - 1);
+fn dispersion_above(histovec: &[u32], valley: usize, genomic_peak: usize) -> f64 {
+    let top = (2 * genomic_peak).min(histovec.len() - 1);
     let (mut n, mut sx, mut sxx) = (0f64, 0f64, 0f64);
-    for count in trough..top {
+    for count in valley..top {
         let w = histovec[count - 1] as f64;
         let c = count as f64;
         n += w;
@@ -368,13 +371,22 @@ fn dispersion_above(histovec: &[u32], trough: usize, peak: usize) -> f64 {
     ((sxx / n - mean * mean).max(0.0)) / mean
 }
 
-/// Tallest bin at or above the trough, as a **count**. Unlike [`coverage_peak`] this cannot lock onto
+/// Distinct k-mers at or above `valley`: the genome lobe's breadth, where `genomic_peak` is its depth.
+/// A floor that breaks contiguous windows deletes k-mers without moving the peak, so only this sees it.
+fn distinct_above(histovec: &[u32], valley: usize) -> u64 {
+    histovec[valley.saturating_sub(1)..]
+        .iter()
+        .map(|&n| n as u64)
+        .sum()
+}
+
+/// Tallest bin at or above the valley, as a **count**. Unlike [`coverage_peak`] this cannot lock onto
 /// the error lobe, which is the whole difference between the two estimators.
-fn peak_above(histovec: &[u32], trough: usize) -> usize {
+fn find_genomic_peak(histovec: &[u32], valley: usize) -> usize {
     let hi = histovec.len() - 1;
-    let mut best_count = trough;
+    let mut best_count = valley;
     let mut best_n = 0u32;
-    for count in trough..hi {
+    for count in valley..hi {
         if histovec[count - 1] > best_n {
             // Strict, so ties keep the lowest count.
             best_n = histovec[count - 1];
@@ -384,27 +396,27 @@ fn peak_above(histovec: &[u32], trough: usize) -> usize {
     best_count
 }
 
-/// The trough estimate for this spectrum. Falls back to [`UNRESOLVED_MINCOUNT`] with a stated verdict
+/// The valley estimate for this spectrum. Falls back to [`UNRESOLVED_MINCOUNT`] with a stated verdict
 /// wherever the lobes are not separated — at 3-5x, trusting it blindly deleted 98-99 % of the genome.
-fn estimate_by_trough(histovec: &[u32]) -> TroughEstimate {
-    let mut est = TroughEstimate {
+fn estimate_by_valley(histovec: &[u32]) -> SpectrumEstimate {
+    let mut est = SpectrumEstimate {
         min_count: UNRESOLVED_MINCOUNT,
         dispersion: f64::NAN,
         ..Default::default()
     };
-    // The seed only has to land past the error head, not on the valley: the search below runs from 2,
+    // The valley seed only has to land past the error head, not on the valley: the search below runs from 2,
     // so an overshoot into the genome lobe still yields the right answer.
-    let Some(seed) = error_trough(histovec) else {
+    let Some(valley_seed) = find_valley_seed(histovec) else {
         est.verdict = Verdict::NeverTurnsUp;
         return est;
     };
-    est.seed = seed;
-    est.peak = peak_above(histovec, seed);
-    est.trough = error_valley(histovec, est.peak);
-    est.peak_n = histovec[est.peak - 1];
-    est.trough_n = histovec[est.trough - 1];
-    est.lobe_ratio = est.peak_n as f64 / est.trough_n.max(1) as f64;
-    est.trough_frac = est.trough as f64 / est.peak as f64;
+    est.valley_seed = valley_seed;
+    est.genomic_peak = find_genomic_peak(histovec, valley_seed);
+    est.valley = find_valley(histovec, est.genomic_peak);
+    est.genomic_peak_n = histovec[est.genomic_peak - 1];
+    est.valley_n = histovec[est.valley - 1];
+    est.gp_to_v_ratio = est.genomic_peak_n as f64 / est.valley_n.max(1) as f64;
+    est.valley_to_peak_xratio = est.valley as f64 / est.genomic_peak as f64;
 
     // k-mer INSTANCES, not distinct k-mers: at 500x the genome is under 1 % of distinct k-mers but most
     // of the sequence, so a distinct-count test would reject a perfectly healthy deep library.
@@ -414,55 +426,58 @@ fn estimate_by_trough(histovec: &[u32]) -> TroughEstimate {
             .sum()
     };
     let total = instances_from(1);
-    est.above_frac = if total == 0 {
+    est.cand_kmer_frac = if total == 0 {
         0.0
     } else {
-        instances_from(est.trough) as f64 / total as f64
+        instances_from(est.valley) as f64 / total as f64
     };
 
     // Computed unconditionally so that a bail-out can still report what the guards would have allowed.
-    // Both are O(peak), once per k.
-    est.guard_measured = measured_guard(histovec, est.trough, est.peak);
-    est.guard_poisson = poisson_guard(est.peak);
-    est.dispersion = dispersion_above(histovec, est.trough, est.peak);
+    // Both are O(genomic peak), once per k.
+    est.guard_measured = measured_guard(histovec, est.valley, est.genomic_peak);
+    est.guard_poisson = poisson_guard(est.genomic_peak);
+    est.dispersion = dispersion_above(histovec, est.valley, est.genomic_peak);
+    est.distinct_above = distinct_above(histovec, est.valley);
 
-    est.verdict = if est.peak <= est.trough {
-        Verdict::NoPeakAboveTrough
-    } else if est.above_frac < MIN_LOBE_INSTANCES {
-        Verdict::LobeHoldsTooLittle
-    } else if est.lobe_ratio < MIN_LOBE_RATIO {
-        Verdict::LobeNotClearOfTrough
+    est.verdict = if est.genomic_peak <= est.valley {
+        Verdict::NoPeakAboveValley
+    } else if est.cand_kmer_frac < MIN_CAND_KMER_FRAC {
+        Verdict::TooFewCandidateKmers
+    } else if est.gp_to_v_ratio < MIN_GP_TO_V_RATIO {
+        Verdict::PeakNotClearOfValley
     } else {
         Verdict::Ok
     };
     if est.verdict.is_ok() {
-        // The trough removes the errors; the guards bound what that costs in genome. The Poisson one
+        // The valley removes the errors; the guards bound what that costs in genome. The Poisson one
         // binds at low coverage, where the two lobes crowd together; at depth it has slack spare.
-        est.min_count = (est.trough as u16).clamp(2, est.guard_measured.min(est.guard_poisson));
+        est.min_count = (est.valley as u16).clamp(2, est.guard_measured.min(est.guard_poisson));
     }
     est
 }
 
 /// The whole derivation, as `key=value` pairs so a directory of logs parses into a table. The prose a
 /// user reads is the warning in [`choose_min_count`], not this.
-fn log_spectrum(histovec: &[u32], estimate: &TroughEstimate) {
+fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
     logw(
         &format!(
-            "K-mer spectrum: seed={} trough={} peak={} trough_n={} peak_n={} lobe_ratio={:.2} \
-             trough_frac={:.3} above_frac={:.4} guard_measured={} guard_poisson={} dispersion={:.1} \
-             min_count={} saturates={} verdict={:?}",
-            estimate.seed,
-            estimate.trough,
-            estimate.peak,
-            estimate.trough_n,
-            estimate.peak_n,
-            estimate.lobe_ratio,
-            estimate.trough_frac,
-            estimate.above_frac,
+            "K-mer spectrum: valley_seed={} valley={} genomic_peak={} valley_n={} genomic_peak_n={} \
+             gp_to_v_ratio={:.2} valley_to_peak_xratio={:.3} cand_kmer_frac={:.4} \
+             guard_measured={} guard_poisson={} dispersion={:.1} min_count={} distinct_above={} \
+             saturates={} verdict={:?}",
+            estimate.valley_seed,
+            estimate.valley,
+            estimate.genomic_peak,
+            estimate.valley_n,
+            estimate.genomic_peak_n,
+            estimate.gp_to_v_ratio,
+            estimate.valley_to_peak_xratio,
+            estimate.cand_kmer_frac,
             estimate.guard_measured,
             estimate.guard_poisson,
             estimate.dispersion,
             estimate.min_count,
+            estimate.distinct_above,
             histovec[histovec.len() - 1] > 0,
             estimate.verdict
         ),
@@ -475,14 +490,15 @@ fn log_spectrum(histovec: &[u32], estimate: &TroughEstimate) {
 /// disagreed across 3780 sweep runs.
 #[cfg(target_family = "wasm")]
 fn log_fit_comparison(histovec: &[u32]) {
-    let peak = coverage_peak(histovec);
-    let floor = ((peak as f64 / 8.0).round() as u16).max(2);
+    // A global argmax, so this is the spectrum's mode and not necessarily the genome lobe's.
+    let mode = coverage_peak(histovec);
+    let floor = ((mode as f64 / 8.0).round() as u16).max(2);
 
     let mut fit = SpectrumFitter::new();
     let would_be = match fit.fit_histogram(histovec[..(LEGACY_HISTO_RANGE - 1)].to_vec()) {
         Ok(minc) if minc > TRUST_FIT_ABOVE => format!("{minc}"),
-        Ok(minc) => format!("{floor} (fit returned {minc}, too small to be trusted; peak {peak})"),
-        Err(e) => format!("{floor} (fit did not converge: {e}; peak {peak})"),
+        Ok(minc) => format!("{floor} (fit returned {minc}, too small to be trusted; mode {mode})"),
+        Err(e) => format!("{floor} (fit did not converge: {e}; mode {mode})"),
     };
     logw(
         &format!("The Poisson mixture would have used {would_be}."),
@@ -501,7 +517,7 @@ const TRUST_FIT_ABOVE: usize = 10;
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
 /// both filter sites keep k-mers with `count >= min_count`.
 fn choose_min_count(histovec: &[u32]) -> u16 {
-    let estimate = estimate_by_trough(histovec);
+    let estimate = estimate_by_valley(histovec);
     log_spectrum(histovec, &estimate);
     #[cfg(target_family = "wasm")]
     log_fit_comparison(histovec);
@@ -511,7 +527,7 @@ fn choose_min_count(histovec: &[u32]) -> u16 {
 
 /// The warning for a spectrum that yielded no usable cutoff. Shared, so the one-pass and the sketch
 /// paths cannot drift apart in what they tell the user.
-fn warn_unresolved(estimate: &TroughEstimate) {
+fn warn_unresolved(estimate: &SpectrumEstimate) {
     // Keyed on the outcome, not only the verdict: a spectrum can be called `ok` and still have the loss
     // guard collapse the cutoff to `UNRESOLVED_MINCOUNT`, which is the same thin-spectrum situation.
     if !estimate.verdict.is_ok() || estimate.min_count == UNRESOLVED_MINCOUNT {
@@ -528,22 +544,23 @@ fn warn_unresolved(estimate: &TroughEstimate) {
     }
 }
 
-/// Resolved *and* with room to spare. A lobe only just clearing [`MIN_LOBE_RATIO`] is the marginal case
+/// Resolved *and* with room to spare. A lobe only just clearing [`MIN_GP_TO_V_RATIO`] is the marginal case
 /// worth a second opinion from the sketch; the band is narrow because a ratio not far above the guard is
 /// still a healthy spectrum, and widening it only buys second passes nobody needs.
 #[cfg(not(target_family = "wasm"))]
-const COMFORTABLE_LOBE_RATIO: f64 = MIN_LOBE_RATIO + 0.5;
+const COMFORTABLE_GP_TO_V_RATIO: f64 = MIN_GP_TO_V_RATIO + 0.5;
 /// Coverage below which a resolving spectrum is not taken at face value: the floor, rather than the
 /// library, may be what made it shallow.
 #[cfg(not(target_family = "wasm"))]
 const MIN_USEFUL_COVERAGE: usize = 25;
-/// A looser floor must lift the genome peak by at least this much to justify a second pass.
+/// A looser floor must lift the genomic peak by at least this much to justify a second pass. Measured:
+/// runs needing it gain from 1.17, and loosening is worth 1.4-8.2x there, so 1.5 refused too much.
 #[cfg(not(target_family = "wasm"))]
-const MIN_COVERAGE_GAIN: f64 = 1.5;
+const MIN_COVERAGE_GAIN: f64 = 1.20;
 
 #[cfg(not(target_family = "wasm"))]
-fn resolves(estimate: &TroughEstimate) -> bool {
-    estimate.verdict.is_ok() && estimate.lobe_ratio >= COMFORTABLE_LOBE_RATIO
+fn resolves(estimate: &SpectrumEstimate) -> bool {
+    estimate.verdict.is_ok() && estimate.gp_to_v_ratio >= COMFORTABLE_GP_TO_V_RATIO
 }
 
 /// The min-count, and the floor it was read at. `floors` is ascending, so this tries the strict floor
@@ -556,31 +573,32 @@ fn choose_min_count_and_floor(
     floors: &[u8],
 ) -> (u16, u8) {
     let strict_floor = floors[floors.len() - 1];
-    let strict = estimate_by_trough(histovec);
+    let strict = estimate_by_valley(histovec);
     log_spectrum(histovec, &strict);
     // Resolving is not enough: a spectrum can separate cleanly at 7x and still assemble badly, because
     // the floor rather than the library is what made it shallow.
-    if resolves(&strict) && strict.peak >= MIN_USEFUL_COVERAGE {
+    if resolves(&strict) && strict.genomic_peak >= MIN_USEFUL_COVERAGE {
         return (strict.min_count, strict_floor);
     }
 
     // The strictest floor that resolved but was too shallow to accept outright, as `(min_count, floor,
-    // peak)`. A looser rung has to beat its peak materially to be worth a second pass, and it is what
+    // genomic peak)`. A looser rung has to beat its genomic peak materially to be worth a second pass, and it is what
     // the walk settles for when no rung reaches useful depth.
-    let mut best = resolves(&strict).then_some((strict.min_count, strict_floor, strict.peak));
+    let mut best = resolves(&strict).then_some((strict.min_count, strict_floor, strict.genomic_peak));
 
     let spectra = sketch.spectra(floors.len());
     for g in (0..floors.len() - 1).rev() {
-        let estimate = estimate_by_trough(&spectra[g]);
+        let estimate = estimate_by_valley(&spectra[g]);
         logw(
             &format!(
-                "Sketch at a base-quality floor of {}: trough={} peak={} lobe_ratio={:.2} \
-                 min_count={} verdict={:?}",
+                "Sketch at a base-quality floor of {}: valley={} genomic_peak={} gp_to_v_ratio={:.2} \
+                 min_count={} distinct_above={} verdict={:?}",
                 floors[g],
-                estimate.trough,
-                estimate.peak,
-                estimate.lobe_ratio,
+                estimate.valley,
+                estimate.genomic_peak,
+                estimate.gp_to_v_ratio,
                 estimate.min_count,
+                estimate.distinct_above,
                 estimate.verdict
             ),
             Some("info"),
@@ -590,15 +608,15 @@ fn choose_min_count_and_floor(
         }
         // A looser rung is only worth a second pass if it is materially deeper than the best so far:
         // depth, not the floor, may simply be the limit.
-        if best.is_some_and(|(_, _, p)| (estimate.peak as f64) < MIN_COVERAGE_GAIN * p as f64) {
+        if best.is_some_and(|(_, _, p)| (estimate.genomic_peak as f64) < MIN_COVERAGE_GAIN * p as f64) {
             continue;
         }
         // Deep enough to settle on; otherwise it becomes the new baseline and the walk keeps loosening,
         // which is what a rung that resolves while still starved needs.
-        if estimate.peak >= MIN_USEFUL_COVERAGE {
+        if estimate.genomic_peak >= MIN_USEFUL_COVERAGE {
             return (estimate.min_count, floors[g]);
         }
-        best = Some((estimate.min_count, floors[g], estimate.peak));
+        best = Some((estimate.min_count, floors[g], estimate.genomic_peak));
     }
 
     // Something separated the lobes, but nothing reached useful depth: take the strictest rung that
@@ -746,7 +764,7 @@ where
 
 /// Draws the first [`LEGACY_HISTO_RANGE`] bins, so the PNG stays comparable with every earlier run. The
 /// final bin no longer piles up everything above it — that pile is now out at [`MAXSIZEHISTO`] — so the
-/// old spike at 500 is gone; the trough-estimator log line carries what lies beyond.
+/// old spike at 500 is gone; the valley-estimator log line carries what lies beyond.
 #[cfg(not(target_family = "wasm"))]
 fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
     let shown = &histovec[..LEGACY_HISTO_RANGE.min(histovec.len())];
@@ -1843,7 +1861,7 @@ mod tests {
             assert_eq!(
                 coverage_peak(&h),
                 expected,
-                "peak planted at count {expected}"
+                "genomic_peak planted at count {expected}"
             );
         }
     }
@@ -1890,7 +1908,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // The trough estimator. Spectra are built from the same model the plan was simulated with: a
+    // The valley estimator. Spectra are built from the same model the plan was simulated with: a
     // genome lobe at Poisson(lambda) over 4.6 Mb, errors at Poisson(lambda * p / 3) over 3k slots.
     // ---------------------------------------------------------------------------------------------
 
@@ -1918,17 +1936,17 @@ mod tests {
     }
 
     /// The case that breaks today: at 500x the error lobe outvotes the genome lobe, so the global
-    /// argmax returns ~3 and `peak/8` yields 2, while the trough finds the real peak out at ~500.
+    /// argmax returns ~3 and `mode/8` yields 2, while the valley finds the real genomic peak out at ~500.
     #[test]
-    fn trough_estimator_survives_a_deep_library() {
+    fn valley_estimator_survives_a_deep_library() {
         let h = synthetic_spectrum(500.0);
         assert!(
             coverage_peak(&h) < 10,
             "the old argmax should be fooled here; that is the bug being fixed"
         );
-        let e = estimate_by_trough(&h);
+        let e = estimate_by_valley(&h);
         assert_eq!(e.verdict, Verdict::Ok);
-        assert!((450..550).contains(&e.peak), "peak was {}", e.peak);
+        assert!((450..550).contains(&e.genomic_peak), "genomic_peak was {}", e.genomic_peak);
         assert!((10..40).contains(&e.min_count), "min_count was {}", e.min_count);
         assert!(genome_loss(500.0, e.min_count) < 1e-6);
     }
@@ -1940,12 +1958,12 @@ mod tests {
     fn the_valley_equals_the_walk_on_a_clean_spectrum() {
         for lam in [20.0, 60.0, 150.0, 500.0] {
             let h = synthetic_spectrum(lam);
-            let seed = error_trough(&h).expect("a clean spectrum turns back up");
-            let peak = peak_above(&h, seed);
+            let valley_seed = find_valley_seed(&h).expect("a clean spectrum turns back up");
+            let genomic_peak = find_genomic_peak(&h, valley_seed);
             assert_eq!(
-                error_valley(&h, peak),
-                seed,
-                "lam {lam}: valley moved (seed {seed}, peak {peak})"
+                find_valley(&h, genomic_peak),
+                valley_seed,
+                "lam {lam}: valley moved (valley_seed {valley_seed}, genomic_peak {genomic_peak})"
             );
         }
     }
@@ -1953,12 +1971,12 @@ mod tests {
     #[test]
     fn a_seed_past_the_genome_lobe_still_finds_the_valley() {
         let h = synthetic_spectrum(500.0);
-        let truth = error_trough(&h).unwrap();
+        let truth = find_valley_seed(&h).unwrap();
         for overshoot in [700, 1500, 4000] {
             assert_eq!(
-                error_valley(&h, overshoot),
+                find_valley(&h, overshoot),
                 truth,
-                "a peak of {overshoot} moved the valley away from {truth}"
+                "a genomic_peak of {overshoot} moved the valley away from {truth}"
             );
         }
     }
@@ -1968,7 +1986,7 @@ mod tests {
     #[test]
     fn a_flat_library_still_bails() {
         let h = synthetic_spectrum(4.0);
-        let e = estimate_by_trough(&h);
+        let e = estimate_by_valley(&h);
         assert_ne!(e.verdict, Verdict::Ok, "min_count was {}", e.min_count);
         assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
     }
@@ -1984,15 +2002,15 @@ mod tests {
             distinct_genome * 50 < distinct_total,
             "the genome should be a small minority of distinct k-mers here"
         );
-        assert_eq!(estimate_by_trough(&h).verdict, Verdict::Ok);
+        assert_eq!(estimate_by_valley(&h).verdict, Verdict::Ok);
     }
 
     /// Where the lobes merge the cutoff must not eat the genome, whether the refusal comes from a
     /// verdict or from the loss guard clamping it. This is the invariant that matters.
     #[test]
-    fn trough_estimator_does_not_cut_when_the_lobes_merge() {
+    fn valley_estimator_does_not_cut_when_the_lobes_merge() {
         for lam in [3.0, 5.0, 8.0, 9.0] {
-            let e = estimate_by_trough(&synthetic_spectrum(lam));
+            let e = estimate_by_valley(&synthetic_spectrum(lam));
             assert_eq!(
                 e.min_count, UNRESOLVED_MINCOUNT,
                 "lambda {lam} cut at {} ({:?})",
@@ -2007,9 +2025,9 @@ mod tests {
     fn every_verdict_has_a_distinct_reason() {
         let all = [
             Verdict::NeverTurnsUp,
-            Verdict::NoPeakAboveTrough,
-            Verdict::LobeHoldsTooLittle,
-            Verdict::LobeNotClearOfTrough,
+            Verdict::NoPeakAboveValley,
+            Verdict::TooFewCandidateKmers,
+            Verdict::PeakNotClearOfValley,
             Verdict::Ok,
         ];
         for (i, a) in all.iter().enumerate() {
@@ -2022,21 +2040,21 @@ mod tests {
         assert!(!Verdict::default().is_ok(), "the default must fail closed");
     }
 
-    /// Each way the lobes can merge must be named accurately: at 3-5x no peak clears the trough at all,
-    /// and at 6-7x there is a peak but it does not stand clear of the valley.
+    /// Each way the lobes can merge must be named accurately: at 3-5x no genomic peak clears the valley at all,
+    /// and at 6-7x there is a genomic peak but it does not stand clear of the valley.
     #[test]
-    fn trough_estimator_names_the_reason_the_lobes_merged() {
+    fn valley_estimator_names_the_reason_the_lobes_merged() {
         for lam in [3.0, 4.0, 5.0] {
             assert_eq!(
-                estimate_by_trough(&synthetic_spectrum(lam)).verdict,
-                Verdict::NoPeakAboveTrough,
+                estimate_by_valley(&synthetic_spectrum(lam)).verdict,
+                Verdict::NoPeakAboveValley,
                 "lambda {lam}"
             );
         }
         for lam in [6.0, 7.0] {
             assert_eq!(
-                estimate_by_trough(&synthetic_spectrum(lam)).verdict,
-                Verdict::LobeNotClearOfTrough,
+                estimate_by_valley(&synthetic_spectrum(lam)).verdict,
+                Verdict::PeakNotClearOfValley,
                 "lambda {lam}"
             );
         }
@@ -2044,7 +2062,7 @@ mod tests {
 
     /// A monotone spectrum has no genome lobe, so the walk runs off into the tail and locks onto a noise
     /// fluctuation. The depth of the valley is what gives it away: the two bins are within ~2 % of each
-    /// other, nowhere near [`MIN_LOBE_RATIO`]. Position cannot be used for this — a clean pair of narrow
+    /// other, nowhere near [`MIN_GP_TO_V_RATIO`]. Position cannot be used for this — a clean pair of narrow
     /// lobes a few counts apart is equally crowded and perfectly resolvable.
     #[test]
     fn a_monotone_spectrum_is_refused_for_having_no_lobe() {
@@ -2054,18 +2072,18 @@ mod tests {
             let ripple = 1.0 + 0.01 * ((c % 7) as f64 - 3.0) / 3.0;
             h[c - 1] = (200_000_000.0 / (c as f64).powf(1.5) * ripple) as u32;
         }
-        // Either refusal is right here — the walk may stop on the crest it locked onto, making peak and
-        // trough equal — but the depth is what rules it out either way.
-        let e = estimate_by_trough(&h);
+        // Either refusal is right here — the walk may stop on the crest it locked onto, making genomic peak and
+        // valley equal — but the depth is what rules it out either way.
+        let e = estimate_by_valley(&h);
         assert_ne!(e.verdict, Verdict::Ok);
         assert!(
-            e.lobe_ratio < MIN_LOBE_RATIO,
-            "trough {} ({}) peak {} ({}) gave lobe_ratio {:.3}",
-            e.trough,
-            e.trough_n,
-            e.peak,
-            e.peak_n,
-            e.lobe_ratio
+            e.gp_to_v_ratio < MIN_GP_TO_V_RATIO,
+            "valley {} ({}) genomic_peak {} ({}) gave gp_to_v_ratio {:.3}",
+            e.valley,
+            e.valley_n,
+            e.genomic_peak,
+            e.genomic_peak_n,
+            e.gp_to_v_ratio
         );
         assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
     }
@@ -2077,20 +2095,20 @@ mod tests {
         let mut h = vec![0u32; MAXSIZEHISTO];
         h[0] = 1_000_000; // error spike at count 1
         h[5] = 100_000; // genome spike at count 6, empty valley between
-        let e = estimate_by_trough(&h);
+        let e = estimate_by_valley(&h);
         assert_eq!(
             e.verdict, Verdict::Ok,
-            "trough {} peak {} lobe_ratio {:.1} trough_frac {:.3}",
-            e.trough, e.peak, e.lobe_ratio, e.trough_frac
+            "valley {} genomic_peak {} gp_to_v_ratio {:.1} valley_to_peak_xratio {:.3}",
+            e.valley, e.genomic_peak, e.gp_to_v_ratio, e.valley_to_peak_xratio
         );
-        assert!(e.trough_frac > 0.6, "the point of the case is that it is crowded");
+        assert!(e.valley_to_peak_xratio > 0.6, "the point of the case is that it is crowded");
     }
 
     /// Through the working range the cutoff must clear the errors without eating the genome.
     #[test]
-    fn trough_estimator_is_safe_through_the_working_range() {
+    fn valley_estimator_is_safe_through_the_working_range() {
         for lam in [10.0, 15.0, 20.0, 50.0, 100.0, 250.0] {
-            let e = estimate_by_trough(&synthetic_spectrum(lam));
+            let e = estimate_by_valley(&synthetic_spectrum(lam));
             assert_eq!(e.verdict, Verdict::Ok, "lambda {lam}");
             assert!(e.min_count >= 2, "lambda {lam}");
             assert!(
@@ -2102,9 +2120,9 @@ mod tests {
         }
     }
 
-    /// The reason for widening the histogram: a peak past the old 500-bin ceiling must still be found.
+    /// The reason for widening the histogram: a genomic peak past the old 500-bin ceiling must still be found.
     #[test]
-    fn trough_estimator_finds_a_peak_beyond_the_old_ceiling() {
+    fn valley_estimator_finds_a_peak_beyond_the_old_ceiling() {
         let mut h = vec![0u32; MAXSIZEHISTO];
         for c in 1..40 {
             h[c - 1] = 1_000_000 / (c as u32 * c as u32); // a decaying error lobe
@@ -2112,19 +2130,19 @@ mod tests {
         for c in 5500..6500 {
             h[c - 1] = 20_000; // a genome lobe far outside LEGACY_HISTO_RANGE
         }
-        let e = estimate_by_trough(&h);
+        let e = estimate_by_valley(&h);
         assert_eq!(e.verdict, Verdict::Ok);
-        assert!(e.peak >= LEGACY_HISTO_RANGE, "peak was {}", e.peak);
+        assert!(e.genomic_peak >= LEGACY_HISTO_RANGE, "genomic_peak was {}", e.genomic_peak);
         assert!(coverage_peak(&h) < LEGACY_HISTO_RANGE);
     }
 
-    /// What cutting at `m` costs, as a fraction of the k-mers above `trough` — the quantity the guard
+    /// What cutting at `m` costs, as a fraction of the k-mers above `valley` — the quantity the guard
     /// budgets, measured the same way from the same histogram.
-    fn measured_loss(histovec: &[u32], trough: usize, m: usize) -> f64 {
-        let total: f64 = (trough..histovec.len())
+    fn measured_loss(histovec: &[u32], valley: usize, m: usize) -> f64 {
+        let total: f64 = (valley..histovec.len())
             .map(|c| histovec[c - 1] as f64)
             .sum();
-        let cut: f64 = (trough..m).map(|c| histovec[c - 1] as f64).sum();
+        let cut: f64 = (valley..m).map(|c| histovec[c - 1] as f64).sum();
         if total > 0.0 {
             cut / total
         } else {
@@ -2138,35 +2156,35 @@ mod tests {
     fn measured_guard_spends_its_budget_and_stops() {
         for lam in [20.0, 50.0, 100.0] {
             let h = synthetic_spectrum(lam);
-            let trough = error_trough(&h).unwrap();
-            let peak = peak_above(&h, trough);
-            let m = measured_guard(&h, trough, peak) as usize;
+            let valley = find_valley_seed(&h).unwrap();
+            let genomic_peak = find_genomic_peak(&h, valley);
+            let m = measured_guard(&h, valley, genomic_peak) as usize;
             assert!(m >= 2, "lambda {lam}");
             assert!(
-                measured_loss(&h, trough, m) <= MAX_GENOME_LOSS,
+                measured_loss(&h, valley, m) <= MAX_GENOME_LOSS,
                 "lambda {lam} guard {m} cost {:.4}",
-                measured_loss(&h, trough, m)
+                measured_loss(&h, valley, m)
             );
             assert!(
-                m + 1 >= peak || measured_loss(&h, trough, m + 1) > MAX_GENOME_LOSS,
+                m + 1 >= genomic_peak || measured_loss(&h, valley, m + 1) > MAX_GENOME_LOSS,
                 "lambda {lam} guard {m} could have gone higher"
             );
         }
     }
 
     /// Neither half is safe alone, so the guard takes the tighter: the Poisson bound binds at low
-    /// coverage, where errors above the trough loosen the measured one, and the measured bound binds at
+    /// coverage, where errors above the valley loosen the measured one, and the measured bound binds at
     /// depth, where the lobe is far too wide for a Poisson tail.
     #[test]
     fn loss_guard_takes_the_tighter_of_its_two_bounds() {
         // Low coverage: the Poisson bound is the strict one.
         let h = synthetic_spectrum(10.0);
-        let trough = error_trough(&h).unwrap();
-        let peak = peak_above(&h, trough);
-        assert!(poisson_guard(peak) < measured_guard(&h, trough, peak));
+        let valley = find_valley_seed(&h).unwrap();
+        let genomic_peak = find_genomic_peak(&h, valley);
+        assert!(poisson_guard(genomic_peak) < measured_guard(&h, valley, genomic_peak));
         assert_eq!(
-            measured_guard(&h, trough, peak).min(poisson_guard(peak)),
-            poisson_guard(peak)
+            measured_guard(&h, valley, genomic_peak).min(poisson_guard(genomic_peak)),
+            poisson_guard(genomic_peak)
         );
 
         // Depth, with a lobe as wide as the real libraries: the measured bound is the strict one.
@@ -2192,14 +2210,14 @@ mod tests {
             let z = (c as f64 - mu) / sd;
             h[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
         }
-        let trough = 60;
-        let m = measured_guard(&h, trough, 200).min(poisson_guard(200)) as usize;
+        let valley = 60;
+        let m = measured_guard(&h, valley, 200).min(poisson_guard(200)) as usize;
         // A Poisson(200) tail would allow ~168; the measured 1 % quantile of this lobe is far lower.
         assert!(m < 150, "guard returned {m}, no tighter than a Poisson tail");
         assert!(
-            measured_loss(&h, trough, m) <= MAX_GENOME_LOSS,
+            measured_loss(&h, valley, m) <= MAX_GENOME_LOSS,
             "guard {m} cost {:.4}",
-            measured_loss(&h, trough, m)
+            measured_loss(&h, valley, m)
         );
     }
 
@@ -2226,19 +2244,19 @@ mod tests {
         );
     }
 
-    /// The swap: on a deep library the trough and the mixture fit disagree, and it is the trough that
+    /// The swap: on a deep library the valley and the mixture fit disagree, and it is the valley that
     /// must come out of `choose_min_count`.
     #[test]
-    fn choose_min_count_returns_the_trough_not_the_fit() {
+    fn choose_min_count_returns_the_valley_not_the_fit() {
         let h = synthetic_spectrum(500.0);
-        let e = estimate_by_trough(&h);
+        let e = estimate_by_valley(&h);
         assert_eq!(e.verdict, Verdict::Ok);
         assert_eq!(choose_min_count(&h), e.min_count);
         // ...and that is emphatically not what the old path would have produced.
         let floor = ((coverage_peak(&h) as f64 / 8.0).round() as u16).max(2);
         assert!(
             e.min_count > floor,
-            "the old floor was {floor} and the trough {}; the swap changes nothing here",
+            "the old floor was {floor} and the valley {}; the swap changes nothing here",
             e.min_count
         );
     }
@@ -2246,11 +2264,11 @@ mod tests {
     // ---- the sketch -------------------------------------------------------------------------------
 
     /// A modest bimodal spectrum as (count, number of distinct k-mers) pairs: an error lobe decaying
-    /// from count 1 and a genome lobe around `peak`.
-    fn bimodal(peak: usize) -> Vec<(u32, usize)> {
+    /// from count 1 and a genome lobe around `genomic_peak`.
+    fn bimodal(genomic_peak: usize) -> Vec<(u32, usize)> {
         let mut out: Vec<(u32, usize)> = (1..=5).map(|c| (c as u32, 4000 / c)).collect();
-        for c in (peak - 12)..=(peak + 12) {
-            let d = (c as f64 - peak as f64) / 5.0;
+        for c in (genomic_peak - 12)..=(genomic_peak + 12) {
+            let d = (c as f64 - genomic_peak as f64) / 5.0;
             out.push((c as u32, (3000.0 * (-0.5 * d * d).exp()) as usize));
         }
         out
@@ -2294,7 +2312,7 @@ mod tests {
         let sampled = &sketch.spectra(1)[0];
         let (ft, st) = (full[9..60].iter().sum::<u32>(), sampled[9..60].iter().sum::<u32>());
         assert!(st > 0, "the sample is empty");
-        // The whole spectrum lives in counts 10..49 in both, and the trough/peak structure is identical.
+        // The whole spectrum lives in counts 10..49 in both, and the valley/genomic peak structure is identical.
         assert_eq!(ft, 60_000);
         let rescaled = st as f64 / sketch.fraction();
         assert!(
@@ -2358,27 +2376,39 @@ mod tests {
         out
     }
 
-    /// A clean separation at a peak of 18 is still starvation: the floor, not the library, may be what
+    /// Doubling every bin doubles the distinct k-mers without moving the mode. `distinct_above` must see
+    /// that and `genomic_peak` must not — the difference a depth criterion is blind to.
+    #[test]
+    fn distinct_above_sees_breadth_that_the_peak_does_not() {
+        let narrow = histo(&bimodal(30));
+        let wide: Vec<u32> = narrow.iter().map(|n| n * 2).collect();
+        let (a, b) = (estimate_by_valley(&narrow), estimate_by_valley(&wide));
+        assert_eq!(a.genomic_peak, b.genomic_peak, "depth is unchanged");
+        assert_eq!(b.distinct_above, 2 * a.distinct_above, "breadth is not");
+    }
+
+    /// A clean separation at a genomic peak of 18 is still starvation: the floor, not the library, may be what
     /// made it shallow, so a materially deeper floor wins even though the strict one resolved.
     #[test]
     fn a_shallow_resolving_spectrum_still_loosens() {
         let shallow = histo(&bimodal(18));
-        let strict = estimate_by_trough(&shallow);
+        let strict = estimate_by_valley(&shallow);
         assert!(resolves(&strict), "the premise: the strict floor does resolve");
-        assert!(strict.peak < MIN_USEFUL_COVERAGE, "peak was {}", strict.peak);
+        assert!(strict.genomic_peak < MIN_USEFUL_COVERAGE, "genomic_peak was {}", strict.genomic_peak);
 
         let sketch = sketch_with(1, &bimodal(40));
         let (_, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 11, "a 2.2x deeper spectrum justifies the recount");
     }
 
-    /// The same shallow spectrum, but loosening barely moves the peak: depth rather than the floor is
+    /// The same shallow spectrum, but loosening barely moves the genomic peak: depth rather than the floor is
     /// the limit, so the second pass is not worth paying for and the strict cutoff stands.
     #[test]
     fn a_shallow_spectrum_with_no_gain_keeps_the_strict_floor() {
         let shallow = histo(&bimodal(18));
-        let strict = estimate_by_trough(&shallow);
-        let sketch = sketch_with(1, &bimodal(22));
+        let strict = estimate_by_valley(&shallow);
+        // 20 against 18 is a gain of 1.11, under `MIN_COVERAGE_GAIN`.
+        let sketch = sketch_with(1, &bimodal(20));
         let (minc, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 25, "no material gain, so no recount");
         assert_eq!(minc, strict.min_count, "and the strict cutoff is kept, not the fallback");
@@ -2402,7 +2432,7 @@ mod tests {
         s
     }
 
-    /// The strict floor does not resolve at all and the middle rung does — but at a peak of 15 it is
+    /// The strict floor does not resolve at all and the middle rung does — but at a genomic peak of 15 it is
     /// still starved, so the walk must keep loosening instead of settling for the first rung that
     /// merely separates. This is art at k=71/81, which stopped at its B rung and stayed fragmented.
     #[test]
@@ -2419,9 +2449,9 @@ mod tests {
     fn a_starved_ladder_settles_for_the_strictest_that_separated() {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let mut sketch = sketch_deepening(&bimodal(15), 0);
-        // Group 0 sees a fifth again as many occurrences: real, but far under `MIN_COVERAGE_GAIN`.
+        // Group 0 sees a tenth again as many occurrences: real, but under `MIN_COVERAGE_GAIN`.
         for c in sketch.counts.values_mut() {
-            c[0] = c[1] / 5;
+            c[0] = c[1] / 10;
         }
         let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 11, "no material gain below it, so the walk stops here");
