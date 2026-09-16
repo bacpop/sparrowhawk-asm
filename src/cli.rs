@@ -23,6 +23,8 @@ pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
+/// Smallest explicit minimum count supported by the Bloom-filter preprocessing path.
+pub(crate) const MIN_BLOOM_COUNT: u16 = 3;
 
 /// Base-quality floor for `k`: [`DEFAULT_MINQUAL`] at or below [`DEFAULT_MINQUAL_K_LO`], 0 at or above
 /// [`DEFAULT_MINQUAL_K_HI`], linear between. A k-mer needs all k of its bases to pass and the window
@@ -59,6 +61,21 @@ fn valid_cpus(s: &str) -> Result<usize, String> {
         Err("Threads must be one or higher".to_string())
     } else {
         Ok(threads)
+    }
+}
+
+/// Reject Bloom-filter configurations whose low thresholds do not populate the count map.
+pub(crate) fn validate_bloom_min_count(
+    do_bloom: bool,
+    explicit_min_count: Option<u16>,
+) -> Result<(), &'static str> {
+    if do_bloom && explicit_min_count.is_some_and(|min_count| min_count < MIN_BLOOM_COUNT) {
+        Err(
+            "--do-bloom does not support --min-count 0, 1, or 2; use --min-count >= 3, omit \
+             --min-count to fit automatically, or remove --do-bloom",
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -162,7 +179,7 @@ pub enum Commands {
         threads: usize,
 
         /// Use, instead of the default filtering, a Bloom filter. This will use less memory and be faster, but will add
-        /// false positive matches to the counting, making possible that a k-mer is counted more times that it should be.
+        /// false positive matches to the counting. Explicit --min-count values 0, 1, and 2 are not supported with Bloom filtering.
         #[arg(long, default_value_t = false)]
         do_bloom: bool,
 

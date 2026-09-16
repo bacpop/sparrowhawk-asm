@@ -90,7 +90,7 @@ fn coverage_peak(histovec: &[u32]) -> usize {
 /// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
 /// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
 const TRUST_FIT_ABOVE: usize = 10;
-const AUTO_FIT_INITIAL_MIN_COUNT: u16 = 3;
+const AUTO_FIT_INITIAL_MIN_COUNT: u16 = crate::cli::MIN_BLOOM_COUNT;
 
 #[inline]
 fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {

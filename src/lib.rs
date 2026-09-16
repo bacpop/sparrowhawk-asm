@@ -261,6 +261,11 @@ pub fn main() {
             no_bubble_collapse,
             no_dead_end_removal,
         } => {
+            if let Err(message) = cli::validate_bloom_min_count(*do_bloom, *min_count) {
+                eprintln!("error: {message}");
+                std::process::exit(2);
+            }
+
             // Create the output directory if it does not exist, so every write below can assume it is
             // there.
             std::fs::create_dir_all(output_dir)
@@ -503,6 +508,12 @@ impl AssemblyHelper {
         no_bubble_collapse: bool,
         no_dead_end_removal: bool,
     ) -> Self {
+        if let Err(message) =
+            cli::validate_bloom_min_count(do_bloom, (!do_fit).then_some(min_count))
+        {
+            panic!("{message}");
+        }
+
         let k = k as usize;
         let chunk_size = chunk_size as usize;
 
