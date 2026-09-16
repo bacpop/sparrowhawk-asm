@@ -1478,22 +1478,46 @@ struct KmerInfo<IntT> {
 #[cfg(not(target_family = "wasm"))]
 type CountMap<IntT> = HashMap<u64, KmerInfo<IntT>, BuildHasherDefault<NoHashHasher<u64>>>;
 
-/// Shards partition the key space, so counting runs on all cores with no locking, and each map is a
-/// fraction of the working set, which probes better than one big one.
+/// Never fewer shards than this, whatever the thread count: below it each map stops being a small
+/// fraction of the working set, which is half of why the key space is split at all.
 #[cfg(not(target_family = "wasm"))]
-const COUNTMAP_SHARDS: usize = 16;
+const MIN_COUNTMAP_SHARDS: usize = 16;
+/// Nor more than this, or the per-batch split pays for buckets that hold almost nothing.
+#[cfg(not(target_family = "wasm"))]
+const MAX_COUNTMAP_SHARDS: usize = 256;
+/// Shards per thread. One, not more: oversubscribing to give rayon work to steal was measured and is a
+/// bad trade, since every extra shard is another half-empty table. At k=81 on 12 threads, 64 shards
+/// cost 17% peak RSS to save 4% wall against 16.
+#[cfg(not(target_family = "wasm"))]
+const SHARDS_PER_THREAD: usize = 1;
 
-/// Pick a shard for a canonical hash, mixing first.
+/// How many shards to split the count-map into.
+///
+/// Shards partition the key space, so counting runs on all cores with no locking, and each map is a
+/// fraction of the working set, which probes better than one big one. The floor of 16 is what every
+/// run up to 16 threads gets, so this only scales where fewer shards than threads would idle workers.
+///
+/// Always a power of two, because [`shard_of`] shifts and masks: a non-power-of-two silently collapses
+/// onto the one below it -- 6 shards would use 2, 12 would use 4 -- with no error, and a balance report
+/// that still reads as healthy because the shards in use stay balanced among themselves.
+#[cfg(not(target_family = "wasm"))]
+fn countmap_shards() -> usize {
+    (rayon::current_num_threads() * SHARDS_PER_THREAD)
+        .next_power_of_two()
+        .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS)
+}
+
+/// Pick a shard for a canonical hash, mixing first. `shards` must be a power of two.
 ///
 /// Neither end of `hc` works raw. Not the high bits: ntHash is uniform but `hc = min(fwd, rc)` is not,
 /// and measured at k=31 the top 4 bits run 12.2% down to 0.37%, a 33x spread that left shard 15 empty.
 /// Not the low bits: `NoHashHasher` passes the hash through and hashbrown indexes buckets with them.
 #[cfg(not(target_family = "wasm"))]
 #[inline(always)]
-fn shard_of(hc: u64) -> usize {
+fn shard_of(hc: u64, shards: usize) -> usize {
     const MIX: u64 = 0x9E37_79B9_7F4A_7C15; // odd, golden-ratio derived
-    ((hc.wrapping_mul(MIX) >> (64 - COUNTMAP_SHARDS.trailing_zeros())) as usize)
-        & (COUNTMAP_SHARDS - 1)
+    debug_assert!(shards.is_power_of_two(), "shard count must be a power of two");
+    ((hc.wrapping_mul(MIX) >> (64 - shards.trailing_zeros())) as usize) & (shards - 1)
 }
 
 /// Count one batch's occurrences into the sharded count-map, sketching as it goes.
@@ -1521,11 +1545,12 @@ fn absorb_into_shards<IntT>(
             sketch.observe(hc, g);
         }
     }
+    let n = shards.len();
     for (hc, hnc, b, g, km) in items {
         if g < keep {
             continue;
         }
-        buckets[shard_of(hc)].push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
+        buckets[shard_of(hc, n)].push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
     }
 
     shards
@@ -1559,12 +1584,16 @@ where
     // The ladder is ascending, so the last group is the strict floor and `keep` is its index.
     let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
     let mut sketch = floors.map(|_| SpectrumSketch::new());
-    let mut shards: Vec<CountMap<IntT>> = (0..COUNTMAP_SHARDS)
+    let n_shards = countmap_shards();
+    log::info!(
+        "Counting k-mers into {n_shards} shards on {} thread(s)",
+        rayon::current_num_threads()
+    );
+    let mut shards: Vec<CountMap<IntT>> = (0..n_shards)
         .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
         .collect();
     // Reused across batches so the per-batch split does not churn allocations.
-    let mut buckets: Vec<Vec<(u64, u64, u8, IntT)>> =
-        (0..COUNTMAP_SHARDS).map(|_| Vec::new()).collect();
+    let mut buckets: Vec<Vec<(u64, u64, u8, IntT)>> = (0..n_shards).map(|_| Vec::new()).collect();
 
     extract_kmers_from_files_batched(input_iters, BATCH_RECORDS, |batch| {
         let items = hash_batch::<IntT>(batch, k, qual.min_qual, floors, keep);
@@ -1823,10 +1852,11 @@ mod tests {
         let (shards, _) =
             bulk_preprocessing_standalone_cpu::<u64, _>(&mut iters, k, &qual, Some(&ladder[..]));
 
+        let n_shards = shards.len();
         let mut got: HashMap<u64, (u32, u64, u8)> = HashMap::default();
         for (idx, shard) in shards.iter().enumerate() {
             for (hc, info) in shard {
-                assert_eq!(shard_of(*hc), idx, "k-mer {hc} is in the wrong shard");
+                assert_eq!(shard_of(*hc, n_shards), idx, "k-mer {hc} is in the wrong shard");
                 got.insert(*hc, (info.count, info.hnc, info.b));
             }
         }
@@ -1848,22 +1878,75 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// `shard_of` must spread a canonical-minimum hash evenly, since the busiest shard paces the
-    /// counting. Sharding on the raw high bits measured a 33x spread here, making 16 shards act like 8.
+    /// Canonical-minimum hashes for the sharding tests: `min(fwd, rc)` has a triangular density, which
+    /// is exactly the bias `shard_of` has to mix away.
     #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn shard_of_is_balanced_on_canonical_minimum_hashes() {
-        let mut sizes = [0usize; COUNTMAP_SHARDS];
-        for i in 0..200_000u64 {
+    fn canonical_minimum_hashes(n: u64) -> impl Iterator<Item = u64> {
+        (0..n).map(|i| {
             let f = i.wrapping_mul(0x2545_F491_4F6C_DD1D);
             let r = (!i).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            sizes[shard_of(f.min(r))] += 1;
+            f.min(r)
+        })
+    }
+
+    /// `shard_of` must spread evenly at every shard count we can pick, since the busiest shard paces
+    /// the counting. Sharding on the raw high bits measured a 33x spread, making 16 shards act like 8.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn shard_of_is_balanced_at_every_shard_count() {
+        for shards in [16usize, 32, 64, 128, 256] {
+            let mut sizes = vec![0usize; shards];
+            for h in canonical_minimum_hashes(400_000) {
+                sizes[shard_of(h, shards)] += 1;
+            }
+            let ideal = 400_000.0 / shards as f64;
+            let worst = *sizes.iter().max().unwrap() as f64 / ideal;
+            assert!(worst < 1.1, "{shards} shards: busiest {worst:.2}x ideal");
+            assert!(
+                sizes.iter().all(|&n| n > 0),
+                "{shards} shards: {} were never used",
+                sizes.iter().filter(|&&n| n == 0).count()
+            );
         }
-        let ideal = 200_000.0 / COUNTMAP_SHARDS as f64;
-        assert!(
-            *sizes.iter().max().unwrap() as f64 / ideal < 1.1,
-            "sizes were {sizes:?}"
+    }
+
+    /// The shard count must be a power of two and within its bounds at every thread count. A
+    /// non-power-of-two silently collapses `shard_of` onto the count below -- 6 would use 2, 12 would
+    /// use 4 -- with no error and a balance report that still reads as healthy.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_shard_count_is_always_a_usable_power_of_two() {
+        for threads in 1..=64usize {
+            let n = (threads * SHARDS_PER_THREAD)
+                .next_power_of_two()
+                .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS);
+            assert!(n.is_power_of_two(), "{threads} threads gave {n} shards");
+            assert!((MIN_COUNTMAP_SHARDS..=MAX_COUNTMAP_SHARDS).contains(&n));
+            assert!(n >= threads.min(MAX_COUNTMAP_SHARDS), "{threads} threads starve at {n} shards");
+        }
+        // The sweep runs 4 threads, where the formula must reproduce the previous fixed constant.
+        assert_eq!(
+            (4 * SHARDS_PER_THREAD)
+                .next_power_of_two()
+                .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS),
+            16
         );
+    }
+
+    /// Whatever the count, every k-mer must land in the shard `shard_of` claims, or the lock-free
+    /// accumulate is unsound.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_live_shard_count_partitions_the_key_space() {
+        let n = countmap_shards();
+        assert!(n.is_power_of_two() && n >= MIN_COUNTMAP_SHARDS);
+        let mut seen = vec![0usize; n];
+        for h in canonical_minimum_hashes(200_000) {
+            let s = shard_of(h, n);
+            assert!(s < n);
+            seen[s] += 1;
+        }
+        assert!(seen.iter().all(|&c| c > 0), "some shard never receives a key");
     }
 
     fn empty_themap() -> HashMap<u64, crate::HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>
