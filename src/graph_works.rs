@@ -870,6 +870,12 @@ impl Assemble for BasicAsm {
         }
 
         let mut ptgraph = DbgGraph::from_kmer_map(k, indict);
+        // The graph has copied everything it needs. Neither map is read again here or by the caller,
+        // which keeps only `thedict` to spell contigs, so holding them through correction is waste.
+        indict.clear();
+        indict.shrink_to_fit();
+        maxmindict.clear();
+        maxmindict.shrink_to_fit();
 
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());

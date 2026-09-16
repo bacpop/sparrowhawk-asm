@@ -166,6 +166,8 @@ pub enum Commands {
         do_bloom: bool,
 
         /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
+        /// Native builds now count into a hash map, which buffers no occurrences, so this is a no-op
+        /// there and is kept only so existing command lines still parse.
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
 
