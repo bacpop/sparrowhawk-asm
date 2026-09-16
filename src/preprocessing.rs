@@ -1126,8 +1126,17 @@ mod tests {
             min_qual: 0,
         };
 
-        assert_eq!(initial_bloom_min_count(&qual, true), 3);
+        assert_eq!(initial_bloom_min_count(&qual, true), 2);
         assert_eq!(initial_bloom_min_count(&qual, false), 7);
+    }
+
+    #[test]
+    fn automatic_spectrum_fit_has_a_floor_of_two() {
+        let mut only_errors = vec![0u32; MAXSIZEHISTO];
+        only_errors[0] = 99;
+        only_errors[1] = 7;
+
+        assert_eq!(apply_spectrum_fit(&only_errors), 2);
     }
 
     #[test]

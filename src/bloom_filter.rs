@@ -115,15 +115,7 @@ impl KmerFilter {
         match self.min_count {
             // No filtering
             0 | 1 => Ordering::Equal,
-            // Just the bloom filter
-            2 => {
-                if self.bloom_add_and_check(kmer_hash) {
-                    Ordering::Equal
-                } else {
-                    Ordering::Less
-                }
-            }
-            // Bloom filter then hash table
+            // Bloom filter then hash table. This also handles min_count = 2.
             _ => {
                 if self.bloom_add_and_check(kmer_hash) {
                     let mut count: u32 = 2;
@@ -177,10 +169,15 @@ mod tests {
     #[test]
     fn min_count_two_reaches_threshold() {
         let mut f = make_filter(2);
+        let h = 1234567890;
+        let nc = 9876543210;
         // First pass: not yet in bloom filter
-        assert_eq!(f.filter(1234567890, 9876543210, 0b01), Ordering::Less);
+        assert_eq!(f.filter(h, nc, 0b01), Ordering::Less);
         // Second pass: bloom filter has it → threshold reached
-        assert_eq!(f.filter(1234567890, 9876543210, 0b01), Ordering::Equal);
+        assert_eq!(f.filter(h, nc, 0b01), Ordering::Equal);
+
+        let counts = f.get_counts_map();
+        assert_eq!(counts.get(&h).map(|entry| entry.0), Some(2));
     }
 
     #[test]

@@ -23,8 +23,8 @@ pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
-/// Smallest explicit minimum count supported by the Bloom-filter preprocessing path.
-pub(crate) const MIN_BLOOM_COUNT: u16 = 3;
+/// Smallest minimum count supported by Bloom filtering and automatic Bloom fitting.
+pub(crate) const MIN_BLOOM_COUNT: u16 = 2;
 
 /// Base-quality floor for `k`: [`DEFAULT_MINQUAL`] at or below [`DEFAULT_MINQUAL_K_LO`], 0 at or above
 /// [`DEFAULT_MINQUAL_K_HI`], linear between. A k-mer needs all k of its bases to pass and the window
@@ -71,7 +71,7 @@ pub(crate) fn validate_bloom_min_count(
 ) -> Result<(), &'static str> {
     if do_bloom && explicit_min_count.is_some_and(|min_count| min_count < MIN_BLOOM_COUNT) {
         Err(
-            "--do-bloom does not support --min-count 0, 1, or 2; use --min-count >= 3, omit \
+            "--do-bloom does not support --min-count 0 or 1; use --min-count >= 2, omit \
              --min-count to fit automatically, or remove --do-bloom",
         )
     } else {
@@ -179,7 +179,7 @@ pub enum Commands {
         threads: usize,
 
         /// Use, instead of the default filtering, a Bloom filter. This will use less memory and be faster, but will add
-        /// false positive matches to the counting. Explicit --min-count values 0, 1, and 2 are not supported with Bloom filtering.
+        /// false positive matches to the counting. Explicit --min-count values 0 and 1 are not supported with Bloom filtering.
         #[arg(long, default_value_t = false)]
         do_bloom: bool,
 
