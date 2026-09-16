@@ -554,18 +554,18 @@ const COMFORTABLE_GP_TO_V_RATIO: f64 = MIN_GP_TO_V_RATIO + 0.5;
 #[cfg(not(target_family = "wasm"))]
 const MIN_USEFUL_COVERAGE: usize = 25;
 /// A looser floor must lift the genomic peak by at least this much to justify a second pass. Measured:
-/// runs needing it gain from 1.17, and loosening is worth 1.4-8.2x there, so 1.5 refused too much.
+/// starved libraries gain only 1.13-1.20 there while loosening is worth 2.2x, so 1.20 refused too much.
 #[cfg(not(target_family = "wasm"))]
-const MIN_COVERAGE_GAIN: f64 = 1.20;
+const MIN_COVERAGE_GAIN: f64 = 1.10;
 
 #[cfg(not(target_family = "wasm"))]
 fn resolves(estimate: &SpectrumEstimate) -> bool {
     estimate.verdict.is_ok() && estimate.gp_to_v_ratio >= COMFORTABLE_GP_TO_V_RATIO
 }
 
-/// The min-count, and the floor it was read at. `floors` is ascending, so this tries the strict floor
-/// first and then loosens: the strictest that resolves wins. Preference rather than a walk, because
-/// resolution is not monotone in the floor — a library can resolve at 25 and at 0 but not at 11.
+/// The min-count, and the floor it was read at. Every candidate floor is evaluated and only then
+/// compared, all against one reference fixed beforehand, so the answer cannot depend on the order the
+/// floors happen to be visited in.
 #[cfg(not(target_family = "wasm"))]
 fn choose_min_count_and_floor(
     histovec: &[u32],
@@ -575,16 +575,15 @@ fn choose_min_count_and_floor(
     let strict_floor = floors[floors.len() - 1];
     let strict = estimate_by_valley(histovec);
     log_spectrum(histovec, &strict);
-    // Resolving is not enough: a spectrum can separate cleanly at 7x and still assemble badly, because
-    // the floor rather than the library is what made it shallow.
+    // A library that already separates at depth needs nothing looser, and this is the only path that
+    // avoids building the sketch spectra at all.
     if resolves(&strict) && strict.genomic_peak >= MIN_USEFUL_COVERAGE {
         return (strict.min_count, strict_floor);
     }
 
-    // The strictest floor that resolved but was too shallow to accept outright, as `(min_count, floor,
-    // genomic peak)`. A looser rung has to beat its genomic peak materially to be worth a second pass, and it is what
-    // the walk settles for when no rung reaches useful depth.
-    let mut best = resolves(&strict).then_some((strict.min_count, strict_floor, strict.genomic_peak));
+    // Every floor that separates, as `(floor, min_count, genomic peak)`. Collected before anything is
+    // judged: accepting one used to raise the bar for the next, stranding runs on a middle floor.
+    let mut cands: Vec<(u8, u16, usize)> = Vec::with_capacity(floors.len());
 
     let spectra = sketch.spectra(floors.len());
     for g in (0..floors.len() - 1).rev() {
@@ -603,30 +602,43 @@ fn choose_min_count_and_floor(
             ),
             Some("info"),
         );
-        if !resolves(&estimate) {
-            continue;
+        if resolves(&estimate) {
+            cands.push((floors[g], estimate.min_count, estimate.genomic_peak));
         }
-        // A looser rung is only worth a second pass if it is materially deeper than the best so far:
-        // depth, not the floor, may simply be the limit.
-        if best.is_some_and(|(_, _, p)| (estimate.genomic_peak as f64) < MIN_COVERAGE_GAIN * p as f64) {
-            continue;
-        }
-        // Deep enough to settle on; otherwise it becomes the new baseline and the walk keeps loosening,
-        // which is what a rung that resolves while still starved needs.
-        if estimate.genomic_peak >= MIN_USEFUL_COVERAGE {
-            return (estimate.min_count, floors[g]);
-        }
-        best = Some((estimate.min_count, floors[g], estimate.genomic_peak));
+    }
+    if resolves(&strict) {
+        cands.push((strict_floor, strict.min_count, strict.genomic_peak));
     }
 
-    // Something separated the lobes, but nothing reached useful depth: take the strictest rung that
-    // did, rather than dropping the filter and admitting errors it cannot pay for in coverage.
-    if let Some((min_count, floor, _)) = best {
+    // The reference is the strictest floor that separated, which is the strict one whenever it did.
+    let Some(&(anchor, _, anchor_peak)) = cands.iter().max_by_key(|&&(floor, _, _)| floor) else {
+        return unresolved(floors);
+    };
+    cands.retain(|&(floor, _, peak)| {
+        floor == anchor || (peak as f64) >= MIN_COVERAGE_GAIN * anchor_peak as f64
+    });
+
+    // Enough coverage somewhere: the strictest floor reaching it admits the fewest error k-mers.
+    if let Some(&(floor, min_count, _)) = cands
+        .iter()
+        .filter(|&&(_, _, peak)| peak >= MIN_USEFUL_COVERAGE)
+        .max_by_key(|&&(floor, _, _)| floor)
+    {
         return (min_count, floor);
     }
+    // Starved everywhere, so take all the depth on offer. Equal peaks are not equal assemblies: a floor
+    // also breaks the run of k consecutive passing bases a k-mer needs, which no spectrum shows.
+    let &(floor, min_count, _) = cands
+        .iter()
+        .min_by_key(|&&(floor, _, _)| floor)
+        .expect("the anchor is always a candidate");
+    (min_count, floor)
+}
 
-    // Nothing resolved at any floor. Drop the quality filter entirely: it is the most depth available,
-    // and the strict estimate cannot be trusted precisely because it did not resolve.
+/// Nothing separated at any floor: drop the filter, which is the most depth available, and warn, because
+/// the assembly will be fragmented whatever is chosen.
+#[cfg(not(target_family = "wasm"))]
+fn unresolved(floors: &[u8]) -> (u16, u8) {
     let loosest = floors[0];
     logw(
         &format!(
@@ -2407,8 +2419,8 @@ mod tests {
     fn a_shallow_spectrum_with_no_gain_keeps_the_strict_floor() {
         let shallow = histo(&bimodal(18));
         let strict = estimate_by_valley(&shallow);
-        // 20 against 18 is a gain of 1.11, under `MIN_COVERAGE_GAIN`.
-        let sketch = sketch_with(1, &bimodal(20));
+        // 19 against 18 is a gain of 1.06, under `MIN_COVERAGE_GAIN`.
+        let sketch = sketch_with(1, &bimodal(19));
         let (minc, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 25, "no material gain, so no recount");
         assert_eq!(minc, strict.min_count, "and the strict cutoff is kept, not the fallback");
@@ -2456,6 +2468,31 @@ mod tests {
         let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 11, "no material gain below it, so the walk stops here");
         assert_ne!(minc, UNRESOLVED_MINCOUNT, "and keeps the cutoff that rung measured");
+    }
+
+    /// The stranding case, from a starved library whose floors sit at peaks 15/17/18. Accepting the
+    /// middle floor must not raise the bar the loosest one has to clear.
+    #[test]
+    fn a_middle_floor_does_not_block_a_looser_one() {
+        let shallow = histo(&bimodal(15));
+        let mut sketch = sketch_deepening(&bimodal(15), 0);
+        for c in sketch.counts.values_mut() {
+            let base = c[1];
+            c[1] = base + base / 7; // the middle floor, a little deeper
+            c[0] = base / 12; // the loosest, deeper still but only just
+        }
+        let (_, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 15, 20]);
+        assert_eq!(floor, 0, "the loosest qualifying floor wins when every floor is starved");
+    }
+
+    /// Order must not matter: the floor chosen is a property of the candidates, not of the walk that
+    /// visits them.
+    #[test]
+    fn a_deep_enough_floor_is_taken_at_its_strictest() {
+        let flat = vec![1000u32; MAXSIZEHISTO];
+        let sketch = sketch_with(1, &bimodal(40));
+        let (_, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        assert_eq!(floor, 11, "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins");
     }
 
     /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an
