@@ -128,10 +128,11 @@ impl fmt::Display for QualOpts {
             "min count: {}; minimum quality {} ({});",
             self.min_count,
             self.min_qual,
-            (self.min_qual + 33) as char,
+            self.min_qual.saturating_add(33) as char,
         )
     }
 }
+
 
 #[cfg(not(target_family = "wasm"))]
 /// Sets up logging
@@ -173,6 +174,8 @@ struct BuildOpts<'a> {
     pop_ratio: f32,
     /// Dead-end paths shorter than this many bases are pruned. Already resolved against k.
     tip_nts: usize,
+    /// Minimum trimmed contig body length written to FASTA.
+    min_contig_length: usize,
     output: PathBuf,
 }
 
@@ -189,16 +192,20 @@ fn count_reads<IntT>(
 where
     IntT: for<'a> UInt<'a>,
 {
-    let mut estimated_kmers: u64 = 0;
-    let mut readers = opts.input_files.iter().flat_map(|(_, files)| {
-        files.iter().map(|file| {
-            estimated_kmers += std::fs::metadata(file).map_or(0, |m| m.len());
-            let reader = needletail::parse_fastx_file(file).unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
-            NeedletailIterator::new(reader)
-        }).collect::<Vec<NeedletailIterator>>()
-    }).collect::<Vec<NeedletailIterator>>();
-    estimated_kmers /= 5;
-    let estimated_kmers: usize = estimated_kmers.try_into().unwrap_or(usize::MAX);
+    let mut readers = opts
+        .input_files
+        .iter()
+        .flat_map(|(_, files)| {
+            files
+                .iter()
+                .map(|file| {
+                    let reader = needletail::parse_fastx_file(file)
+                        .unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
+                    NeedletailIterator::new(reader)
+                })
+                .collect::<Vec<NeedletailIterator>>()
+        })
+        .collect::<Vec<NeedletailIterator>>();
 
     preprocessing::preprocessing_standalone::<IntT, _>(
         &mut readers,
@@ -210,7 +217,6 @@ where
         opts.chunk_size,
         opts.do_bloom,
         opts.do_fit,
-        Some(estimated_kmers),
     )
 }
 
@@ -260,7 +266,13 @@ fn run_build<IntT>(
         opts.tip_nts,
     );
 
-    save_functions::save_as_fasta::<IntT>(&mut contigs, &assembly.thedict, opts.k, opts.output);
+    save_functions::save_as_fasta_with_min_contig_length::<IntT>(
+        &mut contigs,
+        &assembly.thedict,
+        opts.k,
+        opts.min_contig_length,
+        opts.output,
+    );
 }
 
 #[doc(hidden)]
@@ -287,11 +299,17 @@ pub fn main() {
             bubble_pop_ratio,
             tip_length,
             tip_length_kmult,
+            min_contig_length,
             no_histo,
             no_graphs,
             no_bubble_collapse,
             no_dead_end_removal,
         } => {
+            if let Err(message) = cli::validate_bloom_min_count(*do_bloom, *min_count) {
+                eprintln!("error: {message}");
+                std::process::exit(2);
+            }
+
             // Create the output directory if it does not exist, so every write below can assume it is
             // there.
             std::fs::create_dir_all(output_dir)
@@ -385,6 +403,7 @@ pub fn main() {
                 do_dead_end_removal: !no_dead_end_removal,
                 pop_ratio: *bubble_pop_ratio,
                 tip_nts,
+                min_contig_length: *min_contig_length,
                 output,
             };
 
@@ -397,19 +416,39 @@ pub fn main() {
                 0..=2 => panic!("kmer length too small (min. 3)"),
                 3..=32 => {
                     log::info!("k={width_k}: using 64-bit representation");
-                    run_build::<u64>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<u64>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 33..=64 => {
                     log::info!("k={width_k}: using 128-bit representation");
-                    run_build::<u128>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<u128>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 65..=128 => {
                     log::info!("k={width_k}: using 256-bit representation");
-                    run_build::<U256>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<U256>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 129..=256 => {
                     log::info!("k={width_k}: using 512-bit representation");
-                    run_build::<U512>(opts, &mut timevec, &mut out_paths_histo, &mut out_path_graph)
+                    run_build::<U512>(
+                        opts,
+                        &mut timevec,
+                        &mut out_paths_histo,
+                        &mut out_path_graph,
+                    )
                 }
                 _ => panic!("kmer length larger than 256 currently not supported."),
             }
@@ -513,6 +552,12 @@ impl AssemblyHelper {
         no_bubble_collapse: bool,
         no_dead_end_removal: bool,
     ) -> Self {
+        if let Err(message) =
+            cli::validate_bloom_min_count(do_bloom, (!do_fit).then_some(min_count))
+        {
+            panic!("{message}");
+        }
+
         let k = k as usize;
         let chunk_size = chunk_size as usize;
 

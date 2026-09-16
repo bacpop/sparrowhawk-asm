@@ -80,7 +80,7 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
     let idx = if (count as usize) >= MAXSIZEHISTO {
         MAXSIZEHISTO - 1
     } else {
-        count as usize - 1
+        count.saturating_sub(1) as usize
     };
     histovec[idx] = histovec[idx].saturating_add(1);
 }
@@ -512,7 +512,16 @@ fn log_fit_comparison(histovec: &[u32]) {
 /// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
 #[cfg(target_family = "wasm")]
 const TRUST_FIT_ABOVE: usize = 10;
+const AUTO_FIT_INITIAL_MIN_COUNT: u16 = crate::cli::MIN_BLOOM_COUNT;
 
+#[inline]
+fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
+    if do_fit {
+        AUTO_FIT_INITIAL_MIN_COUNT
+    } else {
+        qual.min_count
+    }
+}
 
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
 /// both filter sites keep k-mers with `count >= min_count`.
@@ -711,13 +720,10 @@ fn drain_countmap_into_themap<IntT>(
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn extract_kmers_from_files<F, I>(
-    input_iters: &mut [I],
-    mut on_record: F
-)
+fn extract_kmers_from_files<F, I>(input_iters: &mut [I], mut on_record: F)
 where
     F: FnMut(std::borrow::Cow<'_, [u8]>, usize, Option<&[u8]>),
-    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
 {
     for (idx, records) in input_iters.iter_mut().enumerate() {
         log::info!("Getting kmers from file number {idx}.");
@@ -748,11 +754,10 @@ const BATCH_RECORDS: usize = 8192;
 fn extract_kmers_from_files_batched<F, I>(
     input_iters: &mut [I],
     batch_records: usize,
-    mut on_batch: F
-)
-where
+    mut on_batch: F,
+) where
     F: FnMut(&[OwnedRecord]),
-    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
 {
     let mut batch: Vec<OwnedRecord> = Vec::with_capacity(batch_records);
     for (idx, records) in input_iters.iter_mut().enumerate() {
@@ -1027,10 +1032,12 @@ where
                 ));
             }
         }
-
     }
 
-    logw("Finished getting kmers from the input file(s)", Some("info"));
+    logw(
+        "Finished getting kmers from the input file(s)",
+        Some("info"),
+    );
 
     // The residual chunk. This MUST stay outside the `if let Some(file2)` block above, or single-file
     // input silently loses the k-mers of its trailing partial chunk.
@@ -1123,7 +1130,7 @@ where
 
     let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
 
-    let mut kmer_filter = KmerFilter::new(if do_fit { 3 } else { qual.min_count });
+    let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
     kmer_filter.init();
 
     logw("Entering while loop for the first file...", Some("info"));
@@ -1284,7 +1291,7 @@ fn bloom_filter_preprocessing_standalone<IntT, I>(
 )
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Initialising variables and filter...");
 
@@ -1294,7 +1301,7 @@ where
 
     let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
 
-    let mut kmer_filter = KmerFilter::new(qual.min_count);
+    let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
     kmer_filter.init();
 
     // NOTE, potential TODO? : This could be slightly improved by filling outdict and minmaxdict only once, though it'd require saving also km, but it could be better
@@ -1476,7 +1483,7 @@ fn chunked_preprocessing_standalone<IntT, I>(
 )
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Getting kmers from files. Creating reader...");
 
@@ -1659,11 +1666,10 @@ pub fn preprocessing_standalone<IntT, I>(
     csize: usize,
     do_bloom: bool,
     do_fit: bool,
-    estimated_kmers: Option<usize>,
 ) -> PreprocessedK<IntT>
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item=(Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
 {
     log::info!("Starting preprocessing_standalone with k = {k}");
 
@@ -1684,7 +1690,7 @@ where
             log::info!("Counting k-mers by sorting, in chunks of {csize} records");
         }
 
-        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::with_capacity(estimated_kmers.unwrap_or(200000_usize));
+        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
         let out = chunked_preprocessing_standalone::<IntT, _>(
             input_iters, k, qual, floors, &mut tmpvec, csize, do_fit, out_path,
         );
@@ -1733,6 +1739,24 @@ mod tests {
 
     fn empty_dict() -> HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> {
         HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    #[test]
+    fn initial_bloom_min_count_is_shared_between_modes() {
+        let qual = QualOpts {
+            min_count: 7,
+            min_qual: 0,
+        };
+
+        assert_eq!(initial_bloom_min_count(&qual, true), 2);
+        assert_eq!(initial_bloom_min_count(&qual, false), 7);
+    }
+
+    #[test]
+    fn histogram_zero_count_uses_first_bin() {
+        let mut histovec = vec![0u32; MAXSIZEHISTO];
+        add_to_histogram(&mut histovec, 0);
+        assert_eq!(histovec[0], 1);
     }
 
     #[test]
@@ -1893,9 +1917,8 @@ mod tests {
         assert_eq!(coverage_peak(&only_errors), 2);
     }
 
-
-    /// `coverage_peak` stops one bin short of [`LEGACY_HISTO_RANGE`], and `fit_histogram` is handed the
-    /// same window, so neither can be dragged by whatever sits at the edge of it.
+    /// The last bin saturates (it absorbs every count >= MAXSIZEHISTO), so it must not be mistaken for
+    /// a peak — `fit_histogram` excludes it for the same reason.
     #[test]
     fn coverage_peak_ignores_the_edge_of_its_pinned_window() {
         let mut h = vec![0u32; MAXSIZEHISTO];
@@ -2550,15 +2573,7 @@ where
 
         let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
         let (thedict, maxmindict, themap, mut histovec, used_min_count) =
-            chunked_processing_wasm::<IntT>(
-                file1,
-                file2,
-                k,
-                qual,
-                &mut tmpvec,
-                csize,
-                do_fit,
-            );
+            chunked_processing_wasm::<IntT>(file1, file2, k, qual, &mut tmpvec, csize, do_fit);
         drop(tmpvec);
         histovec.shrink_to_fit();
         (themap, Some(thedict), maxmindict, histovec, used_min_count)

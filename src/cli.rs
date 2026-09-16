@@ -13,10 +13,15 @@ pub const DEFAULT_MINQUAL: u8 = 20;
 pub const DEFAULT_TIP_LEN_NTS: usize = 100;
 /// Default tip-removal k multiplier, matching Minia's `-tip-len-topo-kmult`
 pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
+/// Default minimum contig body length written to FASTA, in nucleotides
+pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 /// Default output directory
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
+/// Smallest minimum count supported by Bloom filtering and automatic Bloom fitting.
+pub(crate) const MIN_BLOOM_COUNT: u16 = 2;
+
 
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
@@ -24,7 +29,7 @@ fn valid_kmer(s: &str) -> Result<usize, String> {
         .parse()
         .map_err(|_| format!("`{s}` isn't a valid k-mer"))?;
     if !(3..=256).contains(&k) || k.is_multiple_of(2) {
-        Err("K-mer must an odd number between 5 and 128 (inclusive)".to_string())
+        Err("K-mer must be an odd number between 3 and 255 (inclusive)".to_string())
     } else {
         Ok(k)
     }
@@ -39,6 +44,21 @@ fn valid_cpus(s: &str) -> Result<usize, String> {
         Err("Threads must be one or higher".to_string())
     } else {
         Ok(threads)
+    }
+}
+
+/// Reject Bloom-filter configurations whose low thresholds do not populate the count map.
+pub(crate) fn validate_bloom_min_count(
+    do_bloom: bool,
+    explicit_min_count: Option<u16>,
+) -> Result<(), &'static str> {
+    if do_bloom && explicit_min_count.is_some_and(|min_count| min_count < MIN_BLOOM_COUNT) {
+        Err(
+            "--do-bloom does not support --min-count 0 or 1; use --min-count >= 2, omit \
+             --min-count to fit automatically, or remove --do-bloom",
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -141,15 +161,13 @@ pub enum Commands {
         threads: usize,
 
         /// Use, instead of the default filtering, a Bloom filter. This will use less memory and be faster, but will add
-        /// false positive matches to the counting, making possible that a k-mer is counted more times that it should be.
+        /// false positive matches to the counting. Explicit --min-count values 0 and 1 are not supported with Bloom filtering.
         #[arg(long, default_value_t = false)]
         do_bloom: bool,
 
         /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
         #[arg(long, default_value_t = 100000)]
         chunk_size: usize,
-
-
 
         /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
         /// treated as an error and popped.
@@ -165,6 +183,11 @@ pub enum Commands {
         /// which is the historical behaviour.
         #[arg(long, default_value_t = DEFAULT_TIP_LEN_KMULT)]
         tip_length_kmult: f32,
+
+        /// Minimum contig body length written to FASTA, in nucleotides. Contigs with exactly this
+        /// length are retained.
+        #[arg(long, default_value_t = DEFAULT_MIN_CONTIG_LENGTH_NTS)]
+        min_contig_length: usize,
 
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
         /// where the contigs output will be. Use this argument if you want it to not do this

@@ -185,27 +185,14 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         }
     }
 
-    /// Get the current k-mer hash
+    /// Get the current k-mer hashes, endpoint bases, and sequence.
     ///
-    /// Returns the canonical k-mer hash, the non-canonical one, the first and last bases, and the k-mer sequence
+    /// The endpoint byte stores the canonical k-mer's first base in bits 3–2 and its last
+    /// base in bits 1–0; bits 7–4 are unused.
     pub fn get_curr_kmerhash_and_bases_and_kmer(&self) -> (u64, u64, u8, IntT) {
-        // OLD bases extraction: we need now to see if we are
         let (canhash, notcanhash, isittherevcomp) =
             self.hash_gen.curr_hash_and_whether_it_is_the_inverse();
-        let thebases: u8; // Last four bits correspond to the canonical kmer bases, first four bits to the alternative kmer bases
-                          //         if isittherevcomp {
-                          //             thebases = (rc_base((self.kmer >> (self.k - 1)*2).as_u8()) & 3)
-                          //                         | (rc_base((self.kmer).as_u8() & 3) << 2)
-                          //                         | ((self.kmer >> (self.k - 1)*2) << 6).as_u8()
-                          //                         | (((self.kmer).as_u8() & 3) << 4);
-                          //         } else {
-                          //             thebases =  (((self.kmer >> (self.k - 1)*2).as_u8() & 3) << 2)
-                          //                         | ((self.kmer).as_u8() & 3)
-                          //                         | (rc_base((self.kmer).as_u8() & 3) << 6)
-                          //                         | (rc_base((self.kmer >> (self.k - 1)*2).as_u8() & 3) << 4);
-                          //         }
-                          //             thebases =  (((self.kmer >> (self.k - 1)*2).as_u8() & 3) << 2)
-                          //                         | ((self.kmer).as_u8() & 3);
+        let thebases: u8;
 
         let thekmer: IntT;
         //         println!("{} {} {}", canhash, notcanhash, isittherevcomp);
@@ -226,8 +213,9 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         (canhash, notcanhash, thebases, thekmer)
     }
 
-    /// Returns (canonical_hash, non_canonical_hash, bases_byte) without computing
-    /// the full k-mer bits. Use in hot loops where the k-mer value itself is not needed.
+    /// Returns `(canonical_hash, non_canonical_hash, endpoint_bases)` without computing the full
+    /// k-mer bits. The endpoint byte uses the same canonical layout as
+    /// [`Self::get_curr_kmerhash_and_bases_and_kmer`].
     pub fn get_curr_hash_and_bases(&self) -> (u64, u64, u8) {
         let (canhash, notcanhash, isittherevcomp) =
             self.hash_gen.curr_hash_and_whether_it_is_the_inverse();
@@ -458,5 +446,35 @@ mod tests {
         assert_eq!(it.end_index() + 1 - k, 0);
         it.get_next_hash_and_bases().unwrap();
         assert_eq!(it.end_index() + 1 - k, 1);
+    }
+
+    /// Test to see if the u8 store the first and last bases as they should
+    #[test]
+    fn endpoint_byte_stores_canonical_first_and_last_bases() {
+        let alphabet = *b"ACTG";
+        let k = 3;
+        let mut orientations_seen = [false; 2];
+
+        for encoded in 0..64 {
+            let seq = [
+                alphabet[(encoded >> 4) & 3],
+                alphabet[(encoded >> 2) & 3],
+                alphabet[encoded & 3],
+            ];
+            let it = Kmer::<u64>::new(Cow::Borrowed(&seq), seq.len(), None, k, 0, true).unwrap();
+            let (_, _, is_reverse_complement) =
+                it.hash_gen.curr_hash_and_whether_it_is_the_inverse();
+            let (_, _, endpoint_bases, canonical) = it.get_curr_kmerhash_and_bases_and_kmer();
+
+            orientations_seen[is_reverse_complement as usize] = true;
+            assert_eq!(
+                (endpoint_bases >> 2) & 3,
+                ((canonical >> (2 * (k - 1))) as u8) & 3
+            );
+            assert_eq!(endpoint_bases & 3, canonical as u8 & 3);
+            assert_eq!(endpoint_bases & 0xf0, 0);
+        }
+
+        assert!(orientations_seen.into_iter().all(|seen| seen));
     }
 }

@@ -1,6 +1,5 @@
 //! Create string representation of contigs out of `DbgGraph`.
 
-use super::corrector::prune_unpaired_edges;
 use super::shrinker::Shrinkable;
 use sparrowhawk_graph::{
     get_nodelist_kmer_length, CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs,
@@ -24,6 +23,9 @@ impl Collapsable for DbgGraph {
             self.connected_components(),
             self.isolated_node_count()
         );
+
+        let removed = erase_junction_nodes(&mut self);
+        log::info!("Removed {removed} branching junction nodes before collapse");
 
         log::info!("Starting collapse loop.");
         // 100 nt, though independent of this value the minimum is always at least k.
@@ -112,6 +114,24 @@ impl Collapsable for DbgGraph {
     }
 }
 
+/// Remove branching junction nodes before collapse walks begin.
+#[inline]
+fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> usize {
+    let junctions: Vec<NodeId> = ptgraph
+        .ambiguous_nodes()
+        .into_iter()
+        .filter(|&node| ptgraph.nonself_degree(node) > 1)
+        .collect();
+
+    let removed = junctions.len();
+
+    for node in junctions {
+        ptgraph.remove_node(node);
+    }
+
+    removed
+}
+
 // Main collapse function/method
 #[inline]
 fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
@@ -146,25 +166,15 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
-            // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
+            // Junctions delimit contigs and are intentionally discarded.
             contigs.push(contig.clone());
             contig.clear();
-
-            // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
-            if num_following == 0 {
-                // We cannot continue.
-                ptgraph.remove_node(current_vertex);
-                return contigs;
-            }
-
             ptgraph.remove_node(current_vertex);
             return contigs;
         }
 
-        // If we arrived here, current_vertex is either considered good to be added to the current
-        // contig, or we have created a contig break and we are starting from this ambiguous node
-        // and also current_edge_index is the vertex through which we should continue our
-        // journey, or we have either a simple loop or a circumference to deal with
+        // If we arrive here, current_vertex has exactly one outgoing neighbour and no preceding
+        // neighbour, so it can be added to the current contig.
 
         // We add the current_vertex to the contig
         let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
@@ -202,19 +212,13 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> Serial
 
     // We need to get the carrytype, the edges, and so on before we can begin. We'll try to set them to get a forward
     // direction with only one neighbour, if possible.
-    // Pairing forbids one-sided patterns here: prune collision leftovers and re-read.
-    let mut outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
-    let mut outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
-    if outmin.is_empty() || outmax.is_empty() {
-        prune_unpaired_edges(ptgraph, v);
-        outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
-        outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
-    }
+    let outmin = ptgraph.outgoing_edges_by_carry(v, CarryType::Min);
+    let outmax = ptgraph.outgoing_edges_by_carry(v, CarryType::Max);
     let outminlen = outmin.len();
     let outmaxlen = outmax.len();
     let outeds = match (outminlen, outmaxlen) {
         (0, 0) => {
-            // Nothing left after the repair: emit the node as its own contig.
+            // An isolated node becomes its own contig.
             contig.push(ptgraph.node_weight(v).unwrap().clone());
             contigs.push(contig);
             ptgraph.remove_node(v);
@@ -257,21 +261,15 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> Serial
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
-            // We've found an ambiguous node/bifurcation, thus we need to stop the current contig and clear the vector
+            // Junctions delimit contigs and are intentionally discarded.
             contigs.push(contig.clone());
             contig.clear();
-
-            // And now what we do depends on the neighbours from this new vertex. OR NOT: LET'S FINISH FOR NOW!
-            if num_following == 0 {
-                // We cannot continue.
-                return contigs;
-            }
+            ptgraph.remove_node(current_vertex);
+            return contigs;
         }
 
-        // If we arrived here, current_vertex is either considered good to be added to the current
-        // contig, or we have created a contig break and we are starting from this ambiguous node
-        // and also current_edge_index is the vertex through which we should continue our
-        // journey, or we have either a simple loop or a circumference to deal with
+        // If we arrive here, current_vertex has exactly one outgoing neighbour and no preceding
+        // neighbour, so it can be added to the current contig.
 
         // We add the current_vertex to the contig
         let mut nwtocopy = ptgraph.node_weight(current_vertex).unwrap().clone();
@@ -313,23 +311,19 @@ mod tests {
         }
     }
 
-    /// A one-sided start (which used to panic as "External node!!!") is repaired and
-    /// walks its available side.
+    /// A legitimate one-carry start walks its available side.
     #[test]
-    fn collapse_walks_a_one_sided_start_instead_of_panicking() {
+    fn collapse_walks_a_legitimate_one_carry_start() {
         let mut g = DbgGraph::new(3);
         let v = g.add_node(node(0));
         let w = g.add_node(node(1));
-        let u = g.add_node(node(2));
         g.add_bi_edge(v, w, EdgeType::MinToMin);
-        g.add_edge(u, v, EdgeType::MinToMax); // phantom: no reverse partner
 
         let contigs = contigs_from_intermediate_vertex(&mut g, v);
 
         assert_eq!(contigs.len(), 1);
         assert_eq!(contigs[0].len(), 2);
-        assert_eq!(g.node_count(), 1); // only `u` is left...
-        assert_eq!(g.out_degree(u), 0); // ...and its phantom edge was pruned
+        assert_eq!(g.node_count(), 0);
     }
 
     /// A start left with no edges at all becomes its own single-node contig.
@@ -343,5 +337,70 @@ mod tests {
         assert_eq!(contigs.len(), 1);
         assert_eq!(contigs[0].len(), 1);
         assert_eq!(g.node_count(), 0);
+    }
+
+    /// External walks discard a branching junction instead of emitting it.
+    #[test]
+    fn external_walk_discards_branching_junction() {
+        let mut g = DbgGraph::new(3);
+        let start = g.add_node(node(0));
+        let junction = g.add_node(node(1));
+        let branch_a = g.add_node(node(2));
+        let branch_b = g.add_node(node(3));
+
+        g.add_bi_edge(start, junction, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
+
+        let contigs = contigs_from_vertex(&mut g, start);
+
+        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs[0].len(), 1);
+        assert_eq!(contigs[0][0].abs_ind, vec![0]);
+        assert!(!contigs.iter().flatten().any(|n| n.abs_ind == vec![1]));
+        assert!(!g.contains_node(junction));
+    }
+
+    /// Intermediate walks apply the same junction-discarding rule as external walks.
+    #[test]
+    fn intermediate_walk_discards_branching_junction() {
+        let mut g = DbgGraph::new(3);
+        let start = g.add_node(node(0));
+        let junction = g.add_node(node(1));
+        let branch_a = g.add_node(node(2));
+        let branch_b = g.add_node(node(3));
+
+        g.add_bi_edge(start, junction, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
+
+        let contigs = contigs_from_intermediate_vertex(&mut g, start);
+
+        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs[0].len(), 1);
+        assert_eq!(contigs[0][0].abs_ind, vec![0]);
+        assert!(!contigs.iter().flatten().any(|n| n.abs_ind == vec![1]));
+        assert!(!g.contains_node(junction));
+    }
+
+    /// Pre-collapse junction erasure removes the junction and its incident edges only.
+    #[test]
+    fn erase_junction_nodes_removes_branching_node_and_edges() {
+        let mut g = DbgGraph::new(3);
+        let junction = g.add_node(node(0));
+        let branch_a = g.add_node(node(1));
+        let branch_b = g.add_node(node(2));
+
+        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
+        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
+
+        assert_eq!(erase_junction_nodes(&mut g), 1);
+        assert!(!g.contains_node(junction));
+        assert!(g.contains_node(branch_a));
+        assert!(g.contains_node(branch_b));
+        assert_eq!(g.out_degree(branch_a), 0);
+        assert_eq!(g.in_degree(branch_a), 0);
+        assert_eq!(g.out_degree(branch_b), 0);
+        assert_eq!(g.in_degree(branch_b), 0);
     }
 }

@@ -40,29 +40,95 @@ pub fn get_input_list(
     file_list: &Option<String>,
     seq_files: &Option<Vec<String>>,
 ) -> Vec<InputFastx> {
-    // Read input
-    match file_list {
+    let input_files = match file_list {
         Some(files) => {
-            let mut input_files: Vec<InputFastx> = Vec::new();
             let f = File::open(files).expect("Unable to open file_list");
             let f = BufReader::new(f);
             log::warn!("You have provided a input TSV file. Currently, all input read files will be considered as only one assembly. This might change in the future.");
-            for line in f.lines() {
-                let line = line.expect("Unable to read line in file_list");
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                let files: Vec<String> = fields.iter().skip(1).map(|x| x.to_string()).collect();
-                input_files.push((fields[0].to_string(), files));
-            }
-            input_files
+
+            f.lines()
+                .enumerate()
+                .map(|(index, line)| {
+                    let line = line.expect("Unable to read line in file_list");
+                    parse_file_list_line(&line, index + 1)
+                })
+                .collect()
         }
-        None => {
-            vec![(
-                "reads".to_owned(),
-                seq_files
-                    .clone()
-                    .expect("Neither input TSV file nor inputs as arguments have been provided"),
-            )]
-        }
+        None => vec![(
+            "reads".to_owned(),
+            seq_files
+                .clone()
+                .expect("Neither input TSV file nor inputs as arguments have been provided"),
+        )],
+    };
+
+    validate_input_files(input_files)
+}
+
+fn parse_file_list_line(line: &str, line_number: usize) -> InputFastx {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+
+    assert!(
+        fields.len() >= 2,
+        "Invalid input file list line {line_number}: expected a sample name followed by at least one read file"
+    );
+
+    (
+        fields[0].to_owned(),
+        fields[1..]
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
+    )
+}
+
+fn validate_input_files(input_files: Vec<InputFastx>) -> Vec<InputFastx> {
+    assert!(
+        !input_files.is_empty(),
+        "Input file list contains no entries; provide at least one sample and read file"
+    );
+
+    for (name, files) in &input_files {
+        assert!(
+            !files.is_empty(),
+            "Input file list entry {name:?} contains no read files"
+        );
+    }
+
+    input_files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_file_list_line, validate_input_files};
+
+    #[test]
+    #[should_panic(expected = "Input file list contains no entries")]
+    fn empty_input_list_is_rejected() {
+        validate_input_files(Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "contains no read files")]
+    fn input_entry_without_read_files_is_rejected() {
+        validate_input_files(vec![("sample".to_owned(), Vec::new())]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid input file list line 3")]
+    fn blank_file_list_line_is_rejected_with_line_number() {
+        parse_file_list_line("   ", 3);
+    }
+
+    #[test]
+    fn file_list_line_parses_sample_and_read_files() {
+        assert_eq!(
+            parse_file_list_line("sample reads_1.fq reads_2.fq", 1),
+            (
+                "sample".to_owned(),
+                vec!["reads_1.fq".to_owned(), "reads_2.fq".to_owned()]
+            )
+        );
     }
 }
 
@@ -75,12 +141,8 @@ pub struct NeedletailIterator {
 #[cfg(not(target_family = "wasm"))]
 impl NeedletailIterator {
     /// Construct from needletail readers
-    pub fn new(
-        reader: Box<dyn needletail::FastxReader>,
-    ) -> Self {
-        Self {
-            reader,
-        }
+    pub fn new(reader: Box<dyn needletail::FastxReader>) -> Self {
+        Self { reader }
     }
 }
 
@@ -88,9 +150,7 @@ impl NeedletailIterator {
 impl Iterator for NeedletailIterator {
     type Item = (Vec<u8>, Option<Vec<u8>>);
 
-    fn next(
-        &mut self,
-    ) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    fn next(&mut self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
         let record = self.reader.next()?.expect("Invalid FASTA/Q record");
         let seq = record.seq();
         let qual = record.qual().map(|qual| qual.to_vec());
