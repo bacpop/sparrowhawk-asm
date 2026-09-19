@@ -748,17 +748,20 @@ type OwnedRecord = (Vec<u8>, Option<Vec<u8>>);
 #[cfg(not(target_family = "wasm"))]
 const BATCH_RECORDS: usize = 8192;
 
-/// Parse `files` into owned batches of records, handing each batch to `on_batch`. The parse stays
-/// serial but overlaps with the workers processing the previous batch.
+/// Parse `files` into owned batches of records, handing each batch to `on_batch`, and return how long
+/// the whole walk took. `on_batch` is called synchronously, so the parse and the compute alternate:
+/// the returned span minus the caller's own timings is what the parse costs.
 #[cfg(not(target_family = "wasm"))]
 fn extract_kmers_from_files_batched<F, I>(
     input_iters: &mut [I],
     batch_records: usize,
     mut on_batch: F,
-) where
+) -> std::time::Duration
+where
     F: FnMut(&[OwnedRecord]),
     I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
 {
+    let t0 = Instant::now();
     let mut batch: Vec<OwnedRecord> = Vec::with_capacity(batch_records);
     for (idx, records) in input_iters.iter_mut().enumerate() {
         log::info!("Getting kmers from file number {idx}.");
@@ -777,6 +780,7 @@ fn extract_kmers_from_files_batched<F, I>(
         on_batch(&batch);
     }
     log::info!("Finished getting kmers from {} file(s)", input_iters.len());
+    t0.elapsed()
 }
 
 /// Draws the first [`LEGACY_HISTO_RANGE`] bins, so the PNG stays comparable with every earlier run. The
@@ -1407,12 +1411,69 @@ fn update_countmap(
     tmpref.0 = tmpref.0.saturating_add(c);
 }
 
-/// Hash one batch of records at a single k, in parallel. The occurrence order fixes the dictionary
-/// insertion order and so the node numbering in the GFA/DOT dumps; contigs do not depend on it.
-///
-/// `floors = Some(ladder)` is pass 1: the iterator runs wide open and every k-mer is tagged with the
-/// strictest floor it clears. `floors = None` filters at the iterator and tags everything `keep`.
+/// The constants of one counting pass: fixed for every record, so they travel together.
 #[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+struct KmerWalk<'a> {
+    k: usize,
+    min_qual: u8,
+    floors: Option<&'a [u8]>,
+    /// Group index of the strict floor: a k-mer tagged below this does not enter the count-map.
+    keep: u8,
+}
+
+/// Walk one record's k-mers, handing each to `emit` as `(hc, hnc, b, group, packed)`. `groups` is the
+/// caller's scratch, reused per record. `floors = Some(ladder)` tags each k-mer with the strictest
+/// floor it clears; `None` filters at the iterator and tags everything `keep`.
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn for_each_kmer<IntT, F>(
+    seq: &[u8],
+    qual_bytes: Option<&[u8]>,
+    w: KmerWalk,
+    groups: &mut Vec<u8>,
+    mut emit: F,
+) where
+    IntT: for<'a> UInt<'a>,
+    F: FnMut(u64, u64, u8, u8, Option<IntT>),
+{
+    // The scratch is shared across records, so a FASTA record must not inherit the previous one's tags.
+    groups.clear();
+    if let (Some(floors), Some(qual)) = (w.floors, qual_bytes) {
+        window_groups(seq, qual, w.k, floors, groups);
+    }
+    let kmer_opt = Kmer::<IntT>::new(
+        std::borrow::Cow::Borrowed(seq),
+        seq.len(),
+        qual_bytes,
+        w.k,
+        // Filtering nothing at the iterator is what "never stop because of qualities" means.
+        if groups.is_empty() { w.min_qual } else { 0 },
+        true,
+    );
+    if let Some(mut kmer_it) = kmer_opt {
+        let (mut hc, mut hnc, mut b) = kmer_it.get_curr_hash_and_bases();
+        loop {
+            // A record with no qualities (FASTA) has nothing to classify: keep every k-mer.
+            let g = if groups.is_empty() {
+                w.keep
+            } else {
+                groups[kmer_it.end_index()]
+            };
+            debug_assert_ne!(g, NONE, "the iterator emitted a window no floor clears");
+            // The packed k-mer is the costly half at k>=51, so build it only for what is kept.
+            emit(hc, hnc, b, g, (g >= w.keep).then(|| kmer_it.get_kmer()));
+            match kmer_it.get_next_hash_and_bases() {
+                Some(next) => (hc, hnc, b) = next,
+                None => break,
+            }
+        }
+    }
+}
+
+/// Hash one batch into one flat vector, in record order. The counting path no longer materialises this
+/// -- it writes straight into per-shard buckets -- so this is the tests' independent reference.
+#[cfg(all(not(target_family = "wasm"), test))]
 fn hash_batch<IntT>(
     batch: &[OwnedRecord],
     k: usize,
@@ -1428,36 +1489,15 @@ where
         .flat_map_iter(|(seq, qual_bytes)| {
             let mut local = Vec::new();
             let mut groups: Vec<u8> = Vec::new();
-            if let (Some(floors), Some(qual)) = (floors, qual_bytes.as_deref()) {
-                window_groups(seq, qual, k, floors, &mut groups);
-            }
-            let kmer_opt = Kmer::<IntT>::new(
-                std::borrow::Cow::Borrowed(seq),
-                seq.len(),
-                qual_bytes.as_deref(),
+            let w = KmerWalk {
                 k,
-                // Filtering nothing at the iterator is what "never stop because of qualities" means.
-                if groups.is_empty() { min_qual } else { 0 },
-                true,
-            );
-            if let Some(mut kmer_it) = kmer_opt {
-                let (mut hc, mut hnc, mut b) = kmer_it.get_curr_hash_and_bases();
-                loop {
-                    // A record with no qualities (FASTA) has nothing to classify: keep every k-mer.
-                    let g = if groups.is_empty() {
-                        keep
-                    } else {
-                        groups[kmer_it.end_index()]
-                    };
-                    debug_assert_ne!(g, NONE, "the iterator emitted a window no floor clears");
-                    // The packed k-mer is the costly half at k>=51, so build it only for what is kept.
-                    local.push((hc, hnc, b, g, (g >= keep).then(|| kmer_it.get_kmer())));
-                    match kmer_it.get_next_hash_and_bases() {
-                        Some(next) => (hc, hnc, b) = next,
-                        None => break,
-                    }
-                }
-            }
+                min_qual,
+                floors,
+                keep,
+            };
+            for_each_kmer::<IntT, _>(seq, qual_bytes.as_deref(), w, &mut groups, |hc, hnc, b, g, km| {
+                local.push((hc, hnc, b, g, km))
+            });
             local
         })
         .collect()
@@ -1478,10 +1518,43 @@ struct KmerInfo<IntT> {
 #[cfg(not(target_family = "wasm"))]
 type CountMap<IntT> = HashMap<u64, KmerInfo<IntT>, BuildHasherDefault<NoHashHasher<u64>>>;
 
-/// Never fewer shards than this, whatever the thread count: below it each map stops being a small
-/// fraction of the working set, which is half of why the key space is split at all.
+/// Where the counting phase spends its time, accumulated over every batch. It is bandwidth-bound
+/// rather than synchronisation-bound, so wall time alone misattributes it, and a few thousand clock
+/// reads per run cost nothing against that.
 #[cfg(not(target_family = "wasm"))]
-const MIN_COUNTMAP_SHARDS: usize = 16;
+#[derive(Default)]
+struct CountTimings {
+    hash_ns: u128,
+    sketch_ns: u128,
+    split_ns: u128,
+    absorb_ns: u128,
+    batches: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl CountTimings {
+    /// `total` is the whole batched walk, so parse is whatever the timed stages did not account for.
+    fn log(&self, total: std::time::Duration) {
+        let inner = self.hash_ns + self.sketch_ns + self.split_ns + self.absorb_ns;
+        let parse = total.as_nanos().saturating_sub(inner);
+        let pct = |n: u128| 100.0 * n as f64 / total.as_nanos().max(1) as f64;
+        log::info!(
+            "Counting phase: {} batches in {:.1} s | parse {:.1}% serial | hash {:.1}% parallel | \
+             sketch {:.1}% serial | split {:.1}% serial | absorb {:.1}% parallel",
+            self.batches,
+            total.as_secs_f64(),
+            pct(parse),
+            pct(self.hash_ns),
+            pct(self.sketch_ns),
+            pct(self.split_ns),
+            pct(self.absorb_ns),
+        );
+    }
+}
+
+/// Never fewer shards than this: below it each map stops being a small fraction of the working set. Heuristically set.
+#[cfg(not(target_family = "wasm"))]
+const MIN_COUNTMAP_SHARDS: usize = 64;
 /// Nor more than this, or the per-batch split pays for buckets that hold almost nothing.
 #[cfg(not(target_family = "wasm"))]
 const MAX_COUNTMAP_SHARDS: usize = 256;
@@ -1520,49 +1593,138 @@ fn shard_of(hc: u64, shards: usize) -> usize {
     ((hc.wrapping_mul(MIX) >> (64 - shards.trailing_zeros())) as usize) & (shards - 1)
 }
 
-/// Count one batch's occurrences into the sharded count-map, sketching as it goes.
-///
-/// Split by shard serially, then count each shard on its own thread: shards partition the key space, so
-/// no two threads reach the same entry. `hnc`, `b` and `km` are the same for every occurrence of a
-/// given `hc`, so recording them on first sight leaves the result order-independent.
+/// Kept k-mers waiting to be absorbed into one shard: hash, non-canonical hash, packed bases, k-mer.
 #[cfg(not(target_family = "wasm"))]
-fn absorb_into_shards<IntT>(
-    items: Vec<(u64, u64, u8, u8, Option<IntT>)>,
+type Bucket<IntT> = Vec<(u64, u64, u8, IntT)>;
+
+/// One rayon task's private scratch, allocated once and reused across every batch.
+#[cfg(not(target_family = "wasm"))]
+struct TaskState<IntT> {
+    /// Kept k-mers, already split by shard. Absorb drains these, so the capacity carries over.
+    buckets: Vec<Bucket<IntT>>,
+    /// `window_groups` scratch, reused for every record the task sees.
+    groups: Vec<u8>,
+    /// Sketch candidates, in record order.
+    cand: Vec<(u64, u8)>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl<IntT> TaskState<IntT> {
+    fn new(n_shards: usize) -> Self {
+        Self {
+            buckets: (0..n_shards).map(|_| Vec::new()).collect(),
+            groups: Vec::new(),
+            cand: Vec::new(),
+        }
+    }
+}
+
+/// Hash one batch straight into the tasks' per-shard buckets, then absorb those into the count-map.
+/// Nothing is materialised in between: a k-mer is written once into a bucket and once into the map,
+/// where the flat-vector version wrote it four times. Shards partition the keys, so absorb needs no lock.
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
+fn count_batch<IntT>(
+    batch: &[OwnedRecord],
+    k: usize,
+    qual: &QualOpts,
+    floors: Option<&[u8]>,
     keep: u8,
     sketch: Option<&mut SpectrumSketch>,
+    states: &mut [TaskState<IntT>],
     shards: &mut [CountMap<IntT>],
-    buckets: &mut [Vec<(u64, u64, u8, IntT)>],
+    t: &mut CountTimings,
 ) where
     IntT: for<'a> UInt<'a>,
 {
-    for bucket in buckets.iter_mut() {
-        bucket.clear();
-    }
-    // The sketch sees every occurrence whatever its tag; the shards see only those clearing the floor
-    // in force. Both happen in this serial split, so the parallel half below still needs no lock.
-    if let Some(sketch) = sketch {
-        for &(hc, _, _, g, _) in &items {
-            sketch.observe(hc, g);
-        }
-    }
-    let n = shards.len();
-    for (hc, hnc, b, g, km) in items {
-        if g < keep {
-            continue;
-        }
-        buckets[shard_of(hc, n)].push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
-    }
+    let n_shards = shards.len();
+    let w = KmerWalk {
+        k,
+        min_qual: qual.min_qual,
+        floors,
+        keep,
+    };
+    // `observe` rejects anything at or above the threshold, and the threshold only ever falls, so
+    // filtering against a snapshot taken now admits exactly what it would have accepted.
+    let thr = sketch.as_ref().map_or(0, |s| s.threshold);
 
-    shards
-        .par_iter_mut()
-        .zip(buckets.par_iter_mut())
-        .for_each(|(map, bucket)| {
-            for (hc, hnc, b, km) in bucket.drain(..) {
-                map.entry(hc)
-                    .and_modify(|e| e.count = e.count.saturating_add(1))
-                    .or_insert(KmerInfo { count: 1, hnc, b, km });
+    let t0 = Instant::now();
+    // One chunk per state, so each task owns its scratch outright and the buckets survive the batch.
+    let chunk = batch.len().div_ceil(states.len().max(1)).max(1);
+    batch
+        .par_chunks(chunk)
+        .zip(states.par_iter_mut())
+        .for_each(|(recs, st)| {
+            let TaskState {
+                buckets,
+                groups,
+                cand,
+            } = st;
+            for (seq, qual_bytes) in recs {
+                for_each_kmer::<IntT, _>(
+                    seq,
+                    qual_bytes.as_deref(),
+                    w,
+                    groups,
+                    |hc, hnc, b, g, km| {
+                        if hc < thr {
+                            cand.push((hc, g));
+                        }
+                        if g >= keep {
+                            buckets[shard_of(hc, n_shards)]
+                                .push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
+                        }
+                    },
+                );
             }
         });
+    t.hash_ns += t0.elapsed().as_nanos();
+
+    // Chunks are contiguous and taken in order, so draining the tasks in order replays the batch in
+    // record order: `observe` sees exactly the sequence the single flat pass used to hand it.
+    let t1 = Instant::now();
+    match sketch {
+        Some(sketch) => {
+            for st in states.iter_mut() {
+                for (hc, g) in st.cand.drain(..) {
+                    sketch.observe(hc, g);
+                }
+            }
+        }
+        None => {
+            for st in states.iter_mut() {
+                st.cand.clear();
+            }
+        }
+    }
+    t.sketch_ns += t1.elapsed().as_nanos();
+
+    // Absorb wants one thread per shard, but the buckets are task-major. Gathering `&mut` references
+    // regroups them shard-major without moving a single k-mer.
+    let t2 = Instant::now();
+    let mut by_shard: Vec<Vec<&mut Bucket<IntT>>> =
+        (0..n_shards).map(|_| Vec::with_capacity(states.len())).collect();
+    for st in states.iter_mut() {
+        for (s, bucket) in st.buckets.iter_mut().enumerate() {
+            by_shard[s].push(bucket);
+        }
+    }
+    t.split_ns += t2.elapsed().as_nanos();
+
+    let t3 = Instant::now();
+    shards
+        .par_iter_mut()
+        .zip(by_shard.par_iter_mut())
+        .for_each(|(map, cols)| {
+            for col in cols.iter_mut() {
+                for (hc, hnc, b, km) in col.drain(..) {
+                    map.entry(hc)
+                        .and_modify(|e| e.count = e.count.saturating_add(1))
+                        .or_insert(KmerInfo { count: 1, hnc, b, km });
+                }
+            }
+        });
+    t.absorb_ns += t3.elapsed().as_nanos();
 }
 
 /// Count every k-mer straight into a [`CountMap`], with the per-floor sketch.
@@ -1592,13 +1754,28 @@ where
     let mut shards: Vec<CountMap<IntT>> = (0..n_shards)
         .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
         .collect();
-    // Reused across batches so the per-batch split does not churn allocations.
-    let mut buckets: Vec<Vec<(u64, u64, u8, IntT)>> = (0..n_shards).map(|_| Vec::new()).collect();
+    // One scratch per thread, allocated here and reused by every batch, so the counting loop itself
+    // allocates nothing.
+    let mut states: Vec<TaskState<IntT>> = (0..rayon::current_num_threads().max(1))
+        .map(|_| TaskState::new(n_shards))
+        .collect();
 
-    extract_kmers_from_files_batched(input_iters, BATCH_RECORDS, |batch| {
-        let items = hash_batch::<IntT>(batch, k, qual.min_qual, floors, keep);
-        absorb_into_shards(items, keep, sketch.as_mut(), &mut shards, &mut buckets);
+    let mut t = CountTimings::default();
+    let total = extract_kmers_from_files_batched(input_iters, BATCH_RECORDS, |batch| {
+        count_batch(
+            batch,
+            k,
+            qual,
+            floors,
+            keep,
+            sketch.as_mut(),
+            &mut states,
+            &mut shards,
+            &mut t,
+        );
+        t.batches += 1;
     });
+    t.log(total);
 
     (shards, sketch)
 }
@@ -1924,13 +2101,17 @@ mod tests {
             assert!((MIN_COUNTMAP_SHARDS..=MAX_COUNTMAP_SHARDS).contains(&n));
             assert!(n >= threads.min(MAX_COUNTMAP_SHARDS), "{threads} threads starve at {n} shards");
         }
-        // The sweep runs 4 threads, where the formula must reproduce the previous fixed constant.
-        assert_eq!(
-            (4 * SHARDS_PER_THREAD)
+        let shards_at = |t: usize| {
+            (t * SHARDS_PER_THREAD)
                 .next_power_of_two()
-                .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS),
-            16
-        );
+                .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS)
+        };
+        // Every thread count the sweep or a workstation uses sits on the floor, which is where the
+        // absorb measurement put the knee. Only a machine with more cores than that scales past it.
+        assert_eq!(shards_at(4), MIN_COUNTMAP_SHARDS);
+        assert_eq!(shards_at(64), MIN_COUNTMAP_SHARDS);
+        assert_eq!(shards_at(128), 128);
+        assert_eq!(shards_at(4096), MAX_COUNTMAP_SHARDS);
     }
 
     /// Whatever the count, every k-mer must land in the shard `shard_of` claims, or the lock-free
