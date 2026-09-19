@@ -748,9 +748,13 @@ type OwnedRecord = (Vec<u8>, Option<Vec<u8>>);
 #[cfg(not(target_family = "wasm"))]
 const BATCH_RECORDS: usize = 8192;
 
-/// Parse `files` into owned batches of records, handing each batch to `on_batch`, and return how long
-/// the whole walk took. `on_batch` is called synchronously, so the parse and the compute alternate:
-/// the returned span minus the caller's own timings is what the parse costs.
+/// Parse `files` into owned batches of records, handing each to `on_batch`, and return how long the
+/// whole walk took. A scoped producer fills the next batch while `on_batch` works on the previous one,
+/// so the parse overlaps the compute instead of alternating with it.
+///
+/// Two buffers circulate on a one-deep queue, which bounds memory and cannot deadlock: the consumer
+/// returns a buffer after every batch, so the producer's `recv` is always eventually satisfied.
+/// One producer and one FIFO means records arrive in exactly the order the serial version used.
 #[cfg(not(target_family = "wasm"))]
 fn extract_kmers_from_files_batched<F, I>(
     input_iters: &mut [I],
@@ -759,27 +763,48 @@ fn extract_kmers_from_files_batched<F, I>(
 ) -> std::time::Duration
 where
     F: FnMut(&[OwnedRecord]),
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + Send,
 {
+    let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<Vec<OwnedRecord>>(1);
+    let (empty_tx, empty_rx) = std::sync::mpsc::sync_channel::<Vec<OwnedRecord>>(2);
+    for _ in 0..2 {
+        let _ = empty_tx.send(Vec::with_capacity(batch_records));
+    }
+    let nfiles = input_iters.len();
     let t0 = Instant::now();
-    let mut batch: Vec<OwnedRecord> = Vec::with_capacity(batch_records);
-    for (idx, records) in input_iters.iter_mut().enumerate() {
-        log::info!("Getting kmers from file number {idx}.");
-        for record in records {
-            let seq: Vec<u8> = record.0;
-            let qual: Option<Vec<u8>> = record.1;
-            batch.push((seq, qual));
-            if batch.len() == batch_records {
-                on_batch(&batch);
-                batch.clear();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut batch = empty_rx.recv().unwrap_or_default();
+            for (idx, records) in input_iters.iter_mut().enumerate() {
+                log::info!("Getting kmers from file number {idx}.");
+                for record in records {
+                    let seq: Vec<u8> = record.0;
+                    let qual: Option<Vec<u8>> = record.1;
+                    batch.push((seq, qual));
+                    if batch.len() == batch_records {
+                        // A closed channel means the consumer is gone; there is nothing left to feed.
+                        if full_tx.send(batch).is_err() {
+                            return;
+                        }
+                        batch = empty_rx
+                            .recv()
+                            .unwrap_or_else(|_| Vec::with_capacity(batch_records));
+                    }
+                }
+                log::info!("Finished getting kmers from file number {idx}.");
             }
+            if !batch.is_empty() {
+                let _ = full_tx.send(batch);
+            }
+        });
+        // The producer holds the only `full_tx`, so this loop ends when the producer does.
+        for mut batch in full_rx {
+            on_batch(&batch);
+            batch.clear();
+            let _ = empty_tx.send(batch);
         }
-        log::info!("Finished getting kmers from file number {idx}.");
-    }
-    if !batch.is_empty() {
-        on_batch(&batch);
-    }
-    log::info!("Finished getting kmers from {} file(s)", input_iters.len());
+    });
+    log::info!("Finished getting kmers from {nfiles} file(s)");
     t0.elapsed()
 }
 
@@ -1741,7 +1766,7 @@ fn bulk_preprocessing_standalone_cpu<IntT, I>(
 ) -> (Vec<CountMap<IntT>>, Option<SpectrumSketch>)
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + Send,
 {
     // The ladder is ascending, so the last group is the strict floor and `keep` is its index.
     let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
@@ -1925,7 +1950,7 @@ pub fn preprocessing_standalone<IntT, I>(
 ) -> PreprocessedK<IntT>
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
+    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + Send,
 {
     log::info!("Starting preprocessing_standalone with k = {k}");
 
