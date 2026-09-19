@@ -18,9 +18,8 @@ use crate::graph_works::Contigs;
 #[cfg(target_family = "wasm")]
 use crate::logw;
 
-/// Writes the contig sequences and hopefully their average counts/coverage in the future
-///
-/// Each contig is trimmed by `k-1` at both ends, keeping only bases two k-mers agree on, as SKESA does.
+/// Writes the full sequence each contig's k-mer path spells, and hopefully their average
+/// counts/coverage in the future.
 pub fn write_sequences_and_coverages<IntT>(
     invec: &mut Contigs,
     inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -57,14 +56,8 @@ fn write_sequences_and_coverages_with_min_contig_length<IntT>(
         let full = spell_path(&contig[0].abs_ind, inmap, k)
             .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"));
 
-        // `full` is n + k - 1 bases for n k-mers; drop k-1 from each end, leaving n - k + 1.
-        if full.len() >= 2 * k - 1 {
-            let body = &full[k - 1..full.len() - (k - 1)];
-            if body.len() >= min_contig_length {
-                invec.contig_sequences.as_mut().unwrap().push(body.to_vec());
-            } else {
-                omitted += 1;
-            }
+        if full.len() >= min_contig_length {
+            invec.contig_sequences.as_mut().unwrap().push(full);
         } else {
             omitted += 1;
         }
@@ -227,10 +220,9 @@ mod tests {
         (dict, path)
     }
 
-    /// Spelled one base per k-mer from S[k-1], then trimmed k-1 from the tail, so the contig must be
-    /// exactly `S[k-1 .. n]` with `n = |S| - k + 1`.
+    /// A contig is the whole sequence its k-mer path spells, so it must come back as `S` itself.
     #[test]
-    fn contig_is_trimmed_by_k_minus_one_at_each_end() {
+    fn contig_preserves_the_full_spelled_path() {
         let k = 31;
         let seq = pseudo_seq(300);
         let n = seq.len() - k + 1; // number of k-mers
@@ -242,23 +234,19 @@ mod tests {
             abs_ind: path,
             innerdir: None,
         }]]);
-        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 100);
+        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 0);
 
         let got = &contigs.contig_sequences.as_ref().unwrap()[0];
-        let want = &seq[k - 1..n];
-        assert_eq!(got.len(), want.len(), "contig length");
-        assert_eq!(got, want, "contig sequence");
-
-        // The trim is symmetric: k-1 gone from the front, k-1 gone from the back.
-        assert_eq!(got.len(), seq.len() - 2 * (k - 1));
+        assert_eq!(got.len(), seq.len(), "contig length");
+        assert_eq!(got, &seq, "contig sequence");
     }
 
-    /// The last base must be the final one two k-mers confirm, `S[n-1]`.
+    /// Both terminal k-mers survive. Guards the end-symmetry the old trim had to be fixed for: an
+    /// off-by-one at either end would clip exactly one of these.
     #[test]
-    fn contig_keeps_the_final_confirmed_base() {
+    fn contig_preserves_both_terminal_kmers() {
         let k = 31;
         let seq = pseudo_seq(300);
-        let n = seq.len() - k + 1;
         let (dict, path) = dict_and_path(&seq, k);
 
         let mut contigs = Contigs::new(vec![vec![NodeStruct {
@@ -266,14 +254,32 @@ mod tests {
             abs_ind: path,
             innerdir: None,
         }]]);
-        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 100);
+        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 0);
 
         let got = &contigs.contig_sequences.as_ref().unwrap()[0];
-        assert_eq!(
-            *got.last().unwrap(),
-            seq[n - 1],
-            "the last base must be S[n-1]; trimming k rather than k-1 would leave S[n-2]"
-        );
+        assert_eq!(&got[..k], &seq[..k], "the first terminal k-mer");
+        assert_eq!(&got[got.len() - k..], &seq[seq.len() - k..], "the last one");
+    }
+
+    /// A path of fewer than k k-mers used to be dropped whatever the minimum, by a `2*k-1` guard that
+    /// outlived the trim it protected. It cost ~104 contigs a run.
+    #[test]
+    fn a_path_shorter_than_k_kmers_is_still_written() {
+        let k = 31;
+        let seq = pseudo_seq(k + 4); // 5 k-mers, far fewer than k
+        let (dict, path) = dict_and_path(&seq, k);
+        assert!(path.len() < k, "fixture must have fewer than k k-mers");
+
+        let mut contigs = Contigs::new(vec![vec![NodeStruct {
+            counts: 1,
+            abs_ind: path,
+            innerdir: None,
+        }]]);
+        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 0);
+
+        let sequences = contigs.contig_sequences.as_ref().unwrap();
+        assert_eq!(sequences.len(), 1, "the short path must still be written");
+        assert_eq!(sequences[0], seq);
     }
 
     #[test]
@@ -281,8 +287,9 @@ mod tests {
         let k = 31;
         let minimum = 500;
 
-        for (body_length, expected_contigs) in [(500, 1), (499, 0)] {
-            let seq = pseudo_seq(body_length + 2 * (k - 1));
+        // The threshold applies to the sequence written, not to a trimmed body, so it means what it says.
+        for (sequence_length, expected_contigs) in [(500, 1), (499, 0)] {
+            let seq = pseudo_seq(sequence_length);
             let (dict, path) = dict_and_path(&seq, k);
             let mut contigs = Contigs::new(vec![vec![NodeStruct {
                 counts: 1,
@@ -295,7 +302,7 @@ mod tests {
             let sequences = contigs.contig_sequences.as_ref().unwrap();
             assert_eq!(sequences.len(), expected_contigs);
             if expected_contigs == 1 {
-                assert_eq!(sequences[0].len(), body_length);
+                assert_eq!(sequences[0].len(), sequence_length);
             }
         }
     }

@@ -174,7 +174,7 @@ struct BuildOpts<'a> {
     pop_ratio: f32,
     /// Dead-end paths shorter than this many bases are pruned. Already resolved against k.
     tip_nts: usize,
-    /// Minimum trimmed contig body length written to FASTA.
+    /// Minimum contig sequence length written to FASTA.
     min_contig_length: usize,
     output: PathBuf,
 }

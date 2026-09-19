@@ -13,7 +13,7 @@ pub const DEFAULT_MINQUAL: u8 = 20;
 pub const DEFAULT_TIP_LEN_NTS: usize = 100;
 /// Default tip-removal k multiplier, matching Minia's `-tip-len-topo-kmult`
 pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
-/// Default minimum contig body length written to FASTA, in nucleotides
+/// Default minimum contig sequence length written to FASTA, in nucleotides
 pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 /// Default output directory
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
@@ -186,8 +186,8 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_TIP_LEN_KMULT)]
         tip_length_kmult: f32,
 
-        /// Minimum contig body length written to FASTA, in nucleotides. Contigs with exactly this
-        /// length are retained.
+        /// Minimum contig sequence length written to FASTA, in nucleotides. Contigs with exactly
+        /// this length are retained.
         #[arg(long, default_value_t = DEFAULT_MIN_CONTIG_LENGTH_NTS)]
         min_contig_length: usize,
 
