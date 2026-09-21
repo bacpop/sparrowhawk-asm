@@ -17,6 +17,10 @@ extern crate num_cpus;
 /// Construction, assembly, shrinkage, pruning, and collapse of DNA de Bruijn graphs
 pub mod graph_works;
 
+/// Native aligned k-mer storage between counting and graph construction.
+#[cfg(not(target_family = "wasm"))]
+pub mod indexed_kmers;
+
 /// Preprocessing functions of the reads & k-mers
 pub mod preprocessing;
 
@@ -256,8 +260,7 @@ fn run_build<IntT>(
 
     let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
         opts.k,
-        &mut assembly.themap,
-        &mut assembly.maxmindict,
+        &mut assembly.kmers,
         &mut Some(timevec),
         out_path_graph,
         opts.do_bubble_collapse,
@@ -268,7 +271,7 @@ fn run_build<IntT>(
 
     save_functions::save_as_fasta_with_min_contig_length::<IntT>(
         &mut contigs,
-        &assembly.thedict,
+        &assembly.kmers,
         opts.k,
         opts.min_contig_length,
         opts.output,

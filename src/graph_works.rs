@@ -18,6 +18,8 @@ use crate::algorithms::corrector::pop_bubbles_by_coverage;
 use crate::algorithms::corrector::Correctable;
 use crate::algorithms::shrinker::Shrinkable;
 use crate::bit_encoding::UInt;
+#[cfg(not(target_family = "wasm"))]
+use crate::indexed_kmers::{IndexedKmers, OrientedKmerIndex};
 use crate::nthash;
 use std::fmt;
 
@@ -26,7 +28,28 @@ use crate::logw;
 #[cfg(target_family = "wasm")]
 use crate::post_state;
 
+#[cfg(not(target_family = "wasm"))]
+use sparrowhawk_graph::IndexedEdge;
 use sparrowhawk_graph::{DbgGraph, EdgeType, HashInfoSimple, SerializedContigs};
+
+/// Retrieves a packed canonical k-mer by its hash.
+pub trait KmerLookup<IntT> {
+    /// Return the packed k-mer associated with `hash`.
+    fn get_kmer(&self, hash: u64) -> Option<IntT>;
+}
+
+impl<IntT: Copy> KmerLookup<IntT> for HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>> {
+    fn get_kmer(&self, hash: u64) -> Option<IntT> {
+        self.get(&hash).copied()
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl<IntT: Copy> KmerLookup<IntT> for IndexedKmers<IntT> {
+    fn get_kmer(&self, hash: u64) -> Option<IntT> {
+        self.get_packed(hash).copied()
+    }
+}
 
 /// Get backwards neighbours, i.e. incoming edges to either the canonical or non-canonical hashes
 pub fn check_bkg(
@@ -141,6 +164,8 @@ pub fn check_fwd(
     outvec
 }
 
+#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
+#[allow(clippy::type_complexity)]
 pub(crate) fn populate_neighbours(
     k: usize,
     indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -185,6 +210,163 @@ pub(crate) fn populate_neighbours(
     }
 
     (nkmers, nalone, directed_edge_refs)
+}
+
+#[cfg(not(target_family = "wasm"))]
+type OrientedLookup = HashMap<u64, OrientedKmerIndex, BuildHasherDefault<NoHashHasher<u64>>>;
+
+#[cfg(not(target_family = "wasm"))]
+fn indexed_edge(
+    hash: u64,
+    lookup: &OrientedLookup,
+    canonical_type: EdgeType,
+    reverse_type: EdgeType,
+) -> Option<IndexedEdge> {
+    lookup.get(&hash).copied().map(|entry| IndexedEdge {
+        target: entry.index(),
+        edge_type: if entry.is_reverse() {
+            reverse_type
+        } else {
+            canonical_type
+        },
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn check_bkg_indexed(
+    hc: u64,
+    hnc: u64,
+    k: usize,
+    bases: u8,
+    lookup: &OrientedLookup,
+) -> Vec<IndexedEdge> {
+    let mut output = Vec::new();
+    let canonical_base = bases & 3;
+    let reverse_base = (bases >> 2) & 3;
+
+    for i in 0..4 {
+        let candidate = nthash::swapbits_18_31_42_51_58_63(
+            (hc ^ nthash::HASH_LOOKUP[canonical_base as usize]
+                ^ (nthash::MS_TAB_5LL[(i as usize * 5) + (k % 5)]
+                    | nthash::MS_TAB_7L[(i as usize * 7) + (k % 7)]
+                    | nthash::MS_TAB_9LC[(i as usize * 9) + (k % 9)]
+                    | nthash::MS_TAB_11CR[(i as usize * 11) + (k % 11)]
+                    | nthash::MS_TAB_13R[(i as usize * 13) + (k % 13)]
+                    | nthash::MS_TAB_19RR[(i as usize * 19) + (k % 19)]))
+                .rotate_right(1),
+        );
+        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MinToMin, EdgeType::MaxToMin)
+        {
+            output.push(edge);
+        }
+
+        let mut candidate = hnc
+            ^ (nthash::MS_TAB_5LL[(rc_base(i) as usize * 5) + (k % 5)]
+                | nthash::MS_TAB_7L[(rc_base(i) as usize * 7) + (k % 7)]
+                | nthash::MS_TAB_9LC[(rc_base(i) as usize * 9) + (k % 9)]
+                | nthash::MS_TAB_11CR[(rc_base(i) as usize * 11) + (k % 11)]
+                | nthash::MS_TAB_13R[(rc_base(i) as usize * 13) + (k % 13)]
+                | nthash::MS_TAB_19RR[(rc_base(i) as usize * 19) + (k % 19)]);
+        candidate ^= nthash::RC_HASH_LOOKUP[reverse_base as usize];
+        candidate = candidate.rotate_right(1);
+        candidate = nthash::swapbits_18_31_42_51_58_63(candidate);
+        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MinToMax, EdgeType::MaxToMax)
+        {
+            output.push(edge);
+        }
+    }
+
+    output
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn check_fwd_indexed(
+    hc: u64,
+    hnc: u64,
+    k: usize,
+    bases: u8,
+    lookup: &OrientedLookup,
+) -> Vec<IndexedEdge> {
+    let mut output = Vec::new();
+    let canonical_base = (bases >> 2) & 3;
+    let reverse_base = bases & 3;
+
+    for i in 0..4 {
+        let mut candidate = hc.rotate_left(1);
+        candidate = nthash::swapbits_0_19_32_43_52_59(candidate);
+        candidate ^= nthash::HASH_LOOKUP[i as usize];
+        candidate ^= nthash::MS_TAB_5LL[(canonical_base as usize * 5) + (k % 5)]
+            | nthash::MS_TAB_7L[(canonical_base as usize * 7) + (k % 7)]
+            | nthash::MS_TAB_9LC[(canonical_base as usize * 9) + (k % 9)]
+            | nthash::MS_TAB_11CR[(canonical_base as usize * 11) + (k % 11)]
+            | nthash::MS_TAB_13R[(canonical_base as usize * 13) + (k % 13)]
+            | nthash::MS_TAB_19RR[(canonical_base as usize * 19) + (k % 19)];
+        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MinToMin, EdgeType::MinToMax)
+        {
+            output.push(edge);
+        }
+
+        let candidate = nthash::swapbits_0_19_32_43_52_59(hnc.rotate_left(1))
+            ^ nthash::RC_HASH_LOOKUP[i as usize]
+            ^ (nthash::MS_TAB_5LL[(rc_base(reverse_base) as usize * 5) + (k % 5)]
+                | nthash::MS_TAB_7L[(rc_base(reverse_base) as usize * 7) + (k % 7)]
+                | nthash::MS_TAB_9LC[(rc_base(reverse_base) as usize * 9) + (k % 9)]
+                | nthash::MS_TAB_11CR[(rc_base(reverse_base) as usize * 11) + (k % 11)]
+                | nthash::MS_TAB_13R[(rc_base(reverse_base) as usize * 13) + (k % 13)]
+                | nthash::MS_TAB_19RR[(rc_base(reverse_base) as usize * 19) + (k % 19)]);
+        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MaxToMin, EdgeType::MaxToMax)
+        {
+            output.push(edge);
+        }
+    }
+
+    output
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn populate_indexed_neighbours<IntT>(
+    k: usize,
+    kmers: &mut IndexedKmers<IntT>,
+) -> (usize, usize, usize) {
+    kmers.initialise_neighbour_slots();
+
+    let canonical_hashes = &kmers.canonical_hashes;
+    let reverse_hashes = &kmers.reverse_hashes;
+    let boundary_bases = &kmers.boundary_bases;
+    let lookup = &kmers.hash_to_index;
+    let neighbours = &mut kmers.neighbours;
+    let predecessor_counts = &mut kmers.predecessor_counts;
+
+    let (alone, directed_edge_refs) = neighbours
+        .par_iter_mut()
+        .zip(predecessor_counts.par_iter_mut())
+        .enumerate()
+        .map(|(index, (slot, predecessor_count))| {
+            let mut edges = check_bkg_indexed(
+                canonical_hashes[index],
+                reverse_hashes[index],
+                k,
+                boundary_bases[index],
+                lookup,
+            );
+            *predecessor_count =
+                u8::try_from(edges.len()).expect("too many predecessor edges for one k-mer");
+            edges.extend(check_fwd_indexed(
+                canonical_hashes[index],
+                reverse_hashes[index],
+                k,
+                boundary_bases[index],
+                lookup,
+            ));
+            *slot = edges;
+            (usize::from(slot.is_empty()), slot.len())
+        })
+        .reduce(
+            || (0, 0),
+            |left, right| (left.0 + right.0, left.1 + right.1),
+        );
+
+    (canonical_hashes.len(), alone, directed_edge_refs)
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -271,7 +453,7 @@ impl fmt::Display for SpellError {
 /// Spell the nucleotides of a walk of canonical k-mer hashes.
 pub fn spell_path<IntT>(
     hashes: &[u64],
-    dict: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    dict: &impl KmerLookup<IntT>,
     k: usize,
 ) -> Result<Vec<u8>, SpellError>
 where
@@ -282,12 +464,10 @@ where
     }
 
     let get = |i: usize| -> Result<IntT, SpellError> {
-        dict.get(&hashes[i])
-            .copied()
-            .ok_or(SpellError::UnknownKmer {
-                index: i,
-                hash: hashes[i],
-            })
+        dict.get_kmer(hashes[i]).ok_or(SpellError::UnknownKmer {
+            index: i,
+            hash: hashes[i],
+        })
     };
 
     let mut prev = get(0)?;
@@ -480,6 +660,92 @@ mod tests {
         assert!(dict
             .values()
             .any(|hi| !hi.pre.is_empty() || !hi.post.is_empty()));
+    }
+
+    fn indexed_from_dicts(
+        packed: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        dict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+    ) -> IndexedKmers<u64> {
+        let mut indexed = IndexedKmers::with_capacity(dict.len());
+        for (&hash, info) in dict {
+            indexed.push(
+                hash,
+                info.hnc,
+                info.b,
+                info.counts,
+                *packed.get(&hash).unwrap(),
+            );
+        }
+        indexed
+    }
+
+    #[test]
+    fn indexed_neighbours_match_legacy_neighbours() {
+        let k = 15;
+        let seq = seq_with_repeat(k);
+        let (packed, mut dict, maxmin) = build_dicts(&seq, k);
+        let mut indexed = indexed_from_dicts(&packed, &dict);
+
+        let legacy_stats = populate_neighbours(k, &mut dict, &maxmin);
+        let indexed_stats = populate_indexed_neighbours(k, &mut indexed);
+        assert_eq!(indexed_stats, legacy_stats);
+
+        for (index, &hash) in indexed.canonical_hashes.iter().enumerate() {
+            let split = usize::from(indexed.predecessor_counts[index]);
+            let mut indexed_pre: Vec<_> = indexed.neighbours[index][..split]
+                .iter()
+                .map(|edge| (indexed.canonical_hashes[edge.target], edge.edge_type))
+                .collect();
+            let mut indexed_post: Vec<_> = indexed.neighbours[index][split..]
+                .iter()
+                .map(|edge| (indexed.canonical_hashes[edge.target], edge.edge_type))
+                .collect();
+            let legacy = dict.get(&hash).unwrap();
+            let mut legacy_pre = legacy.pre.clone();
+            let mut legacy_post = legacy.post.clone();
+            indexed_pre.sort_unstable();
+            indexed_post.sort_unstable();
+            legacy_pre.sort_unstable();
+            legacy_post.sort_unstable();
+            assert_eq!(indexed_pre, legacy_pre, "predecessors differ for {hash}");
+            assert_eq!(indexed_post, legacy_post, "successors differ for {hash}");
+        }
+
+        let legacy_graph = DbgGraph::from_kmer_map(k, &dict);
+        let indexed_graph = DbgGraph::from_indexed_kmers(
+            k,
+            indexed.canonical_hashes,
+            indexed.counts,
+            indexed.neighbours,
+            indexed.predecessor_counts,
+        );
+        assert_eq!(indexed_graph.node_count(), legacy_graph.node_count());
+        assert_eq!(indexed_graph.edge_count(), legacy_graph.edge_count());
+        assert!(indexed_graph.validate().is_ok());
+    }
+
+    #[test]
+    fn indexed_neighbours_are_independent_of_worker_count() {
+        let k = 15;
+        let seq = seq_with_repeat(k);
+        let (packed, dict, _) = build_dicts(&seq, k);
+        let template = indexed_from_dicts(&packed, &dict);
+        let mut serial = template.clone();
+        let mut parallel = template;
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| populate_indexed_neighbours(k, &mut serial));
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| populate_indexed_neighbours(k, &mut parallel));
+
+        assert_eq!(serial.neighbours, parallel.neighbours);
+        assert_eq!(serial.predecessor_counts, parallel.predecessor_counts);
     }
 
     // ── the edge invariant ───────────────────────────────────────────────────
@@ -801,10 +1067,10 @@ mod tests {
 pub trait Assemble {
     #[cfg(not(target_family = "wasm"))]
     /// Assembles given data and writes results into the output file.
+    #[allow(clippy::too_many_arguments)]
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
-        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-        maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        kmers: &mut IndexedKmers<IntT>,
         timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
@@ -832,10 +1098,10 @@ pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
     #[cfg(not(target_family = "wasm"))]
+    #[allow(clippy::too_many_arguments)]
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
-        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-        maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        kmers: &mut IndexedKmers<IntT>,
         timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
         do_bubble_collapse: bool,
@@ -851,7 +1117,7 @@ impl Assemble for BasicAsm {
             timevec.push(Instant::now());
         }
 
-        populate_neighbours(k, indict, maxmindict);
+        populate_indexed_neighbours(k, kmers);
 
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
@@ -869,13 +1135,10 @@ impl Assemble for BasicAsm {
             );
         }
 
-        let mut ptgraph = DbgGraph::from_kmer_map(k, indict);
-        // The graph has copied everything it needs. Neither map is read again here or by the caller,
-        // which keeps only `thedict` to spell contigs, so holding them through correction is waste.
-        indict.clear();
-        indict.shrink_to_fit();
-        maxmindict.clear();
-        maxmindict.shrink_to_fit();
+        kmers.finish_neighbour_search();
+        let (hashes, counts, neighbours, predecessor_counts) = kmers.take_graph_inputs();
+        let mut ptgraph =
+            DbgGraph::from_indexed_kmers(k, hashes, counts, neighbours, predecessor_counts);
 
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());

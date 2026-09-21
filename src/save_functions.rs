@@ -1,7 +1,9 @@
 //! Some docs should be here
 
 use core::panic;
+#[cfg(test)]
 use nohash_hasher::NoHashHasher;
+#[cfg(test)]
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
@@ -13,8 +15,7 @@ use super::io_utils::*;
 
 use crate::bit_encoding::UInt;
 use crate::cli::DEFAULT_MIN_CONTIG_LENGTH_NTS;
-use crate::graph_works::spell_path;
-use crate::graph_works::Contigs;
+use crate::graph_works::{spell_path, Contigs, KmerLookup};
 #[cfg(target_family = "wasm")]
 use crate::logw;
 
@@ -22,7 +23,7 @@ use crate::logw;
 /// counts/coverage in the future.
 pub fn write_sequences_and_coverages<IntT>(
     invec: &mut Contigs,
-    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    inmap: &impl KmerLookup<IntT>,
     k: usize,
 ) where
     IntT: for<'a> UInt<'a>,
@@ -37,7 +38,7 @@ pub fn write_sequences_and_coverages<IntT>(
 
 fn write_sequences_and_coverages_with_min_contig_length<IntT>(
     invec: &mut Contigs,
-    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    inmap: &impl KmerLookup<IntT>,
     k: usize,
     min_contig_length: usize,
 ) where
@@ -77,7 +78,7 @@ fn write_sequences_and_coverages_with_min_contig_length<IntT>(
 #[cfg(not(target_family = "wasm"))]
 pub fn save_as_fasta<IntT>(
     ingraph: &mut Contigs,
-    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    inmap: &impl KmerLookup<IntT>,
     k: usize,
     outfile: PathBuf,
 ) where
@@ -100,7 +101,7 @@ pub fn save_as_fasta<IntT>(
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn save_as_fasta_with_min_contig_length<IntT>(
     ingraph: &mut Contigs,
-    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    inmap: &impl KmerLookup<IntT>,
     k: usize,
     min_contig_length: usize,
     outfile: PathBuf,
@@ -120,7 +121,7 @@ pub(crate) fn save_as_fasta_with_min_contig_length<IntT>(
 #[cfg(not(target_family = "wasm"))]
 pub fn write_as_fasta<IntT, W>(
     ingraph: &mut Contigs,
-    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    inmap: &impl KmerLookup<IntT>,
     k: usize,
     writer: &mut W,
 ) where
@@ -135,7 +136,7 @@ pub fn write_as_fasta<IntT, W>(
 #[cfg(target_family = "wasm")]
 pub fn save_as_fasta_wasm<IntT>(
     ingraph: &mut Contigs,
-    inmap: &HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    inmap: &impl KmerLookup<IntT>,
     k: usize,
 ) -> String
 where

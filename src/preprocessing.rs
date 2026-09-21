@@ -21,6 +21,8 @@ use super::QualOpts;
 
 use crate::bit_encoding::UInt;
 use crate::bloom_filter::KmerFilter;
+#[cfg(not(target_family = "wasm"))]
+use crate::indexed_kmers::IndexedKmers;
 use crate::kmer::Kmer;
 use crate::logw;
 #[cfg(not(target_family = "wasm"))]
@@ -38,12 +40,8 @@ pub struct PreprocessedK<IntT> {
     /// The k this was built with. Hashes from different k live in disjoint spaces, so carrying it
     /// alongside the maps is what stops us mixing them up.
     pub k: usize,
-    /// canonical hash -> k-mer record (counts, hnc, bases, and later the pre/post neighbours)
-    pub themap: HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    /// canonical hash -> packed canonical k-mer bits, used to spell sequence back out
-    pub thedict: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    /// non-canonical hash -> canonical hash
-    pub maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+    /// K-mer fields stored once in aligned vectors, plus their hash-to-index lookup.
+    pub kmers: IndexedKmers<IntT>,
     /// `MAXSIZEHISTO`-bin k-mer spectrum; index `c-1` holds the number of distinct k-mers seen `c` times
     pub histovec: Vec<u32>,
     /// the min-count actually applied (fitted, or taken from the CLI)
@@ -251,7 +249,9 @@ impl Verdict {
         match self {
             Verdict::NeverTurnsUp => "the spectrum never turns back up",
             Verdict::NoPeakAboveValley => "no genomic_peak above the valley",
-            Verdict::TooFewCandidateKmers => "the lobe above the valley holds too little of the sequence",
+            Verdict::TooFewCandidateKmers => {
+                "the lobe above the valley holds too little of the sequence"
+            }
             Verdict::PeakNotClearOfValley => "the lobe above the valley is not raised clear of it",
             // Reached when the lobes did separate but the loss guard pulled the cutoff to the floor.
             Verdict::Ok => "the cutoff would have cost more genome than the guard allows",
@@ -689,6 +689,7 @@ fn build_histogram_from_countmap(
     }
 }
 
+#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
 fn drain_countmap_into_themap<IntT>(
     countmap: &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     themap: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -1093,14 +1094,13 @@ where
 
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
-        logw("Counting finished. Choosing the minimum count...", Some("info"));
+        logw(
+            "Counting finished. Choosing the minimum count...",
+            Some("info"),
+        );
         minc = choose_min_count(&histovec);
         logw(
-            format!(
-                "Minimum count chosen: {}. Starting filtering...",
-                minc
-            )
-            .as_str(),
+            format!("Minimum count chosen: {}. Starting filtering...", minc).as_str(),
             Some("info"),
         );
 
@@ -1263,14 +1263,13 @@ where
 
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
-        logw("Counting finished. Choosing the minimum count...", Some("info"));
+        logw(
+            "Counting finished. Choosing the minimum count...",
+            Some("info"),
+        );
         minc = choose_min_count(&histovec);
         logw(
-            format!(
-                "Minimum count chosen: {}. Starting filtering...",
-                minc
-            )
-            .as_str(),
+            format!("Minimum count chosen: {}. Starting filtering...", minc).as_str(),
             Some("info"),
         );
 
@@ -1305,19 +1304,45 @@ where
 /// Bloom-filter preprocessing. Its spectrum is **not** comparable to the exact counter's: there is no
 /// count-1 bin, and false positives inflate the rest.
 #[cfg(not(target_family = "wasm"))]
+fn bloom_maps_into_indexed_kmers<IntT>(
+    counts: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    mut packed: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
+    minc: u16,
+) -> IndexedKmers<IntT>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    let minc = u32::from(minc);
+    let survivors = counts
+        .values()
+        .filter(|(count, _, _)| *count >= minc)
+        .count();
+    let mut indexed = IndexedKmers::with_capacity(survivors);
+
+    for (hc, (count, hnc, bases)) in counts {
+        if count < minc {
+            continue;
+        }
+        let kmer = packed.remove(&hc).unwrap_or_else(|| {
+            panic!("Bloom-filter survivor with canonical hash {hc} has no packed k-mer")
+        });
+        indexed.push(hc, hnc, bases, count, kmer);
+    }
+
+    debug_assert_eq!(indexed.len(), survivors);
+    indexed
+}
+
+/// Bloom-filter preprocessing. Its spectrum is **not** comparable to the exact counter's: there is no
+/// count-1 bin, and false positives inflate the rest.
+#[cfg(not(target_family = "wasm"))]
 fn bloom_filter_preprocessing_standalone<IntT, I>(
     input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
     do_fit: bool,
     out_path: &mut Option<PathBuf>,
-) -> (
-    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    Vec<u32>,
-    u16,
-)
+) -> (IndexedKmers<IntT>, Vec<u32>, u16)
 where
     IntT: for<'a> UInt<'a>,
     I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
@@ -1325,9 +1350,6 @@ where
     log::info!("Initialising variables and filter...");
 
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut themap = HashMap::with_hasher(BuildHasherDefault::default());
-
     let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
 
     let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
@@ -1340,21 +1362,18 @@ where
             let (hc, hnc, b) = kmer_it.get_curr_hash_and_bases();
             if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
                 outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
-                minmaxdict.entry(hnc).or_insert(hc);
             }
             while let Some((hc, hnc, b)) = kmer_it.get_next_hash_and_bases() {
                 if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
                     outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
-                    minmaxdict.entry(hnc).or_insert(hc);
                 }
             }
         }
     });
     log::info!("Finishing filtering...");
 
-    // Now, get themap, histovec, and filter outdict and minmaxdict
-    let mut countmap = kmer_filter.get_counts_map();
-    countmap.shrink_to_fit();
+    let countmap = std::mem::take(kmer_filter.get_counts_map());
+    drop(kmer_filter);
     let minc;
 
     // This can be optimised. also better written: I had to repeat the code for the retains, to try to improve slightly the running time in
@@ -1366,41 +1385,21 @@ where
         // large (and so that we can detect it).
         log::info!("Choosing the minimum count...");
         minc = choose_min_count(&histovec);
-        log::info!(
-            "Minimum count chosen: {}. Filtering k-mers...",
-            minc
-        );
-
-        drain_countmap_into_themap(
-            &mut countmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            minc,
-            None,
-        );
+        log::info!("Minimum count chosen: {}. Filtering k-mers...", minc);
     } else {
         log::info!("Filtering k-mers...");
         minc = qual.min_count;
-        drain_countmap_into_themap(
-            &mut countmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            minc,
-            Some(&mut histovec),
-        );
+        build_histogram_from_countmap(&countmap, &mut histovec);
     }
 
-    outdict.shrink_to_fit();
-    minmaxdict.shrink_to_fit();
+    let kmers = bloom_maps_into_indexed_kmers(countmap, outdict, minc);
 
     if let Some(p) = out_path {
         plot_kmer_histogram(&histovec, p.as_path());
     }
 
     histovec.shrink_to_fit();
-    (outdict, minmaxdict, themap, histovec, minc)
+    (kmers, histovec, minc)
 }
 
 /// Natively this now has no callers outside the tests: the map counter never materialises a list of
@@ -1520,9 +1519,13 @@ where
                 floors,
                 keep,
             };
-            for_each_kmer::<IntT, _>(seq, qual_bytes.as_deref(), w, &mut groups, |hc, hnc, b, g, km| {
-                local.push((hc, hnc, b, g, km))
-            });
+            for_each_kmer::<IntT, _>(
+                seq,
+                qual_bytes.as_deref(),
+                w,
+                &mut groups,
+                |hc, hnc, b, g, km| local.push((hc, hnc, b, g, km)),
+            );
             local
         })
         .collect()
@@ -1614,7 +1617,10 @@ fn countmap_shards() -> usize {
 #[inline(always)]
 fn shard_of(hc: u64, shards: usize) -> usize {
     const MIX: u64 = 0x9E37_79B9_7F4A_7C15; // odd, golden-ratio derived
-    debug_assert!(shards.is_power_of_two(), "shard count must be a power of two");
+    debug_assert!(
+        shards.is_power_of_two(),
+        "shard count must be a power of two"
+    );
     ((hc.wrapping_mul(MIX) >> (64 - shards.trailing_zeros())) as usize) & (shards - 1)
 }
 
@@ -1696,8 +1702,12 @@ fn count_batch<IntT>(
                             cand.push((hc, g));
                         }
                         if g >= keep {
-                            buckets[shard_of(hc, n_shards)]
-                                .push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
+                            buckets[shard_of(hc, n_shards)].push((
+                                hc,
+                                hnc,
+                                b,
+                                km.expect("a kept k-mer carries its bits"),
+                            ));
                         }
                     },
                 );
@@ -1727,8 +1737,9 @@ fn count_batch<IntT>(
     // Absorb wants one thread per shard, but the buckets are task-major. Gathering `&mut` references
     // regroups them shard-major without moving a single k-mer.
     let t2 = Instant::now();
-    let mut by_shard: Vec<Vec<&mut Bucket<IntT>>> =
-        (0..n_shards).map(|_| Vec::with_capacity(states.len())).collect();
+    let mut by_shard: Vec<Vec<&mut Bucket<IntT>>> = (0..n_shards)
+        .map(|_| Vec::with_capacity(states.len()))
+        .collect();
     for st in states.iter_mut() {
         for (s, bucket) in st.buckets.iter_mut().enumerate() {
             by_shard[s].push(bucket);
@@ -1745,7 +1756,12 @@ fn count_batch<IntT>(
                 for (hc, hnc, b, km) in col.drain(..) {
                     map.entry(hc)
                         .and_modify(|e| e.count = e.count.saturating_add(1))
-                        .or_insert(KmerInfo { count: 1, hnc, b, km });
+                        .or_insert(KmerInfo {
+                            count: 1,
+                            hnc,
+                            b,
+                            km,
+                        });
                 }
             }
         });
@@ -1805,45 +1821,32 @@ where
     (shards, sketch)
 }
 
-/// Split the count-map into the two artefacts the assembler needs, keeping k-mers seen `minc` times.
-///
-/// Unlike [`drain_countmap_into_themap`], which *prunes* dictionaries that were already fully
-/// populated, this one *builds* them, so k-mers below the threshold never enter a map at all.
+/// Consume the count-map into aligned storage, keeping k-mers seen `minc` times.
 #[cfg(not(target_family = "wasm"))]
-#[allow(clippy::type_complexity)]
-fn drain_countmap_bulk<IntT>(
-    shards: Vec<CountMap<IntT>>,
-    minc: u16,
-) -> (
-    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-)
+fn countmaps_into_indexed_kmers<IntT>(shards: Vec<CountMap<IntT>>, minc: u16) -> IndexedKmers<IntT>
 where
     IntT: for<'a> UInt<'a>,
 {
-    let mut themap = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut thedict = HashMap::with_hasher(BuildHasherDefault::default());
+    let minc = u32::from(minc);
+    let survivors = shards
+        .iter()
+        .flat_map(HashMap::values)
+        .filter(|info| info.count >= minc)
+        .count();
+    let mut indexed = IndexedKmers::with_capacity(survivors);
 
-    // Shards are drained in order, so the result does not depend on how many threads did the counting.
+    // Shards are consumed in order. Packed k-mers and metadata move into one aligned slot, so no
+    // intermediate sequence, graph-data, or reverse-hash dictionary is materialised.
     for shard in shards {
         for (hc, info) in shard {
-            if info.count >= minc as u32 {
-                themap.insert(
-                    hc,
-                    HashInfoSimple {
-                        hnc: info.hnc,
-                        b: info.b,
-                        pre: Vec::new(),
-                        post: Vec::new(),
-                        counts: info.count,
-                    },
-                );
-                thedict.insert(hc, info.km);
+            if info.count >= minc {
+                indexed.push(hc, info.hnc, info.b, info.count, info.km);
             }
         }
     }
 
-    (themap, thedict)
+    debug_assert_eq!(indexed.len(), survivors);
+    indexed
 }
 
 /// Choose, filter and plot from a finished sharded count-map.
@@ -1856,14 +1859,7 @@ fn finish_map_counter<IntT>(
     sketch: Option<SpectrumSketch>,
     do_fit: bool,
     out_path: &mut Option<PathBuf>,
-) -> (
-    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    Vec<u32>,
-    u16,
-    u8,
-)
+) -> (IndexedKmers<IntT>, Vec<u32>, u16, u8)
 where
     IntT: for<'a> UInt<'a>,
 {
@@ -1908,30 +1904,19 @@ where
         if chosen_min_qual < qual.min_qual {
             // The caller recounts at the looser floor, so building the maps here is wasted work and
             // wasted memory. Dropping `shards` on the way out is the whole saving.
-            return (
-                HashMap::with_hasher(BuildHasherDefault::default()),
-                HashMap::with_hasher(BuildHasherDefault::default()),
-                HashMap::with_hasher(BuildHasherDefault::default()),
-                histovec,
-                minc,
-                chosen_min_qual,
-            );
+            return (IndexedKmers::default(), histovec, minc, chosen_min_qual);
         }
         log::info!("Minimum count chosen: {minc}. Starting filtering...");
     } else {
         minc = qual.min_count;
     }
 
-    let (themap, thedict) = drain_countmap_bulk::<IntT>(shards, minc);
-    // Falls out of `themap` for free: `HashInfoSimple` already carries `hnc`, and every consumer
-    // re-validates against `themap` anyway, so entries for non-survivors were only dead weight.
-    let maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> =
-        themap.iter().map(|(hc, hi)| (hi.hnc, *hc)).collect();
+    let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
 
     if let Some(p) = out_path {
         plot_kmer_histogram(&histovec, p.as_path());
     }
-    (thedict, maxmindict, themap, histovec, minc, chosen_min_qual)
+    (kmers, histovec, minc, chosen_min_qual)
 }
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
@@ -1954,13 +1939,18 @@ where
 {
     log::info!("Starting preprocessing_standalone with k = {k}");
 
-    let (thedict, maxmindict, themap, histovec, used_min_count, chosen_min_qual) = if do_bloom {
+    let (kmers, histovec, used_min_count, chosen_min_qual) = if do_bloom {
         log::info!("Processing using a Bloom filter");
         // Approximate counting and an exact sketch would disagree by construction, so this path keeps
         // the flat floor and never asks for a recount.
-        let (a, b, c, d, e) =
-            bloom_filter_preprocessing_standalone::<IntT, _>(input_iters, k, qual, do_fit, out_path);
-        (a, b, c, d, e, qual.min_qual)
+        let (kmers, histovec, used_min_count) = bloom_filter_preprocessing_standalone::<IntT, _>(
+            input_iters,
+            k,
+            qual,
+            do_fit,
+            out_path,
+        );
+        (kmers, histovec, used_min_count, qual.min_qual)
     } else {
         if csize != 0 {
             log::warn!(
@@ -1989,9 +1979,7 @@ where
 
     PreprocessedK {
         k,
-        themap,
-        thedict,
-        maxmindict,
+        kmers,
         histovec,
         used_min_count,
         chosen_min_qual,
@@ -2006,6 +1994,57 @@ mod tests {
 
     fn empty_countmap() -> HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
         HashMap::with_hasher(BuildHasherDefault::default())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn countmaps_move_survivors_into_aligned_storage() {
+        let mut shard: CountMap<u64> = HashMap::with_hasher(BuildHasherDefault::default());
+        shard.insert(
+            11,
+            KmerInfo {
+                count: 5,
+                hnc: 19,
+                b: 3,
+                km: 23,
+            },
+        );
+        shard.insert(
+            29,
+            KmerInfo {
+                count: 1,
+                hnc: 31,
+                b: 4,
+                km: 37,
+            },
+        );
+
+        let indexed = countmaps_into_indexed_kmers(vec![shard], 3);
+
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed.canonical_hashes, vec![11]);
+        assert_eq!(indexed.reverse_hashes, vec![19]);
+        assert_eq!(indexed.boundary_bases, vec![3]);
+        assert_eq!(indexed.counts, vec![5]);
+        assert_eq!(indexed.packed_kmers, vec![23]);
+        assert_eq!(indexed.lookup_hash(11), Some((0, false)));
+        assert_eq!(indexed.lookup_hash(19), Some((0, true)));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn bloom_maps_move_only_retained_packed_kmers() {
+        let mut counts = empty_countmap();
+        counts.insert(11, (5, 19, 3));
+        counts.insert(29, (1, 31, 4));
+        let mut packed = HashMap::with_hasher(BuildHasherDefault::default());
+        packed.insert(11, 23_u64);
+        packed.insert(29, 37_u64);
+
+        let indexed = bloom_maps_into_indexed_kmers(counts, packed, 3);
+
+        assert_eq!(indexed.canonical_hashes, vec![11]);
+        assert_eq!(indexed.packed_kmers, vec![23]);
     }
 
     /// Reads for the counter tests. Rotating the backbone keeps most k-mers shared across replicates
@@ -2058,7 +2097,11 @@ mod tests {
         let mut got: HashMap<u64, (u32, u64, u8)> = HashMap::default();
         for (idx, shard) in shards.iter().enumerate() {
             for (hc, info) in shard {
-                assert_eq!(shard_of(*hc, n_shards), idx, "k-mer {hc} is in the wrong shard");
+                assert_eq!(
+                    shard_of(*hc, n_shards),
+                    idx,
+                    "k-mer {hc} is in the wrong shard"
+                );
                 got.insert(*hc, (info.count, info.hnc, info.b));
             }
         }
@@ -2124,7 +2167,10 @@ mod tests {
                 .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS);
             assert!(n.is_power_of_two(), "{threads} threads gave {n} shards");
             assert!((MIN_COUNTMAP_SHARDS..=MAX_COUNTMAP_SHARDS).contains(&n));
-            assert!(n >= threads.min(MAX_COUNTMAP_SHARDS), "{threads} threads starve at {n} shards");
+            assert!(
+                n >= threads.min(MAX_COUNTMAP_SHARDS),
+                "{threads} threads starve at {n} shards"
+            );
         }
         let shards_at = |t: usize| {
             (t * SHARDS_PER_THREAD)
@@ -2152,7 +2198,10 @@ mod tests {
             assert!(s < n);
             seen[s] += 1;
         }
-        assert!(seen.iter().all(|&c| c > 0), "some shard never receives a key");
+        assert!(
+            seen.iter().all(|&c| c > 0),
+            "some shard never receives a key"
+        );
     }
 
     fn empty_themap() -> HashMap<u64, crate::HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>
@@ -2361,7 +2410,10 @@ mod tests {
             add_to_histogram(&mut wide[..], c);
         }
         // Counts below the old ceiling land identically; only what used to saturate now moves.
-        assert_eq!(narrow[..LEGACY_HISTO_RANGE - 1], wide[..LEGACY_HISTO_RANGE - 1]);
+        assert_eq!(
+            narrow[..LEGACY_HISTO_RANGE - 1],
+            wide[..LEGACY_HISTO_RANGE - 1]
+        );
         assert_eq!(coverage_peak(&narrow), coverage_peak(&wide));
     }
 
@@ -2382,7 +2434,12 @@ mod tests {
         let lam_err = lam * 0.01 / 3.0;
         let err_slots = GENOME * 3.0 * K;
         for c in 1..MAXSIZEHISTO {
-            let n = GENOME * poisson(c, lam) + if c < 60 { err_slots * poisson(c, lam_err) } else { 0.0 };
+            let n = GENOME * poisson(c, lam)
+                + if c < 60 {
+                    err_slots * poisson(c, lam_err)
+                } else {
+                    0.0
+                };
             h[c - 1] = n as u32;
         }
         h
@@ -2404,8 +2461,16 @@ mod tests {
         );
         let e = estimate_by_valley(&h);
         assert_eq!(e.verdict, Verdict::Ok);
-        assert!((450..550).contains(&e.genomic_peak), "genomic_peak was {}", e.genomic_peak);
-        assert!((10..40).contains(&e.min_count), "min_count was {}", e.min_count);
+        assert!(
+            (450..550).contains(&e.genomic_peak),
+            "genomic_peak was {}",
+            e.genomic_peak
+        );
+        assert!(
+            (10..40).contains(&e.min_count),
+            "min_count was {}",
+            e.min_count
+        );
         assert!(genome_loss(500.0, e.min_count) < 1e-6);
     }
 
@@ -2555,11 +2620,18 @@ mod tests {
         h[5] = 100_000; // genome spike at count 6, empty valley between
         let e = estimate_by_valley(&h);
         assert_eq!(
-            e.verdict, Verdict::Ok,
+            e.verdict,
+            Verdict::Ok,
             "valley {} genomic_peak {} gp_to_v_ratio {:.1} valley_to_peak_xratio {:.3}",
-            e.valley, e.genomic_peak, e.gp_to_v_ratio, e.valley_to_peak_xratio
+            e.valley,
+            e.genomic_peak,
+            e.gp_to_v_ratio,
+            e.valley_to_peak_xratio
         );
-        assert!(e.valley_to_peak_xratio > 0.6, "the point of the case is that it is crowded");
+        assert!(
+            e.valley_to_peak_xratio > 0.6,
+            "the point of the case is that it is crowded"
+        );
     }
 
     /// Through the working range the cutoff must clear the errors without eating the genome.
@@ -2590,7 +2662,11 @@ mod tests {
         }
         let e = estimate_by_valley(&h);
         assert_eq!(e.verdict, Verdict::Ok);
-        assert!(e.genomic_peak >= LEGACY_HISTO_RANGE, "genomic_peak was {}", e.genomic_peak);
+        assert!(
+            e.genomic_peak >= LEGACY_HISTO_RANGE,
+            "genomic_peak was {}",
+            e.genomic_peak
+        );
         assert!(coverage_peak(&h) < LEGACY_HISTO_RANGE);
     }
 
@@ -2671,7 +2747,10 @@ mod tests {
         let valley = 60;
         let m = measured_guard(&h, valley, 200).min(poisson_guard(200)) as usize;
         // A Poisson(200) tail would allow ~168; the measured 1 % quantile of this lobe is far lower.
-        assert!(m < 150, "guard returned {m}, no tighter than a Poisson tail");
+        assert!(
+            m < 150,
+            "guard returned {m}, no tighter than a Poisson tail"
+        );
         assert!(
             measured_loss(&h, valley, m) <= MAX_GENOME_LOSS,
             "guard {m} cost {:.4}",
@@ -2768,7 +2847,10 @@ mod tests {
         sketch.shrink();
         sketch.shrink();
         let sampled = &sketch.spectra(1)[0];
-        let (ft, st) = (full[9..60].iter().sum::<u32>(), sampled[9..60].iter().sum::<u32>());
+        let (ft, st) = (
+            full[9..60].iter().sum::<u32>(),
+            sampled[9..60].iter().sum::<u32>(),
+        );
         assert!(st > 0, "the sample is empty");
         // The whole spectrum lives in counts 10..49 in both, and the valley/genomic peak structure is identical.
         assert_eq!(ft, 60_000);
@@ -2793,7 +2875,10 @@ mod tests {
         assert_eq!(s.counts[&low][0], 5);
         s.shrink();
         assert_eq!(s.counts[&low][0], 5, "a survivor must keep its count");
-        assert!(!s.counts.contains_key(&high), "a hash above the threshold must go");
+        assert!(
+            !s.counts.contains_key(&high),
+            "a hash above the threshold must go"
+        );
     }
 
     /// A k-mer moves between count bins as the floor drops; it does not appear in two bins at once.
@@ -2820,7 +2905,10 @@ mod tests {
         let floors = [0u8, 11, 25];
         let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &floors);
         assert_eq!(floor, 11, "should loosen to B, not all the way to C");
-        assert!(minc > 2, "a resolving floor must yield a real cutoff, got {minc}");
+        assert!(
+            minc > 2,
+            "a resolving floor must yield a real cutoff, got {minc}"
+        );
     }
 
     /// Build a histogram from a `(count, distinct)` spectrum, as the main table would.
@@ -2851,8 +2939,15 @@ mod tests {
     fn a_shallow_resolving_spectrum_still_loosens() {
         let shallow = histo(&bimodal(18));
         let strict = estimate_by_valley(&shallow);
-        assert!(resolves(&strict), "the premise: the strict floor does resolve");
-        assert!(strict.genomic_peak < MIN_USEFUL_COVERAGE, "genomic_peak was {}", strict.genomic_peak);
+        assert!(
+            resolves(&strict),
+            "the premise: the strict floor does resolve"
+        );
+        assert!(
+            strict.genomic_peak < MIN_USEFUL_COVERAGE,
+            "genomic_peak was {}",
+            strict.genomic_peak
+        );
 
         let sketch = sketch_with(1, &bimodal(40));
         let (_, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
@@ -2869,7 +2964,10 @@ mod tests {
         let sketch = sketch_with(1, &bimodal(19));
         let (minc, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 25, "no material gain, so no recount");
-        assert_eq!(minc, strict.min_count, "and the strict cutoff is kept, not the fallback");
+        assert_eq!(
+            minc, strict.min_count,
+            "and the strict cutoff is kept, not the fallback"
+        );
         assert_ne!(minc, UNRESOLVED_MINCOUNT);
     }
 
@@ -2912,8 +3010,14 @@ mod tests {
             c[0] = c[1] / 10;
         }
         let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
-        assert_eq!(floor, 11, "no material gain below it, so the walk stops here");
-        assert_ne!(minc, UNRESOLVED_MINCOUNT, "and keeps the cutoff that rung measured");
+        assert_eq!(
+            floor, 11,
+            "no material gain below it, so the walk stops here"
+        );
+        assert_ne!(
+            minc, UNRESOLVED_MINCOUNT,
+            "and keeps the cutoff that rung measured"
+        );
     }
 
     /// The stranding case, from a starved library whose floors sit at peaks 15/17/18. Accepting the
@@ -2928,7 +3032,10 @@ mod tests {
             c[0] = base / 12; // the loosest, deeper still but only just
         }
         let (_, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 15, 20]);
-        assert_eq!(floor, 0, "the loosest qualifying floor wins when every floor is starved");
+        assert_eq!(
+            floor, 0,
+            "the loosest qualifying floor wins when every floor is starved"
+        );
     }
 
     /// Order must not matter: the floor chosen is a property of the candidates, not of the walk that
@@ -2938,7 +3045,10 @@ mod tests {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = sketch_with(1, &bimodal(40));
         let (_, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
-        assert_eq!(floor, 11, "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins");
+        assert_eq!(
+            floor, 11,
+            "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins"
+        );
     }
 
     /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an
@@ -2949,7 +3059,10 @@ mod tests {
         let sketch = SpectrumSketch::new();
         let floors = [0u8, 11, 25];
         let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &floors);
-        assert_eq!(floor, 0, "nothing resolved, so the floor goes to the bottom");
+        assert_eq!(
+            floor, 0,
+            "nothing resolved, so the floor goes to the bottom"
+        );
         assert_eq!(minc, UNRESOLVED_MINCOUNT);
     }
 }
