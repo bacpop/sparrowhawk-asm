@@ -17,31 +17,18 @@ const BLOOM_WIDTH: usize = 1 << 27;
 /// Number of bits to use in each bloom block (~1% FPR)
 const BITS_PER_ENTRY: usize = 12;
 
-/// A filter which counts input k-mers, returns whether they have passed a count threshold.
-///
-/// Uses a blocked bloom filter as a first pass to remove singletons.
-/// Code for blocked bloom filter based on:
+/// The blocked Bloom filter's bit array on its own, so the parallel counter can shard it: one array
+/// per count-map shard keeps every buffer single-writer, needing no atomics. Based on
 /// <https://github.com/lemire/Code-used-on-Daniel-Lemire-s-blog/blob/master/2021/10/02/wordbasedbloom.cpp>
-///
-/// This has the advantage of using less memory than a larger countmin filter,
-/// being a bit faster (bloom is ~3x faster than countmin, but having count also
-/// allows entry to dictionary to be only checked once for each passing k-mer)
-///
-/// Once passed through the bloom filter, a HashMap is used for counts >=2.
-/// This filter therefore has no false-negatives and negligible false-negatives
-#[derive(Debug, Clone, Default)]
-pub struct KmerFilter {
-    /// Size of the bloom filter
+#[derive(Debug, Clone)]
+pub struct BloomBits {
+    /// Size of the bloom filter, in 64-bit words
     buf_size: u64,
     /// Buffer for the bloom filter
     buffer: Vec<u64>,
-    /// Table of counts
-    counts: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
-    /// Minimum count to pass filter
-    min_count: u16,
 }
 
-impl KmerFilter {
+impl BloomBits {
     /// Cheap modulo
     /// https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
     #[inline(always)]
@@ -71,8 +58,30 @@ impl KmerFilter {
         Self::reduce(Self::cheap_mix(key), range) as usize
     }
 
-    /// Check if in the bloom filter, add if not. Returns whether passed filter
-    fn bloom_add_and_check(&mut self, key: u64) -> bool {
+    /// Words the unsharded filter uses. A sharded caller divides this, so bits per key are preserved.
+    pub fn default_words() -> u64 {
+        f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64 / 8.0) / (u64::BITS as f64)) as u64
+    }
+
+    /// Sized but not allocated; [`Self::init`] does that, so FASTA input never pays for the buffer.
+    /// Floored at one word, because `location` reduces into this range and would divide by zero.
+    pub fn with_words(words: u64) -> Self {
+        Self {
+            buf_size: words.max(1),
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Allocates the buffer, if it has not been allocated already.
+    pub fn init(&mut self) {
+        if self.buffer.is_empty() {
+            self.buffer.resize(self.buf_size as usize, 0);
+        }
+    }
+
+    /// Set this key's fingerprint, reporting whether it was already present.
+    #[inline]
+    pub fn add_and_check(&mut self, key: u64) -> bool {
         let f_print = Self::fingerprint(key);
         let buf_val = self.buffer[Self::location(key, self.buf_size)].borrow_mut();
         if *buf_val & f_print == f_print {
@@ -82,17 +91,40 @@ impl KmerFilter {
             false
         }
     }
+}
+
+/// A zero-word filter would index an empty buffer, so the default is the full-size one.
+impl Default for BloomBits {
+    fn default() -> Self {
+        Self::with_words(Self::default_words())
+    }
+}
+
+/// A filter which counts input k-mers, returning whether they passed a count threshold. A blocked
+/// bloom filter removes singletons first; past it a HashMap holds counts >= 2, so the filter has no
+/// false negatives and negligible false positives.
+#[derive(Debug, Clone, Default)]
+pub struct KmerFilter {
+    /// The bloom filter's bits
+    bits: BloomBits,
+    /// Table of counts
+    counts: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
+    /// Minimum count to pass filter
+    min_count: u16,
+}
+
+impl KmerFilter {
+    /// Check if in the bloom filter, add if not. Returns whether passed filter
+    fn bloom_add_and_check(&mut self, key: u64) -> bool {
+        self.bits.add_and_check(key)
+    }
 
     /// Creates a new filter with given threshold
     ///
     /// Note:
     pub fn new(min_count: u16) -> Self {
-        let buf_size =
-            f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64 / 8.0) / (u64::BITS as f64))
-                as u64;
         Self {
-            buf_size,
-            buffer: Vec::new(),
+            bits: BloomBits::with_words(BloomBits::default_words()),
             counts: HashMap::with_hasher(BuildHasherDefault::default()),
             min_count,
         }
@@ -102,9 +134,7 @@ impl KmerFilter {
     ///
     /// Allocates memory for bloom filter (which can be avoided with FASTA input)
     pub fn init(&mut self) {
-        if self.buffer.is_empty() {
-            self.buffer.resize(self.buf_size as usize, 0);
-        }
+        self.bits.init();
     }
 
     /// Add an observation of a k-mer and middle base to the filter, and return if it passed

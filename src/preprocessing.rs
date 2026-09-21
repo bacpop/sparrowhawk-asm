@@ -5,7 +5,9 @@ use std::{path::PathBuf, time::Instant};
 
 use libm::lgamma;
 use nohash_hasher::NoHashHasher;
-use std::{cmp::Ordering, collections::HashMap, hash::BuildHasherDefault};
+use std::{collections::HashMap, hash::BuildHasherDefault};
+#[cfg(target_family = "wasm")]
+use std::cmp::Ordering;
 
 use rayon::prelude::*;
 // use std::process::exit;
@@ -20,6 +22,9 @@ use super::QualOpts;
 // use super::bit_encoding::{encode_base, rc_base};
 
 use crate::bit_encoding::UInt;
+#[cfg(not(target_family = "wasm"))]
+use crate::bloom_filter::BloomBits;
+#[cfg(target_family = "wasm")]
 use crate::bloom_filter::KmerFilter;
 #[cfg(not(target_family = "wasm"))]
 use crate::indexed_kmers::IndexedKmers;
@@ -587,8 +592,11 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<Spectrum
 /// bridge, so it severs a contig: what predicts contiguity is their number, not their share. One
 /// percent of a 4.6 Mb genome is 46 000 severed paths, which is why a loss-fraction bound never binds.
 const MAX_GENOME_HOLES: f64 = 1.0;
+#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
 const AUTO_FIT_INITIAL_MIN_COUNT: u16 = crate::cli::MIN_BLOOM_COUNT;
 
+/// Natively the sharded filter has no threshold of its own; the browser's `KmerFilter` still does.
+#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
 #[inline]
 fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
     if do_fit {
@@ -598,11 +606,9 @@ fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
     }
 }
 
-/// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
-/// both filter sites keep k-mers with `count >= min_count`.
-///
-/// Natively this now has no callers outside the tests: both native paths read a peak alongside the
-/// cutoff. The browser still reaches it through its chunked and Bloom entry points.
+/// Choose the minimum k-mer count from the spectrum, as an **inclusive** minimum: both filter sites
+/// keep k-mers with `count >= min_count`. Natively this has no callers outside the tests now; the
+/// browser still reaches it from its chunked and Bloom entry points.
 #[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
 fn choose_min_count(histovec: &[u32]) -> u16 {
     choose_min_count_and_peak(histovec).0
@@ -814,6 +820,7 @@ fn rescaled_strict_spectrum(sketch: &SpectrumSketch, keep: u8) -> Vec<u32> {
     out
 }
 
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 fn build_histogram_from_countmap(
     countmap: &HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     histovec: &mut [u32],
@@ -852,25 +859,6 @@ fn drain_countmap_into_themap<IntT>(
         }
         false
     });
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn extract_kmers_from_files<F, I>(input_iters: &mut [I], mut on_record: F)
-where
-    F: FnMut(std::borrow::Cow<'_, [u8]>, usize, Option<&[u8]>),
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
-{
-    for (idx, records) in input_iters.iter_mut().enumerate() {
-        log::info!("Getting kmers from file number {idx}.");
-        for record in records {
-            let seq: Vec<u8> = record.0;
-            let qual: Option<Vec<u8>> = record.1;
-            let num_bases = seq.len();
-            on_record(seq.into(), num_bases, qual.as_deref());
-        }
-        log::info!("Finished getting kmers from file number {idx}.");
-    }
-    log::info!("Finished getting kmers from {} file(s)", input_iters.len());
 }
 
 /// One FASTQ record, owned: needletail's `Cow` borrows a reader buffer invalidated on the next
@@ -1455,131 +1443,6 @@ where
     (outdict, minmaxdict, themap, histovec, minc)
 }
 
-/// Consume the filter's count map and its packed-k-mer dictionary into aligned storage, keeping k-mers
-/// seen `minc` times. The dictionary must cover every survivor; a gap is a bug, not a missing k-mer.
-#[cfg(not(target_family = "wasm"))]
-fn bloom_maps_into_indexed_kmers<IntT>(
-    counts: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
-    mut packed: HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    minc: u16,
-) -> IndexedKmers<IntT>
-where
-    IntT: for<'a> UInt<'a>,
-{
-    let minc = u32::from(minc);
-    let survivors = counts
-        .values()
-        .filter(|(count, _, _)| *count >= minc)
-        .count();
-    let mut indexed = IndexedKmers::with_capacity(survivors);
-
-    for (hc, (count, hnc, bases)) in counts {
-        if count < minc {
-            continue;
-        }
-        let kmer = packed.remove(&hc).unwrap_or_else(|| {
-            panic!("Bloom-filter survivor with canonical hash {hc} has no packed k-mer")
-        });
-        indexed.push(hc, hnc, bases, count, kmer);
-    }
-
-    debug_assert_eq!(indexed.len(), survivors);
-    indexed
-}
-
-/// Bloom-filter preprocessing: approximate counting, everything else as the exact path. Every spectrum
-/// decision is read from the sketch, which is exact on its subsample; the Bloom histogram is only plotted.
-#[cfg(not(target_family = "wasm"))]
-#[allow(clippy::type_complexity)]
-fn bloom_filter_preprocessing_standalone<IntT, I>(
-    input_iters: &mut [I],
-    k: usize,
-    qual: &QualOpts,
-    floors: Option<&[u8]>,
-    do_fit: bool,
-    out_path: &mut Option<PathBuf>,
-) -> (IndexedKmers<IntT>, Vec<u32>, u16, u8, PeakSource)
-where
-    IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>,
-{
-    log::info!("Initialising variables and filter...");
-
-    let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
-
-    let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
-    kmer_filter.init();
-
-    // Built on every pass, ladder or not: the count map has no count-1 bin and false positives inflate
-    // the rest, so the sketch is the only spectrum on this path worth reading.
-    let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
-    let mut sketch = SpectrumSketch::new();
-    let w = KmerWalk {
-        k,
-        min_qual: qual.min_qual,
-        floors,
-        keep,
-    };
-    let mut groups: Vec<u8> = Vec::new();
-
-    extract_kmers_from_files(input_iters, |seq, _num_bases, qual_bytes| {
-        for_each_kmer::<IntT, _>(&seq, qual_bytes, w, &mut groups, |hc, hnc, b, g, km| {
-            sketch.observe(hc, g);
-            if g >= keep && Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                outdict
-                    .entry(hc)
-                    .or_insert_with(|| km.expect("a kept k-mer carries its bits"));
-            }
-        });
-    });
-    log::info!("Finishing filtering...");
-
-    let countmap = std::mem::take(kmer_filter.get_counts_map());
-    drop(kmer_filter);
-    build_histogram_from_countmap(&countmap, &mut histovec);
-    let exact = rescaled_strict_spectrum(&sketch, keep);
-
-    let minc;
-    let mut chosen_min_qual = qual.min_qual;
-    let genomic_peak;
-    if do_fit {
-        log::info!("Counting finished. Choosing the minimum count...");
-        match floors {
-            Some(floors) => {
-                (minc, chosen_min_qual, genomic_peak) =
-                    choose_min_count_and_floor(&exact, &sketch, floors);
-            }
-            None => (minc, genomic_peak) = choose_min_count_and_peak(&exact),
-        }
-        if chosen_min_qual < qual.min_qual {
-            // The caller recounts at the looser floor, so filtering here is wasted work.
-            return (
-                IndexedKmers::default(),
-                histovec,
-                minc,
-                chosen_min_qual,
-                genomic_peak,
-            );
-        }
-        log::info!("Minimum count chosen: {minc}. Filtering k-mers...");
-    } else {
-        minc = qual.min_count;
-        genomic_peak = peak_of(&estimate_by_valley(&exact), &exact);
-    }
-    log::info!("Single-copy coverage read from the spectrum: {genomic_peak:?}");
-
-    let kmers = bloom_maps_into_indexed_kmers(countmap, outdict, minc);
-
-    if let Some(p) = out_path {
-        plot_kmer_histogram(&histovec, p.as_path());
-        write_kmer_spectrum_tsv(&histovec, p.as_path());
-    }
-
-    histovec.shrink_to_fit();
-    (kmers, histovec, minc, chosen_min_qual, genomic_peak)
-}
-
 /// Natively this now has no callers outside the tests: the map counter never materialises a list of
 /// occurrences to run-length count. The browser still reaches it through `chunked_processing_wasm`.
 #[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
@@ -1842,11 +1705,19 @@ fn count_batch<IntT>(
     sketch: Option<&mut SpectrumSketch>,
     states: &mut [TaskState<IntT>],
     shards: &mut [CountMap<IntT>],
+    blooms: &mut [Option<BloomBits>],
     t: &mut CountTimings,
 ) where
     IntT: for<'a> UInt<'a>,
 {
     let n_shards = shards.len();
+    // The filter eats each k-mer's first sighting, so a surviving entry opens at 2 rather than 1 --
+    // exactly what the serial `KmerFilter::filter` did.
+    let base = if blooms.iter().any(Option::is_some) {
+        2
+    } else {
+        1
+    };
     let w = KmerWalk {
         k,
         min_qual: qual.min_qual,
@@ -1929,13 +1800,21 @@ fn count_batch<IntT>(
     shards
         .par_iter_mut()
         .zip(by_shard.par_iter_mut())
-        .for_each(|(map, cols)| {
+        .zip(blooms.par_iter_mut())
+        .for_each(|((map, cols), bloom)| {
             for col in cols.iter_mut() {
                 for (hc, hnc, b, km) in col.drain(..) {
+                    // A k-mer's first sighting only sets bits; counting starts on the second. The
+                    // bits are sharded by the same key as the map, so this stays single-writer.
+                    if let Some(bits) = bloom.as_mut() {
+                        if !bits.add_and_check(hc) {
+                            continue;
+                        }
+                    }
                     map.entry(hc)
                         .and_modify(|e| e.count = e.count.saturating_add(1))
                         .or_insert(KmerInfo {
-                            count: 1,
+                            count: base,
                             hnc,
                             b,
                             km,
@@ -1957,6 +1836,7 @@ fn bulk_preprocessing_standalone_cpu<IntT, I>(
     k: usize,
     qual: &QualOpts,
     floors: Option<&[u8]>,
+    do_bloom: bool,
 ) -> (Vec<CountMap<IntT>>, Option<SpectrumSketch>)
 where
     IntT: for<'a> UInt<'a>,
@@ -1964,12 +1844,27 @@ where
 {
     // The ladder is ascending, so the last group is the strict floor and `keep` is its index.
     let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
-    let mut sketch = floors.map(|_| SpectrumSketch::new());
+    // A Bloom table has no count-1 bin, so its spectrum has to come from the sketch whether or not a
+    // ladder was asked for.
+    let mut sketch = (floors.is_some() || do_bloom).then(SpectrumSketch::new);
     let n_shards = countmap_shards();
     log::info!(
-        "Counting k-mers into {n_shards} shards on {} thread(s)",
-        rayon::current_num_threads()
+        "Counting k-mers into {n_shards} shards on {} thread(s){}",
+        rayon::current_num_threads(),
+        if do_bloom { ", behind a Bloom filter" } else { "" }
     );
+    // One slice of the bit array per shard, so each stays single-writer and the parallel absorb needs
+    // no atomics. Splitting the words keeps bits per key exactly as the unsharded filter had them.
+    let mut blooms: Vec<Option<BloomBits>> = (0..n_shards)
+        .map(|_| {
+            do_bloom.then(|| {
+                let mut bits =
+                    BloomBits::with_words(BloomBits::default_words() / n_shards as u64);
+                bits.init();
+                bits
+            })
+        })
+        .collect();
     let mut shards: Vec<CountMap<IntT>> = (0..n_shards)
         .map(|_| HashMap::with_hasher(BuildHasherDefault::default()))
         .collect();
@@ -1990,6 +1885,7 @@ where
             sketch.as_mut(),
             &mut states,
             &mut shards,
+            &mut blooms,
             &mut t,
         );
         t.batches += 1;
@@ -2036,6 +1932,7 @@ fn finish_map_counter<IntT>(
     floors: Option<&[u8]>,
     sketch: Option<SpectrumSketch>,
     do_fit: bool,
+    do_bloom: bool,
     out_path: &mut Option<PathBuf>,
 ) -> (IndexedKmers<IntT>, Vec<u32>, u16, u8, PeakSource)
 where
@@ -2067,6 +1964,18 @@ where
         }
     }
 
+    // A Bloom table has no count-1 bin and false positives inflate the rest, so its own histogram is
+    // only drawn; every decision is read from the sketch, which is exact on its subsample.
+    let sketch_spectrum;
+    let spectrum: &[u32] = if do_bloom {
+        let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
+        sketch_spectrum =
+            rescaled_strict_spectrum(sketch.as_ref().expect("the Bloom path always sketches"), keep);
+        &sketch_spectrum
+    } else {
+        &histovec
+    };
+
     let minc;
     // The floor the spectrum asks for. Only the fitting path can ask for a looser one.
     let mut chosen_min_qual = qual.min_qual;
@@ -2076,11 +1985,14 @@ where
         log::info!("Counting finished. Choosing the minimum count...");
         match (&sketch, floors) {
             (Some(sketch), Some(floors)) => {
-                check_sketch_against_table(&histovec, sketch, floors.len() - 1);
+                // The table is a bin short under Bloom counting, so the comparison would be noise.
+                if !do_bloom {
+                    check_sketch_against_table(&histovec, sketch, floors.len() - 1);
+                }
                 (minc, chosen_min_qual, genomic_peak) =
-                    choose_min_count_and_floor(&histovec, sketch, floors);
+                    choose_min_count_and_floor(spectrum, sketch, floors);
             }
-            _ => (minc, genomic_peak) = choose_min_count_and_peak(&histovec),
+            _ => (minc, genomic_peak) = choose_min_count_and_peak(spectrum),
         }
         if chosen_min_qual < qual.min_qual {
             // The caller recounts at the looser floor, so building the maps here is wasted work and
@@ -2096,9 +2008,9 @@ where
         log::info!("Minimum count chosen: {minc}. Starting filtering...");
     } else {
         minc = qual.min_count;
-        // `--min-count` fixes the cutoff, not the coverage. The histogram above spans every distinct
-        // k-mer including singletons, so it is the same spectrum the fitting path reads.
-        genomic_peak = peak_of(&estimate_by_valley(&histovec), &histovec);
+        // `--min-count` fixes the cutoff, not the coverage. The spectrum above spans every distinct
+        // k-mer including singletons, so it is the same one the fitting path reads.
+        genomic_peak = peak_of(&estimate_by_valley(spectrum), spectrum);
     }
     log::info!("Single-copy coverage read from the spectrum: {genomic_peak:?}");
 
@@ -2137,22 +2049,11 @@ where
              occurrences, so memory is bounded by the number of distinct k-mers instead."
         );
     }
-    let (kmers, histovec, used_min_count, chosen_min_qual, genomic_peak) = if do_bloom {
-        log::info!("Processing using a Bloom filter");
-        bloom_filter_preprocessing_standalone::<IntT, _>(
-            input_iters,
-            k,
-            qual,
-            floors,
-            do_fit,
-            out_path,
-        )
-    } else {
-        log::info!("Counting k-mers into a hash map, without sorting");
-        let (shards, sketch) =
-            bulk_preprocessing_standalone_cpu::<IntT, _>(input_iters, k, qual, floors);
-        finish_map_counter::<IntT>(shards, qual, floors, sketch, do_fit, out_path)
-    };
+    log::info!("Counting k-mers into a hash map, without sorting");
+    let (shards, sketch) =
+        bulk_preprocessing_standalone_cpu::<IntT, _>(input_iters, k, qual, floors, do_bloom);
+    let (kmers, histovec, used_min_count, chosen_min_qual, genomic_peak) =
+        finish_map_counter::<IntT>(shards, qual, floors, sketch, do_fit, do_bloom, out_path);
 
     if let Some(timevec) = timevec.as_mut() {
         timevec.push(Instant::now());
@@ -2222,22 +2123,6 @@ mod tests {
         assert_eq!(indexed.lookup_hash(19), Some((0, true)));
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn bloom_maps_move_only_retained_packed_kmers() {
-        let mut counts = empty_countmap();
-        counts.insert(11, (5, 19, 3));
-        counts.insert(29, (1, 31, 4));
-        let mut packed = HashMap::with_hasher(BuildHasherDefault::default());
-        packed.insert(11, 23_u64);
-        packed.insert(29, 37_u64);
-
-        let indexed = bloom_maps_into_indexed_kmers(counts, packed, 3);
-
-        assert_eq!(indexed.canonical_hashes, vec![11]);
-        assert_eq!(indexed.packed_kmers, vec![23]);
-    }
-
     /// Reads for the counter tests. Rotating the backbone keeps most k-mers shared across replicates
     /// while making the seam k-mers unique, so the spectrum has a singleton lobe as well as a deep one.
     /// Each read is mostly Q37 with one dip through Q11 to Q2, moved along by replicate: the dip has to
@@ -2282,7 +2167,7 @@ mod tests {
 
         let mut iters = [reads.clone().into_iter()];
         let (shards, _) =
-            bulk_preprocessing_standalone_cpu::<u64, _>(&mut iters, k, &qual, Some(&ladder[..]));
+            bulk_preprocessing_standalone_cpu::<u64, _>(&mut iters, k, &qual, Some(&ladder[..]), false);
 
         let n_shards = shards.len();
         let mut got: HashMap<u64, (u32, u64, u8)> = HashMap::default();
@@ -2312,6 +2197,79 @@ mod tests {
             "the fixture produced no k-mers above the floor"
         );
         assert_eq!(got, want);
+    }
+
+    /// True occurrence count per k-mer above the strict floor, from the independent reference hasher.
+    #[cfg(not(target_family = "wasm"))]
+    fn true_counts(reads: &[OwnedRecord], k: usize, min_qual: u8, ladder: &[u8]) -> HashMap<u64, u32> {
+        let keep = (ladder.len() - 1) as u8;
+        let mut want: HashMap<u64, u32> = HashMap::default();
+        for (hc, _, _, g, _) in hash_batch::<u64>(reads, k, min_qual, Some(ladder), keep) {
+            if g >= keep {
+                *want.entry(hc).or_insert(0) += 1;
+            }
+        }
+        want
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn bloom_shards(reads: Vec<OwnedRecord>, k: usize, qual: &QualOpts, ladder: &[u8]) -> HashMap<u64, u32> {
+        let mut iters = [reads.into_iter()];
+        let (shards, _) =
+            bulk_preprocessing_standalone_cpu::<u64, _>(&mut iters, k, qual, Some(ladder), true);
+        let mut got: HashMap<u64, u32> = HashMap::default();
+        for shard in &shards {
+            for (hc, info) in shard {
+                got.insert(*hc, info.count);
+            }
+        }
+        got
+    }
+
+    /// What the sharded filter guarantees: it eats a k-mer's first sighting, so a survivor's count is
+    /// its true count, or one more when a false positive let that first sighting through.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_sharded_bloom_counts_what_the_filter_promises() {
+        let reads = counter_test_reads();
+        let ladder = [0u8, 11, 25];
+        let qual = QualOpts {
+            min_count: 2,
+            min_qual: 25,
+        };
+        let want = true_counts(&reads, 11, qual.min_qual, &ladder);
+        let got = bloom_shards(reads, 11, &qual, &ladder);
+
+        assert!(!want.is_empty(), "the fixture produced no k-mers");
+        for (hc, &n) in &want {
+            match got.get(hc) {
+                Some(&c) => assert!(
+                    c == n || c == n + 1,
+                    "k-mer {hc} seen {n} times came back as {c}"
+                ),
+                // A singleton is invisible unless a false positive admitted it, which is allowed.
+                None => assert_eq!(n, 1, "k-mer {hc} seen {n} times is missing from the table"),
+            }
+        }
+        assert!(
+            want.values().any(|&n| n >= 2),
+            "the fixture has no repeated k-mer to count"
+        );
+    }
+
+    /// Shard assignment is fixed and each shard replays in record order, so rayon's scheduling cannot
+    /// change the answer.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn sharded_bloom_counting_is_reproducible() {
+        let ladder = [0u8, 11, 25];
+        let qual = QualOpts {
+            min_count: 2,
+            min_qual: 25,
+        };
+        let first = bloom_shards(counter_test_reads(), 11, &qual, &ladder);
+        let second = bloom_shards(counter_test_reads(), 11, &qual, &ladder);
+        assert_eq!(first, second);
     }
 
     /// Canonical-minimum hashes for the sharding tests: `min(fwd, rc)` has a triangular density, which
@@ -3133,6 +3091,22 @@ mod tests {
             .collect()
     }
 
+    /// Drive the real counting pair the pipeline uses, so these tests exercise the dispatch rather
+    /// than a shape of their own.
+    #[cfg(not(target_family = "wasm"))]
+    fn count_and_finish(
+        reads: Vec<OwnedRecord>,
+        k: usize,
+        qual: &QualOpts,
+        ladder: &[u8],
+        do_bloom: bool,
+    ) -> (IndexedKmers<u64>, Vec<u32>, u16, u8, PeakSource) {
+        let mut iters = [reads.into_iter()];
+        let (shards, sketch) =
+            bulk_preprocessing_standalone_cpu::<u64, _>(&mut iters, k, qual, Some(ladder), do_bloom);
+        finish_map_counter::<u64>(shards, qual, Some(ladder), sketch, true, do_bloom, &mut None)
+    }
+
     /// The point of reading the spectrum from the sketch: the Bloom path now reports a usable peak,
     /// even though its own histogram has no count-1 bin to read one from.
     #[cfg(not(target_family = "wasm"))]
@@ -3144,16 +3118,8 @@ mod tests {
             min_count: 2,
             min_qual: 25,
         };
-        let mut iters = [reads.into_iter()];
         let (kmers, histovec, minc, chosen_min_qual, peak) =
-            bloom_filter_preprocessing_standalone::<u64, _>(
-                &mut iters,
-                31,
-                &qual,
-                Some(&ladder[..]),
-                true,
-                &mut None,
-            );
+            count_and_finish(reads, 31, &qual, &ladder, true);
 
         assert_eq!(histovec[0], 0, "a Bloom histogram cannot hold singletons");
         assert!(
@@ -3162,7 +3128,8 @@ mod tests {
         );
         // Every base is Q37, so the strict floor keeps everything and nothing asks to loosen.
         assert_eq!(chosen_min_qual, 25);
-        // A k-mer sits in 70 of the 2900 read starts at 1500 reads, so the lobe is around 36.
+        // A band, not a point: reads start at random offsets and the sketch subsamples, so the lobe
+        // lands near the library's depth rather than on it.
         let p = peak.value().unwrap();
         assert!((25..=50).contains(&p), "peak {p} is not the library's");
         assert!(minc >= 2 && (minc as u32) < p, "cutoff {minc} against peak {p}");
@@ -3181,15 +3148,7 @@ mod tests {
             min_count: 2,
             min_qual: 25,
         };
-        let mut iters = [reads.into_iter()];
-        let (kmers, _, _, chosen_min_qual, peak) = bloom_filter_preprocessing_standalone::<u64, _>(
-            &mut iters,
-            31,
-            &qual,
-            Some(&ladder[..]),
-            true,
-            &mut None,
-        );
+        let (kmers, _, _, chosen_min_qual, peak) = count_and_finish(reads, 31, &qual, &ladder, true);
 
         assert_eq!(chosen_min_qual, 11, "the loose rung is the one that separates");
         assert_eq!(kmers.len(), 0, "a recount pass must not build the table");
