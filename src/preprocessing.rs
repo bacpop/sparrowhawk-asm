@@ -27,8 +27,7 @@ use crate::kmer::Kmer;
 use crate::logw;
 #[cfg(not(target_family = "wasm"))]
 use crate::qual_profile::{window_groups, MAX_GROUPS, NONE};
-#[cfg(target_family = "wasm")]
-use crate::spectrum_fitter::SpectrumFitter;
+use crate::spectrum_fitter::{fit_spectrum, SpectrumFit};
 
 /// Tuple for name and list of input files
 pub type InputFastx = (String, Vec<String>);
@@ -49,6 +48,9 @@ pub struct PreprocessedK<IntT> {
     /// the base-quality floor the spectrum asked for. Below `QualOpts::min_qual` when the lobes only
     /// separated at a looser floor, which is the caller's signal to recount.
     pub chosen_min_qual: u8,
+    /// Single-copy coverage of the spectrum *this* map was filtered against, as a count. Correction
+    /// reads it to tell an error branch from a real one.
+    pub genomic_peak: PeakSource,
 }
 
 // #[cfg(target_family = "wasm")]
@@ -257,6 +259,63 @@ impl Verdict {
             Verdict::Ok => "the cutoff would have cost more genome than the guard allows",
         }
     }
+}
+
+/// Where a single-copy coverage figure came from. Correction is more careful with a fallback than
+/// with a fitted peak, so the provenance travels with the number rather than being inferred later.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PeakSource {
+    /// The spectrum's lobes separated and `genomic_peak` is trustworthy.
+    Fitted(u32),
+    /// They did not, so the occurrence-weighted median stands in.
+    Fallback(u32),
+    /// No spectrum was read at all: Bloom counting, or an empty histogram.
+    #[default]
+    Unknown,
+}
+
+impl PeakSource {
+    /// The coverage figure, whatever its provenance.
+    pub fn value(self) -> Option<u32> {
+        match self {
+            Self::Fitted(peak) | Self::Fallback(peak) => Some(peak),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// The fitted peak when the lobes separated, else the occurrence-weighted median.
+///
+/// `genomic_peak` is an argmax *above a valley*, so on a merged spectrum it names the error lobe.
+/// Refusing it there is what lets every consumer treat `Fitted` as trustworthy.
+fn peak_of(estimate: &SpectrumEstimate, histovec: &[u32]) -> PeakSource {
+    if estimate.verdict.is_ok() {
+        PeakSource::Fitted(estimate.genomic_peak as u32)
+    } else {
+        occurrence_weighted_median(histovec).map_or(PeakSource::Unknown, PeakSource::Fallback)
+    }
+}
+
+/// Single-copy coverage without needing a valley: the smallest count at which k-mers of that count
+/// or less hold half of all k-mer *occurrences*. Error k-mers are many but each occurs a few times,
+/// so they carry little occurrence mass, and the median lands in the genomic lobe regardless.
+fn occurrence_weighted_median(histovec: &[u32]) -> Option<u32> {
+    // `histovec[c - 1]` is the count-`c` bin, so the count is the index plus one. u64 is ample: the
+    // total is the number of k-mers in the reads, ~1e10 at the very most.
+    let occurrences = |(i, n): (usize, &u32)| (i as u64 + 1) * u64::from(*n);
+    let total: u64 = histovec.iter().enumerate().map(occurrences).sum();
+    if total == 0 {
+        return None;
+    }
+
+    let mut seen = 0u64;
+    for (i, n) in histovec.iter().enumerate() {
+        seen += occurrences((i, n));
+        if seen * 2 >= total {
+            return u32::try_from(i + 1).ok();
+        }
+    }
+    None
 }
 
 /// Smoothed spectrum height at `count` (a count, not an index).
@@ -488,30 +547,46 @@ fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
 /// What the Poisson mixture would have chosen. Kept for the browser, where there is no benchmark sweep
 /// to calibrate against; native runs do not fit at all, since the estimator beat it wherever they
 /// disagreed across 3780 sweep runs.
-#[cfg(target_family = "wasm")]
-fn log_fit_comparison(histovec: &[u32]) {
-    // A global argmax, so this is the spectrum's mode and not necessarily the genome lobe's.
-    let mode = coverage_peak(histovec);
-    let floor = ((mode as f64 / 8.0).round() as u16).max(2);
-
-    let mut fit = SpectrumFitter::new();
-    let would_be = match fit.fit_histogram(histovec[..(LEGACY_HISTO_RANGE - 1)].to_vec()) {
-        Ok(minc) if minc > TRUST_FIT_ABOVE => format!("{minc}"),
-        Ok(minc) => format!("{floor} (fit returned {minc}, too small to be trusted; mode {mode})"),
-        Err(e) => format!("{floor} (fit did not converge: {e}; mode {mode})"),
-    };
-    logw(
-        &format!("The Poisson mixture would have used {would_be}."),
-        Some("info"),
-    );
+/// Fit the spectrum and report it. Seeded from the valley estimator's own peak and dispersion: the
+/// estimator locates the lobe, the fit refines it and separates the error lobe from it explicitly.
+/// `None` when no start converges, which leaves the estimator's answer standing.
+fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<SpectrumFit> {
+    match fit_spectrum(histovec, estimate.genomic_peak, estimate.dispersion) {
+        Ok(fit) => {
+            logw(
+                &format!(
+                    "Spectrum fit: mean={:.1} dispersion={:.2} error_mean={:.2} w=({:.3}/{:.3}/{:.3}) \
+                     genome_kmers={:.3e} crossover={} hole_cutoff={}",
+                    fit.mean,
+                    fit.dispersion,
+                    fit.error_mean,
+                    fit.w_error,
+                    fit.w_single,
+                    fit.w_repeat,
+                    fit.genome_kmers,
+                    fit.crossover(),
+                    fit.hole_cutoff(MAX_GENOME_HOLES),
+                ),
+                Some("info"),
+            );
+            Some(fit)
+        }
+        Err(e) => {
+            logw(
+                &format!("Spectrum fit did not converge ({e}); keeping the valley estimate."),
+                Some("info"),
+            );
+            None
+        }
+    }
 }
 
 // =====================================================================================================
 
-/// A fitted cutoff at or below this is treated as unreliable and replaced by the histogram floor.
-/// Measured cutoffs split cleanly into a trustworthy group (14-52) and an untrustworthy one (2-8).
-#[cfg(target_family = "wasm")]
-const TRUST_FIT_ABOVE: usize = 10;
+/// Expected single-copy k-mers the cutoff may strand below itself. Each is a hole the graph cannot
+/// bridge, so it severs a contig: what predicts contiguity is their number, not their share. One
+/// percent of a 4.6 Mb genome is 46 000 severed paths, which is why a loss-fraction bound never binds.
+const MAX_GENOME_HOLES: f64 = 1.0;
 const AUTO_FIT_INITIAL_MIN_COUNT: u16 = crate::cli::MIN_BLOOM_COUNT;
 
 #[inline]
@@ -526,12 +601,44 @@ fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
 /// Choose the minimum k-mer count from the spectrum. The returned value is an **inclusive** minimum:
 /// both filter sites keep k-mers with `count >= min_count`.
 fn choose_min_count(histovec: &[u32]) -> u16 {
-    let estimate = estimate_by_valley(histovec);
+    choose_min_count_and_peak(histovec).0
+}
+
+/// As [`choose_min_count`], and also the single-copy coverage the same estimate found.
+///
+/// The valley separates the lobes; the fit then says how much genome cutting there would cost. Those
+/// answer different questions, and on deep libraries the valley is far the more aggressive.
+fn choose_min_count_and_peak(histovec: &[u32]) -> (u16, PeakSource) {
+    let mut estimate = estimate_by_valley(histovec);
     log_spectrum(histovec, &estimate);
-    #[cfg(target_family = "wasm")]
-    log_fit_comparison(histovec);
+    let fit = fit_and_log(histovec, &estimate);
+    apply_hole_guard(&mut estimate, fit.as_ref());
     warn_unresolved(&estimate);
-    estimate.min_count
+    (estimate.min_count, peak_of(&estimate, histovec))
+}
+
+/// Lower the cutoff to whatever strands at most [`MAX_GENOME_HOLES`] single-copy k-mers.
+///
+/// A **ceiling** on the valley, never a raise: the valley already removes the errors, and the only
+/// failure measured was cutting too deep. Floored at 2, and a no-op when the fit did not converge, so
+/// the worst case is exactly the behaviour without a fit.
+fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&SpectrumFit>) {
+    if !estimate.verdict.is_ok() {
+        return;
+    }
+    let Some(fit) = fit else { return };
+
+    let guarded = fit.hole_cutoff(MAX_GENOME_HOLES);
+    if guarded < estimate.min_count {
+        logw(
+            &format!(
+                "Cutting at {} would strand more than {} single-copy k-mers; using {} instead.",
+                estimate.min_count, MAX_GENOME_HOLES, guarded
+            ),
+            Some("info"),
+        );
+        estimate.min_count = guarded.max(2);
+    }
 }
 
 /// The warning for a spectrum that yielded no usable cutoff. Shared, so the one-pass and the sketch
@@ -580,14 +687,17 @@ fn choose_min_count_and_floor(
     histovec: &[u32],
     sketch: &SpectrumSketch,
     floors: &[u8],
-) -> (u16, u8) {
+) -> (u16, u8, PeakSource) {
     let strict_floor = floors[floors.len() - 1];
-    let strict = estimate_by_valley(histovec);
+    let mut strict = estimate_by_valley(histovec);
     log_spectrum(histovec, &strict);
     // A library that already separates at depth needs nothing looser, and this is the only path that
-    // avoids building the sketch spectra at all.
+    // avoids building the sketch spectra at all. It is also the common case, so the hole guard has to
+    // be applied here too and not only in `choose_min_count_and_peak`.
     if resolves(&strict) && strict.genomic_peak >= MIN_USEFUL_COVERAGE {
-        return (strict.min_count, strict_floor);
+        let fit = fit_and_log(histovec, &strict);
+        apply_hole_guard(&mut strict, fit.as_ref());
+        return (strict.min_count, strict_floor, peak_of(&strict, histovec));
     }
 
     // Every floor that separates, as `(floor, min_count, genomic peak)`. Collected before anything is
@@ -621,33 +731,36 @@ fn choose_min_count_and_floor(
 
     // The reference is the strictest floor that separated, which is the strict one whenever it did.
     let Some(&(anchor, _, anchor_peak)) = cands.iter().max_by_key(|&&(floor, _, _)| floor) else {
-        return unresolved(floors);
+        return unresolved(floors, histovec);
     };
     cands.retain(|&(floor, _, peak)| {
         floor == anchor || (peak as f64) >= MIN_COVERAGE_GAIN * anchor_peak as f64
     });
 
+    // Every candidate resolved, so its peak is fitted. A peak from a *sketch* candidate is measured on
+    // a subsample at a floor the table was not counted at — but that case always loosens the floor, and
+    // the caller then recounts, so such a value never reaches a graph.
     // Enough coverage somewhere: the strictest floor reaching it admits the fewest error k-mers.
-    if let Some(&(floor, min_count, _)) = cands
+    if let Some(&(floor, min_count, peak)) = cands
         .iter()
         .filter(|&&(_, _, peak)| peak >= MIN_USEFUL_COVERAGE)
         .max_by_key(|&&(floor, _, _)| floor)
     {
-        return (min_count, floor);
+        return (min_count, floor, PeakSource::Fitted(peak as u32));
     }
     // Starved everywhere, so take all the depth on offer. Equal peaks are not equal assemblies: a floor
     // also breaks the run of k consecutive passing bases a k-mer needs, which no spectrum shows.
-    let &(floor, min_count, _) = cands
+    let &(floor, min_count, peak) = cands
         .iter()
         .min_by_key(|&&(floor, _, _)| floor)
         .expect("the anchor is always a candidate");
-    (min_count, floor)
+    (min_count, floor, PeakSource::Fitted(peak as u32))
 }
 
 /// Nothing separated at any floor: drop the filter, which is the most depth available, and warn, because
 /// the assembly will be fragmented whatever is chosen.
 #[cfg(not(target_family = "wasm"))]
-fn unresolved(floors: &[u8]) -> (u16, u8) {
+fn unresolved(floors: &[u8], histovec: &[u32]) -> (u16, u8, PeakSource) {
     let loosest = floors[0];
     logw(
         &format!(
@@ -657,7 +770,12 @@ fn unresolved(floors: &[u8]) -> (u16, u8) {
         ),
         Some("warn"),
     );
-    (UNRESOLVED_MINCOUNT, loosest)
+    // Nothing separated, so there is no fitted peak to report — only the median standing in.
+    (
+        UNRESOLVED_MINCOUNT,
+        loosest,
+        occurrence_weighted_median(histovec).map_or(PeakSource::Unknown, PeakSource::Fallback),
+    )
 }
 
 /// The sketch's own spectrum at the floor in force, rescaled, against the table built beside it. Free on
@@ -807,6 +925,26 @@ where
     });
     log::info!("Finished getting kmers from {nfiles} file(s)");
     t0.elapsed()
+}
+
+/// Writes the spectrum beside its plot as `count<TAB>distinct`, so a run's cutoff decision can be
+/// replayed offline. The PNG is truncated to [`LEGACY_HISTO_RANGE`] and cannot be read back.
+#[cfg(not(target_family = "wasm"))]
+fn write_kmer_spectrum_tsv(histovec: &[u32], out_path: &std::path::Path) {
+    use std::io::Write;
+    let path = out_path.with_extension("spectrum.tsv");
+    let Ok(file) = std::fs::File::create(&path) else {
+        log::warn!("Could not write the k-mer spectrum to {}", path.display());
+        return;
+    };
+    let mut w = std::io::BufWriter::new(file);
+    let _ = writeln!(w, "count\tdistinct");
+    // `histovec[c - 1]` is the count-`c` bin. Trailing empty bins are skipped, but the saturating top
+    // bin is kept when occupied: it is the only sign that counts ran off the end of the histogram.
+    let last = histovec.iter().rposition(|&n| n > 0).unwrap_or(0);
+    for (i, &n) in histovec[..=last].iter().enumerate() {
+        let _ = writeln!(w, "{}\t{}", i + 1, n);
+    }
 }
 
 /// Draws the first [`LEGACY_HISTO_RANGE`] bins, so the PNG stays comparable with every earlier run. The
@@ -1396,6 +1534,7 @@ where
 
     if let Some(p) = out_path {
         plot_kmer_histogram(&histovec, p.as_path());
+        write_kmer_spectrum_tsv(&histovec, p.as_path());
     }
 
     histovec.shrink_to_fit();
@@ -1859,7 +1998,7 @@ fn finish_map_counter<IntT>(
     sketch: Option<SpectrumSketch>,
     do_fit: bool,
     out_path: &mut Option<PathBuf>,
-) -> (IndexedKmers<IntT>, Vec<u32>, u16, u8)
+) -> (IndexedKmers<IntT>, Vec<u32>, u16, u8, PeakSource)
 where
     IntT: for<'a> UInt<'a>,
 {
@@ -1892,31 +2031,45 @@ where
     let minc;
     // The floor the spectrum asks for. Only the fitting path can ask for a looser one.
     let mut chosen_min_qual = qual.min_qual;
+    // Single-copy coverage of the spectrum this very map is filtered against.
+    let genomic_peak;
     if do_fit {
         log::info!("Counting finished. Choosing the minimum count...");
         match (&sketch, floors) {
             (Some(sketch), Some(floors)) => {
                 check_sketch_against_table(&histovec, sketch, floors.len() - 1);
-                (minc, chosen_min_qual) = choose_min_count_and_floor(&histovec, sketch, floors);
+                (minc, chosen_min_qual, genomic_peak) =
+                    choose_min_count_and_floor(&histovec, sketch, floors);
             }
-            _ => minc = choose_min_count(&histovec),
+            _ => (minc, genomic_peak) = choose_min_count_and_peak(&histovec),
         }
         if chosen_min_qual < qual.min_qual {
             // The caller recounts at the looser floor, so building the maps here is wasted work and
             // wasted memory. Dropping `shards` on the way out is the whole saving.
-            return (IndexedKmers::default(), histovec, minc, chosen_min_qual);
+            return (
+                IndexedKmers::default(),
+                histovec,
+                minc,
+                chosen_min_qual,
+                genomic_peak,
+            );
         }
         log::info!("Minimum count chosen: {minc}. Starting filtering...");
     } else {
         minc = qual.min_count;
+        // `--min-count` fixes the cutoff, not the coverage. The histogram above spans every distinct
+        // k-mer including singletons, so it is the same spectrum the fitting path reads.
+        genomic_peak = peak_of(&estimate_by_valley(&histovec), &histovec);
     }
+    log::info!("Single-copy coverage read from the spectrum: {genomic_peak:?}");
 
     let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
 
     if let Some(p) = out_path {
         plot_kmer_histogram(&histovec, p.as_path());
+        write_kmer_spectrum_tsv(&histovec, p.as_path());
     }
-    (kmers, histovec, minc, chosen_min_qual)
+    (kmers, histovec, minc, chosen_min_qual, genomic_peak)
 }
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
@@ -1939,7 +2092,7 @@ where
 {
     log::info!("Starting preprocessing_standalone with k = {k}");
 
-    let (kmers, histovec, used_min_count, chosen_min_qual) = if do_bloom {
+    let (kmers, histovec, used_min_count, chosen_min_qual, genomic_peak) = if do_bloom {
         log::info!("Processing using a Bloom filter");
         // Approximate counting and an exact sketch would disagree by construction, so this path keeps
         // the flat floor and never asks for a recount.
@@ -1950,7 +2103,15 @@ where
             do_fit,
             out_path,
         );
-        (kmers, histovec, used_min_count, qual.min_qual)
+        // A Bloom spectrum has no count-1 bin and false positives inflate the rest, so its peak is
+        // not the library's. Report none rather than a number that means something else.
+        (
+            kmers,
+            histovec,
+            used_min_count,
+            qual.min_qual,
+            PeakSource::Unknown,
+        )
     } else {
         if csize != 0 {
             log::warn!(
@@ -1983,6 +2144,7 @@ where
         histovec,
         used_min_count,
         chosen_min_qual,
+        genomic_peak,
     }
 }
 
@@ -2903,7 +3065,7 @@ mod tests {
         // Mass in group 1 only, so floors 1 and 0 both see the bimodal spectrum and floor 2 sees nothing.
         let sketch = sketch_with(1, &bimodal(40));
         let floors = [0u8, 11, 25];
-        let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &floors);
+        let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
         assert_eq!(floor, 11, "should loosen to B, not all the way to C");
         assert!(
             minc > 2,
@@ -2950,7 +3112,7 @@ mod tests {
         );
 
         let sketch = sketch_with(1, &bimodal(40));
-        let (_, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
+        let (_, floor, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 11, "a 2.2x deeper spectrum justifies the recount");
     }
 
@@ -2962,7 +3124,7 @@ mod tests {
         let strict = estimate_by_valley(&shallow);
         // 19 against 18 is a gain of 1.06, under `MIN_COVERAGE_GAIN`.
         let sketch = sketch_with(1, &bimodal(19));
-        let (minc, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
+        let (minc, floor, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 25, "no material gain, so no recount");
         assert_eq!(
             minc, strict.min_count,
@@ -2995,7 +3157,7 @@ mod tests {
     fn a_resolving_but_starved_rung_keeps_loosening() {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = sketch_deepening(&bimodal(15), 2);
-        let (_, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        let (_, floor, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 0, "a 3x deeper rung is there and must be taken");
     }
 
@@ -3009,15 +3171,9 @@ mod tests {
         for c in sketch.counts.values_mut() {
             c[0] = c[1] / 10;
         }
-        let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
-        assert_eq!(
-            floor, 11,
-            "no material gain below it, so the walk stops here"
-        );
-        assert_ne!(
-            minc, UNRESOLVED_MINCOUNT,
-            "and keeps the cutoff that rung measured"
-        );
+        let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        assert_eq!(floor, 11, "no material gain below it, so the walk stops here");
+        assert_ne!(minc, UNRESOLVED_MINCOUNT, "and keeps the cutoff that rung measured");
     }
 
     /// The stranding case, from a starved library whose floors sit at peaks 15/17/18. Accepting the
@@ -3031,11 +3187,8 @@ mod tests {
             c[1] = base + base / 7; // the middle floor, a little deeper
             c[0] = base / 12; // the loosest, deeper still but only just
         }
-        let (_, floor) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 15, 20]);
-        assert_eq!(
-            floor, 0,
-            "the loosest qualifying floor wins when every floor is starved"
-        );
+        let (_, floor, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 15, 20]);
+        assert_eq!(floor, 0, "the loosest qualifying floor wins when every floor is starved");
     }
 
     /// Order must not matter: the floor chosen is a property of the candidates, not of the walk that
@@ -3044,11 +3197,8 @@ mod tests {
     fn a_deep_enough_floor_is_taken_at_its_strictest() {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = sketch_with(1, &bimodal(40));
-        let (_, floor) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
-        assert_eq!(
-            floor, 11,
-            "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins"
-        );
+        let (_, floor, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        assert_eq!(floor, 11, "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins");
     }
 
     /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an
@@ -3058,12 +3208,75 @@ mod tests {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = SpectrumSketch::new();
         let floors = [0u8, 11, 25];
-        let (minc, floor) = choose_min_count_and_floor(&flat, &sketch, &floors);
-        assert_eq!(
-            floor, 0,
-            "nothing resolved, so the floor goes to the bottom"
-        );
+        let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
+        assert_eq!(floor, 0, "nothing resolved, so the floor goes to the bottom");
         assert_eq!(minc, UNRESOLVED_MINCOUNT);
+    }
+
+    // ---- Single-copy coverage: fitted, and the fallback when the lobes merge ----
+
+    /// A clean deep library must report a *fitted* peak near the true coverage.
+    #[test]
+    fn a_deep_library_reports_a_fitted_peak() {
+        let h = synthetic_spectrum(120.0);
+        match peak_of(&estimate_by_valley(&h), &h) {
+            PeakSource::Fitted(p) => assert!(
+                (100..=140).contains(&p),
+                "fitted peak {p} should sit near the true 120x"
+            ),
+            other => panic!("expected a fitted peak, got {other:?}"),
+        }
+    }
+
+    /// The case this fallback exists for. A merged spectrum must never report `Fitted`, because
+    /// `genomic_peak` is then an argmax above a valley that was never found: the error lobe.
+    #[test]
+    fn an_unresolved_spectrum_falls_back_to_the_median() {
+        let flat = vec![1000u32; MAXSIZEHISTO];
+        assert!(
+            !estimate_by_valley(&flat).verdict.is_ok(),
+            "fixture must not resolve"
+        );
+        assert!(
+            matches!(
+                peak_of(&estimate_by_valley(&flat), &flat),
+                PeakSource::Fallback(_)
+            ),
+            "a merged spectrum must fall back, never report a fitted peak"
+        );
+    }
+
+    /// The median must land in the genomic lobe, not the error lobe, even though error k-mers vastly
+    /// outnumber genomic ones: each carries only a few occurrences, so they hold little of the mass.
+    ///
+    /// This also pins the indexing. `histovec[c - 1]` is the count-`c` bin, and an estimator reading
+    /// the index as the count would report one less here.
+    #[test]
+    fn the_occurrence_weighted_median_ignores_the_error_lobe() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        h[0] = 5_000_000; // 5M singleton error k-mers: many, but one occurrence each
+        h[39] = 1_000_000; // 1M genomic k-mers at 40x: fewer, but 40 occurrences each
+        let median = occurrence_weighted_median(&h).expect("a non-empty spectrum has a median");
+        assert_eq!(median, 40, "the median must name the genomic lobe's count");
+    }
+
+    /// A single bin, so the answer is forced and the off-by-one has nowhere to hide.
+    #[test]
+    fn the_median_of_one_bin_is_that_bins_count() {
+        let mut h = vec![0u32; MAXSIZEHISTO];
+        h[6] = 10; // ten k-mers seen 7 times each
+        assert_eq!(occurrence_weighted_median(&h), Some(7));
+    }
+
+    /// Nothing counted at all: no coverage can be claimed, fitted or otherwise.
+    #[test]
+    fn an_empty_spectrum_reports_unknown() {
+        let empty = vec![0u32; MAXSIZEHISTO];
+        assert_eq!(occurrence_weighted_median(&empty), None);
+        assert_eq!(
+            peak_of(&estimate_by_valley(&empty), &empty),
+            PeakSource::Unknown
+        );
     }
 }
 

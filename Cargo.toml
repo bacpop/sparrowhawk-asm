@@ -30,6 +30,10 @@ petgraph = { version = "0.8.1" }
 sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", rev = "93d19ae2138640752796415a9f76db437fbc9179" }
 bnum = { version = "0.13.0", features = ["serde", "numtraits"] }
 libm = { version = "0.2" }
+# The spectrum fit runs on both targets. `wasm-bindgen` is added per-target below: on native it would
+# pull `getrandom/js`, whose backend is wasm-only.
+argmin = { version = "0.10.0", default-features = false }
+argmin-math = { version = "0.4" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 needletail = { version = "0.6.3", default-features = false, features = ["flate2"] }
@@ -39,9 +43,7 @@ fern = { version = "0.7.1" }
 humantime = { version = "2.2.0" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-argmin = { version = "0.10.0", features = ["wasm-bindgen"] }
-argmin-math = { version = "0.4" }
-argmin-observer-slog = { version = "0.1.0" }
+argmin = { version = "0.10.0", default-features = false, features = ["wasm-bindgen"] }
 js-sys = { version = "0.3.51" }
 wasm-bindgen = { version = "0.2" }
 simple-error = { version = "0.2" }

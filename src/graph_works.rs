@@ -13,9 +13,10 @@ use super::io_utils::*;
 use needletail::parser::write_fasta;
 
 use crate::algorithms::collapser::Collapsable;
-#[cfg(not(target_family = "wasm"))]
-use crate::algorithms::corrector::pop_bubbles_by_coverage;
 use crate::algorithms::corrector::Correctable;
+use crate::algorithms::corrector::CorrectionOpts;
+#[cfg(not(target_family = "wasm"))]
+use crate::algorithms::path_correction::{remove_bulges, remove_erroneous_connections};
 use crate::algorithms::shrinker::Shrinkable;
 use crate::bit_encoding::UInt;
 #[cfg(not(target_family = "wasm"))]
@@ -1073,10 +1074,7 @@ pub trait Assemble {
         kmers: &mut IndexedKmers<IntT>,
         timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
-        do_bubble_collapse: bool,
-        do_dead_end_removal: bool,
-        pop_ratio: f32,
-        tip_nts: usize,
+        correction: CorrectionOpts,
     ) -> Contigs;
 
     #[cfg(target_family = "wasm")]
@@ -1085,10 +1083,7 @@ pub trait Assemble {
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        do_bubble_collapse: bool,
-        do_dead_end_removal: bool,
-        pop_ratio: f32,
-        tip_nts: usize,
+        correction: CorrectionOpts,
     ) -> (Contigs, String, String, String);
 }
 
@@ -1104,11 +1099,22 @@ impl Assemble for BasicAsm {
         kmers: &mut IndexedKmers<IntT>,
         timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
-        do_bubble_collapse: bool,
-        do_dead_end_removal: bool,
-        pop_ratio: f32,
-        tip_nts: usize,
+        correction: CorrectionOpts,
     ) -> Contigs {
+        // Unpacked once, so the body below reads exactly as it did when these were parameters.
+        let CorrectionOpts {
+            do_bubble_collapse,
+            do_dead_end_removal,
+            pop_ratio,
+            tip_nts,
+            tip_rctc_nts,
+            tip_rctc_cutoff,
+            coverage,
+            do_ec_removal,
+            ec_ratio,
+            ec_require_both_flanks,
+        } = correction;
+
         logw(
             "Constructing graph. Searching for neighbours...",
             Some("info"),
@@ -1165,7 +1171,7 @@ impl Assemble for BasicAsm {
         loop {
             let shrink_changed_graph = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
-                ptgraph.remove_dead_paths(tip_nts)
+                ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff)
             } else {
                 false
             };
@@ -1182,11 +1188,18 @@ impl Assemble for BasicAsm {
         loop {
             let mut changed = false;
             if do_bubble_collapse {
-                changed |= pop_bubbles_by_coverage(&mut ptgraph, pop_ratio);
+                changed |= remove_bulges(&mut ptgraph, pop_ratio, &coverage);
+            }
+            if do_ec_removal {
+                changed |= remove_erroneous_connections(
+                    &mut ptgraph,
+                    ec_ratio,
+                    ec_require_both_flanks,
+                );
             }
             changed |= ptgraph.shrink();
             if do_dead_end_removal {
-                changed |= ptgraph.remove_dead_paths(tip_nts);
+                changed |= ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff);
             }
             if !changed {
                 break;
@@ -1273,11 +1286,23 @@ impl Assemble for BasicAsm {
         k: usize,
         indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
         maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        do_bubble_collapse: bool,
-        do_dead_end_removal: bool,
-        pop_ratio: f32,
-        tip_nts: usize,
+        correction: CorrectionOpts,
     ) -> (Contigs, String, String, String) {
+        // Unpacked once, so the body below reads exactly as it did when these were parameters.
+        let CorrectionOpts {
+            do_bubble_collapse,
+            do_dead_end_removal,
+            pop_ratio,
+            tip_nts,
+            tip_rctc_nts,
+            tip_rctc_cutoff,
+            coverage,
+            // EC removal is native-only, so the browser never reads these.
+            do_ec_removal: _,
+            ec_ratio: _,
+            ec_require_both_flanks: _,
+        } = correction;
+
         logw("Starting assembler!", Some("info"));
 
         post_state("assembly:starting");
@@ -1309,7 +1334,7 @@ impl Assemble for BasicAsm {
         loop {
             let shrink_changed_graph = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
-                ptgraph.remove_dead_paths(tip_nts)
+                ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff)
             } else {
                 false
             };
@@ -1321,11 +1346,11 @@ impl Assemble for BasicAsm {
         loop {
             let mut changed = false;
             if do_bubble_collapse {
-                changed |= ptgraph.correct_bubbles(pop_ratio);
+                changed |= ptgraph.correct_bubbles(pop_ratio, &coverage);
             }
             changed |= ptgraph.shrink();
             if do_dead_end_removal {
-                changed |= ptgraph.remove_dead_paths(tip_nts);
+                changed |= ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff);
             }
             if !changed {
                 break;

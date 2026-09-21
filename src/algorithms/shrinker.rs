@@ -141,7 +141,11 @@ impl Shrinkable for DbgGraph {
             return true;
         }
 
-        let mut countsformean: Vec<u32> = vec![self.node_weight(base_node).unwrap().counts];
+        // Every contribution is read before its node is merged away, so `abs_ind` is still the
+        // number of k-mers that node alone represents.
+        let base_weight = self.node_weight(base_node).unwrap();
+        let mut countsformean: Vec<(u32, usize)> =
+            vec![(base_weight.counts, base_weight.abs_ind.len())];
 
         log::trace!("Starting shrinkage!");
         if self.out_degree_bi(next_node, currtype) == 0 {
@@ -159,7 +163,8 @@ impl Shrinkable for DbgGraph {
                 return pruned;
             }
 
-            countsformean.push(self.node_weight(next_node).unwrap().counts);
+            let next_weight = self.node_weight(next_node).unwrap();
+            countsformean.push((next_weight.counts, next_weight.abs_ind.len()));
             let next_base_weight = self.remove_node(next_node).unwrap();
             let ind = self.in_neighbours_bi(base_node, initty);
 
@@ -224,7 +229,8 @@ impl Shrinkable for DbgGraph {
                 panic!("This should not happen");
             }
 
-            countsformean.push(self.node_weight(next_node).unwrap().counts);
+            let next_weight = self.node_weight(next_node).unwrap();
+            countsformean.push((next_weight.counts, next_weight.abs_ind.len()));
             let next_base_weight = self.remove_node(next_node).unwrap();
             let prospfromandto = prospective_node.1.get_from_and_to();
             currtype = prospfromandto.0;
@@ -240,7 +246,9 @@ impl Shrinkable for DbgGraph {
                 && self.in_degree_bi(prospective_node.0, prospfromandto.1) == 0
             {
                 // Prospective_node is an ambiguous node, but only because it is an external where we can finish.
-                countsformean.push(self.node_weight(prospective_node.0).unwrap().counts);
+                let prospective_weight = self.node_weight(prospective_node.0).unwrap();
+                countsformean
+                    .push((prospective_weight.counts, prospective_weight.abs_ind.len()));
                 let next_base_weight = self.remove_node(prospective_node.0).unwrap();
                 let nw = self.node_weight_mut(base_node).unwrap();
 

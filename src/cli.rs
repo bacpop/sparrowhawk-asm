@@ -13,6 +13,10 @@ pub const DEFAULT_MINQUAL: u8 = 20;
 pub const DEFAULT_TIP_LEN_NTS: usize = 100;
 /// Default tip-removal k multiplier, matching Minia's `-tip-len-topo-kmult`
 pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
+/// Minia's `_tipLen_RCTC_kMult` (`Simplifications.cpp:94`): the longer band judged on coverage
+pub const DEFAULT_TIP_RCTC_KMULT: f32 = 10.0;
+/// Minia's `_tipRCTCcutoff` (`Simplifications.cpp:95`), SPAdes-derived
+pub const DEFAULT_TIP_RCTC_CUTOFF: f64 = 2.0;
 /// Default minimum contig sequence length written to FASTA, in nucleotides
 pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 /// Default output directory
@@ -176,6 +180,26 @@ pub enum Commands {
         #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
         bubble_pop_ratio: f32,
 
+        /// Fraction of the fitted single-copy coverage below which a bubble branch is treated as an
+        /// error, whatever its sibling carries. Ignored when no coverage could be established.
+        #[arg(long)]
+        bubble_peak_ratio: Option<f32>,
+
+        /// Do not remove erroneous connections: short weakly-covered paths joining two branch points.
+        #[arg(long, default_value_t = false)]
+        no_ec_removal: bool,
+
+        /// Erroneous-connection removal: a connector goes when both its flanking branches carry this
+        /// many times its coverage.
+        #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_EC_COVERAGE_RATIO)]
+        ec_coverage_ratio: f64,
+
+        /// Erroneous-connection removal: require *both* flanks over the ratio rather than either.
+        /// Off by default, matching Minia (`Simplifications.cpp:1786` ORs the two sides). Measured,
+        /// the strict variant removes about half as many connectors for no measurable quality gain.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        ec_require_both_flanks: bool,
+
         /// Tip removal: dead-end paths shorter than this many bases are pruned. The threshold actually
         /// used is `max(--tip-length, --tip-length-kmult * k)`.
         #[arg(long, default_value_t = DEFAULT_TIP_LEN_NTS)]
@@ -185,6 +209,21 @@ pub enum Commands {
         /// which is the historical behaviour.
         #[arg(long, default_value_t = DEFAULT_TIP_LEN_KMULT)]
         tip_length_kmult: f32,
+
+        /// Tip removal: also prune dead ends up to `--tip-length-rctc-kmult * k` bases when the
+        /// junction they hang off is much better covered. Minia's second tier
+        /// (`Simplifications.cpp:559`). Zero disables it, leaving only the length rule.
+        #[arg(long, default_value_t = DEFAULT_TIP_RCTC_KMULT)]
+        tip_length_rctc_kmult: f32,
+
+        /// Tip removal: a longer tip goes when its junction's other neighbours average this many
+        /// times its coverage (Minia's `-tip-rctc-cutoff`, `Simplifications.cpp:95`).
+        #[arg(long, default_value_t = DEFAULT_TIP_RCTC_CUTOFF)]
+        tip_rctc_cutoff: f64,
+
+        /// Tip removal: keep only the length rule, dropping the coverage tier entirely.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        no_tip_rctc: bool,
 
         /// Minimum contig sequence length written to FASTA, in nucleotides. Contigs with exactly
         /// this length are retained.

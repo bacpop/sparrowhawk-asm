@@ -47,7 +47,6 @@ pub mod algorithms;
 pub mod bloom_filter;
 
 /// Fits the k-mer spectrum to automatically get a min_count (taken from ska.rust!
-#[cfg(target_family = "wasm")]
 pub mod spectrum_fitter;
 
 #[cfg(target_family = "wasm")]
@@ -176,8 +175,18 @@ struct BuildOpts<'a> {
     do_dead_end_removal: bool,
     /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is popped.
     pop_ratio: f32,
+    /// Fraction of single-copy coverage below which a branch is an error. `None` keeps the default
+    /// for however the coverage was established.
+    peak_ratio: Option<f32>,
     /// Dead-end paths shorter than this many bases are pruned. Already resolved against k.
     tip_nts: usize,
+    /// Upper bound of the coverage-judged tip band, already resolved against k. Zero disables it.
+    tip_rctc_nts: usize,
+    /// How many times better covered a junction must be than the tip hanging off it.
+    tip_rctc_cutoff: f64,
+    do_ec_removal: bool,
+    ec_ratio: f64,
+    ec_require_both_flanks: bool,
     /// Minimum contig sequence length written to FASTA.
     min_contig_length: usize,
     output: PathBuf,
@@ -263,10 +272,24 @@ fn run_build<IntT>(
         &mut assembly.kmers,
         &mut Some(timevec),
         out_path_graph,
-        opts.do_bubble_collapse,
-        opts.do_dead_end_removal,
-        opts.pop_ratio,
-        opts.tip_nts,
+        algorithms::corrector::CorrectionOpts {
+            do_bubble_collapse: opts.do_bubble_collapse,
+            do_dead_end_removal: opts.do_dead_end_removal,
+            pop_ratio: opts.pop_ratio,
+            tip_nts: opts.tip_nts,
+            tip_rctc_nts: opts.tip_rctc_nts,
+            tip_rctc_cutoff: opts.tip_rctc_cutoff,
+            // The spectrum of the pass that actually produced `themap`: after a recount, pass 2's,
+            // read at the loosened floor the graph's k-mers were counted at.
+            coverage: algorithms::corrector::CoverageRef::new(
+                assembly.genomic_peak,
+                assembly.used_min_count,
+            )
+            .with_error_fraction(opts.peak_ratio),
+            do_ec_removal: opts.do_ec_removal,
+            ec_ratio: opts.ec_ratio,
+            ec_require_both_flanks: opts.ec_require_both_flanks,
+        },
     );
 
     save_functions::save_as_fasta_with_min_contig_length::<IntT>(
@@ -300,8 +323,15 @@ pub fn main() {
             do_bloom,
             chunk_size,
             bubble_pop_ratio,
+            bubble_peak_ratio,
+            no_ec_removal,
+            ec_coverage_ratio,
+            ec_require_both_flanks,
             tip_length,
             tip_length_kmult,
+            tip_length_rctc_kmult,
+            tip_rctc_cutoff,
+            no_tip_rctc,
             min_contig_length,
             no_histo,
             no_graphs,
@@ -387,6 +417,24 @@ pub fn main() {
                 );
                 std::process::exit(2);
             }
+            if let Some(ratio) = bubble_peak_ratio {
+                if !(*ratio > 0.0 && *ratio < 1.0) {
+                    eprintln!(
+                        "error: --bubble-peak-ratio must be strictly between 0 and 1 (got {ratio}). \
+                         It is the fraction of single-copy coverage below which a branch counts as an \
+                         error."
+                    );
+                    std::process::exit(2);
+                }
+            }
+            if !(ec_coverage_ratio.is_finite() && *ec_coverage_ratio > 1.0) {
+                eprintln!(
+                    "error: --ec-coverage-ratio must be finite and greater than 1 (got \
+                     {ec_coverage_ratio}). It is how many times a connector's flanks must out-cover \
+                     it before the connector is treated as erroneous."
+                );
+                std::process::exit(2);
+            }
             if *tip_length_kmult < 0.0 {
                 eprintln!(
                     "error: --tip-length-kmult must be >= 0 (got {tip_length_kmult}). Zero keeps the \
@@ -394,7 +442,26 @@ pub fn main() {
                 );
                 std::process::exit(2);
             }
+            if *tip_length_rctc_kmult < 0.0 {
+                eprintln!(
+                    "error: --tip-length-rctc-kmult must be >= 0 (got {tip_length_rctc_kmult}). \
+                     Zero drops the coverage tier, leaving only the length rule."
+                );
+                std::process::exit(2);
+            }
+            if !tip_rctc_cutoff.is_finite() || *tip_rctc_cutoff <= 0.0 {
+                eprintln!(
+                    "error: --tip-rctc-cutoff must be finite and > 0 (got {tip_rctc_cutoff}). It is \
+                     how many times better covered a junction must be than the tip hanging off it."
+                );
+                std::process::exit(2);
+            }
             let tip_nts = algorithms::corrector::tip_length_nts(*tip_length, *tip_length_kmult, *k);
+            let tip_rctc_nts = if *no_tip_rctc {
+                0 // `.max(limit)` in `remove_dead_paths` then empties the band
+            } else {
+                algorithms::corrector::tip_length_nts(*tip_length, *tip_length_rctc_kmult, *k)
+            };
             let opts = BuildOpts {
                 input_files: &input_files,
                 k: *k,
@@ -405,7 +472,13 @@ pub fn main() {
                 do_bubble_collapse: !no_bubble_collapse,
                 do_dead_end_removal: !no_dead_end_removal,
                 pop_ratio: *bubble_pop_ratio,
+                peak_ratio: *bubble_peak_ratio,
+                do_ec_removal: !no_ec_removal,
+                ec_ratio: *ec_coverage_ratio,
+                ec_require_both_flanks: *ec_require_both_flanks,
                 tip_nts,
+                tip_rctc_nts,
+                tip_rctc_cutoff: *tip_rctc_cutoff,
                 min_contig_length: *min_contig_length,
                 output,
             };
@@ -779,14 +852,30 @@ impl AssemblyHelper {
             self.k,
             self.preprocessed_data.as_mut().unwrap(),
             self.maxmindict.as_mut().unwrap(),
-            !self.no_bubble_collapse,
-            !self.no_dead_end_removal,
-            self.bubble_pop_ratio,
-            algorithms::corrector::tip_length_nts(
-                cli::DEFAULT_TIP_LEN_NTS,
-                self.tip_length_kmult,
-                self.k,
-            ),
+            algorithms::corrector::CorrectionOpts {
+                do_bubble_collapse: !self.no_bubble_collapse,
+                do_dead_end_removal: !self.no_dead_end_removal,
+                pop_ratio: self.bubble_pop_ratio,
+                tip_nts: algorithms::corrector::tip_length_nts(
+                    cli::DEFAULT_TIP_LEN_NTS,
+                    self.tip_length_kmult,
+                    self.k,
+                ),
+                // `remove_dead_paths` is compiled for wasm, so the coverage tier is live here too.
+                tip_rctc_nts: algorithms::corrector::tip_length_nts(
+                    cli::DEFAULT_TIP_LEN_NTS,
+                    cli::DEFAULT_TIP_RCTC_KMULT,
+                    self.k,
+                ),
+                tip_rctc_cutoff: cli::DEFAULT_TIP_RCTC_CUTOFF,
+                // `preprocessing_wasm` does not carry a peak out, so the browser states that it knows
+                // no coverage and the bubble rule there stays exactly what it is today.
+                coverage: algorithms::corrector::CoverageRef::unknown(),
+                // wasm does not compile `path_correction`; the loop there never reaches EC removal.
+                do_ec_removal: false,
+                ec_ratio: algorithms::corrector::DEFAULT_EC_COVERAGE_RATIO,
+                ec_require_both_flanks: true,
+            },
         );
 
         post_state("assembly:saving");

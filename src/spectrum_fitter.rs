@@ -1,331 +1,407 @@
-//! Tools for estimating a count cutoff with FASTQ input.
+//! Fits a coverage model to the k-mer spectrum, to choose a count cutoff.
 //!
-//! This module has a basic k-mer counter using a dictionary, and then uses
-//! maximum likelihood with some basic numerical optimisation to fit a two-component
-//! mixture of Poissons to determine a coverage model. This can be used to classify
-//! a count cutoff with noisy data.
+//! Three components: a Poisson error lobe, and negative-binomial genome lobes at single-copy and
+//! two-copy coverage sharing one mean and one dispersion. Fitted by maximum likelihood.
 //!
 //! ====================================================== Got from ska-rust!! =====
 //!
-//! [`SpectrumFitter`] is the main interface.
-
-use core::panic;
+//! [`fit_spectrum`] is the main interface.
 
 use argmin::{
-    core::{
-        // observers::{ObserverMode, SlogLogger},
-        observers::ObserverMode,
-        CostFunction,
-        Error,
-        Executor,
-        Gradient,
-        State,
-        TerminationReason::SolverConverged,
-    },
-    solver::{
-        linesearch::{condition::ArmijoCondition, BacktrackingLineSearch},
-        quasinewton::BFGS,
-    },
+    core::{CostFunction, Error, Executor, State, TerminationReason::SolverConverged},
+    solver::neldermead::NelderMead,
 };
-use argmin_observer_slog::SlogLogger;
 use libm::lgamma;
 
-use crate::logw;
-use log;
+/// Genome lobes modelled: single-copy and two-copy. The two-copy lobe carries little weight but
+/// absorbs the right tail, which otherwise inflates the dispersion by 20-60 %. A third lobe was
+/// measured at a fitted weight of 0.000-0.009 and is not worth its parameter.
+const REPEAT_LOBE_COPIES: f64 = 2.0;
 
-// const MAX_COUNT : usize = 500;
-const MIN_FREQ: u32 = 50;
-const INIT_W0: f64 = 0.8f64;
-const INIT_C: f64 = 20.0f64;
+/// The fitted mean is pinned to this window around the peak the valley estimator found. Unpinned, the
+/// model relabels the observed peak as a repeat lobe and puts a near-empty single-copy lobe at half or
+/// a third of the coverage — an identifiability failure that costs nothing in likelihood.
+const MU_LO: f64 = 0.75;
+const MU_SPAN: f64 = 0.58;
 
-/// K-mer counts and a coverage model for a single sample, using a pair of FASTQ files as input
+/// Dispersions to restart the fit from, alongside the valley estimator's own guess.
 ///
-/// Call [`SpectrumFitter::new()`] to count k-mers, then [`SpectrumFitter::fit_histogram()`]
-/// to fit the model and find a cutoff. [`SpectrumFitter::plot_hist()`] can be used to
-/// extract a table of the output for plotting purposes.
-#[derive(Default, Debug)]
-pub struct SpectrumFitter {
-    /// Estimated error weight
-    w0: f64,
-    /// Estimated coverage
-    c: f64,
-    /// Coverage cutoff
-    cutoff: usize,
-    /// Has the fit been run
-    fitted: bool,
+/// A single start is not enough: `dispersion = 1 + exp(theta)` flattens as `theta` falls, so the
+/// simplex can crawl out to the Poisson boundary and stop there while still reporting convergence.
+/// Measured, that happened in half the spectra tried, once costing 6.7e6 in log-likelihood.
+const DISPERSION_SEEDS: [f64; 3] = [2.0, 8.0, 15.0];
+
+/// Counts above this multiple of the peak are not fitted: they are repeats beyond the two-copy lobe.
+const FIT_WINDOW_PEAK_MULT: usize = 6;
+
+const MAX_ITERS: u64 = 5_000;
+/// Offset applied to one coordinate at a time to build the initial simplex.
+const SIMPLEX_STEP: f64 = 0.5;
+
+/// A fitted coverage model.
+#[derive(Clone, Copy, Debug)]
+pub struct SpectrumFit {
+    /// Share of distinct k-mers that are sequencing errors.
+    pub w_error: f64,
+    /// Share that are single-copy genome.
+    pub w_single: f64,
+    /// Share that are two-copy repeat.
+    pub w_repeat: f64,
+    /// Single-copy coverage: the mean of the genome lobe.
+    pub mean: f64,
+    /// Variance-to-mean ratio of the genome lobe; 1.0 is Poisson.
+    pub dispersion: f64,
+    /// Mean of the Poisson error lobe. Measured at 1.0-1.15 on real libraries.
+    pub error_mean: f64,
+    /// Distinct single-copy k-mers the fit implies, i.e. an estimate of genome size.
+    pub genome_kmers: f64,
 }
 
-impl SpectrumFitter {
-    /// Count split k-mers from a pair of input FASTQ files.
-    pub fn new() -> Self {
-        Self {
-            w0: INIT_W0,
-            c: INIT_C,
-            cutoff: 0,
-            fitted: false,
-        }
-    }
-
-    /// Fit the coverage model to the histogram of counts
+impl SpectrumFit {
+    /// Largest cutoff expected to strand at most `budget` single-copy k-mers below itself.
     ///
-    /// Returns the fitted cutoff if successful.
-    ///
-    /// # Errors
-    /// - If the optimiser didn't finish (reached 100 iterations or another problem).
-    /// - If the linesearch cannot be constructed (may be a bounds issue, or poor data).
-    /// - If the optimiser is still running (this shouldn't happen).
-    ///
-    /// # Panics
-    /// - If the fit has already been run
-    pub fn fit_histogram(&mut self, mut counts: Vec<u32>) -> Result<usize, Error> {
-        if self.fitted {
-            panic!("Model already fitted");
+    /// Each stranded k-mer is a hole the graph cannot bridge, so it severs a contig. This bounds their
+    /// number rather than their share: a share far under 1 % still hides tens of thousands of breaks.
+    pub fn hole_cutoff(&self, budget: f64) -> u16 {
+        if self.genome_kmers <= 0.0 || !self.mean.is_finite() || self.mean < 2.0 {
+            return 2;
         }
+        let allowed = budget / self.genome_kmers;
+        let ceiling = self.mean.round() as usize;
 
-        // Truncate count vec and covert to float
-        counts = counts
-            .iter()
-            .rev()
-            .skip_while(|x| **x < MIN_FREQ)
-            .copied()
-            .collect();
-        counts.reverse();
-        let counts_f64: Vec<f64> = counts.iter().map(|x| *x as f64).collect();
-
-        // Fit with maximum likelihood. Using BFGS optimiser and simple line search
-        // seems to work fine
-        logw(
-            "Fitting Poisson mixture model using maximum likelihood",
-            Some("info"),
-        );
-        let mixture_fit = MixPoisson { counts: counts_f64 };
-        let init_param: Vec<f64> = vec![self.w0, self.c];
-
-        // This is required. I tried the numerical Hessian but the scale was wrong
-        // and it gave very poor results for the c optimisation
-        let init_hessian: Vec<Vec<f64>> = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let linesearch = BacktrackingLineSearch::new(ArmijoCondition::new(0.0001f64)?);
-        let solver = BFGS::new(linesearch).with_tolerance_cost(1e-6)?;
-
-        // Usually around 10 iterations should be enough
-        let mut exec = Executor::new(mixture_fit, solver).configure(|state| {
-            state
-                .param(init_param)
-                .inv_hessian(init_hessian)
-                .max_iters(20)
-        });
-
-        if log::log_enabled!(log::Level::Debug) {
-            exec = exec.add_observer(SlogLogger::term(), ObserverMode::Always);
-        }
-
-        let res = exec.run()?;
-
-        // Print diagnostics
-        logw(format!("{res}").as_str(), Some("info"));
-        if let Some(termination_reason) = res.state().get_termination_reason() {
-            if *termination_reason == SolverConverged {
-                // Best parameter vector
-                let best = res.state().get_best_param().unwrap();
-                self.w0 = best[0];
-                self.c = best[1];
-
-                // calculate the coverage cutoff
-                self.cutoff = find_cutoff(best, counts.len());
-                self.fitted = true;
-                Ok(self.cutoff)
-            } else {
-                Err(Error::msg(format!(
-                    "Optimiser did not converge: {}",
-                    termination_reason.text()
-                )))
+        let mut cdf = ln_dnbinom(0.0, self.mean, self.dispersion).exp();
+        let mut m = 1usize;
+        while m < ceiling {
+            let next = cdf + ln_dnbinom(m as f64, self.mean, self.dispersion).exp();
+            if next > allowed {
+                break;
             }
-        } else {
-            Err(Error::msg("Optimiser did not finish running"))
+            cdf = next;
+            m += 1;
+        }
+        (m as u16).max(2)
+    }
+
+    /// The count at which the genome lobe overtakes the error lobe: the mixture's own decision
+    /// boundary. Logged for comparison; it sits near the valley and is the more conservative choice.
+    pub fn crossover(&self) -> u16 {
+        let ceiling = (self.mean.round() as usize).max(2);
+        for c in 1..ceiling {
+            let err = self.w_error.ln() + ln_dpois(c as f64, self.error_mean);
+            let gen = self.w_single.ln() + ln_dnbinom(c as f64, self.mean, self.dispersion);
+            if gen > err {
+                return (c as u16).max(2);
+            }
+        }
+        (ceiling as u16).max(2)
+    }
+}
+
+/// Fit the coverage model to a spectrum, seeded from the valley estimator's peak and dispersion.
+///
+/// `histovec[c - 1]` is the number of distinct k-mers seen `c` times. Returns `Err` if no start
+/// converged, which the caller should treat as "keep the estimator's own answer".
+pub fn fit_spectrum(
+    histovec: &[u32],
+    peak: usize,
+    dispersion_hint: f64,
+) -> Result<SpectrumFit, Error> {
+    if peak < 2 || histovec.len() < 2 {
+        return Err(Error::msg("no usable genome peak to fit around"));
+    }
+    // Counts and weights inside the window, skipping empty bins: they contribute nothing to the
+    // likelihood and every one would cost three density evaluations per iteration.
+    let top = (FIT_WINDOW_PEAK_MULT * peak).min(histovec.len() - 1);
+    let observed: Vec<(f64, f64)> = histovec[..top]
+        .iter()
+        .enumerate()
+        .filter(|(_, &n)| n > 0)
+        .map(|(i, &n)| ((i + 1) as f64, f64::from(n)))
+        .collect();
+    if observed.is_empty() {
+        return Err(Error::msg("no counts inside the fit window"));
+    }
+    let total: f64 = observed.iter().map(|(_, n)| n).sum();
+
+    let problem = MixtureFit {
+        observed,
+        peak: peak as f64,
+    };
+
+    let hint = if dispersion_hint.is_finite() && dispersion_hint > 1.0 {
+        dispersion_hint
+    } else {
+        2.0
+    };
+
+    let mut best: Option<(f64, Vec<f64>)> = None;
+    for seed in DISPERSION_SEEDS.iter().copied().chain(std::iter::once(hint)) {
+        let start = vec![0.0, 0.0, 0.0, (seed - 1.0).max(1e-3).ln(), 0.0];
+        let Ok(res) = run_one(problem.clone(), start) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(cost, _)| res.0 < *cost) {
+            best = Some(res);
+        }
+    }
+
+    let Some((_, theta)) = best else {
+        return Err(Error::msg("no start converged"));
+    };
+    Ok(problem.unpack(&theta, total))
+}
+
+/// One Nelder-Mead run. The simplex is the start point plus one offset coordinate each.
+fn run_one(problem: MixtureFit, start: Vec<f64>) -> Result<(f64, Vec<f64>), Error> {
+    let mut simplex = vec![start.clone()];
+    for i in 0..start.len() {
+        let mut v = start.clone();
+        v[i] += SIMPLEX_STEP;
+        simplex.push(v);
+    }
+
+    let res = Executor::new(problem, NelderMead::new(simplex))
+        .configure(|state| state.max_iters(MAX_ITERS))
+        .run()?;
+
+    match res.state().get_termination_reason() {
+        Some(reason) if *reason == SolverConverged => {
+            let cost = res.state().get_best_cost();
+            let param = res
+                .state()
+                .get_best_param()
+                .ok_or_else(|| Error::msg("converged without a parameter vector"))?;
+            Ok((cost, param.clone()))
+        }
+        _ => Err(Error::msg("did not converge")),
+    }
+}
+
+/// The spectrum being fitted, and the peak the mean is pinned around.
+#[derive(Clone)]
+struct MixtureFit {
+    observed: Vec<(f64, f64)>,
+    peak: f64,
+}
+
+impl MixtureFit {
+    /// Map the unconstrained parameters onto the model.
+    ///
+    /// Every constraint is structural rather than a penalty, so the optimiser cannot propose an
+    /// invalid model and never meets a cliff. The error component is softmax's reference category:
+    /// adding a constant to every weight leaves the mixture unchanged, so fixing one removes a flat
+    /// ridge and a simplex dimension.
+    fn params(&self, theta: &[f64]) -> Params {
+        let (ln_error, ln_single, ln_repeat) = ln_softmax3(0.0, theta[0], theta[1]);
+        Params {
+            ln_error,
+            ln_single,
+            ln_repeat,
+            mean: self.peak * (MU_LO + MU_SPAN / (1.0 + (-theta[2]).exp())),
+            dispersion: 1.0 + theta[3].exp(),
+            error_mean: theta[4].exp(),
+        }
+    }
+
+    fn unpack(&self, theta: &[f64], total: f64) -> SpectrumFit {
+        let p = self.params(theta);
+        let w_single = p.ln_single.exp();
+        SpectrumFit {
+            w_error: p.ln_error.exp(),
+            w_single,
+            w_repeat: p.ln_repeat.exp(),
+            mean: p.mean,
+            dispersion: p.dispersion,
+            error_mean: p.error_mean,
+            genome_kmers: w_single * total,
         }
     }
 }
 
-// Helper struct for optimisation which keep counts as state
-struct MixPoisson {
-    counts: Vec<f64>,
+/// The model on its natural scale, as the cost function reads it.
+struct Params {
+    ln_error: f64,
+    ln_single: f64,
+    ln_repeat: f64,
+    mean: f64,
+    dispersion: f64,
+    error_mean: f64,
 }
 
-// These just use Vec rather than ndarray, simpler packaging and doubt
-// there's any performance difference with two params
-// negative log-likelihood
-impl CostFunction for MixPoisson {
-    /// Type of the parameter vector
+impl CostFunction for MixtureFit {
     type Param = Vec<f64>;
-    /// Type of the return value computed by the cost function
     type Output = f64;
 
-    /// Apply the cost function to a parameters `p`
-    fn cost(&self, p: &Self::Param) -> Result<Self::Output, Error> {
-        Ok(-log_likelihood(p, &self.counts))
-    }
-}
-
-// negative grad(ll)
-impl Gradient for MixPoisson {
-    /// Type of the parameter vector
-    type Param = Vec<f64>;
-    /// Type of the gradient
-    type Gradient = Vec<f64>;
-
-    /// Compute the gradient at parameter `p`.
-    fn gradient(&self, p: &Self::Param) -> Result<Self::Gradient, Error> {
-        // As doing minimisation, need to invert sign of gradients
-        Ok(grad_ll(p, &self.counts).iter().map(|x| -*x).collect())
-    }
-}
-
-// log-sum-exp needed to combine components likelihoods
-// (hard coded as two here, of course could be generalised to N)
-fn lse(a: f64, b: f64) -> f64 {
-    let xstar = f64::max(a, b);
-    xstar + f64::ln(f64::exp(a - xstar) + f64::exp(b - xstar))
-}
-
-// Natural log of Poisson density
-fn ln_dpois(x: f64, lambda: f64) -> f64 {
-    x * f64::ln(lambda) - lgamma(x + 1.0) - lambda
-}
-
-// error component (mean of 1)
-fn a(w0: f64, i: f64) -> f64 {
-    f64::ln(w0) + ln_dpois(i, 1.0)
-}
-
-// coverage component (mean of coverage)
-fn b(w0: f64, c: f64, i: f64) -> f64 {
-    f64::ln(1.0 - w0) + ln_dpois(i, c)
-}
-
-// Mixture model likelihood
-fn log_likelihood(pars: &[f64], counts: &[f64]) -> f64 {
-    let w0 = pars[0];
-    let c = pars[1];
-    let mut ll = 0.0;
-    // 'soft' bounds. I think f64::NEG_INFINITY might be mathematically better
-    // but arg_min doesn't like it
-    if !(0.0..=1.0).contains(&w0) || c < 1.0 {
-        ll = f64::MIN;
-    } else {
-        for (i, count) in counts.iter().enumerate() {
-            let i_f64 = i as f64 + 1.0;
-            ll += *count * lse(a(w0, i_f64), b(w0, c, i_f64));
+    /// Negative log-likelihood of the spectrum under the mixture, each bin weighted by its height.
+    fn cost(&self, theta: &Self::Param) -> Result<Self::Output, Error> {
+        let p = self.params(theta);
+        if !(p.mean.is_finite() && p.dispersion.is_finite() && p.error_mean.is_finite())
+            || p.error_mean <= 0.0
+        {
+            return Ok(f64::INFINITY);
         }
+
+        let mut ll = 0.0;
+        for &(count, weight) in &self.observed {
+            let a = p.ln_error + ln_dpois(count, p.error_mean);
+            let b = p.ln_single + ln_dnbinom(count, p.mean, p.dispersion);
+            let c = p.ln_repeat + ln_dnbinom(count, REPEAT_LOBE_COPIES * p.mean, p.dispersion);
+            ll += weight * lse3(a, b, c);
+        }
+        Ok(-ll)
     }
-    ll
 }
 
-// Analytic gradient. Bounds not needed as this is only evaluated
-// when the ll is valid
-fn grad_ll(pars: &[f64], counts: &[f64]) -> Vec<f64> {
-    let w0 = pars[0];
-    let c = pars[1];
+/// Log of the three softmax weights, computed in log space so no exponential can overflow.
+fn ln_softmax3(a: f64, b: f64, c: f64) -> (f64, f64, f64) {
+    let norm = lse3(a, b, c);
+    (a - norm, b - norm, c - norm)
+}
 
-    let mut grad_w0 = 0.0;
-    let mut grad_c = 0.0;
-    for (i, count) in counts.iter().enumerate() {
-        let i_f64 = i as f64 + 1.0;
-        let a_val = a(w0, i_f64);
-        let b_val = b(w0, c, i_f64);
-        let dlda = 1.0 / (1.0 + f64::exp(b_val - a_val));
-        let dldb = 1.0 / (1.0 + f64::exp(a_val - b_val));
-        grad_w0 += *count * (dlda / w0 - dldb / (1.0 - w0));
-        grad_c += *count * (dldb * (i_f64 / c - 1.0));
+/// Log-sum-exp of three terms, shifted by the largest so the exponentials stay in range.
+fn lse3(a: f64, b: f64, c: f64) -> f64 {
+    let m = a.max(b).max(c);
+    if !m.is_finite() {
+        return m;
     }
-    vec![grad_w0, grad_c]
+    m + ((a - m).exp() + (b - m).exp() + (c - m).exp()).ln()
+}
+
+/// Natural log of the Poisson density.
+fn ln_dpois(x: f64, lambda: f64) -> f64 {
+    x * lambda.ln() - lgamma(x + 1.0) - lambda
+}
+
+/// Natural log of the negative-binomial density, by mean and dispersion (`variance = dispersion *
+/// mean`), so `r = mean / (dispersion - 1)` and `p = 1 / dispersion`. Tends to the Poisson as the
+/// dispersion approaches 1, which is where the genome lobe of a clean simulated library sits.
+fn ln_dnbinom(x: f64, mean: f64, dispersion: f64) -> f64 {
+    if dispersion <= 1.0 + 1e-9 {
+        return ln_dpois(x, mean);
+    }
+    let r = mean / (dispersion - 1.0);
+    lgamma(x + r) - lgamma(x + 1.0) - lgamma(r)
+        + r * (-dispersion.ln())
+        + x * (1.0 - 1.0 / dispersion).ln()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a bimodal k-mer spectrum: error peak at freq 1-3, coverage peak at freq ~20.
-    fn make_bimodal_histogram() -> Vec<u32> {
-        let mut h = vec![0u32; 499];
-        h[0] = 200_000; // freq=1 (error singletons)
-        h[1] = 80_000; // freq=2
-        h[2] = 30_000; // freq=3
-                       // low counts between peaks (still >= MIN_FREQ=50 so they survive truncation)
-        for i in 3..17 {
-            h[i] = 100;
+    /// A spectrum drawn from the model: Poisson errors, then genome lobes at `mu` and `2 mu`.
+    fn synthetic(
+        mean: f64,
+        dispersion: f64,
+        genome: f64,
+        err_mass: f64,
+        repeat_frac: f64,
+    ) -> Vec<u32> {
+        let mut h = vec![0u32; 8000];
+        for (i, slot) in h.iter_mut().enumerate() {
+            let c = (i + 1) as f64;
+            let single = genome * (1.0 - repeat_frac) * ln_dnbinom(c, mean, dispersion).exp();
+            let repeat = genome * repeat_frac * ln_dnbinom(c, 2.0 * mean, dispersion).exp();
+            let err = genome * err_mass * ln_dpois(c, 1.0).exp();
+            *slot = (single + repeat + err) as u32;
         }
-        h[17] = 60_000; // freq=18
-        h[18] = 80_000; // freq=19 (coverage peak)
-        h[19] = 100_000; // freq=20
-        h[20] = 80_000; // freq=21
-        h[21] = 60_000; // freq=22
         h
     }
 
     #[test]
-    fn bimodal_histogram_does_not_panic() {
-        let mut fit = SpectrumFitter::new();
-        let counts = make_bimodal_histogram();
-        let _ = fit.fit_histogram(counts);
-        // Just verify it completes without panicking
+    fn fit_recovers_a_known_mixture() {
+        let h = synthetic(95.0, 6.6, 4.6e6, 3.0, 0.03);
+        let f = fit_spectrum(&h, 95, 6.6).expect("should converge");
+        assert!(
+            (f.mean - 95.0).abs() < 5.0 && (f.dispersion - 6.6).abs() < 1.5,
+            "genome lobe: mean {} (want 95), dispersion {} (want 6.6)",
+            f.mean,
+            f.dispersion
+        );
+        // The error lobe absorbs part of the genome lobe's left tail, which biases its mean upward;
+        // the wider the genome lobe, the more so. Real spectra measured 1.00-1.15, this fixture 1.6.
+        assert!(
+            (1.0..2.0).contains(&f.error_mean),
+            "error mean {}",
+            f.error_mean
+        );
+        let expected = 4.6e6 * 0.97;
+        assert!(
+            (f.genome_kmers - expected).abs() / expected < 0.2,
+            "genome k-mers {}",
+            f.genome_kmers
+        );
+    }
+
+    /// The failure that made multi-start mandatory: seeded at the true dispersion alone, the simplex
+    /// can walk to the Poisson boundary and stop. The multi-start must not end up there.
+    #[test]
+    fn multi_start_escapes_the_dispersion_boundary() {
+        let h = synthetic(95.0, 6.6, 4.6e6, 3.0, 0.03);
+        let f = fit_spectrum(&h, 95, 6.6).expect("should converge");
+        assert!(
+            f.dispersion > 1.5,
+            "collapsed to the Poisson boundary: {}",
+            f.dispersion
+        );
+    }
+
+    /// Unpinned, the model relabels the peak as a repeat lobe and halves the mean. The window must
+    /// hold it at the observed peak.
+    #[test]
+    fn a_constrained_mean_cannot_relabel_the_peak() {
+        let h = synthetic(95.0, 6.6, 4.6e6, 3.0, 0.10);
+        let f = fit_spectrum(&h, 95, 6.6).expect("should converge");
+        assert!(
+            f.mean >= 95.0 * MU_LO && f.mean <= 95.0 * (MU_LO + MU_SPAN),
+            "mean {} escaped the window around the peak",
+            f.mean
+        );
     }
 
     #[test]
-    fn bimodal_histogram_converges() {
-        let mut fit = SpectrumFitter::new();
-        let counts = make_bimodal_histogram();
-        let result = fit.fit_histogram(counts);
-        // A well-formed bimodal histogram should allow the optimizer to converge.
-        // If it doesn't (Err), we accept that too — this just checks no panic.
-        if let Ok(cutoff) = result {
-            // Cutoff should be somewhere between error and coverage peaks (1-17)
-            assert!(
-                cutoff >= 1 && cutoff < 18,
-                "cutoff={cutoff} out of expected range 1-17"
-            );
+    fn fit_matches_poisson_when_dispersion_is_one() {
+        for x in [0.0, 1.0, 5.0, 40.0] {
+            let nb = ln_dnbinom(x, 20.0, 1.0);
+            let po = ln_dpois(x, 20.0);
+            assert!((nb - po).abs() < 1e-9, "x={x}: {nb} vs {po}");
         }
+        // Just past the switch the two must still be close, or the limit is discontinuous.
+        assert!((ln_dnbinom(5.0, 20.0, 1.001) - ln_dpois(5.0, 20.0)).abs() < 0.05);
+    }
+
+    /// The k=81 simulation case: shallow coverage, lobes nearly merged, dispersion near the boundary.
+    #[test]
+    fn merged_lobes_still_recover_the_genome_mean() {
+        let h = synthetic(19.0, 1.2, 4.6e6, 2.0, 0.02);
+        let f = fit_spectrum(&h, 19, 1.2).expect("should converge");
+        assert!((f.mean - 19.0).abs() < 2.0, "mean {}", f.mean);
     }
 
     #[test]
-    fn all_zeros_histogram_returns_err_or_min_cutoff() {
-        let mut fit = SpectrumFitter::new();
-        // All zeros: truncation removes everything → empty histogram
-        let counts = vec![0u32; 499];
-        let result = fit.fit_histogram(counts);
-        // Either fails to converge (Err) or returns some minimal cutoff. Must not panic.
-        match result {
-            Ok(cutoff) => assert!(cutoff >= 1),
-            Err(_) => {} // expected: optimizer cannot converge on empty data
-        }
+    fn a_degenerate_spectrum_does_not_converge() {
+        assert!(fit_spectrum(&vec![0u32; 8000], 95, 6.6).is_err());
+        assert!(fit_spectrum(&synthetic(95.0, 6.6, 4.6e6, 3.0, 0.03), 1, 6.6).is_err());
     }
 
+    /// The cutoff bounds holes, so it can only loosen as the budget grows, and never falls below 2.
     #[test]
-    #[should_panic(expected = "Model already fitted")]
-    fn fit_histogram_twice_panics() {
-        let mut fit = SpectrumFitter::new();
-        let counts = make_bimodal_histogram();
-        let _ = fit.fit_histogram(counts.clone());
-        // If the first call succeeded, fitted=true and the second call panics.
-        // If the first call failed (Err), fitted=false and this test will fail (not panic).
-        // The bimodal histogram is designed to converge, so the first call should succeed.
-        let _ = fit.fit_histogram(counts);
-    }
-}
-
-// Root finder at integer steps -- when is the responsibility of
-// the b component higher than the a component
-fn find_cutoff(pars: &[f64], max_cutoff: usize) -> usize {
-    let w0 = pars[0];
-    let c = pars[1];
-
-    let mut cutoff = 1;
-    while cutoff < max_cutoff {
-        let cutoff_f64 = cutoff as f64;
-        let root = a(w0, cutoff_f64) - b(w0, c, cutoff_f64);
-        if root < 0.0 {
-            break;
+    fn the_hole_cutoff_is_monotone_in_the_budget() {
+        let f = SpectrumFit {
+            w_error: 0.7,
+            w_single: 0.29,
+            w_repeat: 0.01,
+            mean: 95.0,
+            dispersion: 6.6,
+            error_mean: 1.0,
+            genome_kmers: 4.6e6,
+        };
+        let mut last = 0u16;
+        for budget in [0.5, 1.0, 5.0, 50.0] {
+            let c = f.hole_cutoff(budget);
+            assert!(c >= last, "budget {budget} tightened the cutoff");
+            assert!(c >= 2);
+            last = c;
         }
-        cutoff += 1;
     }
-    cutoff
 }
