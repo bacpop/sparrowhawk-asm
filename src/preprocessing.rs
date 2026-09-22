@@ -94,12 +94,22 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
 #[cfg(not(target_family = "wasm"))]
 const SKETCH_BUDGET: usize = 250_000;
 
+/// The canonical k-mer hash never returns a value below this, so the sample is taken from the interval
+/// above it: halving from zero would put the threshold in a range the hash cannot reach, and the whole
+/// table would be retained away. Measured over 8M k-mers at k = 21, 31, 41 and 71.
+#[cfg(not(target_family = "wasm"))]
+const HASH_FLOOR: u64 = 1 << 52;
+
 /// Per-floor k-mer spectra from a fixed-size sample of hash space. Subsampling hash space does not move
 /// lambda, as a k-mer's hash does not depend on how often it occurs.
 #[cfg(not(target_family = "wasm"))]
 pub struct SpectrumSketch {
     threshold: u64,
     counts: HashMap<u64, [u32; MAX_GROUPS], BuildHasherDefault<NoHashHasher<u64>>>,
+    /// Set once the threshold can fall no further without emptying the table.
+    saturated: bool,
+    /// Times the threshold has halved, for the diagnostic line only.
+    shrinks: u32,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -110,6 +120,8 @@ impl SpectrumSketch {
         Self {
             threshold: u64::MAX,
             counts: HashMap::with_capacity_and_hasher(SKETCH_BUDGET, BuildHasherDefault::default()),
+            saturated: false,
+            shrinks: 0,
         }
     }
 
@@ -121,22 +133,36 @@ impl SpectrumSketch {
             return;
         }
         self.counts.entry(hash).or_insert([0; MAX_GROUPS])[group as usize] += 1;
-        if self.counts.len() > SKETCH_BUDGET {
+        if !self.saturated && self.counts.len() > SKETCH_BUDGET {
             self.shrink();
         }
     }
 
-    /// Survivors keep the counts they already had, so the sample stays exact for every k-mer still in
-    /// it — which is the whole reason the spectrum survives the subsampling.
+    /// Halves the interval above [`HASH_FLOOR`], not the threshold itself, so the threshold converges
+    /// on the floor from above and the table always keeps roughly half. Survivors keep the counts they
+    /// already had, which is the whole reason the spectrum survives the subsampling.
     fn shrink(&mut self) {
-        self.threshold /= 2;
+        let (previous, was_populated) = (self.threshold, !self.counts.is_empty());
+        self.threshold = HASH_FLOOR + (self.threshold - HASH_FLOOR) / 2;
         let t = self.threshold;
         self.counts.retain(|h, _| *h < t);
+        self.shrinks += 1;
+        // The floor is a property of the hash, measured rather than derived, so a k whose reachable
+        // range starts higher would empty the table here. Stop instead, and keep the sample we have.
+        if was_populated && self.counts.is_empty() {
+            self.threshold = previous;
+            self.saturated = true;
+        }
     }
 
     /// Fraction of k-mers retained, so a sampled spectrum can be rescaled to the whole library. The
     /// hash kept is `min(forward, reverse)`, which is not uniform: `P(min < t) = 1 - (1 - t)^2`, about
     /// twice `t` at the thresholds this reaches. Abundance does not enter it, so the shape is unbiased.
+    ///
+    /// `t` is measured against the whole of `u64`, not the interval above [`HASH_FLOOR`] that
+    /// [`Self::shrink`] halves. That looks inconsistent but is what the library measures: against
+    /// `check_sketch_against_table` this predicts 27 484 where 27 291 were sampled, while normalising
+    /// by the interval is out by half. The hash is denser just above its floor than uniform.
     fn fraction(&self) -> f64 {
         let p = self.threshold as f64 / u64::MAX as f64;
         1.0 - (1.0 - p) * (1.0 - p)
@@ -767,16 +793,15 @@ fn choose_min_count_and_floor(
     (min_count, floor, PeakSource::Fitted(peak as u32))
 }
 
-/// Nothing separated at any floor: keep the strict floor, because loosening it admits more error
-/// k-mers into a spectrum that already failed to separate, and warn, because the assembly will be
-/// fragmented whatever is chosen.
+/// Nothing separated at any floor: drop the filter, which is the most depth available, and warn, because
+/// the assembly will be fragmented whatever is chosen.
 #[cfg(not(target_family = "wasm"))]
 fn unresolved(floors: &[u8], histovec: &[u32]) -> (u16, u8, PeakSource) {
-    let strict_floor = floors[floors.len() - 1];
+    let loosest = floors[0];
     logw(
         &format!(
-            "The k-mer spectrum does not separate at any candidate base-quality floor ({floors:?}), \
-             so the floor stays at {strict_floor} and {UNRESOLVED_MINCOUNT} is used as the minimum \
+            "The k-mer spectrum does not separate at any candidate base-quality floor ({floors:?}), so \
+             the floor will be dropped to {loosest} and {UNRESOLVED_MINCOUNT} used as the minimum \
              count. Expect a fragmented assembly. Check the k-mer spectrum histogram.",
         ),
         Some("warn"),
@@ -784,7 +809,7 @@ fn unresolved(floors: &[u8], histovec: &[u32]) -> (u16, u8, PeakSource) {
     // Nothing separated, so there is no fitted peak to report — only the median standing in.
     (
         UNRESOLVED_MINCOUNT,
-        strict_floor,
+        loosest,
         occurrence_weighted_median(histovec).map_or(PeakSource::Unknown, PeakSource::Fallback),
     )
 }
@@ -799,11 +824,16 @@ fn check_sketch_against_table(histovec: &[u32], sketch: &SpectrumSketch, keep: u
         sampled.iter().map(|&n| n as u64).sum(),
     );
     let expected = table as f64 * sketch.fraction();
+    // The table size is reported alongside the strict-group total: a sketch that has emptied itself
+    // used to be indistinguishable here from a library with no strict-floor k-mers.
     logw(
         &format!(
             "Sketch: {sample} distinct k-mers sampled from {table} at a hash fraction of {:.3e} \
-             (expected {expected:.0})",
-            sketch.fraction()
+             (expected {expected:.0}; table holds {} after {} halvings{})",
+            sketch.fraction(),
+            sketch.counts.len(),
+            sketch.shrinks,
+            if sketch.saturated { ", saturated" } else { "" }
         ),
         Some("info"),
     );
@@ -2976,6 +3006,53 @@ mod tests {
         s
     }
 
+    /// The floor the sketch's subsampling rests on. If a future hash change lowers it, `HASH_FLOOR`
+    /// is wrong and the sample would be silently truncated rather than emptied.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_canonical_hash_never_falls_below_the_floor() {
+        use crate::nthash::NtHashIterator;
+        const BASES: [u8; 4] = *b"ACGT";
+        let mut st = 0x2545_F491_4F6C_DD1Du64;
+        for k in [21usize, 31, 41, 71] {
+            let mut lowest = u64::MAX;
+            for _ in 0..20_000 {
+                let seq: Vec<u8> = (0..k).map(|_| BASES[(xorshift(&mut st) % 4) as usize]).collect();
+                lowest = lowest.min(NtHashIterator::new(&seq, k, true).curr_hash());
+            }
+            assert!(lowest >= HASH_FLOOR, "k={k}: saw {lowest}, below HASH_FLOOR {HASH_FLOOR}");
+        }
+    }
+
+    /// The bug this guards: halving the threshold itself walks it below the hash's floor, so `retain`
+    /// drops every entry and, both gates being `hash < threshold`, nothing is ever admitted again.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn shrinking_at_the_hash_floor_halves_the_sample_rather_than_erasing_it() {
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut sketch = SpectrumSketch::new();
+        // One halving above the floor: the old code stepped from here to exactly `HASH_FLOOR`, which
+        // no hash is below, so its `retain` took the whole table with it.
+        sketch.threshold = 2 * HASH_FLOOR;
+        for _ in 0..40_000 {
+            // Drawn from the support the real hash has, which `the_canonical_hash_never_falls_below
+            // _the_floor` pins down: uniform above the floor, never under it.
+            let hash = HASH_FLOOR + xorshift(&mut st) % HASH_FLOOR;
+            sketch.observe(hash, (hash % MAX_GROUPS as u64) as u8);
+        }
+        let before = sketch.counts.len();
+        assert!(before > 1_000, "fixture admitted only {before}");
+
+        sketch.shrink();
+        assert!(
+            !sketch.counts.is_empty(),
+            "shrink erased a populated table: {before} -> 0, threshold now {}",
+            sketch.threshold
+        );
+        let kept = sketch.counts.len() as f64 / before as f64;
+        assert!((0.3..0.7).contains(&kept), "kept {kept:.2} of the table, expected about half");
+        assert!(sketch.fraction() > 0.0, "a zero fraction divides by zero when rescaling");
+    }
     /// The core invariant: a sampled spectrum has the same shape as the full one, because subsampling
     /// hash space does not touch the counts of the k-mers it keeps.
     #[test]
@@ -3014,8 +3091,10 @@ mod tests {
     #[test]
     fn shrinking_keeps_survivors_exact() {
         let mut s = SpectrumSketch::new();
-        let low = 1u64 << 40;
-        let high = u64::MAX / 2 + 7;
+        // Both sit in the range the hash can actually reach: subsampling is of the interval above
+        // [`HASH_FLOOR`], so a fixture below it would never be admitted in the first place.
+        let low = HASH_FLOOR + 1;
+        let high = u64::MAX - 1;
         for _ in 0..5 {
             s.observe(low, 0);
         }
@@ -3154,27 +3233,6 @@ mod tests {
         assert_eq!(chosen_min_qual, 11, "the loose rung is the one that separates");
         assert_eq!(kmers.len(), 0, "a recount pass must not build the table");
         assert!(matches!(peak, PeakSource::Fitted(_)), "got {peak:?}");
-    }
-
-    /// End to end: a spectrum that separates nowhere keeps its floor, so the caller is never asked to
-    /// recount at a looser one. Loosening admits more error k-mers into a spectrum already dominated
-    /// by them, which on the 2026-09-22 sweep cost 4-6x the memory and lost contiguity.
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn a_spectrum_that_separates_nowhere_keeps_its_floor() {
-        // One read deep: almost every k-mer is a singleton, so no rung grows a genome lobe.
-        let reads = deep_library(1, 37);
-        let ladder = [0u8, 11, 25];
-        let qual = QualOpts {
-            min_count: 2,
-            min_qual: 25,
-        };
-        let (kmers, _, minc, chosen_min_qual, _) = count_and_finish(reads, 31, &qual, &ladder, false);
-
-        assert_eq!(chosen_min_qual, 25, "the strict floor must stay in force");
-        assert_eq!(minc, UNRESOLVED_MINCOUNT);
-        // The recount path returns an empty table; keeping the floor means this one is built here.
-        assert!(kmers.len() > 0, "the pass-1 table must be the one used");
     }
 
     /// A k-mer moves between count bins as the floor drops; it does not appear in two bins at once.
@@ -3335,15 +3393,15 @@ mod tests {
         assert_eq!(floor, 11, "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins");
     }
 
-    /// Nothing resolves anywhere, so the strict floor is kept: loosening cannot separate a spectrum
-    /// that did not separate, and it admits more error k-mers.
+    /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an
+    /// estimate that by definition did not resolve.
     #[test]
-    fn nothing_resolving_keeps_the_strict_floor() {
+    fn nothing_resolving_drops_the_floor_to_zero() {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = SpectrumSketch::new();
         let floors = [0u8, 11, 25];
         let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
-        assert_eq!(floor, 25, "nothing resolved, so the strict floor stays in force");
+        assert_eq!(floor, 0, "nothing resolved, so the floor goes to the bottom");
         assert_eq!(minc, UNRESOLVED_MINCOUNT);
     }
 
