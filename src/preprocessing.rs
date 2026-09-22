@@ -32,6 +32,8 @@ use crate::kmer::Kmer;
 use crate::logw;
 #[cfg(not(target_family = "wasm"))]
 use crate::qual_profile::{window_groups, MAX_GROUPS, NONE};
+#[cfg(not(target_family = "wasm"))]
+use crate::spectrum_fitter::fitted_distinct_total;
 use crate::spectrum_fitter::{fit_spectrum, SpectrumFit};
 
 /// Tuple for name and list of input files
@@ -72,13 +74,18 @@ use wasm_bindgen_file_reader::WebSysFile;
 // For the fitting, we'll use actually MAXSIZEHISTO - 1
 const MAXSIZEHISTO: usize = 8000;
 
-/// Bins the original fit, peak finder and plot see. Pinned at the historical `MAXSIZEHISTO` so that
-/// widening the histogram cannot move them: `add_to_histogram` writes count `c` to index `c-1`, so
-/// indices 0..498 are identical either way and every legacy reader stays inside that window.
+/// Historical window used by [`coverage_peak`] and returned through the WASM preprocessing JSON. It
+/// does not limit the current valley or mixture fit.
 pub(crate) const LEGACY_HISTO_RANGE: usize = 500;
+
+/// Abundance bins displayed by the native diagnostic PNG.
+#[cfg(not(target_family = "wasm"))]
+const NATIVE_PLOT_RANGE: usize = 700;
 
 /// The pinned window has to fit inside the histogram, or the legacy readers would index out of bounds.
 const _: () = assert!(LEGACY_HISTO_RANGE <= MAXSIZEHISTO);
+#[cfg(not(target_family = "wasm"))]
+const _: () = assert!(NATIVE_PLOT_RANGE <= MAXSIZEHISTO);
 
 #[inline]
 fn add_to_histogram(histovec: &mut [u32], count: u32) {
@@ -191,8 +198,8 @@ impl SpectrumSketch {
 /// [`LEGACY_HISTO_RANGE`], so above ~500x the true genomic peak is invisible here. It is also a *global* argmax,
 /// so on a deep library the error lobe outvotes the genome lobe — see [`find_genomic_peak`].
 ///
-/// Natively this now has no callers outside the tests, which assert exactly that failure; the browser
-/// still reaches it through the mixture fit.
+/// This now has no production callers; it remains as the pinned legacy estimator exercised by the
+/// compatibility tests below. The browser independently keeps returning the same first 500 bins.
 #[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
 fn coverage_peak(histovec: &[u32]) -> usize {
     let mut best_count = 2usize; // nothing above the error peak; the caller's floor of 2 then applies
@@ -230,7 +237,7 @@ const UNRESOLVED_MINCOUNT: u16 = 2;
 
 /// What the valley estimator concluded, and every intermediate it passed through. The extra fields are
 /// carried so one log line can reproduce the decision.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct SpectrumEstimate {
     /// Where [`find_valley_seed`]'s walk stopped, before [`find_valley`] refined it.
     valley_seed: usize,
@@ -256,6 +263,65 @@ struct SpectrumEstimate {
     /// Variance-to-mean ratio of the genome lobe, or NaN when there is no usable lobe.
     dispersion: f64,
     verdict: Verdict,
+}
+
+/// Values needed to explain the spectrum decision in the native PNG. Kept independent of plotting
+/// types so the fitting path can carry it without pulling native-only code into WASM.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy, Default)]
+struct SpectrumPlotDiagnostics {
+    valley: Option<usize>,
+    empirical_peak: Option<usize>,
+    fit: Option<SpectrumFit>,
+    fit_attempted: bool,
+    fitted_distinct_total: Option<f64>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl SpectrumPlotDiagnostics {
+    fn new(
+        histovec: &[u32],
+        estimate: &SpectrumEstimate,
+        fit: Option<SpectrumFit>,
+        fit_attempted: bool,
+    ) -> Self {
+        Self {
+            valley: (estimate.valley > 0).then_some(estimate.valley),
+            empirical_peak: (estimate.genomic_peak > 0).then_some(estimate.genomic_peak),
+            fit,
+            fit_attempted,
+            fitted_distinct_total: fit
+                .map(|_| fitted_distinct_total(histovec, estimate.genomic_peak)),
+        }
+    }
+
+    fn record_fit(
+        &mut self,
+        histovec: &[u32],
+        estimate: &SpectrumEstimate,
+        fit: Option<SpectrumFit>,
+    ) {
+        self.fit = fit;
+        self.fit_attempted = true;
+        self.fitted_distinct_total =
+            fit.map(|_| fitted_distinct_total(histovec, estimate.genomic_peak));
+    }
+}
+
+#[cfg(target_family = "wasm")]
+#[derive(Clone, Copy, Default)]
+struct SpectrumPlotDiagnostics;
+
+#[cfg(target_family = "wasm")]
+impl SpectrumPlotDiagnostics {
+    fn new(
+        _histovec: &[u32],
+        _estimate: &SpectrumEstimate,
+        _fit: Option<SpectrumFit>,
+        _fit_attempted: bool,
+    ) -> Self {
+        Self
+    }
 }
 
 /// Why the estimator accepted or refused a spectrum. The default is a *refusal* on purpose: every path
@@ -575,9 +641,6 @@ fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
     );
 }
 
-/// What the Poisson mixture would have chosen. Kept for the browser, where there is no benchmark sweep
-/// to calibrate against; native runs do not fit at all, since the estimator beat it wherever they
-/// disagreed across 3780 sweep runs.
 /// Fit the spectrum and report it. Seeded from the valley estimator's own peak and dispersion: the
 /// estimator locates the lobe, the fit refines it and separates the error lobe from it explicitly.
 /// `None` when no start converges, which leaves the estimator's answer standing.
@@ -644,13 +707,17 @@ fn choose_min_count(histovec: &[u32]) -> u16 {
 ///
 /// The valley separates the lobes; the fit then says how much genome cutting there would cost. Those
 /// answer different questions, and on deep libraries the valley is far the more aggressive.
-fn choose_min_count_and_peak(histovec: &[u32]) -> (u16, PeakSource) {
+fn choose_min_count_and_peak(histovec: &[u32]) -> (u16, PeakSource, SpectrumPlotDiagnostics) {
     let mut estimate = estimate_by_valley(histovec);
     log_spectrum(histovec, &estimate);
     let fit = fit_and_log(histovec, &estimate);
     apply_hole_guard(&mut estimate, fit.as_ref());
     warn_unresolved(&estimate);
-    (estimate.min_count, peak_of(&estimate, histovec))
+    (
+        estimate.min_count,
+        peak_of(&estimate, histovec),
+        SpectrumPlotDiagnostics::new(histovec, &estimate, fit, true),
+    )
 }
 
 /// Lower the cutoff to whatever strands at most [`MAX_GENOME_HOLES`] single-copy k-mers.
@@ -723,7 +790,7 @@ fn choose_min_count_and_floor(
     histovec: &[u32],
     sketch: &SpectrumSketch,
     floors: &[u8],
-) -> (u16, u8, PeakSource) {
+) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>) {
     let strict_floor = floors[floors.len() - 1];
     let mut strict = estimate_by_valley(histovec);
     log_spectrum(histovec, &strict);
@@ -733,7 +800,12 @@ fn choose_min_count_and_floor(
     if resolves(&strict) && strict.genomic_peak >= MIN_USEFUL_COVERAGE {
         let fit = fit_and_log(histovec, &strict);
         apply_hole_guard(&mut strict, fit.as_ref());
-        return (strict.min_count, strict_floor, peak_of(&strict, histovec));
+        return (
+            strict.min_count,
+            strict_floor,
+            peak_of(&strict, histovec),
+            Some(SpectrumPlotDiagnostics::new(histovec, &strict, fit, true)),
+        );
     }
 
     // Every floor that separates, as `(floor, min_count, genomic peak)`. Collected before anything is
@@ -782,7 +854,13 @@ fn choose_min_count_and_floor(
         .filter(|&&(_, _, peak)| peak >= MIN_USEFUL_COVERAGE)
         .max_by_key(|&&(floor, _, _)| floor)
     {
-        return (min_count, floor, PeakSource::Fitted(peak as u32));
+        return (
+            min_count,
+            floor,
+            PeakSource::Fitted(peak as u32),
+            (floor == strict_floor)
+                .then(|| SpectrumPlotDiagnostics::new(histovec, &strict, None, false)),
+        );
     }
     // Starved everywhere, so take all the depth on offer. Equal peaks are not equal assemblies: a floor
     // also breaks the run of k consecutive passing bases a k-mer needs, which no spectrum shows.
@@ -790,13 +868,22 @@ fn choose_min_count_and_floor(
         .iter()
         .min_by_key(|&&(floor, _, _)| floor)
         .expect("the anchor is always a candidate");
-    (min_count, floor, PeakSource::Fitted(peak as u32))
+    (
+        min_count,
+        floor,
+        PeakSource::Fitted(peak as u32),
+        (floor == strict_floor)
+            .then(|| SpectrumPlotDiagnostics::new(histovec, &strict, None, false)),
+    )
 }
 
 /// Nothing separated at any floor: drop the filter, which is the most depth available, and warn, because
 /// the assembly will be fragmented whatever is chosen.
 #[cfg(not(target_family = "wasm"))]
-fn unresolved(floors: &[u8], histovec: &[u32]) -> (u16, u8, PeakSource) {
+fn unresolved(
+    floors: &[u8],
+    histovec: &[u32],
+) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>) {
     let loosest = floors[0];
     logw(
         &format!(
@@ -811,6 +898,7 @@ fn unresolved(floors: &[u8], histovec: &[u32]) -> (u16, u8, PeakSource) {
         UNRESOLVED_MINCOUNT,
         loosest,
         occurrence_weighted_median(histovec).map_or(PeakSource::Unknown, PeakSource::Fallback),
+        None,
     )
 }
 
@@ -962,8 +1050,8 @@ where
     t0.elapsed()
 }
 
-/// Writes the spectrum beside its plot as `count<TAB>distinct`, so a run's cutoff decision can be
-/// replayed offline. The PNG is truncated to [`LEGACY_HISTO_RANGE`] and cannot be read back.
+/// Writes the full spectrum beside its plot as `count<TAB>distinct`, so a run's cutoff decision can
+/// be replayed offline. The PNG is truncated to [`NATIVE_PLOT_RANGE`] and cannot be read back.
 #[cfg(not(target_family = "wasm"))]
 fn write_kmer_spectrum_tsv(histovec: &[u32], out_path: &std::path::Path) {
     use std::io::Write;
@@ -982,40 +1070,215 @@ fn write_kmer_spectrum_tsv(histovec: &[u32], out_path: &std::path::Path) {
     }
 }
 
-/// Draws the first [`LEGACY_HISTO_RANGE`] bins, so the PNG stays comparable with every earlier run. The
-/// final bin no longer piles up everything above it — that pile is now out at [`MAXSIZEHISTO`] — so the
-/// old spike at 500 is gone; the valley-estimator log line carries what lies beyond.
+/// Draw the spectrum used for the decision and all diagnostics available from its mixture fit. Bloom
+/// counting additionally shows its biased raw count map; the principal histogram remains the rescaled
+/// sketch that the estimator and fit actually read.
 #[cfg(not(target_family = "wasm"))]
-fn plot_kmer_histogram(histovec: &[u32], out_path: &std::path::Path) {
-    let shown = &histovec[..LEGACY_HISTO_RANGE.min(histovec.len())];
+fn plot_kmer_histogram(
+    decision_spectrum: &[u32],
+    raw_bloom_spectrum: Option<&[u32]>,
+    diagnostics: &SpectrumPlotDiagnostics,
+    out_path: &std::path::Path,
+) {
+    const Y_MAX: f64 = 200_000.0;
+
+    let mut markers = Vec::new();
+    if let Some(valley) = diagnostics.valley {
+        markers.push((
+            valley as f64,
+            RGBColor(0, 150, 110),
+            format!("Empirical valley = {valley}"),
+        ));
+    }
+    if let Some(peak) = diagnostics.empirical_peak {
+        markers.push((
+            peak as f64,
+            RGBColor(0, 150, 200),
+            format!("Empirical peak = {peak}"),
+        ));
+    }
+    if let Some(fit) = diagnostics.fit {
+        markers.push((
+            fit.mean,
+            RGBColor(30, 90, 220),
+            format!("Fitted mean = {:.1}", fit.mean),
+        ));
+        let mode = fit.single_copy_mode();
+        markers.push((
+            mode as f64,
+            RGBColor(210, 70, 170),
+            format!("Fitted mode = {mode}"),
+        ));
+        let crossover = fit.crossover();
+        markers.push((
+            f64::from(crossover),
+            RGBColor(120, 70, 200),
+            format!("Error/genome crossover = {crossover}"),
+        ));
+    }
+
+    let mut notes: Vec<String> = markers
+        .iter()
+        .filter(|(x, _, _)| *x > NATIVE_PLOT_RANGE as f64)
+        .map(|(_, _, label)| format!("{label} (off-scale)"))
+        .collect();
+    if diagnostics.fit_attempted && diagnostics.fit.is_none() {
+        notes.push("mixture fit unavailable".to_string());
+    }
+    let caption = if notes.is_empty() {
+        "k-mer spectrum".to_string()
+    } else {
+        format!("k-mer spectrum — {}", notes.join(", "))
+    };
+
     let backend = BitMapBackend::new(out_path, (1280, 960));
     let root = backend.into_drawing_area();
     let _ = root.fill(&WHITE);
     let mut chart = ChartBuilder::on(&root)
         .x_label_area_size(35)
-        .y_label_area_size(40)
+        .y_label_area_size(65)
         .margin(5)
-        .caption("k-mer spectrum", ("ibm-plex-sans", 30.0))
-        .build_cartesian_2d(
-            (0u32..(LEGACY_HISTO_RANGE as u32)).into_segmented(),
-            0u32..200000u32,
-        )
+        .caption(caption, ("ibm-plex-sans", 24.0))
+        .build_cartesian_2d(0.0f64..NATIVE_PLOT_RANGE as f64, 0.0f64..Y_MAX)
         .unwrap();
     chart
         .configure_mesh()
         .disable_x_mesh()
-        .bold_line_style(WHITE.mix(0.3))
-        .y_desc("Counts")
+        .x_labels(15)
+        .y_labels(11)
+        .max_light_lines(2)
+        .light_line_style(RGBColor(220, 220, 220).mix(0.35))
+        .bold_line_style(RGBColor(180, 180, 180).mix(0.4))
+        .y_desc("Distinct k-mers")
         .x_desc("k-mer frequency")
         .axis_desc_style(("ibm-plex-sans", 15))
+        .y_label_formatter(&|y| format!("{y:.0}"))
         .draw()
         .unwrap();
+
+    let shown = &decision_spectrum[..NATIVE_PLOT_RANGE.min(decision_spectrum.len())];
     chart
-        .draw_series(
-            Histogram::vertical(&chart)
-                .style(RED.filled())
-                .data(shown.iter().enumerate().map(|(i, x)| (i as u32, *x))),
-        )
+        .draw_series(shown.iter().enumerate().map(|(i, &height)| {
+            let count = (i + 1) as f64;
+            Rectangle::new(
+                [(count - 0.5, 0.0), (count + 0.5, f64::from(height))],
+                RED.mix(0.42).filled(),
+            )
+        }))
+        .unwrap()
+        .label(if raw_bloom_spectrum.is_some() {
+            "Rescaled sketch used for fitting"
+        } else {
+            "Observed spectrum"
+        })
+        .legend(|(x, y)| Rectangle::new([(x, y - 4), (x + 16, y + 4)], RED.mix(0.42).filled()));
+
+    if let Some(raw) = raw_bloom_spectrum {
+        chart
+            .draw_series(LineSeries::new(
+                raw.iter()
+                    .take(NATIVE_PLOT_RANGE)
+                    .enumerate()
+                    .map(|(i, &height)| ((i + 1) as f64, f64::from(height))),
+                RGBColor(95, 95, 95).stroke_width(1),
+            ))
+            .unwrap()
+            .label("Raw Bloom count map")
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 16, y)],
+                    RGBColor(95, 95, 95).stroke_width(1),
+                )
+            });
+    }
+
+    if let (Some(fit), Some(scale)) = (diagnostics.fit, diagnostics.fitted_distinct_total) {
+        let components: Vec<(f64, [f64; 3])> = (1..=NATIVE_PLOT_RANGE)
+            .map(|count| {
+                let probabilities = fit.component_probabilities(count as f64);
+                (count as f64, probabilities.map(|p| scale * p))
+            })
+            .collect();
+
+        chart
+            .draw_series(LineSeries::new(
+                components
+                    .iter()
+                    .map(|(count, values)| (*count, values.iter().sum())),
+                BLACK.stroke_width(3),
+            ))
+            .unwrap()
+            .label("Fitted mixture")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 16, y)], BLACK.stroke_width(3)));
+        chart
+            .draw_series(DashedLineSeries::new(
+                components.iter().map(|(count, values)| (*count, values[0])),
+                6,
+                5,
+                RGBColor(235, 145, 0).stroke_width(2),
+            ))
+            .unwrap()
+            .label("Error component")
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 16, y)],
+                    RGBColor(235, 145, 0).stroke_width(2),
+                )
+            });
+        chart
+            .draw_series(DashedLineSeries::new(
+                components.iter().map(|(count, values)| (*count, values[1])),
+                6,
+                5,
+                RGBColor(30, 90, 220).stroke_width(2),
+            ))
+            .unwrap()
+            .label("Single-copy component")
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 16, y)],
+                    RGBColor(30, 90, 220).stroke_width(2),
+                )
+            });
+        chart
+            .draw_series(DashedLineSeries::new(
+                components.iter().map(|(count, values)| (*count, values[2])),
+                2,
+                5,
+                RGBColor(100, 100, 100).stroke_width(2),
+            ))
+            .unwrap()
+            .label("Two-copy component")
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 16, y)],
+                    RGBColor(100, 100, 100).stroke_width(2),
+                )
+            });
+    }
+
+    for (x, colour, label) in markers {
+        if x > NATIVE_PLOT_RANGE as f64 {
+            continue;
+        }
+        chart
+            .draw_series(LineSeries::new(
+                [(x, 0.0), (x, Y_MAX)],
+                colour.stroke_width(2),
+            ))
+            .unwrap()
+            .label(label)
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 16, y)], colour.stroke_width(2))
+            });
+    }
+
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .background_style(WHITE.mix(0.82))
+        .border_style(BLACK)
+        .draw()
         .unwrap();
     root.present()
         .expect("Unable to write result to file. Does the output folder exist?");
@@ -2012,6 +2275,7 @@ where
     let mut chosen_min_qual = qual.min_qual;
     // Single-copy coverage of the spectrum this very map is filtered against.
     let genomic_peak;
+    let mut plot_diagnostics;
     if do_fit {
         log::info!("Counting finished. Choosing the minimum count...");
         match (&sketch, floors) {
@@ -2020,10 +2284,14 @@ where
                 if !do_bloom {
                     check_sketch_against_table(&histovec, sketch, floors.len() - 1);
                 }
-                (minc, chosen_min_qual, genomic_peak) =
+                (minc, chosen_min_qual, genomic_peak, plot_diagnostics) =
                     choose_min_count_and_floor(spectrum, sketch, floors);
             }
-            _ => (minc, genomic_peak) = choose_min_count_and_peak(spectrum),
+            _ => {
+                let diagnostics;
+                (minc, genomic_peak, diagnostics) = choose_min_count_and_peak(spectrum);
+                plot_diagnostics = Some(diagnostics);
+            }
         }
         if chosen_min_qual < qual.min_qual {
             // The caller recounts at the looser floor, so building the maps here is wasted work and
@@ -2041,14 +2309,33 @@ where
         minc = qual.min_count;
         // `--min-count` fixes the cutoff, not the coverage. The spectrum above spans every distinct
         // k-mer including singletons, so it is the same one the fitting path reads.
-        genomic_peak = peak_of(&estimate_by_valley(spectrum), spectrum);
+        let estimate = estimate_by_valley(spectrum);
+        genomic_peak = peak_of(&estimate, spectrum);
+        plot_diagnostics = Some(SpectrumPlotDiagnostics::new(
+            spectrum, &estimate, None, false,
+        ));
     }
     log::info!("Single-copy coverage read from the spectrum: {genomic_peak:?}");
 
     let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
 
     if let Some(p) = out_path {
-        plot_kmer_histogram(&histovec, p.as_path());
+        if do_fit {
+            if let Some(diagnostics) = plot_diagnostics.as_mut() {
+                if !diagnostics.fit_attempted {
+                    let estimate = estimate_by_valley(spectrum);
+                    let fit = fit_and_log(spectrum, &estimate);
+                    diagnostics.record_fit(spectrum, &estimate, fit);
+                }
+            }
+        }
+        let diagnostics = plot_diagnostics.unwrap_or_default();
+        plot_kmer_histogram(
+            spectrum,
+            do_bloom.then_some(histovec.as_slice()),
+            &diagnostics,
+            p.as_path(),
+        );
         write_kmer_spectrum_tsv(&histovec, p.as_path());
     }
     (kmers, histovec, minc, chosen_min_qual, genomic_peak)
@@ -2114,6 +2401,71 @@ mod tests {
     use super::*;
     use nohash_hasher::NoHashHasher;
     use std::{collections::HashMap, hash::BuildHasherDefault};
+
+    #[test]
+    fn legacy_and_native_plot_ranges_are_independent() {
+        assert_eq!(LEGACY_HISTO_RANGE, 500);
+        #[cfg(not(target_family = "wasm"))]
+        assert_eq!(NATIVE_PLOT_RANGE, 700);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn explicit_cutoff_diagnostics_do_not_contain_a_fit() {
+        let spectrum = vec![0u32; MAXSIZEHISTO];
+        let estimate = SpectrumEstimate {
+            valley: 12,
+            genomic_peak: 95,
+            ..SpectrumEstimate::default()
+        };
+        let diagnostics = SpectrumPlotDiagnostics::new(&spectrum, &estimate, None, false);
+        assert_eq!(diagnostics.valley, Some(12));
+        assert_eq!(diagnostics.empirical_peak, Some(95));
+        assert!(!diagnostics.fit_attempted);
+        assert!(diagnostics.fit.is_none());
+        assert!(diagnostics.fitted_distinct_total.is_none());
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_diagnostic_plot_renders_exact_and_bloom_spectra() {
+        let mut decision = vec![0u32; MAXSIZEHISTO];
+        for count in 1..=NATIVE_PLOT_RANGE {
+            decision[count - 1] = if count < 20 {
+                100_000 / count as u32
+            } else {
+                let distance = count.abs_diff(95) as f64;
+                (8_000.0 * (-distance * distance / 450.0).exp()) as u32
+            };
+        }
+        let mut raw_bloom = decision.clone();
+        raw_bloom[0] = 0;
+        let estimate = SpectrumEstimate {
+            valley: 20,
+            genomic_peak: 95,
+            ..SpectrumEstimate::default()
+        };
+        let fit = SpectrumFit {
+            w_error: 0.7,
+            w_single: 0.29,
+            w_repeat: 0.01,
+            mean: 95.0,
+            dispersion: 6.6,
+            error_mean: 1.2,
+            genome_kmers: 4.6e6,
+        };
+        let diagnostics = SpectrumPlotDiagnostics::new(&decision, &estimate, Some(fit), true);
+
+        for (suffix, raw) in [("exact", None), ("bloom", Some(raw_bloom.as_slice()))] {
+            let path = std::env::temp_dir().join(format!(
+                "sparrowhawk-spectrum-{suffix}-{}.png",
+                std::process::id()
+            ));
+            plot_kmer_histogram(&decision, raw, &diagnostics, &path);
+            assert!(std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0));
+            std::fs::remove_file(path).expect("remove temporary spectrum plot");
+        }
+    }
 
     fn empty_countmap() -> HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
         HashMap::with_hasher(BuildHasherDefault::default())
@@ -2570,7 +2922,7 @@ mod tests {
     }
 
     /// The last bin saturates (it absorbs every count >= MAXSIZEHISTO), so it must not be mistaken for
-    /// a peak — `fit_histogram` excludes it for the same reason.
+    /// a peak — the current mixture fit excludes it for the same reason.
     #[test]
     fn coverage_peak_ignores_the_edge_of_its_pinned_window() {
         let mut h = vec![0u32; MAXSIZEHISTO];
@@ -3257,7 +3609,7 @@ mod tests {
         // Mass in group 1 only, so floors 1 and 0 both see the bimodal spectrum and floor 2 sees nothing.
         let sketch = sketch_with(1, &bimodal(40));
         let floors = [0u8, 11, 25];
-        let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
+        let (minc, floor, _, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
         assert_eq!(floor, 11, "should loosen to B, not all the way to C");
         assert!(
             minc > 2,
@@ -3304,7 +3656,7 @@ mod tests {
         );
 
         let sketch = sketch_with(1, &bimodal(40));
-        let (_, floor, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
+        let (_, floor, _, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 11, "a 2.2x deeper spectrum justifies the recount");
     }
 
@@ -3316,7 +3668,8 @@ mod tests {
         let strict = estimate_by_valley(&shallow);
         // 19 against 18 is a gain of 1.06, under `MIN_COVERAGE_GAIN`.
         let sketch = sketch_with(1, &bimodal(19));
-        let (minc, floor, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
+        let (minc, floor, _, _) =
+            choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 25, "no material gain, so no recount");
         assert_eq!(
             minc, strict.min_count,
@@ -3349,7 +3702,7 @@ mod tests {
     fn a_resolving_but_starved_rung_keeps_loosening() {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = sketch_deepening(&bimodal(15), 2);
-        let (_, floor, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        let (_, floor, _, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 0, "a 3x deeper rung is there and must be taken");
     }
 
@@ -3363,7 +3716,7 @@ mod tests {
         for c in sketch.counts.values_mut() {
             c[0] = c[1] / 10;
         }
-        let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        let (minc, floor, _, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 11, "no material gain below it, so the walk stops here");
         assert_ne!(minc, UNRESOLVED_MINCOUNT, "and keeps the cutoff that rung measured");
     }
@@ -3379,7 +3732,7 @@ mod tests {
             c[1] = base + base / 7; // the middle floor, a little deeper
             c[0] = base / 12; // the loosest, deeper still but only just
         }
-        let (_, floor, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 15, 20]);
+        let (_, floor, _, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 15, 20]);
         assert_eq!(floor, 0, "the loosest qualifying floor wins when every floor is starved");
     }
 
@@ -3389,7 +3742,7 @@ mod tests {
     fn a_deep_enough_floor_is_taken_at_its_strictest() {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = sketch_with(1, &bimodal(40));
-        let (_, floor, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
+        let (_, floor, _, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 11, "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins");
     }
 
@@ -3400,7 +3753,7 @@ mod tests {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = SpectrumSketch::new();
         let floors = [0u8, 11, 25];
-        let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
+        let (minc, floor, _, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
         assert_eq!(floor, 0, "nothing resolved, so the floor goes to the bottom");
         assert_eq!(minc, UNRESOLVED_MINCOUNT);
     }

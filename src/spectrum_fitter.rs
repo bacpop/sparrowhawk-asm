@@ -34,6 +34,15 @@ const DISPERSION_SEEDS: [f64; 3] = [2.0, 8.0, 15.0];
 /// Counts above this multiple of the peak are not fitted: they are repeats beyond the two-copy lobe.
 const FIT_WINDOW_PEAK_MULT: usize = 6;
 
+pub(crate) fn fit_window_end(histogram_len: usize, peak: usize) -> usize {
+    (FIT_WINDOW_PEAK_MULT * peak).min(histogram_len.saturating_sub(1))
+}
+
+pub(crate) fn fitted_distinct_total(histovec: &[u32], peak: usize) -> f64 {
+    let top = fit_window_end(histovec.len(), peak);
+    histovec[..top].iter().map(|&n| f64::from(n)).sum()
+}
+
 const MAX_ITERS: u64 = 5_000;
 /// Offset applied to one coordinate at a time to build the initial simplex.
 const SIMPLEX_STEP: f64 = 0.5;
@@ -58,6 +67,32 @@ pub struct SpectrumFit {
 }
 
 impl SpectrumFit {
+    /// Weighted probabilities of the error, single-copy and two-copy components at one abundance.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn component_probabilities(&self, count: f64) -> [f64; 3] {
+        [
+            self.w_error * ln_dpois(count, self.error_mean).exp(),
+            self.w_single * ln_dnbinom(count, self.mean, self.dispersion).exp(),
+            self.w_repeat
+                * ln_dnbinom(count, REPEAT_LOBE_COPIES * self.mean, self.dispersion).exp(),
+        ]
+    }
+
+    /// Upper mode of the fitted single-copy negative binomial.
+    ///
+    /// With `variance = dispersion * mean`, the mode is
+    /// `floor(mean - (dispersion - 1))`, bounded below by zero. When two adjacent integer modes tie,
+    /// this convention returns the upper one.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn single_copy_mode(&self) -> u32 {
+        let mode = self.mean - (self.dispersion - 1.0);
+        if mode.is_finite() && mode > 0.0 {
+            mode.floor().min(f64::from(u32::MAX)) as u32
+        } else {
+            0
+        }
+    }
+
     /// Largest cutoff expected to strand at most `budget` single-copy k-mers below itself.
     ///
     /// Each stranded k-mer is a hole the graph cannot bridge, so it severs a contig. This bounds their
@@ -111,7 +146,7 @@ pub fn fit_spectrum(
     }
     // Counts and weights inside the window, skipping empty bins: they contribute nothing to the
     // likelihood and every one would cost three density evaluations per iteration.
-    let top = (FIT_WINDOW_PEAK_MULT * peak).min(histovec.len() - 1);
+    let top = fit_window_end(histovec.len(), peak);
     let observed: Vec<(f64, f64)> = histovec[..top]
         .iter()
         .enumerate()
@@ -121,7 +156,7 @@ pub fn fit_spectrum(
     if observed.is_empty() {
         return Err(Error::msg("no counts inside the fit window"));
     }
-    let total: f64 = observed.iter().map(|(_, n)| n).sum();
+    let total = fitted_distinct_total(histovec, peak);
 
     let problem = MixtureFit {
         observed,
@@ -382,6 +417,65 @@ mod tests {
     fn a_degenerate_spectrum_does_not_converge() {
         assert!(fit_spectrum(&vec![0u32; 8000], 95, 6.6).is_err());
         assert!(fit_spectrum(&synthetic(95.0, 6.6, 4.6e6, 3.0, 0.03), 1, 6.6).is_err());
+    }
+
+    #[test]
+    fn the_fit_window_and_its_total_use_the_same_bins() {
+        let mut h = vec![0u32; 8000];
+        h[0] = 3;
+        h[2477] = 5;
+        h[2478] = 11;
+        assert_eq!(fit_window_end(h.len(), 413), 2478);
+        assert_eq!(fitted_distinct_total(&h, 413), 8.0);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn fitted_mode_uses_the_negative_binomial_not_the_mean() {
+        let fit = SpectrumFit {
+            w_error: 0.877,
+            w_single: 0.123,
+            w_repeat: 0.0,
+            mean: 417.5,
+            dispersion: 139.22,
+            error_mean: 1.49,
+            genome_kmers: 2.184e6,
+        };
+        assert_eq!(fit.single_copy_mode(), 279);
+
+        let probabilities = fit.component_probabilities(413.0);
+        assert!(probabilities.iter().all(|p| p.is_finite() && *p >= 0.0));
+        let mixture_probability = probabilities.iter().sum::<f64>();
+        assert!(mixture_probability > 0.0 && mixture_probability <= 1.0);
+        assert!(fit.component_probabilities(279.0)[1] >= fit.component_probabilities(278.0)[1]);
+        assert!(fit.component_probabilities(279.0)[1] >= fit.component_probabilities(280.0)[1]);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn fitted_mode_handles_the_poisson_boundary_and_zero_mode() {
+        let mut fit = SpectrumFit {
+            w_error: 0.0,
+            w_single: 1.0,
+            w_repeat: 0.0,
+            mean: 95.0,
+            dispersion: 1.0,
+            error_mean: 1.0,
+            genome_kmers: 1.0,
+        };
+        assert_eq!(fit.single_copy_mode(), 95);
+
+        fit.mean = 5.0;
+        fit.dispersion = 8.0;
+        assert_eq!(fit.single_copy_mode(), 0);
+
+        fit.mean = 20.0;
+        fit.dispersion = 6.0;
+        assert_eq!(
+            fit.single_copy_mode(),
+            15,
+            "the upper tied mode is reported"
+        );
     }
 
     /// The cutoff bounds holes, so it can only loosen as the budget grows, and never falls below 2.
