@@ -767,15 +767,16 @@ fn choose_min_count_and_floor(
     (min_count, floor, PeakSource::Fitted(peak as u32))
 }
 
-/// Nothing separated at any floor: drop the filter, which is the most depth available, and warn, because
-/// the assembly will be fragmented whatever is chosen.
+/// Nothing separated at any floor: keep the strict floor, because loosening it admits more error
+/// k-mers into a spectrum that already failed to separate, and warn, because the assembly will be
+/// fragmented whatever is chosen.
 #[cfg(not(target_family = "wasm"))]
 fn unresolved(floors: &[u8], histovec: &[u32]) -> (u16, u8, PeakSource) {
-    let loosest = floors[0];
+    let strict_floor = floors[floors.len() - 1];
     logw(
         &format!(
-            "The k-mer spectrum does not separate at any candidate base-quality floor ({floors:?}), so \
-             the floor will be dropped to {loosest} and {UNRESOLVED_MINCOUNT} used as the minimum \
+            "The k-mer spectrum does not separate at any candidate base-quality floor ({floors:?}), \
+             so the floor stays at {strict_floor} and {UNRESOLVED_MINCOUNT} is used as the minimum \
              count. Expect a fragmented assembly. Check the k-mer spectrum histogram.",
         ),
         Some("warn"),
@@ -783,7 +784,7 @@ fn unresolved(floors: &[u8], histovec: &[u32]) -> (u16, u8, PeakSource) {
     // Nothing separated, so there is no fitted peak to report — only the median standing in.
     (
         UNRESOLVED_MINCOUNT,
-        loosest,
+        strict_floor,
         occurrence_weighted_median(histovec).map_or(PeakSource::Unknown, PeakSource::Fallback),
     )
 }
@@ -3155,6 +3156,27 @@ mod tests {
         assert!(matches!(peak, PeakSource::Fitted(_)), "got {peak:?}");
     }
 
+    /// End to end: a spectrum that separates nowhere keeps its floor, so the caller is never asked to
+    /// recount at a looser one. Loosening admits more error k-mers into a spectrum already dominated
+    /// by them, which on the 2026-09-22 sweep cost 4-6x the memory and lost contiguity.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_spectrum_that_separates_nowhere_keeps_its_floor() {
+        // One read deep: almost every k-mer is a singleton, so no rung grows a genome lobe.
+        let reads = deep_library(1, 37);
+        let ladder = [0u8, 11, 25];
+        let qual = QualOpts {
+            min_count: 2,
+            min_qual: 25,
+        };
+        let (kmers, _, minc, chosen_min_qual, _) = count_and_finish(reads, 31, &qual, &ladder, false);
+
+        assert_eq!(chosen_min_qual, 25, "the strict floor must stay in force");
+        assert_eq!(minc, UNRESOLVED_MINCOUNT);
+        // The recount path returns an empty table; keeping the floor means this one is built here.
+        assert!(kmers.len() > 0, "the pass-1 table must be the one used");
+    }
+
     /// A k-mer moves between count bins as the floor drops; it does not appear in two bins at once.
     #[test]
     fn a_kmer_moves_between_count_bins_when_the_floor_drops() {
@@ -3313,15 +3335,15 @@ mod tests {
         assert_eq!(floor, 11, "both floors clear MIN_USEFUL_COVERAGE, so the stricter one wins");
     }
 
-    /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an
-    /// estimate that by definition did not resolve.
+    /// Nothing resolves anywhere, so the strict floor is kept: loosening cannot separate a spectrum
+    /// that did not separate, and it admits more error k-mers.
     #[test]
-    fn nothing_resolving_drops_the_floor_to_zero() {
+    fn nothing_resolving_keeps_the_strict_floor() {
         let flat = vec![1000u32; MAXSIZEHISTO];
         let sketch = SpectrumSketch::new();
         let floors = [0u8, 11, 25];
         let (minc, floor, _) = choose_min_count_and_floor(&flat, &sketch, &floors);
-        assert_eq!(floor, 0, "nothing resolved, so the floor goes to the bottom");
+        assert_eq!(floor, 25, "nothing resolved, so the strict floor stays in force");
         assert_eq!(minc, UNRESOLVED_MINCOUNT);
     }
 
