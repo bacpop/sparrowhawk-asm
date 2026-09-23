@@ -60,7 +60,8 @@ impl BloomBits {
 
     /// Words the unsharded filter uses. A sharded caller divides this, so bits per key are preserved.
     pub fn default_words() -> u64 {
-        f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64 / 8.0) / (u64::BITS as f64)) as u64
+        //f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64 / 8.0) / (u64::BITS as f64)) as u64
+        f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64) / (u64::BITS as f64)) as u64 // I think this is a bug, removing it
     }
 
     /// Sized but not allocated; [`Self::init`] does that, so FASTA input never pays for the buffer.
