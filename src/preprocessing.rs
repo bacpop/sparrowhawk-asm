@@ -771,7 +771,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
             &format!(
                 "Spectrum fit candidate: error_model={} genome_model={} status={} log_likelihood={:.6e} bic={:.6e} \
                  deviance={:.6e} mode={} repeat_mode={} error_mode={} mean={:.1} dispersion={:.2} \
-                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} total_iterations={} best_iterations={}",
+                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} total_iterations={} capped_starts={} best_iterations={}",
                 attempt.error_model,
                 attempt.genome_model,
                 status,
@@ -787,6 +787,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                 fit.error_params.tail_exponent,
                 fit.error_params.weibull_shape.map_or_else(|| "n/a".to_string(), |shape| format!("{shape:.6}")),
                 attempt.total_iterations,
+                attempt.capped_starts,
                 fit.best_iterations,
             ),
             Some("info"),
@@ -794,13 +795,14 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
     } else {
         logw(
             &format!(
-                "Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={}",
+                "Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={} capped_starts={}",
                 attempt.error_model,
                 attempt.genome_model,
                 attempt
                     .rejection
                     .expect("an absent candidate always has a rejection reason"),
                 attempt.total_iterations,
+                attempt.capped_starts,
             ),
             Some("info"),
         );

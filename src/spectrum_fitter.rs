@@ -7,6 +7,8 @@
 //!
 //! [`fit_spectrum`] is the main interface.
 
+#[cfg(not(target_family = "wasm"))]
+use argmin::core::TerminationReason::MaxItersReached;
 use argmin::{
     core::{CostFunction, Error, Executor, State, TerminationReason::SolverConverged},
     solver::neldermead::NelderMead,
@@ -46,10 +48,12 @@ pub(crate) fn fitted_distinct_total(histovec: &[u32], peak: usize) -> f64 {
 }
 
 const MAX_ITERS: u64 = 5_000;
+#[cfg(not(target_family = "wasm"))]
+const NATIVE_MAX_ITERS: u64 = 500;
 /// Offset applied to one coordinate at a time to build the initial simplex.
 const SIMPLEX_STEP: f64 = 0.5;
 /// Argmin defaults to machine epsilon, which is needlessly strict for likelihoods around 1e7 and
-/// makes an otherwise stationary simplex run to [`MAX_ITERS`].
+/// makes an otherwise stationary simplex run to [`NATIVE_MAX_ITERS`].
 #[cfg(not(target_family = "wasm"))]
 const NATIVE_SD_TOLERANCE: f64 = 1e-4;
 
@@ -656,6 +660,7 @@ pub(crate) struct FitAttempt {
     pub(crate) candidate: Option<NativeSpectrumFit>,
     pub(crate) rejection: Option<FitRejection>,
     pub(crate) total_iterations: u64,
+    pub(crate) capped_starts: u32,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -871,6 +876,7 @@ pub(crate) fn fit_native_spectrum(
             valley,
             peak,
             hint,
+            NATIVE_MAX_ITERS,
         )
     };
     let ((pareto_nb, pareto_normal), (weibull_nb, weibull_normal)) = rayon::join(
@@ -903,9 +909,11 @@ fn fit_native_candidate(
     valley: usize,
     empirical_peak: usize,
     dispersion_hint: f64,
+    max_iters: u64,
 ) -> FitAttempt {
     let mut best: Option<(f64, Vec<f64>, u64)> = None;
     let mut total_iterations = 0u64;
+    let mut capped_starts = 0u32;
     for seed in DISPERSION_SEEDS
         .iter()
         .copied()
@@ -929,15 +937,19 @@ fn fit_native_candidate(
             if problem.error_model == ErrorModel::FreeSingletonWeibull {
                 start.push(shape.ln());
             }
-            let Ok((cost, params, iterations)) = run_native_one(problem.clone(), start) else {
+            let Ok(outcome) = run_native_one(problem.clone(), start, max_iters) else {
                 continue;
             };
-            total_iterations = total_iterations.saturating_add(iterations);
+            total_iterations = total_iterations.saturating_add(outcome.iterations);
+            capped_starts += u32::from(outcome.hit_cap);
+            let Some((cost, params)) = outcome.converged else {
+                continue;
+            };
             if best
                 .as_ref()
                 .is_none_or(|(best_cost, _, _)| cost < *best_cost)
             {
-                best = Some((cost, params, iterations));
+                best = Some((cost, params, outcome.iterations));
             }
         }
     }
@@ -949,6 +961,7 @@ fn fit_native_candidate(
             candidate: None,
             rejection: Some(FitRejection::OptimisationFailed),
             total_iterations,
+            capped_starts,
         };
     };
     let fit = problem.unpack(&params, cost, best_iterations);
@@ -959,14 +972,23 @@ fn fit_native_candidate(
         candidate: Some(fit),
         rejection,
         total_iterations,
+        capped_starts,
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct NativeRunOutcome {
+    converged: Option<(f64, Vec<f64>)>,
+    iterations: u64,
+    hit_cap: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
 fn run_native_one(
     problem: NativeMixtureFit,
     start: Vec<f64>,
-) -> Result<(f64, Vec<f64>, u64), Error> {
+    max_iters: u64,
+) -> Result<NativeRunOutcome, Error> {
     let mut simplex = vec![start.clone()];
     for index in 0..start.len() {
         let mut vertex = start.clone();
@@ -975,23 +997,24 @@ fn run_native_one(
     }
     let solver = NelderMead::new(simplex).with_sd_tolerance(NATIVE_SD_TOLERANCE)?;
     let result = Executor::new(problem, solver)
-        .configure(|state| state.max_iters(MAX_ITERS))
+        .configure(|state| state.max_iters(max_iters))
         .run()?;
-    match result.state().get_termination_reason() {
-        Some(reason) if *reason == SolverConverged => {
-            let state = result.state();
-            let params = state
-                .get_best_param()
-                .ok_or_else(|| Error::msg("converged without a parameter vector"))?;
-            let cost = state.get_best_cost();
-            if cost.is_finite() {
-                Ok((cost, params.clone(), state.get_iter()))
-            } else {
-                Err(Error::msg("converged without a finite likelihood"))
-            }
-        }
-        _ => Err(Error::msg("did not converge")),
-    }
+    let state = result.state();
+    let termination = state.get_termination_reason();
+    let converged = if matches!(termination, Some(reason) if *reason == SolverConverged)
+        && state.get_best_cost().is_finite()
+    {
+        state
+            .get_best_param()
+            .map(|params| (state.get_best_cost(), params.clone()))
+    } else {
+        None
+    };
+    Ok(NativeRunOutcome {
+        converged,
+        iterations: state.get_iter(),
+        hit_cap: matches!(termination, Some(reason) if *reason == MaxItersReached),
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1365,6 +1388,39 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    fn capped_native_starts_count_iterations_but_are_not_candidates() {
+        let histogram = native_synthetic(
+            ErrorParams {
+                singleton_probability: 0.85,
+                tail_exponent: 1.8,
+                weibull_shape: None,
+            },
+            GenomeModel::NegativeBinomial,
+        );
+        let observed: Arc<[(f64, f64)]> = histogram[..300]
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(index, &count)| ((index + 1) as f64, f64::from(count)))
+            .collect::<Vec<_>>()
+            .into();
+        let problem = NativeMixtureFit {
+            observed_total: observed.iter().map(|&(_, count)| count).sum(),
+            observed,
+            peak: 50.0,
+            fit_window_end: 300,
+            error_model: ErrorModel::SingletonPareto,
+            genome_model: GenomeModel::NegativeBinomial,
+        };
+        let attempt = fit_native_candidate(problem, 12, 50, 4.0, 1);
+        assert_eq!(attempt.capped_starts, 8);
+        assert_eq!(attempt.total_iterations, 8);
+        assert!(attempt.candidate.is_none());
+        assert_eq!(attempt.rejection, Some(FitRejection::OptimisationFailed));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
     fn free_singleton_weibull_nests_ordinary_weibull_geometric_and_one_inflated() {
         for (scale, shape) in [(1.2_f64, 0.6_f64), (0.7, 1.0)] {
             let base_singleton = -(-scale).exp_m1();
@@ -1539,6 +1595,7 @@ mod tests {
             candidate: Some(fit),
             rejection: None,
             total_iterations: 1,
+            capped_starts: 0,
         };
         let make = |error_model, genome_model| {
             let error_params = ErrorParams {
@@ -1728,6 +1785,7 @@ mod tests {
             candidate: None,
             rejection: Some(FitRejection::OptimisationFailed),
             total_iterations: 0,
+            capped_starts: 0,
         };
         assert!(select_native_fit(&[
             rejected(ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
