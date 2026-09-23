@@ -443,6 +443,7 @@ pub(crate) enum FitRejection {
     OptimisationFailed,
     NonFiniteLikelihood,
     InvalidComponents,
+    GenomeLobeOutsideFitWindow,
     ErrorModePastValley,
     PrimaryModeOutsideBand,
     RepeatModeTooEarly,
@@ -455,6 +456,7 @@ impl fmt::Display for FitRejection {
             Self::OptimisationFailed => "optimisation_failed",
             Self::NonFiniteLikelihood => "non_finite_likelihood",
             Self::InvalidComponents => "invalid_components",
+            Self::GenomeLobeOutsideFitWindow => "genome_lobe_outside_fit_window",
             Self::ErrorModePastValley => "error_mode_past_valley",
             Self::PrimaryModeOutsideBand => "primary_mode_outside_band",
             Self::RepeatModeTooEarly => "repeat_mode_too_early",
@@ -576,12 +578,16 @@ impl NativeSpectrumFit {
         ]
     }
 
-    pub(crate) fn hole_cutoff(&self, budget: f64) -> u16 {
-        if self.genome_kmers <= 0.0 || !self.mean.is_finite() || self.mean < 2.0 {
-            return 2;
+    pub(crate) fn hole_cutoff(&self, budget: f64) -> Option<u16> {
+        if self.genome_kmers <= 0.0
+            || !self.mean.is_finite()
+            || self.mean < 2.0
+            || self.fit_window_end < 2
+        {
+            return None;
         }
         let allowed = budget / self.genome_kmers;
-        let ceiling = self.mean.round() as usize;
+        let ceiling = (self.mean.round() as usize).min(self.fit_window_end);
         let mut cdf = match self.genome_model {
             GenomeModel::NegativeBinomial => ln_dnbinom(0.0, self.mean, self.dispersion).exp(),
             GenomeModel::Normal => {
@@ -594,23 +600,26 @@ impl NativeSpectrumFit {
                 + native_ln_genome(cutoff as f64, self.mean, self.dispersion, self.genome_model)
                     .exp();
             if next > allowed {
-                break;
+                return Some((cutoff.min(u16::MAX as usize) as u16).max(2));
             }
             cdf = next;
             cutoff += 1;
         }
-        (cutoff.min(u16::MAX as usize) as u16).max(2)
+        None
     }
 
-    pub(crate) fn crossover(&self) -> u16 {
-        let ceiling = self.mean.round().max(2.0) as usize;
+    pub(crate) fn crossover(&self) -> Option<u16> {
+        if !self.mean.is_finite() || self.mean < 2.0 || self.fit_window_end < 2 {
+            return None;
+        }
+        let ceiling = (self.mean.round().max(2.0) as usize).min(self.fit_window_end);
         for count in 1..ceiling {
             let heights = self.component_heights(count);
             if heights[1] > heights[0] {
-                return (count.min(u16::MAX as usize) as u16).max(2);
+                return Some((count.min(u16::MAX as usize) as u16).max(2));
             }
         }
-        (ceiling.min(u16::MAX as usize) as u16).max(2)
+        None
     }
 
     pub(crate) fn shadow_error_floor(&self, reference_fraction: f64) -> u16 {
@@ -1026,6 +1035,16 @@ fn validate_native_fit(
         || !fit.error_kmers.is_finite()
     {
         return Some(FitRejection::InvalidComponents);
+    }
+    if !fit.mean.is_finite()
+        || fit.mean <= 0.0
+        || !fit.dispersion.is_finite()
+        || fit.dispersion <= 1.0
+    {
+        return Some(FitRejection::InvalidComponents);
+    }
+    if fit.primary_mode() > fit.fit_window_end || fit.repeat_mode() > fit.fit_window_end {
+        return Some(FitRejection::GenomeLobeOutsideFitWindow);
     }
     if fit.error_mode() >= valley {
         return Some(FitRejection::ErrorModePastValley);
@@ -1516,7 +1535,9 @@ mod tests {
             120,
         );
         let allowed = 0.1;
-        let cutoff = fit.hole_cutoff(allowed * fit.genome_kmers);
+        let cutoff = fit
+            .hole_cutoff(allowed * fit.genome_kmers)
+            .expect("the allowed-hole boundary should be crossed inside the fit window");
         let sigma = (fit.dispersion * fit.mean).sqrt();
         let below_cutoff = normal_cdf((f64::from(cutoff) - 0.5 - fit.mean) / sigma);
         let including_cutoff = normal_cdf((f64::from(cutoff) + 0.5 - fit.mean) / sigma);
@@ -1694,6 +1715,71 @@ mod tests {
             validate_native_fit(&outside, 12, 100),
             Some(FitRejection::PrimaryModeOutsideBand)
         );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn degenerate_genome_parameters_and_modes_outside_fit_window_are_rejected() {
+        let params = ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 2.0,
+            weibull_shape: None,
+        };
+        for (mean, dispersion) in [(0.0, 4.0), (100.0, 1.0), (f64::INFINITY, 4.0)] {
+            let fit = NativeSpectrumFit::for_test(
+                ErrorModel::SingletonPareto,
+                GenomeModel::NegativeBinomial,
+                [0.7, 0.29, 0.01],
+                mean,
+                dispersion,
+                params,
+                1.0e6,
+                120,
+            );
+            assert_eq!(
+                validate_native_fit(&fit, 12, 100),
+                Some(FitRejection::InvalidComponents),
+                "mean={mean}, dispersion={dispersion}"
+            );
+        }
+
+        let outside = NativeSpectrumFit::for_test(
+            ErrorModel::SingletonPareto,
+            GenomeModel::NegativeBinomial,
+            [0.7, 0.29, 0.01],
+            100.0,
+            5.0,
+            params,
+            1.0e6,
+            120,
+        );
+        assert!(outside.primary_mode() <= outside.fit_window_end);
+        assert!(outside.repeat_mode() > outside.fit_window_end);
+        assert_eq!(
+            validate_native_fit(&outside, 12, outside.primary_mode()),
+            Some(FitRejection::GenomeLobeOutsideFitWindow)
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_cutoff_searches_stop_at_the_fit_window() {
+        let fit = NativeSpectrumFit::for_test(
+            ErrorModel::SingletonPareto,
+            GenomeModel::NegativeBinomial,
+            [0.999_999_999, 0.000_000_001, 0.0],
+            100.0,
+            5.0,
+            ErrorParams {
+                singleton_probability: 0.85,
+                tail_exponent: 2.0,
+                weibull_shape: None,
+            },
+            1.0e6,
+            20,
+        );
+        assert_eq!(fit.crossover(), None);
+        assert_eq!(fit.hole_cutoff(f64::INFINITY), None);
     }
 
     #[cfg(not(target_family = "wasm"))]

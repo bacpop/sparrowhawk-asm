@@ -823,8 +823,9 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
                 fit.w_repeat,
                 fit.genome_kmers,
                 fit.error_kmers,
-                fit.crossover(),
-                fit.hole_cutoff(MAX_GENOME_HOLES),
+                fit.crossover().map_or_else(|| "none".to_string(), |value| value.to_string()),
+                fit.hole_cutoff(MAX_GENOME_HOLES)
+                    .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 fit.best_iterations,
                 elapsed.as_millis(),
             ),
@@ -973,16 +974,17 @@ fn apply_hole_guard(
 ) {
     let Some(fit) = fit else { return };
     if estimate.verdict.is_ok() {
-        let guarded = fit.hole_cutoff(MAX_GENOME_HOLES);
-        if guarded < estimate.min_count {
-            logw(
-                &format!(
-                    "Cutting at {} would strand more than {} single-copy k-mers; using {} instead.",
-                    estimate.min_count, MAX_GENOME_HOLES, guarded
-                ),
-                Some("info"),
-            );
-            estimate.min_count = guarded.max(2);
+        if let Some(guarded) = fit.hole_cutoff(MAX_GENOME_HOLES) {
+            if guarded < estimate.min_count {
+                logw(
+                    &format!(
+                        "Cutting at {} would strand more than {} single-copy k-mers; using {} instead.",
+                        estimate.min_count, MAX_GENOME_HOLES, guarded
+                    ),
+                    Some("info"),
+                );
+                estimate.min_count = guarded.max(2);
+            }
         }
     }
 
@@ -993,14 +995,15 @@ fn apply_hole_guard(
         .expect("the 100% error floor is always present");
     let genomic_guarded_min = estimate.min_count;
     estimate.min_count = estimate.min_count.max(enforced.floor);
+    let hole_cutoff = fit.hole_cutoff(MAX_GENOME_HOLES);
     logw(
         &format!(
-            "Spectrum 100% error floor enforced: floor={} previous_min_count={} final_min_count={} hole_cutoff={} conflict={}",
+            "Spectrum 100% error floor enforced: floor={} previous_min_count={} final_min_count={} hole_cutoff={:?} conflict={}",
             enforced.floor,
             genomic_guarded_min,
             estimate.min_count,
-            fit.hole_cutoff(MAX_GENOME_HOLES),
-            enforced.floor > fit.hole_cutoff(MAX_GENOME_HOLES),
+            hole_cutoff,
+            hole_cutoff.is_some_and(|cutoff| enforced.floor > cutoff),
         ),
         Some("info"),
     );
@@ -1110,6 +1113,19 @@ fn choose_min_count_and_floor(
     sketch: &SpectrumSketch,
     floors: &[u8],
 ) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>) {
+    choose_min_count_and_floor_with_fit(histovec, sketch, floors, fit_and_log)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn choose_min_count_and_floor_with_fit<F>(
+    histovec: &[u32],
+    sketch: &SpectrumSketch,
+    floors: &[u8],
+    fit_strict: F,
+) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>)
+where
+    F: FnOnce(&[u32], &SpectrumEstimate) -> Option<NativeSpectrumFit>,
+{
     let strict_floor = floors[floors.len() - 1];
     let mut strict = estimate_by_valley(histovec);
     log_spectrum(histovec, &strict);
@@ -1117,13 +1133,23 @@ fn choose_min_count_and_floor(
     // avoids building the sketch spectra at all. It is also the common case, so the hole guard has to
     // be applied here too and not only in `choose_min_count_and_peak`.
     if resolves(&strict) && strict.genomic_peak >= MIN_USEFUL_COVERAGE {
-        let fit = fit_and_log(histovec, &strict);
-        apply_hole_guard(&mut strict, fit.as_ref(), histovec);
-        return (
-            strict.min_count,
-            strict_floor,
-            peak_of(&strict, histovec),
-            Some(SpectrumPlotDiagnostics::new(histovec, &strict, fit, true)),
+        if let Some(fit) = fit_strict(histovec, &strict) {
+            apply_hole_guard(&mut strict, Some(&fit), histovec);
+            return (
+                strict.min_count,
+                strict_floor,
+                peak_of(&strict, histovec),
+                Some(SpectrumPlotDiagnostics::new(
+                    histovec,
+                    &strict,
+                    Some(fit),
+                    true,
+                )),
+            );
+        }
+        logw(
+            "No usable spectrum fit at the strict quality floor; evaluating lower quality floors.",
+            Some("info"),
         );
     }
 
@@ -1438,13 +1464,14 @@ fn plot_markers(diagnostics: &SpectrumPlotDiagnostics, used_min_count: u16) -> V
             label: format!("Fitted mode = {mode}"),
             line_style: MarkerLineStyle::Solid,
         });
-        let crossover = fit.crossover();
-        markers.push(PlotMarker {
-            x: f64::from(crossover),
-            colour: RGBColor(120, 70, 200),
-            label: format!("Error/genome crossover = {crossover}"),
-            line_style: MarkerLineStyle::Solid,
-        });
+        if let Some(crossover) = fit.crossover() {
+            markers.push(PlotMarker {
+                x: f64::from(crossover),
+                colour: RGBColor(120, 70, 200),
+                label: format!("Error/genome crossover = {crossover}"),
+                line_style: MarkerLineStyle::Solid,
+            });
+        }
     }
     if let Some(shadows) = diagnostics.shadow_floors {
         let mut grouped: Vec<(u16, Vec<u8>)> = Vec::new();
@@ -4430,6 +4457,31 @@ mod tests {
             "and the strict cutoff is kept, not the fallback"
         );
         assert_ne!(minc, UNRESOLVED_MINCOUNT);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_failed_strict_floor_fit_checks_lower_quality_floors() {
+        let strict_histogram = histo(&bimodal(30));
+        let strict = estimate_by_valley(&strict_histogram);
+        assert!(resolves(&strict));
+        assert!(strict.genomic_peak >= MIN_USEFUL_COVERAGE);
+
+        let sketch = sketch_with(1, &bimodal(40));
+        let (min_count, floor, _, diagnostics) = choose_min_count_and_floor_with_fit(
+            &strict_histogram,
+            &sketch,
+            &[0u8, 11, 25],
+            |_, _| None,
+        );
+
+        // The current arbitration still prefers the strict floor when its empirical peak is useful.
+        // A diagnostics object with no fit proves it fell through to evaluate the floor sketches.
+        assert_eq!(floor, 25);
+        assert_ne!(min_count, UNRESOLVED_MINCOUNT);
+        let diagnostics = diagnostics.expect("the strict-floor sketch result carries diagnostics");
+        assert!(!diagnostics.fit_attempted);
+        assert!(diagnostics.fit.is_none());
     }
 
     /// A sketch where the loose rung sees `extra` further occurrences of every k-mer, which is what
