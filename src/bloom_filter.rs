@@ -61,7 +61,8 @@ impl BloomBits {
     /// Words the unsharded filter uses. A sharded caller divides this, so bits per key are preserved.
     pub fn default_words() -> u64 {
         //f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64 / 8.0) / (u64::BITS as f64)) as u64
-        f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64) / (u64::BITS as f64)) as u64 // I think this is a bug, removing it
+        f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64) / (u64::BITS as f64)) as u64
+        // I think this is a bug, removing it
     }
 
     /// Sized but not allocated; [`Self::init`] does that, so FASTA input never pays for the buffer.
@@ -78,6 +79,18 @@ impl BloomBits {
         if self.buffer.is_empty() {
             self.buffer.resize(self.buf_size as usize, 0);
         }
+    }
+
+    /// Number of set bits and allocated bits in the Bloom buffer.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn occupancy(&self) -> (u64, u64) {
+        let set_bits = self
+            .buffer
+            .iter()
+            .map(|word| u64::from(word.count_ones()))
+            .sum();
+        let capacity_bits = self.buffer.len() as u64 * u64::BITS as u64;
+        (set_bits, capacity_bits)
     }
 
     /// Set this key's fingerprint, reporting whether it was already present.
@@ -250,5 +263,21 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(stored_nc, nc);
         assert_eq!(stored_bases, bases);
+    }
+
+    #[test]
+    fn bloom_occupancy_counts_set_bits_without_changing_the_filter() {
+        let mut bits = BloomBits::with_words(2);
+        bits.init();
+        assert_eq!(bits.occupancy(), (0, 128));
+
+        assert!(!bits.add_and_check(0x1234_5678_9ABC_DEF0));
+        let after_first_insert = bits.occupancy();
+        assert!(after_first_insert.0 > 0);
+        assert!(after_first_insert.0 <= 5);
+        assert_eq!(after_first_insert.1, 128);
+
+        assert!(bits.add_and_check(0x1234_5678_9ABC_DEF0));
+        assert_eq!(bits.occupancy(), after_first_insert);
     }
 }

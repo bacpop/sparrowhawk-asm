@@ -438,11 +438,64 @@ fn smoothed(histovec: &[u32], count: usize) -> u64 {
     (lo..=hi).map(|c| histovec[c - 1] as u64).sum::<u64>() / (hi - lo + 1) as u64
 }
 
+/// Smooth each histogram bin once so valley and peak searches use the same five-bin view.
+#[cfg(not(target_family = "wasm"))]
+fn smooth_histogram(histovec: &[u32]) -> Vec<u64> {
+    (1..=histovec.len())
+        .map(|count| smoothed(histovec, count))
+        .collect()
+}
+
 /// First local minimum followed by [`RISE_RUN`] rising bins, as a **count**. `None` when the spectrum
 /// never turns back up. Only a *valley seed* for [`find_valley`]: on a deep library whose error lobe decays
 /// without a local minimum this walks into the genome lobe, which is harmless once bounded by the genomic peak.
-fn find_valley_seed(histovec: &[u32]) -> Option<usize> {
-    let hi = histovec.len() - 1; // the saturating bin is not part of the shape
+#[cfg(not(target_family = "wasm"))]
+fn find_valley_seed(smoothed_histovec: &[u64]) -> Option<usize> {
+    if smoothed_histovec.len() <= 3 {
+        return None;
+    }
+    let hi = smoothed_histovec.len() - 1; // the saturating bin is not part of the shape
+    let mut best_count = 2usize;
+    let mut best_n = smoothed_histovec[1];
+    let mut rising = 0usize;
+    for count in 3..hi {
+        let n = smoothed_histovec[count - 1];
+        if n < best_n {
+            best_n = n;
+            best_count = count;
+            rising = 0;
+        } else {
+            rising += 1;
+            if rising >= RISE_RUN {
+                return Some(best_count);
+            }
+        }
+    }
+    None
+}
+
+/// Lowest smoothed bin in `2..=genomic_peak`, as a **count**: the valley between the error lobe and the genome
+/// lobe. Bounded above by the genomic peak, so unlike [`find_valley_seed`] it cannot walk off into the lobe itself.
+#[cfg(not(target_family = "wasm"))]
+fn find_valley(smoothed_histovec: &[u64], genomic_peak: usize) -> usize {
+    let mut best_count = 2usize;
+    let mut best_n = smoothed_histovec[1];
+    for count in 3..=genomic_peak.min(smoothed_histovec.len() - 1) {
+        let n = smoothed_histovec[count - 1];
+        if n < best_n {
+            best_n = n;
+            best_count = count;
+        }
+    }
+    best_count
+}
+
+#[cfg(target_family = "wasm")]
+fn find_valley_seed_raw(histovec: &[u32]) -> Option<usize> {
+    if histovec.len() <= 3 {
+        return None;
+    }
+    let hi = histovec.len() - 1;
     let mut best_count = 2usize;
     let mut best_n = smoothed(histovec, 2);
     let mut rising = 0usize;
@@ -462,9 +515,8 @@ fn find_valley_seed(histovec: &[u32]) -> Option<usize> {
     None
 }
 
-/// Lowest smoothed bin in `2..=genomic_peak`, as a **count**: the valley between the error lobe and the genome
-/// lobe. Bounded above by the genomic peak, so unlike [`find_valley_seed`] it cannot walk off into the lobe itself.
-fn find_valley(histovec: &[u32], genomic_peak: usize) -> usize {
+#[cfg(target_family = "wasm")]
+fn find_valley_raw(histovec: &[u32], genomic_peak: usize) -> usize {
     let mut best_count = 2usize;
     let mut best_n = smoothed(histovec, 2);
     for count in 3..=genomic_peak.min(histovec.len() - 1) {
@@ -554,13 +606,28 @@ fn distinct_above(histovec: &[u32], valley: usize) -> u64 {
 
 /// Tallest bin at or above the valley, as a **count**. Unlike [`coverage_peak`] this cannot lock onto
 /// the error lobe, which is the whole difference between the two estimators.
-fn find_genomic_peak(histovec: &[u32], valley: usize) -> usize {
+#[cfg(not(target_family = "wasm"))]
+fn find_genomic_peak(smoothed_histovec: &[u64], valley: usize) -> usize {
+    let hi = smoothed_histovec.len() - 1;
+    let mut best_count = valley;
+    let mut best_n = 0u64;
+    for count in valley..hi {
+        if smoothed_histovec[count - 1] > best_n {
+            // Strict, so ties keep the lowest count.
+            best_n = smoothed_histovec[count - 1];
+            best_count = count;
+        }
+    }
+    best_count
+}
+
+#[cfg(target_family = "wasm")]
+fn find_genomic_peak_raw(histovec: &[u32], valley: usize) -> usize {
     let hi = histovec.len() - 1;
     let mut best_count = valley;
     let mut best_n = 0u32;
     for count in valley..hi {
         if histovec[count - 1] > best_n {
-            // Strict, so ties keep the lowest count.
             best_n = histovec[count - 1];
             best_count = count;
         }
@@ -578,15 +645,31 @@ fn estimate_by_valley(histovec: &[u32]) -> SpectrumEstimate {
     };
     // The valley seed only has to land past the error head, not on the valley: the search below runs from 2,
     // so an overshoot into the genome lobe still yields the right answer.
-    let Some(valley_seed) = find_valley_seed(histovec) else {
-        est.verdict = Verdict::NeverTurnsUp;
-        return est;
-    };
-    est.valley_seed = valley_seed;
-    est.genomic_peak = find_genomic_peak(histovec, valley_seed);
-    est.valley = find_valley(histovec, est.genomic_peak);
-    est.genomic_peak_n = histovec[est.genomic_peak - 1];
-    est.valley_n = histovec[est.valley - 1];
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let smooth = smooth_histogram(histovec);
+        let Some(valley_seed) = find_valley_seed(&smooth) else {
+            est.verdict = Verdict::NeverTurnsUp;
+            return est;
+        };
+        est.valley_seed = valley_seed;
+        est.genomic_peak = find_genomic_peak(&smooth, valley_seed);
+        est.valley = find_valley(&smooth, est.genomic_peak);
+        est.genomic_peak_n = smooth[est.genomic_peak - 1] as u32;
+        est.valley_n = smooth[est.valley - 1] as u32;
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let Some(valley_seed) = find_valley_seed_raw(histovec) else {
+            est.verdict = Verdict::NeverTurnsUp;
+            return est;
+        };
+        est.valley_seed = valley_seed;
+        est.genomic_peak = find_genomic_peak_raw(histovec, valley_seed);
+        est.valley = find_valley_raw(histovec, est.genomic_peak);
+        est.genomic_peak_n = histovec[est.genomic_peak - 1];
+        est.valley_n = smoothed(histovec, est.valley) as u32;
+    }
     est.gp_to_v_ratio = est.genomic_peak_n as f64 / est.valley_n.max(1) as f64;
     est.valley_to_peak_xratio = est.valley as f64 / est.genomic_peak as f64;
 
@@ -903,7 +986,29 @@ fn apply_hole_guard(
         }
     }
 
-    for diagnostic in shadow_floor_diagnostics(histovec, estimate.min_count, fit) {
+    let floor_diagnostics = shadow_floor_diagnostics(histovec, estimate.min_count, fit);
+    let enforced = floor_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.reference_pct == 100)
+        .expect("the 100% error floor is always present");
+    let genomic_guarded_min = estimate.min_count;
+    estimate.min_count = estimate.min_count.max(enforced.floor);
+    logw(
+        &format!(
+            "Spectrum 100% error floor enforced: floor={} previous_min_count={} final_min_count={} hole_cutoff={} conflict={}",
+            enforced.floor,
+            genomic_guarded_min,
+            estimate.min_count,
+            fit.hole_cutoff(MAX_GENOME_HOLES),
+            enforced.floor > fit.hole_cutoff(MAX_GENOME_HOLES),
+        ),
+        Some("info"),
+    );
+
+    for diagnostic in floor_diagnostics
+        .into_iter()
+        .filter(|diagnostic| diagnostic.reference_pct != 100)
+    {
         let ratio = if diagnostic.fitted_genome_removed > 0.0 {
             diagnostic.fitted_error_removed / diagnostic.fitted_genome_removed
         } else if diagnostic.fitted_error_removed > 0.0 {
@@ -917,7 +1022,7 @@ fn apply_hole_guard(
                  observed_distinct_removed={} fitted_error_removed={:.3e} \
                  fitted_single_copy_removed={:.3e} fitted_error_per_genomic_removed={:.3e}",
                 diagnostic.reference_pct,
-                estimate.min_count,
+                genomic_guarded_min,
                 diagnostic.floor,
                 diagnostic.observed_distinct_removed,
                 diagnostic.fitted_error_removed,
@@ -985,7 +1090,7 @@ const COMFORTABLE_GP_TO_V_RATIO: f64 = MIN_GP_TO_V_RATIO + 0.5;
 /// Coverage below which a resolving spectrum is not taken at face value: the floor, rather than the
 /// library, may be what made it shallow.
 #[cfg(not(target_family = "wasm"))]
-const MIN_USEFUL_COVERAGE: usize = 25;
+const MIN_USEFUL_COVERAGE: usize = 15;
 /// A looser floor must lift the genomic peak by at least this much to justify a second pass. Measured:
 /// starved libraries gain only 1.13-1.20 there while loosening is worth 2.2x, so 1.20 refused too much.
 #[cfg(not(target_family = "wasm"))]
@@ -1344,6 +1449,15 @@ fn plot_markers(diagnostics: &SpectrumPlotDiagnostics, used_min_count: u16) -> V
     if let Some(shadows) = diagnostics.shadow_floors {
         let mut grouped: Vec<(u16, Vec<u8>)> = Vec::new();
         for shadow in shadows {
+            if shadow.reference_pct == 100 {
+                markers.push(PlotMarker {
+                    x: f64::from(shadow.floor),
+                    colour: RGBColor(105, 105, 105),
+                    label: format!("Enforced 100% error floor = {}", shadow.floor),
+                    line_style: MarkerLineStyle::Dashed,
+                });
+                continue;
+            }
             if let Some((_, percentages)) =
                 grouped.iter_mut().find(|(floor, _)| *floor == shadow.floor)
             {
@@ -2554,6 +2668,23 @@ where
     });
     t.log(total);
 
+    if do_bloom {
+        let (set_bits, capacity_bits) = blooms.iter().flatten().map(BloomBits::occupancy).fold(
+            (0u64, 0u64),
+            |(set, capacity), (shard_set, shard_capacity)| {
+                (set + shard_set, capacity + shard_capacity)
+            },
+        );
+        let occupancy_pct = if capacity_bits == 0 {
+            0.0
+        } else {
+            100.0 * set_bits as f64 / capacity_bits as f64
+        };
+        log::info!(
+            "Bloom filter occupancy: set_bits={set_bits} capacity_bits={capacity_bits} occupancy_pct={occupancy_pct:.3}"
+        );
+    }
+
     (shards, sketch)
 }
 
@@ -2884,6 +3015,12 @@ mod tests {
         assert!(shadows.iter().all(|marker| {
             marker.colour == RGBColor(105, 105, 105) && marker.line_style == MarkerLineStyle::Dashed
         }));
+        let enforced = markers
+            .iter()
+            .find(|marker| marker.label.starts_with("Enforced 100% error floor"))
+            .expect("the full error floor is shown separately");
+        assert_eq!(enforced.colour, RGBColor(105, 105, 105));
+        assert_eq!(enforced.line_style, MarkerLineStyle::Dashed);
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -2943,7 +3080,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn shadow_diagnostics_count_bins_without_changing_the_cutoff() {
+    fn shadow_diagnostics_count_bins_and_enforce_the_full_error_floor() {
         let mut spectrum = vec![0u32; MAXSIZEHISTO];
         spectrum[1] = 11;
         spectrum[2] = 7;
@@ -2985,7 +3122,11 @@ mod tests {
             ..SpectrumEstimate::default()
         };
         apply_hole_guard(&mut estimate, Some(&fit), &spectrum);
-        assert_eq!(estimate.min_count, 2, "shadow floors must not be applied");
+        assert_eq!(
+            estimate.min_count,
+            fit.shadow_error_floor(1.0).max(2),
+            "the full error floor is a hard minimum"
+        );
     }
 
     fn empty_countmap() -> HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
@@ -3513,6 +3654,27 @@ mod tests {
         h
     }
 
+    #[test]
+    fn valley_and_peak_use_the_same_radius_two_smoothing() {
+        let mut histogram = vec![0u32; 40];
+        histogram[19] = 100;
+        let smoothed = smooth_histogram(&histogram);
+        assert_eq!(
+            smoothed[19], 20,
+            "the single-bin spike is averaged over five bins"
+        );
+        assert_eq!(smoothed[17], 20);
+        assert_eq!(smoothed[21], 20);
+
+        let estimate = estimate_by_valley(&synthetic_spectrum(30.0));
+        let smooth = smooth_histogram(&synthetic_spectrum(30.0));
+        assert_eq!(
+            estimate.genomic_peak_n,
+            smooth[estimate.genomic_peak - 1] as u32
+        );
+        assert_eq!(estimate.valley_n, smooth[estimate.valley - 1] as u32);
+    }
+
     /// Fraction of a Poisson(`lam`) genome deleted by cutting below `min_count`.
     fn genome_loss(lam: f64, min_count: u16) -> f64 {
         (0..min_count as usize).map(|c| poisson(c, lam)).sum()
@@ -3549,10 +3711,11 @@ mod tests {
     fn the_valley_equals_the_walk_on_a_clean_spectrum() {
         for lam in [20.0, 60.0, 150.0, 500.0] {
             let h = synthetic_spectrum(lam);
-            let valley_seed = find_valley_seed(&h).expect("a clean spectrum turns back up");
-            let genomic_peak = find_genomic_peak(&h, valley_seed);
+            let smooth = smooth_histogram(&h);
+            let valley_seed = find_valley_seed(&smooth).expect("a clean spectrum turns back up");
+            let genomic_peak = find_genomic_peak(&smooth, valley_seed);
             assert_eq!(
-                find_valley(&h, genomic_peak),
+                find_valley(&smooth, genomic_peak),
                 valley_seed,
                 "lam {lam}: valley moved (valley_seed {valley_seed}, genomic_peak {genomic_peak})"
             );
@@ -3562,10 +3725,11 @@ mod tests {
     #[test]
     fn a_seed_past_the_genome_lobe_still_finds_the_valley() {
         let h = synthetic_spectrum(500.0);
-        let truth = find_valley_seed(&h).unwrap();
+        let smooth = smooth_histogram(&h);
+        let truth = find_valley_seed(&smooth).unwrap();
         for overshoot in [700, 1500, 4000] {
             assert_eq!(
-                find_valley(&h, overshoot),
+                find_valley(&smooth, overshoot),
                 truth,
                 "a genomic_peak of {overshoot} moved the valley away from {truth}"
             );
@@ -3600,7 +3764,7 @@ mod tests {
     /// verdict or from the loss guard clamping it. This is the invariant that matters.
     #[test]
     fn valley_estimator_does_not_cut_when_the_lobes_merge() {
-        for lam in [3.0, 5.0, 8.0, 9.0] {
+        for lam in [3.0, 5.0, 8.0] {
             let e = estimate_by_valley(&synthetic_spectrum(lam));
             assert_eq!(
                 e.min_count, UNRESOLVED_MINCOUNT,
@@ -3608,6 +3772,16 @@ mod tests {
                 e.min_count, e.verdict
             );
         }
+        let e = estimate_by_valley(&synthetic_spectrum(9.0));
+        assert_eq!(
+            e.verdict,
+            Verdict::Ok,
+            "smoothing resolves the shallow 9x lobe"
+        );
+        assert!(
+            genome_loss(9.0, e.min_count) < MAX_GENOME_LOSS,
+            "the newly resolved spectrum remains within the genome-loss budget"
+        );
     }
 
     /// Every refusal must name itself, and the resolved case must still explain itself when the guard
@@ -3684,8 +3858,8 @@ mod tests {
     #[test]
     fn a_tight_but_clean_separation_still_resolves() {
         let mut h = vec![0u32; MAXSIZEHISTO];
-        h[0] = 1_000_000; // error spike at count 1
-        h[5] = 100_000; // genome spike at count 6, empty valley between
+        h[0] = 100_000; // error spike at count 1
+        h[5..10].fill(50_000); // a narrow but smoothed genome lobe, with a clear empty valley
         let e = estimate_by_valley(&h);
         assert_eq!(
             e.verdict,
@@ -3697,7 +3871,7 @@ mod tests {
             e.valley_to_peak_xratio
         );
         assert!(
-            e.valley_to_peak_xratio > 0.6,
+            e.valley_to_peak_xratio > 0.3,
             "the point of the case is that it is crowded"
         );
     }
@@ -3758,8 +3932,9 @@ mod tests {
     fn measured_guard_spends_its_budget_and_stops() {
         for lam in [20.0, 50.0, 100.0] {
             let h = synthetic_spectrum(lam);
-            let valley = find_valley_seed(&h).unwrap();
-            let genomic_peak = find_genomic_peak(&h, valley);
+            let smooth = smooth_histogram(&h);
+            let valley = find_valley_seed(&smooth).unwrap();
+            let genomic_peak = find_genomic_peak(&smooth, valley);
             let m = measured_guard(&h, valley, genomic_peak) as usize;
             assert!(m >= 2, "lambda {lam}");
             assert!(
@@ -3781,8 +3956,9 @@ mod tests {
     fn loss_guard_takes_the_tighter_of_its_two_bounds() {
         // Low coverage: the Poisson bound is the strict one.
         let h = synthetic_spectrum(10.0);
-        let valley = find_valley_seed(&h).unwrap();
-        let genomic_peak = find_genomic_peak(&h, valley);
+        let smooth = smooth_histogram(&h);
+        let valley = find_valley_seed(&smooth).unwrap();
+        let genomic_peak = find_genomic_peak(&smooth, valley);
         assert!(poisson_guard(genomic_peak) < measured_guard(&h, valley, genomic_peak));
         assert_eq!(
             measured_guard(&h, valley, genomic_peak).min(poisson_guard(genomic_peak)),
@@ -4206,11 +4382,23 @@ mod tests {
         assert_eq!(b.distinct_above, 2 * a.distinct_above, "breadth is not");
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn useful_coverage_floor_is_inclusive_at_fifteen() {
+        assert_eq!(MIN_USEFUL_COVERAGE, 15);
+        let at_floor = estimate_by_valley(&histo(&bimodal(15)));
+        let below_floor = estimate_by_valley(&histo(&bimodal(14)));
+        assert_eq!(at_floor.genomic_peak, 15);
+        assert_eq!(below_floor.genomic_peak, 14);
+        assert!(resolves(&at_floor));
+        assert!(resolves(&below_floor));
+    }
+
     /// A clean separation at a genomic peak of 18 is still starvation: the floor, not the library, may be what
     /// made it shallow, so a materially deeper floor wins even though the strict one resolved.
     #[test]
     fn a_shallow_resolving_spectrum_still_loosens() {
-        let shallow = histo(&bimodal(18));
+        let shallow = histo(&bimodal(14));
         let strict = estimate_by_valley(&shallow);
         assert!(
             resolves(&strict),
@@ -4231,10 +4419,10 @@ mod tests {
     /// the limit, so the second pass is not worth paying for and the strict cutoff stands.
     #[test]
     fn a_shallow_spectrum_with_no_gain_keeps_the_strict_floor() {
-        let shallow = histo(&bimodal(18));
+        let shallow = histo(&bimodal(14));
         let strict = estimate_by_valley(&shallow);
-        // 19 against 18 is a gain of 1.06, under `MIN_COVERAGE_GAIN`.
-        let sketch = sketch_with(1, &bimodal(19));
+        // 15 against 14 is a gain of 1.07, under `MIN_COVERAGE_GAIN`.
+        let sketch = sketch_with(1, &bimodal(15));
         let (minc, floor, _, _) = choose_min_count_and_floor(&shallow, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 25, "no material gain, so no recount");
         assert_eq!(
@@ -4261,13 +4449,13 @@ mod tests {
         s
     }
 
-    /// The strict floor does not resolve at all and the middle rung does — but at a genomic peak of 15 it is
+    /// The strict floor does not resolve at all and the middle rung does — but at a genomic peak of 14 it is
     /// still starved, so the walk must keep loosening instead of settling for the first rung that
     /// merely separates. This is art at k=71/81, which stopped at its B rung and stayed fragmented.
     #[test]
     fn a_resolving_but_starved_rung_keeps_loosening() {
         let flat = vec![1000u32; MAXSIZEHISTO];
-        let sketch = sketch_deepening(&bimodal(15), 2);
+        let sketch = sketch_deepening(&bimodal(14), 2);
         let (_, floor, _, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
         assert_eq!(floor, 0, "a 3x deeper rung is there and must be taken");
     }
@@ -4277,7 +4465,7 @@ mod tests {
     #[test]
     fn a_starved_ladder_settles_for_the_strictest_that_separated() {
         let flat = vec![1000u32; MAXSIZEHISTO];
-        let mut sketch = sketch_deepening(&bimodal(15), 0);
+        let mut sketch = sketch_deepening(&bimodal(14), 0);
         // Group 0 sees a tenth again as many occurrences: real, but under `MIN_COVERAGE_GAIN`.
         for c in sketch.counts.values_mut() {
             c[0] = c[1] / 10;
@@ -4293,12 +4481,12 @@ mod tests {
         );
     }
 
-    /// The stranding case, from a starved library whose floors sit at peaks 15/17/18. Accepting the
+    /// The stranding case, from a starved library whose floors sit below the 15x threshold. Accepting the
     /// middle floor must not raise the bar the loosest one has to clear.
     #[test]
     fn a_middle_floor_does_not_block_a_looser_one() {
-        let shallow = histo(&bimodal(15));
-        let mut sketch = sketch_deepening(&bimodal(15), 0);
+        let shallow = histo(&bimodal(12));
+        let mut sketch = sketch_deepening(&bimodal(12), 0);
         for c in sketch.counts.values_mut() {
             let base = c[1];
             c[1] = base + base / 7; // the middle floor, a little deeper

@@ -49,7 +49,7 @@ pub(crate) fn fitted_distinct_total(histovec: &[u32], peak: usize) -> f64 {
 
 const MAX_ITERS: u64 = 5_000;
 #[cfg(not(target_family = "wasm"))]
-const NATIVE_MAX_ITERS: u64 = 500;
+const NATIVE_MAX_ITERS: u64 = 1_000;
 /// Offset applied to one coordinate at a time to build the initial simplex.
 const SIMPLEX_STEP: f64 = 0.5;
 /// Argmin defaults to machine epsilon, which is needlessly strict for likelihoods around 1e7 and
@@ -369,6 +369,8 @@ impl ErrorModel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GenomeModel {
     NegativeBinomial,
+    // Retained for distribution helpers and comparison tests; native model selection uses only NB.
+    #[allow(dead_code)]
     Normal,
 }
 
@@ -667,7 +669,7 @@ pub(crate) struct FitAttempt {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FitSearchResult {
     pub(crate) selected: Option<NativeSpectrumFit>,
-    pub(crate) attempts: [FitAttempt; 4],
+    pub(crate) attempts: [FitAttempt; 2],
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -879,26 +881,16 @@ pub(crate) fn fit_native_spectrum(
             NATIVE_MAX_ITERS,
         )
     };
-    let ((pareto_nb, pareto_normal), (weibull_nb, weibull_normal)) = rayon::join(
+    let (pareto_nb, weibull_nb) = rayon::join(
+        || run(ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
         || {
-            rayon::join(
-                || run(ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
-                || run(ErrorModel::SingletonPareto, GenomeModel::Normal),
-            )
-        },
-        || {
-            rayon::join(
-                || {
-                    run(
-                        ErrorModel::FreeSingletonWeibull,
-                        GenomeModel::NegativeBinomial,
-                    )
-                },
-                || run(ErrorModel::FreeSingletonWeibull, GenomeModel::Normal),
+            run(
+                ErrorModel::FreeSingletonWeibull,
+                GenomeModel::NegativeBinomial,
             )
         },
     );
-    let attempts = [pareto_nb, pareto_normal, weibull_nb, weibull_normal];
+    let attempts = [pareto_nb, weibull_nb];
     let selected = select_native_fit(&attempts);
     Ok(FitSearchResult { selected, attempts })
 }
@@ -1050,11 +1042,9 @@ fn validate_native_fit(
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn select_native_fit(attempts: &[FitAttempt; 4]) -> Option<NativeSpectrumFit> {
+fn select_native_fit(attempts: &[FitAttempt; 2]) -> Option<NativeSpectrumFit> {
     let mut selected: Option<NativeSpectrumFit> = None;
-    // Normal lobes are useful fit diagnostics, but their unconstrained left tail can imply more
-    // than the one-k-mer hole budget even below count 1, forcing the cutoff down to 2. Keep
-    // their attempts and logs, but never let them determine the cutoff.
+    // The native search only runs negative-binomial genome candidates.
     for attempt in attempts
         .iter()
         .filter(|attempt| attempt.genome_model == GenomeModel::NegativeBinomial)
@@ -1375,18 +1365,16 @@ mod tests {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    fn native_synthetic(error: ErrorParams, genome_model: GenomeModel) -> Vec<u32> {
+    fn native_synthetic(error: ErrorParams) -> Vec<u32> {
         let mut histogram = vec![0u32; 601];
-        let mean = if genome_model == GenomeModel::NegativeBinomial {
-            53.0
-        } else {
-            50.0
-        };
+        let mean = 53.0;
         for (index, bin) in histogram.iter_mut().enumerate() {
             let count = (index + 1) as f64;
             let error_height = 400_000.0 * error.log_probability(count).exp();
-            let single = 200_000.0 * native_ln_genome(count, mean, 4.0, genome_model).exp();
-            let repeat = 15_000.0 * native_ln_genome(count, 2.0 * mean, 4.0, genome_model).exp();
+            let single =
+                200_000.0 * native_ln_genome(count, mean, 4.0, GenomeModel::NegativeBinomial).exp();
+            let repeat = 15_000.0
+                * native_ln_genome(count, 2.0 * mean, 4.0, GenomeModel::NegativeBinomial).exp();
             *bin = (error_height + single + repeat).round() as u32;
         }
         histogram
@@ -1395,14 +1383,11 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn capped_native_starts_count_iterations_but_are_not_candidates() {
-        let histogram = native_synthetic(
-            ErrorParams {
-                singleton_probability: 0.85,
-                tail_exponent: 1.8,
-                weibull_shape: None,
-            },
-            GenomeModel::NegativeBinomial,
-        );
+        let histogram = native_synthetic(ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 1.8,
+            weibull_shape: None,
+        });
         let observed: Arc<[(f64, f64)]> = histogram[..300]
             .iter()
             .enumerate()
@@ -1542,64 +1527,56 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn native_fit_recovers_the_pareto_tail_with_both_genomic_families() {
-        for genome_model in [GenomeModel::NegativeBinomial, GenomeModel::Normal] {
-            let error = ErrorParams {
-                singleton_probability: 0.85,
-                tail_exponent: 1.8,
-                weibull_shape: None,
-            };
-            let result = fit_native_spectrum(&native_synthetic(error, genome_model), 12, 50, 4.0)
-                .expect("synthetic fit should run");
-            assert_eq!(result.attempts.len(), 4);
-            assert_eq!(
-                result
-                    .attempts
-                    .iter()
-                    .filter(|attempt| attempt.genome_model == GenomeModel::Normal)
-                    .count(),
-                2
-            );
-            let selected = result.selected.expect("one candidate should survive");
-            assert_eq!(selected.genome_model, GenomeModel::NegativeBinomial);
-            assert_eq!(
-                selected.error_model,
-                ErrorModel::SingletonPareto,
-                "{result:?}"
-            );
-            assert!(selected.primary_mode().abs_diff(50) <= 3, "{result:?}");
-            assert!(
-                (selected.error_params.tail_exponent - 1.8).abs() < 0.5,
-                "{result:?}"
-            );
-        }
+    fn native_fit_recovers_the_pareto_tail_with_negative_binomial_genomes() {
+        let error = ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 1.8,
+            weibull_shape: None,
+        };
+        let result = fit_native_spectrum(&native_synthetic(error), 12, 50, 4.0)
+            .expect("synthetic fit should run");
+        assert_eq!(result.attempts.len(), 2);
+        assert!(result
+            .attempts
+            .iter()
+            .all(|attempt| attempt.genome_model == GenomeModel::NegativeBinomial));
+        let selected = result.selected.expect("one candidate should survive");
+        assert_eq!(selected.genome_model, GenomeModel::NegativeBinomial);
+        assert_eq!(
+            selected.error_model,
+            ErrorModel::SingletonPareto,
+            "{result:?}"
+        );
+        assert!(selected.primary_mode().abs_diff(50) <= 3, "{result:?}");
+        assert!(
+            (selected.error_params.tail_exponent - 1.8).abs() < 0.5,
+            "{result:?}"
+        );
     }
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn native_fit_recovers_the_weibull_tail_with_both_genomic_families() {
-        for genome_model in [GenomeModel::NegativeBinomial, GenomeModel::Normal] {
-            let error = ErrorParams {
-                singleton_probability: 0.78,
-                tail_exponent: 1.5,
-                weibull_shape: Some(0.8),
-            };
-            let result = fit_native_spectrum(&native_synthetic(error, genome_model), 12, 50, 4.0)
-                .expect("synthetic fit should run");
-            let selected = result.selected.expect("one candidate should survive");
-            assert_eq!(
-                selected.error_model,
-                ErrorModel::FreeSingletonWeibull,
-                "{result:?}"
-            );
-            assert!(selected.primary_mode().abs_diff(50) <= 3, "{result:?}");
-            assert!(selected.error_params.weibull_shape.is_some());
-        }
+    fn native_fit_recovers_the_weibull_tail_with_negative_binomial_genomes() {
+        let error = ErrorParams {
+            singleton_probability: 0.78,
+            tail_exponent: 1.5,
+            weibull_shape: Some(0.8),
+        };
+        let result = fit_native_spectrum(&native_synthetic(error), 12, 50, 4.0)
+            .expect("synthetic fit should run");
+        let selected = result.selected.expect("one candidate should survive");
+        assert_eq!(
+            selected.error_model,
+            ErrorModel::FreeSingletonWeibull,
+            "{result:?}"
+        );
+        assert!(selected.primary_mode().abs_diff(50) <= 3, "{result:?}");
+        assert!(selected.error_params.weibull_shape.is_some());
     }
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn bic_ties_prefer_pareto_and_normal_fits_are_diagnostic_only() {
+    fn bic_ties_prefer_pareto_and_lower_bic_selects_weibull() {
         let error = ErrorParams {
             singleton_probability: 0.85,
             tail_exponent: 2.0,
@@ -1633,26 +1610,17 @@ mod tests {
         };
         let mut attempts = [
             make(ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
-            make(ErrorModel::SingletonPareto, GenomeModel::Normal),
             make(
                 ErrorModel::FreeSingletonWeibull,
                 GenomeModel::NegativeBinomial,
             ),
-            make(ErrorModel::FreeSingletonWeibull, GenomeModel::Normal),
         ];
         let selected = select_native_fit(&attempts).expect("a fit should be selected");
         assert_eq!(
             (selected.error_model, selected.genome_model),
             (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial)
         );
-        attempts[1].candidate.as_mut().unwrap().bic -= 1.0e6;
-        attempts[3].candidate.as_mut().unwrap().bic -= 1.0e6;
-        let selected = select_native_fit(&attempts).expect("a fit should be selected");
-        assert_eq!(
-            (selected.error_model, selected.genome_model),
-            (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial)
-        );
-        attempts[2].candidate.as_mut().unwrap().bic -= 2.0;
+        attempts[1].candidate.as_mut().unwrap().bic -= 2.0;
         let selected = select_native_fit(&attempts).expect("a fit should be selected");
         assert_eq!(
             (selected.error_model, selected.genome_model),
@@ -1815,12 +1783,10 @@ mod tests {
         };
         assert!(select_native_fit(&[
             rejected(ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
-            rejected(ErrorModel::SingletonPareto, GenomeModel::Normal),
             rejected(
                 ErrorModel::FreeSingletonWeibull,
                 GenomeModel::NegativeBinomial
             ),
-            rejected(ErrorModel::FreeSingletonWeibull, GenomeModel::Normal),
         ])
         .is_none());
     }
