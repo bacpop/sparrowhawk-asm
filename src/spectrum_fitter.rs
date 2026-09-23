@@ -1052,7 +1052,13 @@ fn validate_native_fit(
 #[cfg(not(target_family = "wasm"))]
 fn select_native_fit(attempts: &[FitAttempt; 4]) -> Option<NativeSpectrumFit> {
     let mut selected: Option<NativeSpectrumFit> = None;
-    for attempt in attempts {
+    // Normal lobes are useful fit diagnostics, but their unconstrained left tail can imply more
+    // than the one-k-mer hole budget even below count 1, forcing the cutoff down to 2. Keep
+    // their attempts and logs, but never let them determine the cutoff.
+    for attempt in attempts
+        .iter()
+        .filter(|attempt| attempt.genome_model == GenomeModel::NegativeBinomial)
+    {
         let Some(candidate) = attempt
             .rejection
             .is_none()
@@ -1545,7 +1551,17 @@ mod tests {
             };
             let result = fit_native_spectrum(&native_synthetic(error, genome_model), 12, 50, 4.0)
                 .expect("synthetic fit should run");
+            assert_eq!(result.attempts.len(), 4);
+            assert_eq!(
+                result
+                    .attempts
+                    .iter()
+                    .filter(|attempt| attempt.genome_model == GenomeModel::Normal)
+                    .count(),
+                2
+            );
             let selected = result.selected.expect("one candidate should survive");
+            assert_eq!(selected.genome_model, GenomeModel::NegativeBinomial);
             assert_eq!(
                 selected.error_model,
                 ErrorModel::SingletonPareto,
@@ -1583,7 +1599,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn bic_ties_prefer_pareto_then_negative_binomial() {
+    fn bic_ties_prefer_pareto_and_normal_fits_are_diagnostic_only() {
         let error = ErrorParams {
             singleton_probability: 0.85,
             tail_exponent: 2.0,
@@ -1629,11 +1645,21 @@ mod tests {
             (selected.error_model, selected.genome_model),
             (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial)
         );
-        attempts[3].candidate.as_mut().unwrap().bic -= 2.0;
+        attempts[1].candidate.as_mut().unwrap().bic -= 1.0e6;
+        attempts[3].candidate.as_mut().unwrap().bic -= 1.0e6;
         let selected = select_native_fit(&attempts).expect("a fit should be selected");
         assert_eq!(
             (selected.error_model, selected.genome_model),
-            (ErrorModel::FreeSingletonWeibull, GenomeModel::Normal)
+            (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial)
+        );
+        attempts[2].candidate.as_mut().unwrap().bic -= 2.0;
+        let selected = select_native_fit(&attempts).expect("a fit should be selected");
+        assert_eq!(
+            (selected.error_model, selected.genome_model),
+            (
+                ErrorModel::FreeSingletonWeibull,
+                GenomeModel::NegativeBinomial
+            )
         );
     }
 

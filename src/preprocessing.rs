@@ -37,7 +37,7 @@ use crate::logw;
 #[cfg(not(target_family = "wasm"))]
 use crate::qual_profile::{window_groups, MAX_GROUPS, NONE};
 #[cfg(not(target_family = "wasm"))]
-use crate::spectrum_fitter::{fit_native_spectrum, FitAttempt, NativeSpectrumFit};
+use crate::spectrum_fitter::{fit_native_spectrum, FitAttempt, GenomeModel, NativeSpectrumFit};
 #[cfg(target_family = "wasm")]
 use crate::spectrum_fitter::{fit_spectrum, SpectrumFit};
 
@@ -762,6 +762,7 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
 
 #[cfg(not(target_family = "wasm"))]
 fn log_native_fit_attempt(attempt: &FitAttempt) {
+    let selection_eligible = attempt.genome_model == GenomeModel::NegativeBinomial;
     if let Some(fit) = attempt.candidate {
         let status = attempt.rejection.map_or_else(
             || "accepted".to_string(),
@@ -771,7 +772,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
             &format!(
                 "Spectrum fit candidate: error_model={} genome_model={} status={} log_likelihood={:.6e} bic={:.6e} \
                  deviance={:.6e} mode={} repeat_mode={} error_mode={} mean={:.1} dispersion={:.2} \
-                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} total_iterations={} capped_starts={} best_iterations={}",
+                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} total_iterations={} capped_starts={} best_iterations={} selection_eligible={}",
                 attempt.error_model,
                 attempt.genome_model,
                 status,
@@ -789,13 +790,14 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                 attempt.total_iterations,
                 attempt.capped_starts,
                 fit.best_iterations,
+                selection_eligible,
             ),
             Some("info"),
         );
     } else {
         logw(
             &format!(
-                "Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={} capped_starts={}",
+                "Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={} capped_starts={} selection_eligible={}",
                 attempt.error_model,
                 attempt.genome_model,
                 attempt
@@ -803,6 +805,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                     .expect("an absent candidate always has a rejection reason"),
                 attempt.total_iterations,
                 attempt.capped_starts,
+                selection_eligible,
             ),
             Some("info"),
         );
