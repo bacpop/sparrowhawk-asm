@@ -1464,14 +1464,25 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
     );
 
     timed_spectrum_stage!(backend_name, "canvas fill", root.fill(&WHITE).unwrap());
-    let mut chart = timed_spectrum_stage!(
+    log::info!("Spectrum plot {backend_name}: chart caption={caption:?} caption_font=sans-serif");
+    let mut builder = timed_spectrum_stage!(
         backend_name,
-        "chart creation",
+        "chart builder initialisation",
         ChartBuilder::on(&root)
+    );
+    timed_spectrum_stage!(backend_name, "chart layout settings", {
+        builder
             .x_label_area_size(35)
             .y_label_area_size(65)
-            .margin(5)
-            .caption(caption, ("ibm-plex-sans", 24.0))
+            .margin(5);
+    });
+    timed_spectrum_stage!(backend_name, "caption style setup", {
+        builder.caption(caption, ("sans-serif", 24.0));
+    });
+    let mut chart = timed_spectrum_stage!(
+        backend_name,
+        "Cartesian chart build (including caption measurement and drawing)",
+        builder
             .build_cartesian_2d(0.0f64..plot_end as f64, 0.0f64..Y_MAX)
             .unwrap()
     );
@@ -1680,7 +1691,7 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
 
     let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
     drop(chart);
-    let axis_style = TextStyle::from(("ibm-plex-sans", 15).into_font());
+    let axis_style = TextStyle::from(("sans-serif", 15).into_font());
     let y_title_y = plot_y.start + (plot_y.end - plot_y.start) / 4;
     timed_spectrum_stage!(
         backend_name,
