@@ -1617,6 +1617,21 @@ fn plot_kmer_histogram(
     used_min_count: u16,
     out_path: &std::path::Path,
 ) {
+    // Register before constructing any text style; with Plotters' `ttf` feature disabled,
+    // `ab_glyph` reads this bundled font instead of querying system fonts.
+    static REGISTER_FONT: std::sync::Once = std::sync::Once::new();
+    REGISTER_FONT.call_once(|| {
+        assert!(
+            plotters::style::register_font(
+                "sans-serif",
+                FontStyle::Normal,
+                include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf"),
+            )
+            .is_ok(),
+            "Bundled IBM Plex Sans font is invalid"
+        );
+    });
+
     draw_kmer_histogram(
         BitMapBackend::new(out_path, (1280, 960)).into_drawing_area(),
         decision_spectrum,

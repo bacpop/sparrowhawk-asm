@@ -38,7 +38,7 @@ argmin-math = { version = "0.4" }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 needletail = { version = "0.6.3", default-features = false, features = ["flate2"] }
 indicatif = { version = "0.17.11", features = ["rayon"] }
-plotters = { version = "0.3.7", features = ["ab_glyph"] }
+plotters = { version = "0.3.7", default-features = false, features = ["ab_glyph", "bitmap_backend", "bitmap_encoder", "svg_backend", "line_series"] }
 fern = { version = "0.7.1" }
 humantime = { version = "2.2.0" }
 
