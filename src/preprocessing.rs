@@ -1503,24 +1503,24 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
                 components
                     .iter()
                     .map(|(count, values)| (*count, values.iter().sum())),
-                BLACK.stroke_width(3),
+                BLACK.stroke_width(2),
             ))
             .unwrap()
             .label("Fitted mixture")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 16, y)], BLACK.stroke_width(3)));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 16, y)], BLACK.stroke_width(2)));
         chart
             .draw_series(DashedLineSeries::new(
                 components.iter().map(|(count, values)| (*count, values[0])),
                 6,
                 5,
-                RGBColor(235, 145, 0).stroke_width(2),
+                RGBColor(235, 145, 0).stroke_width(1),
             ))
             .unwrap()
             .label(format!("{} error component", fit.error_model))
             .legend(|(x, y)| {
                 PathElement::new(
                     vec![(x, y), (x + 16, y)],
-                    RGBColor(235, 145, 0).stroke_width(2),
+                    RGBColor(235, 145, 0).stroke_width(1),
                 )
             });
         chart
@@ -1528,14 +1528,14 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
                 components.iter().map(|(count, values)| (*count, values[1])),
                 6,
                 5,
-                RGBColor(30, 90, 220).stroke_width(2),
+                RGBColor(30, 90, 220).stroke_width(1),
             ))
             .unwrap()
             .label(format!("Single-copy ({})", fit.genome_model))
             .legend(|(x, y)| {
                 PathElement::new(
                     vec![(x, y), (x + 16, y)],
-                    RGBColor(30, 90, 220).stroke_width(2),
+                    RGBColor(30, 90, 220).stroke_width(1),
                 )
             });
         chart
@@ -1543,14 +1543,14 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
                 components.iter().map(|(count, values)| (*count, values[2])),
                 2,
                 5,
-                RGBColor(100, 100, 100).stroke_width(2),
+                RGBColor(100, 100, 100).stroke_width(1),
             ))
             .unwrap()
             .label(format!("Two-copy ({})", fit.genome_model))
             .legend(|(x, y)| {
                 PathElement::new(
                     vec![(x, y), (x + 16, y)],
-                    RGBColor(100, 100, 100).stroke_width(2),
+                    RGBColor(100, 100, 100).stroke_width(1),
                 )
             });
     }
@@ -1562,19 +1562,19 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
         let annotation = match marker.line_style {
             MarkerLineStyle::Solid => chart.draw_series(LineSeries::new(
                 [(marker.x, 0.0), (marker.x, Y_MAX)],
-                marker.colour.stroke_width(2),
+                marker.colour.stroke_width(1),
             )),
             MarkerLineStyle::Dashed => chart.draw_series(DashedLineSeries::new(
                 [(marker.x, 0.0), (marker.x, Y_MAX)],
                 6,
                 5,
-                marker.colour.stroke_width(2),
+                marker.colour.stroke_width(1),
             )),
         }
         .unwrap();
         let colour = marker.colour;
         annotation.label(marker.label).legend(move |(x, y)| {
-            PathElement::new(vec![(x, y), (x + 16, y)], colour.stroke_width(2))
+            PathElement::new(vec![(x, y), (x + 16, y)], colour.stroke_width(1))
         });
     }
 
