@@ -26,7 +26,6 @@ pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 /// Smallest minimum count supported by Bloom filtering and automatic Bloom fitting.
 pub(crate) const MIN_BLOOM_COUNT: u16 = 2;
 
-
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
     let k: usize = s
@@ -230,8 +229,8 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_MIN_CONTIG_LENGTH_NTS)]
         min_contig_length: usize,
 
-        /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG in the same folder
-        /// where the contigs output will be. Use this argument if you want it to not do this
+        /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG and
+        /// SVG in the same folder where the contigs output will be. Use this argument to disable it.
         #[arg(long, default_value_t = false)]
         no_histo: bool,
 
