@@ -1431,7 +1431,7 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
     if diagnostics.fit_attempted && diagnostics.fit.is_none() {
         notes.push("mixture fit unavailable".to_string());
     }
-    let _caption = if notes.is_empty() {
+    let caption = if notes.is_empty() {
         "k-mer spectrum".to_string()
     } else {
         format!("k-mer spectrum — {}", notes.join(", "))
@@ -1442,7 +1442,7 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
         .x_label_area_size(35)
         .y_label_area_size(65)
         .margin(5)
-        // .caption(_caption, ("sans-serif", 24.0))
+        .caption(caption, 24.0)
         .build_cartesian_2d(0.0f64..plot_end as f64, 0.0f64..Y_MAX)
         .unwrap();
     chart
@@ -1588,7 +1588,7 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
 
     let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
     drop(chart);
-    let axis_style = TextStyle::from(("sans-serif", 15).into_font());
+    let axis_style = 15.0.into_text_style(&root);
     let y_title_y = plot_y.start + (plot_y.end - plot_y.start) / 4;
     root.draw(&Text::new(
         "Counts",
