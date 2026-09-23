@@ -1406,28 +1406,11 @@ fn native_plot_end(
         .min(histogram_end)
 }
 
-#[cfg(not(target_family = "wasm"))]
-macro_rules! timed_spectrum_stage {
-    ($backend:expr, $stage:expr, $work:expr) => {{
-        log::info!("Spectrum plot {}: start {}", $backend, $stage);
-        let started = Instant::now();
-        let result = $work;
-        log::info!(
-            "Spectrum plot {}: done {} elapsed_ms={}",
-            $backend,
-            $stage,
-            started.elapsed().as_millis()
-        );
-        result
-    }};
-}
-
 /// Draw the spectrum used for the decision and all diagnostics available from its mixture fit. Bloom
 /// counting additionally shows its biased raw count map; the principal histogram remains the rescaled
 /// sketch that the estimator and fit actually read.
 #[cfg(not(target_family = "wasm"))]
 fn draw_kmer_histogram<DB: DrawingBackend>(
-    backend_name: &'static str,
     root: DrawingArea<DB, Shift>,
     decision_spectrum: &[u32],
     raw_bloom_spectrum: Option<&[u32]>,
@@ -1438,290 +1421,192 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
 {
     const Y_MAX: f64 = 200_000.0;
 
-    let (markers, plot_end, caption) = timed_spectrum_stage!(backend_name, "setup", {
-        let markers = plot_markers(diagnostics, used_min_count);
-        let plot_end = native_plot_end(decision_spectrum.len(), diagnostics, used_min_count);
-        let mut notes: Vec<String> = markers
-            .iter()
-            .filter(|marker| marker.x > plot_end as f64)
-            .map(|marker| format!("{} (off-scale)", marker.label))
-            .collect();
-        if diagnostics.fit_attempted && diagnostics.fit.is_none() {
-            notes.push("mixture fit unavailable".to_string());
-        }
-        let caption = if notes.is_empty() {
-            "k-mer spectrum".to_string()
-        } else {
-            format!("k-mer spectrum — {}", notes.join(", "))
-        };
-        (markers, plot_end, caption)
-    });
-    log::info!(
-        "Spectrum plot {backend_name}: spectrum_bins={} plot_end={plot_end} fit_window_end={} markers={} y_max={Y_MAX}",
-        decision_spectrum.len(),
-        diagnostics.fit.map_or(0, |fit| fit.fit_window_end),
-        markers.len()
-    );
+    let markers = plot_markers(diagnostics, used_min_count);
+    let plot_end = native_plot_end(decision_spectrum.len(), diagnostics, used_min_count);
+    let mut notes: Vec<String> = markers
+        .iter()
+        .filter(|marker| marker.x > plot_end as f64)
+        .map(|marker| format!("{} (off-scale)", marker.label))
+        .collect();
+    if diagnostics.fit_attempted && diagnostics.fit.is_none() {
+        notes.push("mixture fit unavailable".to_string());
+    }
+    let _caption = if notes.is_empty() {
+        "k-mer spectrum".to_string()
+    } else {
+        format!("k-mer spectrum — {}", notes.join(", "))
+    };
 
-    timed_spectrum_stage!(backend_name, "canvas fill", root.fill(&WHITE).unwrap());
-    log::info!("Spectrum plot {backend_name}: chart caption={caption:?} caption_font=sans-serif");
-    let mut builder = timed_spectrum_stage!(
-        backend_name,
-        "chart builder initialisation",
-        ChartBuilder::on(&root)
-    );
-    timed_spectrum_stage!(backend_name, "chart layout settings", {
-        builder
-            .x_label_area_size(35)
-            .y_label_area_size(65)
-            .margin(5);
-    });
-    timed_spectrum_stage!(backend_name, "caption style setup", {
-        builder.caption(caption, ("sans-serif", 24.0));
-    });
-    let mut chart = timed_spectrum_stage!(
-        backend_name,
-        "Cartesian chart build (including caption measurement and drawing)",
-        builder
-            .build_cartesian_2d(0.0f64..plot_end as f64, 0.0f64..Y_MAX)
-            .unwrap()
-    );
-    timed_spectrum_stage!(
-        backend_name,
-        "mesh",
-        chart
-            .configure_mesh()
-            .disable_x_mesh()
-            .x_labels(15)
-            .y_labels(11)
-            .max_light_lines(2)
-            .light_line_style(RGBColor(220, 220, 220).mix(0.35))
-            .bold_line_style(RGBColor(180, 180, 180).mix(0.4))
-            .y_label_formatter(&|y| format!("{y:.0}"))
-            .draw()
-            .unwrap()
-    );
+    root.fill(&WHITE).unwrap();
+    let mut chart = ChartBuilder::on(&root)
+        .x_label_area_size(35)
+        .y_label_area_size(65)
+        .margin(5)
+        // .caption(_caption, ("sans-serif", 24.0))
+        .build_cartesian_2d(0.0f64..plot_end as f64, 0.0f64..Y_MAX)
+        .unwrap();
+    chart
+        .configure_mesh()
+        .disable_x_mesh()
+        .x_labels(15)
+        .y_labels(11)
+        .max_light_lines(2)
+        .light_line_style(RGBColor(220, 220, 220).mix(0.35))
+        .bold_line_style(RGBColor(180, 180, 180).mix(0.4))
+        .y_label_formatter(&|y| format!("{y:.0}"))
+        .draw()
+        .unwrap();
 
     let shown = &decision_spectrum[..plot_end.min(decision_spectrum.len())];
-    log::info!(
-        "Spectrum plot {backend_name}: histogram_bins={} max_observed_bin={}",
-        shown.len(),
-        shown.iter().copied().max().unwrap_or(0)
-    );
-    timed_spectrum_stage!(
-        backend_name,
-        "histogram bars",
-        chart
-            .draw_series(shown.iter().enumerate().map(|(i, &height)| {
-                let count = (i + 1) as f64;
-                Rectangle::new(
-                    [(count - 0.5, 0.0), (count + 0.5, f64::from(height))],
-                    RED.mix(0.42).filled(),
-                )
-            }))
-            .unwrap()
-            .label(if raw_bloom_spectrum.is_some() {
-                "Rescaled sketch used for fitting"
-            } else {
-                "Observed spectrum"
-            })
-            .legend(|(x, y)| Rectangle::new([(x, y - 4), (x + 16, y + 4)], RED.mix(0.42).filled()))
-    );
+    chart
+        .draw_series(shown.iter().enumerate().map(|(i, &height)| {
+            let count = (i + 1) as f64;
+            Rectangle::new(
+                [(count - 0.5, 0.0), (count + 0.5, f64::from(height))],
+                RED.mix(0.42).filled(),
+            )
+        }))
+        .unwrap()
+        .label(if raw_bloom_spectrum.is_some() {
+            "Rescaled sketch used for fitting"
+        } else {
+            "Observed spectrum"
+        })
+        .legend(|(x, y)| Rectangle::new([(x, y - 4), (x + 16, y + 4)], RED.mix(0.42).filled()));
 
     if let Some(raw) = raw_bloom_spectrum {
-        timed_spectrum_stage!(
-            backend_name,
-            "raw Bloom curve",
-            chart
-                .draw_series(LineSeries::new(
-                    raw.iter()
-                        .take(plot_end)
-                        .enumerate()
-                        .map(|(i, &height)| ((i + 1) as f64, f64::from(height))),
+        chart
+            .draw_series(LineSeries::new(
+                raw.iter()
+                    .take(plot_end)
+                    .enumerate()
+                    .map(|(i, &height)| ((i + 1) as f64, f64::from(height))),
+                RGBColor(95, 95, 95).stroke_width(1),
+            ))
+            .unwrap()
+            .label("Raw Bloom count map")
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 16, y)],
                     RGBColor(95, 95, 95).stroke_width(1),
-                ))
-                .unwrap()
-                .label("Raw Bloom count map")
-                .legend(|(x, y)| {
-                    PathElement::new(
-                        vec![(x, y), (x + 16, y)],
-                        RGBColor(95, 95, 95).stroke_width(1),
-                    )
-                })
-        );
+                )
+            });
     }
 
     if let Some(fit) = diagnostics.fit {
-        let components: Vec<(f64, [f64; 3])> = timed_spectrum_stage!(
-            backend_name,
-            "fitted-component calculation",
-            (1..=plot_end.min(fit.fit_window_end))
-                .map(|count| (count as f64, fit.component_heights(count)))
-                .collect()
-        );
-        let non_finite = components
-            .iter()
-            .flat_map(|(_, values)| values.iter())
-            .filter(|&&value| !value.is_finite())
-            .count();
-        let max_component = components
-            .iter()
-            .flat_map(|(_, values)| values.iter())
-            .copied()
-            .filter(|value| value.is_finite())
-            .fold(0.0_f64, f64::max);
-        log::info!(
-            "Spectrum plot {backend_name}: fitted_points={} non_finite_components={non_finite} max_component_height={max_component:.3e}",
-            components.len()
-        );
+        let components: Vec<(f64, [f64; 3])> = (1..=plot_end.min(fit.fit_window_end))
+            .map(|count| (count as f64, fit.component_heights(count)))
+            .collect();
 
-        timed_spectrum_stage!(
-            backend_name,
-            "fitted mixture curve",
-            chart
-                .draw_series(LineSeries::new(
-                    components
-                        .iter()
-                        .map(|(count, values)| (*count, values.iter().sum())),
-                    BLACK.stroke_width(2),
-                ))
-                .unwrap()
-                .label("Fitted mixture")
-                .legend(|(x, y)| PathElement::new(
+        chart
+            .draw_series(LineSeries::new(
+                components
+                    .iter()
+                    .map(|(count, values)| (*count, values.iter().sum())),
+                BLACK.stroke_width(2),
+            ))
+            .unwrap()
+            .label("Fitted mixture")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 16, y)], BLACK.stroke_width(2)));
+        chart
+            .draw_series(DashedLineSeries::new(
+                components.iter().map(|(count, values)| (*count, values[0])),
+                6,
+                5,
+                RGBColor(235, 145, 0).stroke_width(1),
+            ))
+            .unwrap()
+            .label(format!("{} error component", fit.error_model))
+            .legend(|(x, y)| {
+                PathElement::new(
                     vec![(x, y), (x + 16, y)],
-                    BLACK.stroke_width(2)
-                ))
-        );
-        timed_spectrum_stage!(
-            backend_name,
-            "error component curve",
-            chart
-                .draw_series(DashedLineSeries::new(
-                    components.iter().map(|(count, values)| (*count, values[0])),
-                    6,
-                    5,
                     RGBColor(235, 145, 0).stroke_width(1),
-                ))
-                .unwrap()
-                .label(format!("{} error component", fit.error_model))
-                .legend(|(x, y)| {
-                    PathElement::new(
-                        vec![(x, y), (x + 16, y)],
-                        RGBColor(235, 145, 0).stroke_width(1),
-                    )
-                })
-        );
-        timed_spectrum_stage!(
-            backend_name,
-            "single-copy component curve",
-            chart
-                .draw_series(DashedLineSeries::new(
-                    components.iter().map(|(count, values)| (*count, values[1])),
-                    6,
-                    5,
+                )
+            });
+        chart
+            .draw_series(DashedLineSeries::new(
+                components.iter().map(|(count, values)| (*count, values[1])),
+                6,
+                5,
+                RGBColor(30, 90, 220).stroke_width(1),
+            ))
+            .unwrap()
+            .label(format!("Single-copy ({})", fit.genome_model))
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 16, y)],
                     RGBColor(30, 90, 220).stroke_width(1),
-                ))
-                .unwrap()
-                .label(format!("Single-copy ({})", fit.genome_model))
-                .legend(|(x, y)| {
-                    PathElement::new(
-                        vec![(x, y), (x + 16, y)],
-                        RGBColor(30, 90, 220).stroke_width(1),
-                    )
-                })
-        );
-        timed_spectrum_stage!(
-            backend_name,
-            "two-copy component curve",
-            chart
-                .draw_series(DashedLineSeries::new(
-                    components.iter().map(|(count, values)| (*count, values[2])),
-                    2,
-                    5,
+                )
+            });
+        chart
+            .draw_series(DashedLineSeries::new(
+                components.iter().map(|(count, values)| (*count, values[2])),
+                2,
+                5,
+                RGBColor(100, 100, 100).stroke_width(1),
+            ))
+            .unwrap()
+            .label(format!("Two-copy ({})", fit.genome_model))
+            .legend(|(x, y)| {
+                PathElement::new(
+                    vec![(x, y), (x + 16, y)],
                     RGBColor(100, 100, 100).stroke_width(1),
-                ))
-                .unwrap()
-                .label(format!("Two-copy ({})", fit.genome_model))
-                .legend(|(x, y)| {
-                    PathElement::new(
-                        vec![(x, y), (x + 16, y)],
-                        RGBColor(100, 100, 100).stroke_width(1),
-                    )
-                })
-        );
+                )
+            });
     }
 
     for marker in markers {
         if marker.x > plot_end as f64 {
             continue;
         }
-        let marker_stage = format!("marker {} at x={:.1}", marker.label, marker.x);
-        timed_spectrum_stage!(backend_name, &marker_stage, {
-            let annotation = match marker.line_style {
-                MarkerLineStyle::Solid => chart.draw_series(LineSeries::new(
-                    [(marker.x, 0.0), (marker.x, Y_MAX)],
-                    marker.colour.stroke_width(1),
-                )),
-                MarkerLineStyle::Dashed => chart.draw_series(DashedLineSeries::new(
-                    [(marker.x, 0.0), (marker.x, Y_MAX)],
-                    6,
-                    5,
-                    marker.colour.stroke_width(1),
-                )),
-            }
-            .unwrap();
-            let colour = marker.colour;
-            annotation.label(marker.label).legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 16, y)], colour.stroke_width(1))
-            });
+        let annotation = match marker.line_style {
+            MarkerLineStyle::Solid => chart.draw_series(LineSeries::new(
+                [(marker.x, 0.0), (marker.x, Y_MAX)],
+                marker.colour.stroke_width(1),
+            )),
+            MarkerLineStyle::Dashed => chart.draw_series(DashedLineSeries::new(
+                [(marker.x, 0.0), (marker.x, Y_MAX)],
+                6,
+                5,
+                marker.colour.stroke_width(1),
+            )),
+        }
+        .unwrap();
+        let colour = marker.colour;
+        annotation.label(marker.label).legend(move |(x, y)| {
+            PathElement::new(vec![(x, y), (x + 16, y)], colour.stroke_width(1))
         });
     }
 
-    timed_spectrum_stage!(
-        backend_name,
-        "legend",
-        chart
-            .configure_series_labels()
-            .position(SeriesLabelPosition::UpperRight)
-            .background_style(WHITE.mix(0.82))
-            .border_style(BLACK)
-            .draw()
-            .unwrap()
-    );
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .background_style(WHITE.mix(0.82))
+        .border_style(BLACK)
+        .draw()
+        .unwrap();
 
     let (plot_x, plot_y) = chart.plotting_area().get_pixel_range();
     drop(chart);
     let axis_style = TextStyle::from(("sans-serif", 15).into_font());
     let y_title_y = plot_y.start + (plot_y.end - plot_y.start) / 4;
-    timed_spectrum_stage!(
-        backend_name,
-        "y-axis title",
-        root.draw(&Text::new(
-            "Counts",
-            (plot_x.start - 52, y_title_y),
-            axis_style
-                .clone()
-                .transform(FontTransform::Rotate270)
-                .pos(Pos::new(HPos::Center, VPos::Center)),
-        ))
-        .unwrap()
-    );
-    timed_spectrum_stage!(
-        backend_name,
-        "x-axis title",
-        root.draw(&Text::new(
-            "k-mer frequency",
-            (plot_x.end - 1, plot_y.end + 30),
-            axis_style.pos(Pos::new(HPos::Right, VPos::Top)),
-        ))
-        .unwrap()
-    );
-    timed_spectrum_stage!(
-        backend_name,
-        "file present",
-        root.present()
-            .expect("Unable to write result to file. Does the output folder exist?")
-    );
+    root.draw(&Text::new(
+        "Counts",
+        (plot_x.start - 52, y_title_y),
+        axis_style
+            .clone()
+            .transform(FontTransform::Rotate270)
+            .pos(Pos::new(HPos::Center, VPos::Center)),
+    ))
+    .unwrap();
+    root.draw(&Text::new(
+        "k-mer frequency",
+        (plot_x.end - 1, plot_y.end + 30),
+        axis_style.pos(Pos::new(HPos::Right, VPos::Top)),
+    ))
+    .unwrap();
+    root.present()
+        .expect("Unable to write result to file. Does the output folder exist?");
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1732,32 +1617,20 @@ fn plot_kmer_histogram(
     used_min_count: u16,
     out_path: &std::path::Path,
 ) {
-    log::info!("Spectrum plot png: output={}", out_path.display());
-    timed_spectrum_stage!(
-        "png",
-        "complete render and save",
-        draw_kmer_histogram(
-            "png",
-            BitMapBackend::new(out_path, (1280, 960)).into_drawing_area(),
-            decision_spectrum,
-            raw_bloom_spectrum,
-            diagnostics,
-            used_min_count,
-        )
+    draw_kmer_histogram(
+        BitMapBackend::new(out_path, (1280, 960)).into_drawing_area(),
+        decision_spectrum,
+        raw_bloom_spectrum,
+        diagnostics,
+        used_min_count,
     );
     let svg_path = out_path.with_extension("svg");
-    log::info!("Spectrum plot svg: output={}", svg_path.display());
-    timed_spectrum_stage!(
-        "svg",
-        "complete render and save",
-        draw_kmer_histogram(
-            "svg",
-            SVGBackend::new(&svg_path, (1280, 960)).into_drawing_area(),
-            decision_spectrum,
-            raw_bloom_spectrum,
-            diagnostics,
-            used_min_count,
-        )
+    draw_kmer_histogram(
+        SVGBackend::new(&svg_path, (1280, 960)).into_drawing_area(),
+        decision_spectrum,
+        raw_bloom_spectrum,
+        diagnostics,
+        used_min_count,
     );
 }
 
@@ -2799,34 +2672,19 @@ where
     }
     log::info!("Single-copy coverage read from the spectrum: {genomic_peak:?}");
 
-    let conversion_started = Instant::now();
-    log::info!("Spectrum output: start count-map conversion min_count={minc}");
     let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
-    log::info!(
-        "Spectrum output: done count-map conversion elapsed_ms={} survivors={}",
-        conversion_started.elapsed().as_millis(),
-        kmers.len()
-    );
 
     if let Some(p) = out_path {
         if do_fit {
             if let Some(diagnostics) = plot_diagnostics.as_mut() {
                 if !diagnostics.fit_attempted {
-                    log::info!("Spectrum output: start deferred fit");
-                    let deferred_fit_started = Instant::now();
                     let estimate = estimate_by_valley(spectrum);
                     let fit = fit_and_log(spectrum, &estimate);
                     diagnostics.record_fit(spectrum, &estimate, fit);
-                    log::info!(
-                        "Spectrum output: done deferred fit elapsed_ms={}",
-                        deferred_fit_started.elapsed().as_millis()
-                    );
                 }
             }
         }
         let diagnostics = plot_diagnostics.unwrap_or_default();
-        log::info!("Spectrum output: start histogram plots");
-        let plots_started = Instant::now();
         plot_kmer_histogram(
             spectrum,
             do_bloom.then_some(histovec.as_slice()),
@@ -2834,17 +2692,7 @@ where
             minc,
             p.as_path(),
         );
-        log::info!(
-            "Spectrum output: done histogram plots elapsed_ms={}",
-            plots_started.elapsed().as_millis()
-        );
-        log::info!("Spectrum output: start spectrum TSV");
-        let tsv_started = Instant::now();
         write_kmer_spectrum_tsv(&histovec, p.as_path());
-        log::info!(
-            "Spectrum output: done spectrum TSV elapsed_ms={}",
-            tsv_started.elapsed().as_millis()
-        );
     }
     (kmers, histovec, minc, chosen_min_qual, genomic_peak)
 }
