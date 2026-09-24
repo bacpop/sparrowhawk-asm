@@ -1191,11 +1191,8 @@ impl Assemble for BasicAsm {
                 changed |= remove_bulges(&mut ptgraph, pop_ratio, &coverage);
             }
             if do_ec_removal {
-                changed |= remove_erroneous_connections(
-                    &mut ptgraph,
-                    ec_ratio,
-                    ec_require_both_flanks,
-                );
+                changed |=
+                    remove_erroneous_connections(&mut ptgraph, ec_ratio, ec_require_both_flanks);
             }
             changed |= ptgraph.shrink();
             if do_dead_end_removal {

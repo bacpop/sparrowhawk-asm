@@ -57,8 +57,9 @@ pub(crate) fn validate_bloom_min_count(
 ) -> Result<(), &'static str> {
     if do_bloom && explicit_min_count.is_some_and(|min_count| min_count < MIN_BLOOM_COUNT) {
         Err(
-            "--do-bloom does not support --min-count 0 or 1; use --min-count >= 2, omit \
-             --min-count to fit automatically, or remove --do-bloom",
+            "Bloom counting does not support explicit --min-count 0 or 1; use --min-count >= 2, \
+             omit --min-count for automatic fitting, or disable Bloom counting (native CLI: \
+             --no-bloom)",
         )
     } else {
         Ok(())
@@ -163,10 +164,10 @@ pub enum Commands {
         #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
         threads: usize,
 
-        /// Use, instead of the default filtering, a Bloom filter. This will use less memory and be faster, but will add
-        /// false positive matches to the counting. Explicit --min-count values 0 and 1 are not supported with Bloom filtering.
+        /// Disable the default Bloom counting and use exact k-mer counts. Bloom counting uses less memory
+        /// and may be faster, but can add false-positive matches. Required for explicit --min-count 0 or 1.
         #[arg(long, default_value_t = false)]
-        do_bloom: bool,
+        no_bloom: bool,
 
         /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
         /// Native builds now count into a hash map, which buffers no occurrences, so this is a no-op
@@ -252,4 +253,47 @@ pub enum Commands {
 /// Function to parse command line args into [`Args`] struct
 pub fn cli_args() -> Args {
     Args::parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_build(args: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(args)
+    }
+
+    #[test]
+    fn bloom_is_enabled_by_default_and_can_be_disabled() {
+        let default = parse_build(&["sparrowhawk-asm", "build", "reads.fastq"]).unwrap();
+        let disabled =
+            parse_build(&["sparrowhawk-asm", "build", "reads.fastq", "--no-bloom"]).unwrap();
+
+        let Commands::Build {
+            no_bloom: default_no_bloom,
+            ..
+        } = default.command;
+        let Commands::Build {
+            no_bloom: disabled_no_bloom,
+            ..
+        } = disabled.command;
+
+        assert!(!default_no_bloom);
+        assert!(disabled_no_bloom);
+        assert!(validate_bloom_min_count(!default_no_bloom, Some(2)).is_ok());
+        assert!(validate_bloom_min_count(!disabled_no_bloom, Some(1)).is_ok());
+    }
+
+    #[test]
+    fn removed_do_bloom_flag_is_rejected() {
+        assert!(parse_build(&["sparrowhawk-asm", "build", "reads.fastq", "--do-bloom",]).is_err());
+    }
+
+    #[test]
+    fn explicit_zero_and_singleton_counts_require_no_bloom() {
+        for min_count in [0, 1] {
+            assert!(validate_bloom_min_count(true, Some(min_count)).is_err());
+            assert!(validate_bloom_min_count(false, Some(min_count)).is_ok());
+        }
+    }
 }

@@ -116,4 +116,9 @@ Alternatively, you could have run:
 ./sparrowhawk-asm build /path/to/the/read_1.fastq /path/to/the/read_2.fastq -k 31 --threads 1 -v --min-count 5 --output-dir ./ --output-prefix prefix
 ```
 
+The native CLI uses Bloom counting by default to reduce memory use, with possible false-positive k-mer counts.
+Pass `--no-bloom` to use exact counts instead. Bloom counting requires an explicit `--min-count` of at least 2;
+explicit values 0 or 1 require `--no-bloom`. The old `--do-bloom` flag has been removed: omit it to use the new
+default, or add `--no-bloom` to preserve the former non-Bloom default.
+
 In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. A native diagnostic plot of the k-mer frequency spectrum will be saved in the same directory as `prefix_kmerspectrum.png`. Runs using automatic count selection overlay the fitted error, single-copy, and repeat components, the total mixture, the empirical valley and peak, the fitted single-copy mean and mode, and the error/genome crossover. With Bloom counting, the plot shows both the rescaled sketch used for fitting and the raw Bloom count map. These optional files can be avoided with the corresponding arguments.

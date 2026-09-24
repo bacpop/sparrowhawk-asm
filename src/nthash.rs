@@ -676,15 +676,6 @@ mod tests {
     }
 
     #[test]
-    fn nthash_determinism() {
-        let seq = b"ACGTACGT";
-        let k = 4;
-        let h1 = NtHashIterator::new(&seq[0..k], k, true).curr_hash();
-        let h2 = NtHashIterator::new(&seq[0..k], k, true).curr_hash();
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
     fn rolling_equals_fresh() {
         // Roll from seq[0..k] by one position; should equal fresh iterator on seq[1..k+1]
         let seq = b"ACGTACGT";

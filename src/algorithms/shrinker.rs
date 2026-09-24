@@ -247,8 +247,7 @@ impl Shrinkable for DbgGraph {
             {
                 // Prospective_node is an ambiguous node, but only because it is an external where we can finish.
                 let prospective_weight = self.node_weight(prospective_node.0).unwrap();
-                countsformean
-                    .push((prospective_weight.counts, prospective_weight.abs_ind.len()));
+                countsformean.push((prospective_weight.counts, prospective_weight.abs_ind.len()));
                 let next_base_weight = self.remove_node(prospective_node.0).unwrap();
                 let nw = self.node_weight_mut(base_node).unwrap();
 

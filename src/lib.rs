@@ -136,7 +136,6 @@ impl fmt::Display for QualOpts {
     }
 }
 
-
 #[cfg(not(target_family = "wasm"))]
 /// Sets up logging
 pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
@@ -201,7 +200,7 @@ fn count_reads<IntT>(
     floors: Option<&[u8]>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
-) -> preprocessing::PreprocessedK<IntT>
+) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
 {
@@ -240,7 +239,8 @@ fn run_build<IntT>(
     timevec: &mut Vec<Instant>,
     out_paths_histo: &mut [Option<PathBuf>],
     out_path_graph: &mut Option<PathBuf>,
-) where
+) -> Result<(), preprocessing::PreprocessingError>
+where
     IntT: for<'a> UInt<'a>,
 {
     // The alphabet only, from the head of the first file: a few thousand reads show all 4-5 bins, and
@@ -251,8 +251,13 @@ fn run_build<IntT>(
     );
     log::info!("Candidate base-quality floors: {ladder:?}");
 
-    let mut assembly =
-        count_reads::<IntT>(&opts, opts.quality, Some(&ladder), timevec, &mut out_paths_histo[0]);
+    let mut assembly = count_reads::<IntT>(
+        &opts,
+        opts.quality,
+        Some(&ladder),
+        timevec,
+        &mut out_paths_histo[0],
+    )?;
     let chosen = assembly.chosen_min_qual;
     if chosen < opts.quality.min_qual {
         // Why it loosened is logged by the estimator, which is the only place that knows.
@@ -261,10 +266,13 @@ fn run_build<IntT>(
              k-mers.",
             opts.quality.min_qual
         );
-        let loosened = QualOpts { min_count: opts.quality.min_count, min_qual: chosen };
+        let loosened = QualOpts {
+            min_count: opts.quality.min_count,
+            min_qual: chosen,
+        };
         // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
         drop(assembly);
-        assembly = count_reads::<IntT>(&opts, &loosened, None, timevec, &mut out_paths_histo[0]);
+        assembly = count_reads::<IntT>(&opts, &loosened, None, timevec, &mut out_paths_histo[0])?;
     }
 
     let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
@@ -299,6 +307,7 @@ fn run_build<IntT>(
         opts.min_contig_length,
         opts.output,
     );
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -320,7 +329,7 @@ pub fn main() {
             min_count,
             min_qual,
             threads,
-            do_bloom,
+            no_bloom,
             chunk_size,
             bubble_pop_ratio,
             bubble_peak_ratio,
@@ -338,7 +347,8 @@ pub fn main() {
             no_bubble_collapse,
             no_dead_end_removal,
         } => {
-            if let Err(message) = cli::validate_bloom_min_count(*do_bloom, *min_count) {
+            let do_bloom = !*no_bloom;
+            if let Err(message) = cli::validate_bloom_min_count(do_bloom, *min_count) {
                 eprintln!("error: {message}");
                 std::process::exit(2);
             }
@@ -467,7 +477,7 @@ pub fn main() {
                 k: *k,
                 quality: &quality,
                 chunk_size: *chunk_size,
-                do_bloom: *do_bloom,
+                do_bloom,
                 do_fit,
                 do_bubble_collapse: !no_bubble_collapse,
                 do_dead_end_removal: !no_dead_end_removal,
@@ -488,7 +498,7 @@ pub fn main() {
                 panic!("Support for even k-mer lengths not implemented");
             }
             let width_k = *k;
-            match width_k {
+            let build_result = match width_k {
                 0..=2 => panic!("kmer length too small (min. 3)"),
                 3..=32 => {
                     log::info!("k={width_k}: using 64-bit representation");
@@ -527,6 +537,10 @@ pub fn main() {
                     )
                 }
                 _ => panic!("kmer length larger than 256 currently not supported."),
+            };
+            if let Err(error) = build_result {
+                eprintln!("error: {error}");
+                std::process::exit(1);
             }
         }
     }

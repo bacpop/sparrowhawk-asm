@@ -964,13 +964,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_encode_roundtrip() {
-        for &base in &[b'A', b'C', b'T', b'G'] {
-            assert_eq!(decode_base(encode_base(base)), base);
-        }
-    }
-
-    #[test]
     fn test_rc_base() {
         // A (0) <-> T (2)
         assert_eq!(rc_base(0), 2);

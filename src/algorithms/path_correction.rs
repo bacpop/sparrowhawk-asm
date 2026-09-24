@@ -396,11 +396,7 @@ fn should_delete(candidate: f64, alternative: f64, pop_ratio: f32, coverage: &Co
     by_ratio || by_coverage
 }
 
-pub(crate) fn remove_bulges(
-    graph: &mut DbgGraph,
-    pop_ratio: f32,
-    coverage: &CoverageRef,
-) -> bool {
+pub(crate) fn remove_bulges(graph: &mut DbgGraph, pop_ratio: f32, coverage: &CoverageRef) -> bool {
     let max_length = bulge_max_kmers(graph.k());
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
@@ -571,8 +567,7 @@ pub(crate) fn remove_erroneous_connections(
         } else {
             left > ratio * connector || right > ratio * connector
         };
-        if weak_enough && candidate_still_matches(graph, &candidate, max_length)
-        {
+        if weak_enough && candidate_still_matches(graph, &candidate, max_length) {
             delete_internal(graph, &candidate);
             removed += 1;
             changed = true;

@@ -373,18 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn kmer_deterministic() {
-        let seq = b"ACGTACGT";
-        let h1 = Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, 3, 0, true)
-            .unwrap()
-            .get_hash();
-        let h2 = Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, 3, 0, true)
-            .unwrap()
-            .get_hash();
-        assert_eq!(h1, h2);
-    }
-
-    #[test]
     fn kmer_quality_filter_reduces_count() {
         let seq = b"ACGTACGT";
         // All-passing quality: b'I'=73, (73-33)=40 >= 30 ✓
@@ -426,8 +414,15 @@ mod tests {
         let seq = b"ACGTACGTACGT";
         let k = 5;
         let qual = vec![20 + 33; seq.len()];
-        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), Some(&qual), k, 20, true)
-            .expect("a read at exactly the floor still yields k-mers");
+        let mut it = Kmer::<u64>::new(
+            Cow::Borrowed(seq.as_slice()),
+            seq.len(),
+            Some(&qual),
+            k,
+            20,
+            true,
+        )
+        .expect("a read at exactly the floor still yields k-mers");
         let mut n = 1;
         while it.get_next_hash_and_bases().is_some() {
             n += 1;

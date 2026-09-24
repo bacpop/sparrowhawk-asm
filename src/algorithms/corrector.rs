@@ -1,7 +1,9 @@
 //! Corrects parts of the provided graph, if needed
 use crate::logw;
 use crate::preprocessing::PeakSource;
-use sparrowhawk_graph::{BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId, NodeStruct};
+use sparrowhawk_graph::{
+    BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId, NodeStruct,
+};
 
 use crate::EdgeWeight;
 
@@ -364,7 +366,12 @@ pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32, coverage: &Cove
             // own successors. `out_degree >= 2` is a necessary condition for two Min-carry branches,
             // so it excludes nothing and spares the edge walk on most nodes.
             g.out_degree(*n) >= 2
-                && bubble_shape_ok(g, *n, &g.bubble_start_edges_by_carry(*n, CarryType::Min), true)
+                && bubble_shape_ok(
+                    g,
+                    *n,
+                    &g.bubble_start_edges_by_carry(*n, CarryType::Min),
+                    true,
+                )
         })
         .collect::<BTreeSet<NodeId>>();
 
@@ -1015,7 +1022,10 @@ mod tests {
         graph.add_bi_edge(head, tail, EdgeType::MinToMin);
 
         let (removed, by_rctc) = walk_tip(&graph, head, DEFAULT_TIP_RCTC_CUTOFF);
-        assert!(removed.is_empty(), "40 k-mers is over the tier-one limit of 10");
+        assert!(
+            removed.is_empty(),
+            "40 k-mers is over the tier-one limit of 10"
+        );
         assert!(!by_rctc);
     }
 
@@ -1135,7 +1145,11 @@ mod tests {
 
         let (mut g, _s, _) = bubble_with_counts(40, 40);
         let before = g.node_count();
-        assert!(!pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO, &CoverageRef::unknown()));
+        assert!(!pop_bubbles_by_coverage(
+            &mut g,
+            DEFAULT_POP_RATIO,
+            &CoverageRef::unknown()
+        ));
         assert_eq!(g.node_count(), before, "the graph must be untouched");
     }
 
@@ -1154,7 +1168,11 @@ mod tests {
 
         let (mut g, _s, _) = bubble_with_counts(100, 5);
         let before = g.node_count();
-        assert!(pop_bubbles_by_coverage(&mut g, DEFAULT_POP_RATIO, &CoverageRef::unknown()));
+        assert!(pop_bubbles_by_coverage(
+            &mut g,
+            DEFAULT_POP_RATIO,
+            &CoverageRef::unknown()
+        ));
         assert!(
             g.node_count() < before,
             "the popped branch and end node are gone"
@@ -1167,7 +1185,10 @@ mod tests {
     #[test]
     fn a_branch_exactly_on_the_ratio_survives() {
         let (g, _s, mids) = bubble_with_counts(100, 10);
-        assert_eq!(choose_branch_by_counts(&g, &mids, 0.1, &CoverageRef::unknown()), BubbleChoice::Leave);
+        assert_eq!(
+            choose_branch_by_counts(&g, &mids, 0.1, &CoverageRef::unknown()),
+            BubbleChoice::Leave
+        );
 
         let (g, _s, mids) = bubble_with_counts(100, 9);
         assert_eq!(
@@ -1597,5 +1618,4 @@ fn check_backwards_path(
             return;
         }
     }
-
 }

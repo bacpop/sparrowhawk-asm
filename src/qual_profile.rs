@@ -76,7 +76,11 @@ pub fn window_groups(seq: &[u8], qual: &[u8], k: usize, floors: &[u8], out: &mut
         );
         let mut best = NONE;
         for (g, floor) in floors.iter().enumerate() {
-            run[g] = if valid && phred >= *floor { run[g] + 1 } else { 0 };
+            run[g] = if valid && phred >= *floor {
+                run[g] + 1
+            } else {
+                0
+            };
             if run[g] >= k {
                 best = g as u8;
             }
@@ -112,10 +116,12 @@ mod tests {
         let seq = b"ACGTACGTAACGGTTACGATCGATTACGGCATCAGGTACAGGTTACAGGATCAGGTACA";
         // A quality string spanning all three bins, with a dip and a recovery.
         let qual: Vec<u8> = (0..seq.len())
-            .map(|i| 33 + match i % 9 {
-                0 | 1 => 2u8,
-                2 | 3 | 4 => 11,
-                _ => 25,
+            .map(|i| {
+                33 + match i % 9 {
+                    0 | 1 => 2u8,
+                    2 | 3 | 4 => 11,
+                    _ => 25,
+                }
             })
             .collect();
         let floors = vec![0u8, 11, 25];

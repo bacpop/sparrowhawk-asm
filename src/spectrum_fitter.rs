@@ -622,11 +622,8 @@ impl NativeSpectrumFit {
         None
     }
 
-    pub(crate) fn shadow_error_floor(&self, reference_fraction: f64) -> u16 {
-        if !reference_fraction.is_finite() || reference_fraction <= 0.0 {
-            return 2;
-        }
-        let reference = reference_fraction * self.component_heights(self.primary_mode())[1];
+    pub(crate) fn error_floor_cutoff(&self) -> u16 {
+        let reference = self.component_heights(self.primary_mode())[1];
         let mut last_bad = 0usize;
         for count in 1..=self.fit_window_end {
             if self.component_heights(count)[0] >= reference {
@@ -635,32 +632,6 @@ impl NativeSpectrumFit {
         }
         last_bad.saturating_add(1).min(u16::MAX as usize).max(2) as u16
     }
-
-    pub(crate) fn expected_error_between(&self, from: u16, to: u16) -> f64 {
-        expected_between(from, to, self.error_kmers, |count| {
-            self.error_params.log_probability(count)
-        })
-    }
-
-    pub(crate) fn expected_genome_between(&self, from: u16, to: u16) -> f64 {
-        expected_between(from, to, self.genome_kmers, |count| {
-            native_ln_genome(count, self.mean, self.dispersion, self.genome_model)
-        })
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn expected_between<F>(from: u16, to: u16, population: f64, log_pmf: F) -> f64
-where
-    F: Fn(f64) -> f64,
-{
-    if to <= from || !population.is_finite() || population <= 0.0 {
-        return 0.0;
-    }
-    population
-        * (from..to)
-            .map(|count| log_pmf(f64::from(count)).exp())
-            .sum::<f64>()
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1227,6 +1198,8 @@ mod tests {
         h
     }
 
+    /// This known-mixture fixture also guards against convergence to the Poisson boundary: the
+    /// recovered dispersion must remain within 1.5 of the true value, 6.6.
     #[test]
     fn fit_recovers_a_known_mixture() {
         let h = synthetic(95.0, 6.6, 4.6e6, 3.0, 0.03);
@@ -1249,19 +1222,6 @@ mod tests {
             (f.genome_kmers - expected).abs() / expected < 0.2,
             "genome k-mers {}",
             f.genome_kmers
-        );
-    }
-
-    /// The failure that made multi-start mandatory: seeded at the true dispersion alone, the simplex
-    /// can walk to the Poisson boundary and stop. The multi-start must not end up there.
-    #[test]
-    fn multi_start_escapes_the_dispersion_boundary() {
-        let h = synthetic(95.0, 6.6, 4.6e6, 3.0, 0.03);
-        let f = fit_spectrum(&h, 95, 6.6).expect("should converge");
-        assert!(
-            f.dispersion > 1.5,
-            "collapsed to the Poisson boundary: {}",
-            f.dispersion
         );
     }
 
@@ -1822,7 +1782,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn shadow_floors_are_monotone_and_exclude_the_last_bad_count() {
+    fn active_error_floor_is_one_past_the_last_overlapping_count() {
         for model in [
             ErrorModel::SingletonPareto,
             ErrorModel::FreeSingletonWeibull,
@@ -1842,15 +1802,12 @@ mod tests {
                 10.0e6,
                 570,
             );
-            let floors = [0.25, 0.5, 0.75, 1.0].map(|x| fit.shadow_error_floor(x));
-            assert!(floors.windows(2).all(|pair| pair[0] >= pair[1]));
-            for (fraction, floor) in [0.25, 0.5, 0.75, 1.0].into_iter().zip(floors) {
-                if floor > 2 {
-                    let reference = fraction * fit.component_heights(fit.primary_mode())[1];
-                    assert!(fit.component_heights(usize::from(floor - 1))[0] >= reference);
-                    if usize::from(floor) <= fit.fit_window_end {
-                        assert!(fit.component_heights(usize::from(floor))[0] < reference);
-                    }
+            let floor = fit.error_floor_cutoff();
+            if floor > 2 {
+                let reference = fit.component_heights(fit.primary_mode())[1];
+                assert!(fit.component_heights(usize::from(floor - 1))[0] >= reference);
+                if usize::from(floor) <= fit.fit_window_end {
+                    assert!(fit.component_heights(usize::from(floor))[0] < reference);
                 }
             }
         }
