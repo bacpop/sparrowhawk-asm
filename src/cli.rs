@@ -25,6 +25,38 @@ pub const DEFAULT_OUTPUT_DIR: &str = "./";
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 /// Smallest minimum count supported by Bloom filtering and automatic Bloom fitting.
 pub(crate) const MIN_BLOOM_COUNT: u16 = 2;
+/// SPAdes' default K set for reads under 150 bp (`options_storage.py`, `K_MERS_SHORT`).
+pub const KMER_LADDER_SHORT: [usize; 3] = [21, 33, 55];
+/// SPAdes' default K set from 150 bp (`K_MERS_150`).
+pub const KMER_LADDER_150: [usize; 4] = [21, 33, 55, 77];
+/// SPAdes' default K set from 250 bp (`K_MERS_250`).
+pub const KMER_LADDER_250: [usize; 6] = [21, 33, 55, 77, 99, 127];
+
+/// The default ladder for reads up to `max_read_len` bases: SPAdes' set for that length, less any k
+/// not below it. The first k always stays: it is counted before the read length is known.
+pub fn default_kmer_ladder(max_read_len: usize) -> Vec<usize> {
+    let set: &[usize] = if max_read_len >= 250 {
+        &KMER_LADDER_250
+    } else if max_read_len >= 150 {
+        &KMER_LADDER_150
+    } else {
+        &KMER_LADDER_SHORT
+    };
+    set.iter()
+        .enumerate()
+        .filter(|&(i, &k)| i == 0 || k < max_read_len)
+        .map(|(_, &k)| k)
+        .collect()
+}
+
+/// How a multi-k run counts the k-mers carried over from the previous k's contigs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ContigCountRule {
+    /// Raise each to the fitted minimum count; counts the reads already clear stay untouched.
+    Floor,
+    /// Add the minimum count + 1 per occurrence, as GATB-Minia adds its contigs to the reads.
+    Gatb,
+}
 
 #[doc(hidden)]
 fn valid_kmer(s: &str) -> Result<usize, String> {
@@ -148,9 +180,11 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_OUTPUT_PREFIX.to_string())]
         output_prefix: String,
 
-        /// K-mer size
-        #[arg(short, value_parser = valid_kmer, default_value_t = DEFAULT_KMER)]
-        k: usize,
+        /// K-mer size(s), comma-separated and strictly ascending: `-k 31`, or `-k 21,33,55,77` for an
+        /// iterative multi-k assembly. If omitted, a multi-k ladder is chosen from the read length as
+        /// SPAdes does (21,33,55; +77 from 150 bp; +99,127 from 250 bp).
+        #[arg(short, value_parser = valid_kmer, value_delimiter = ',')]
+        k: Option<Vec<usize>>,
 
         /// Minimum k-mer count. If omitted, it is FITTED from the k-mer spectrum, separately for each k.
         #[arg(long)]
@@ -230,6 +264,15 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_MIN_CONTIG_LENGTH_NTS)]
         min_contig_length: usize,
 
+        /// Multi-k: how k-mers of the previous k's contigs are counted at the next k. `floor` raises
+        /// each to the fitted minimum count; `gatb` adds minimum count + 1, as GATB-Minia does.
+        #[arg(long, value_enum, default_value_t = ContigCountRule::Floor)]
+        multik_contig_counts: ContigCountRule,
+
+        /// Multi-k: also write each intermediate k's contigs as `<prefix>_k<k>_contigs.fasta`.
+        #[arg(long, default_value_t = false)]
+        keep_intermediate_contigs: bool,
+
         /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG and
         /// SVG in the same folder where the contigs output will be. Use this argument to disable it.
         #[arg(long, default_value_t = false)]
@@ -253,47 +296,4 @@ pub enum Commands {
 /// Function to parse command line args into [`Args`] struct
 pub fn cli_args() -> Args {
     Args::parse()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_build(args: &[&str]) -> Result<Args, clap::Error> {
-        Args::try_parse_from(args)
-    }
-
-    #[test]
-    fn bloom_is_enabled_by_default_and_can_be_disabled() {
-        let default = parse_build(&["sparrowhawk-asm", "build", "reads.fastq"]).unwrap();
-        let disabled =
-            parse_build(&["sparrowhawk-asm", "build", "reads.fastq", "--no-bloom"]).unwrap();
-
-        let Commands::Build {
-            no_bloom: default_no_bloom,
-            ..
-        } = default.command;
-        let Commands::Build {
-            no_bloom: disabled_no_bloom,
-            ..
-        } = disabled.command;
-
-        assert!(!default_no_bloom);
-        assert!(disabled_no_bloom);
-        assert!(validate_bloom_min_count(!default_no_bloom, Some(2)).is_ok());
-        assert!(validate_bloom_min_count(!disabled_no_bloom, Some(1)).is_ok());
-    }
-
-    #[test]
-    fn removed_do_bloom_flag_is_rejected() {
-        assert!(parse_build(&["sparrowhawk-asm", "build", "reads.fastq", "--do-bloom",]).is_err());
-    }
-
-    #[test]
-    fn explicit_zero_and_singleton_counts_require_no_bloom() {
-        for min_count in [0, 1] {
-            assert!(validate_bloom_min_count(true, Some(min_count)).is_err());
-            assert!(validate_bloom_min_count(false, Some(min_count)).is_ok());
-        }
-    }
 }

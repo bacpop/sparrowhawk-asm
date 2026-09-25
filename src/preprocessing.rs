@@ -33,6 +33,8 @@ use crate::bloom_filter::BloomBits;
 #[cfg(target_family = "wasm")]
 use crate::bloom_filter::KmerFilter;
 #[cfg(not(target_family = "wasm"))]
+use crate::cli::ContigCountRule;
+#[cfg(not(target_family = "wasm"))]
 use crate::indexed_kmers::IndexedKmers;
 use crate::kmer::Kmer;
 use crate::logw;
@@ -2677,11 +2679,106 @@ where
     indexed
 }
 
+/// Contig bases hashed per round when carrying contigs in; bounds the transient k-mer buffer.
+#[cfg(not(target_family = "wasm"))]
+const CARRY_CHUNK_BASES: usize = 1 << 20;
+
+/// A multi-k step's previous contigs, and how their k-mers are counted when carried in.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+pub struct CarriedContigs<'a> {
+    /// The previous k's contigs, spelled.
+    pub seqs: &'a [Vec<u8>],
+    /// How each carried k-mer's count is set.
+    pub rule: ContigCountRule,
+}
+
+/// Put every k-mer of `carried` into the count-map so the `minc` filter keeps it, and return how many
+/// the reads never produced. Each chunk is hashed in parallel, then absorbed one writer per shard.
+#[cfg(not(target_family = "wasm"))]
+fn carry_contig_kmers<IntT>(
+    shards: &mut [CountMap<IntT>],
+    carried: CarriedContigs,
+    k: usize,
+    minc: u16,
+) -> usize
+where
+    IntT: for<'a> UInt<'a>,
+{
+    let n_shards = shards.len();
+    let minc = u32::from(minc);
+    let before: usize = shards.iter().map(HashMap::len).sum();
+    let w = KmerWalk {
+        k,
+        min_qual: 0,
+        floors: None,
+        keep: 0,
+    };
+    let mut rest = carried.seqs;
+    while !rest.is_empty() {
+        let mut take = 1;
+        let mut bases = rest[0].len();
+        while take < rest.len() && bases + rest[take].len() <= CARRY_CHUNK_BASES {
+            bases += rest[take].len();
+            take += 1;
+        }
+        let (chunk, tail) = rest.split_at(take);
+        rest = tail;
+
+        let mut kmers: Vec<(u64, u64, u8, IntT)> = chunk
+            .par_iter()
+            .flat_map_iter(|seq| {
+                let mut local = Vec::new();
+                let mut groups = Vec::new();
+                for_each_kmer::<IntT, _>(seq, None, w, &mut groups, |hc, hnc, b, _, km| {
+                    local.push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
+                });
+                local
+            })
+            .collect();
+        kmers.par_sort_unstable_by_key(|e| shard_of(e.0, n_shards));
+        let mut runs: Vec<&[(u64, u64, u8, IntT)]> = Vec::with_capacity(n_shards);
+        let mut from = 0;
+        for s in 0..n_shards {
+            let len = kmers[from..].partition_point(|e| shard_of(e.0, n_shards) == s);
+            runs.push(&kmers[from..from + len]);
+            from += len;
+        }
+        shards.par_iter_mut().zip(runs).for_each(|(map, run)| {
+            for &(hc, hnc, b, km) in run {
+                match carried.rule {
+                    ContigCountRule::Floor => {
+                        map.entry(hc)
+                            .and_modify(|e| e.count = e.count.max(minc))
+                            .or_insert(KmerInfo {
+                                count: minc,
+                                hnc,
+                                b,
+                                km,
+                            });
+                    }
+                    ContigCountRule::Gatb => {
+                        map.entry(hc)
+                            .and_modify(|e| e.count = e.count.saturating_add(minc + 1))
+                            .or_insert(KmerInfo {
+                                count: minc + 1,
+                                hnc,
+                                b,
+                                km,
+                            });
+                    }
+                }
+            }
+        });
+    }
+    shards.iter().map(HashMap::len).sum::<usize>() - before
+}
+
 /// Choose, filter and plot from a finished sharded count-map.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn finish_map_counter<IntT>(
-    shards: Vec<CountMap<IntT>>,
+    mut shards: Vec<CountMap<IntT>>,
     k: usize,
     qual: &QualOpts,
     floors: Option<&[u8]>,
@@ -2689,6 +2786,7 @@ fn finish_map_counter<IntT>(
     sketch: Option<SpectrumSketch>,
     do_fit: bool,
     do_bloom: bool,
+    carried: Option<CarriedContigs>,
     out_path: &mut Option<PathBuf>,
 ) -> Result<(IndexedKmers<IntT>, Vec<u32>, u16, u8, PeakSource), PreprocessingError>
 where
@@ -2805,6 +2903,16 @@ where
     }
     log::info!("Single-copy coverage read from the spectrum: {genomic_peak:?}");
 
+    // Only now: the reads alone set the cutoff, and the carried k-mers must not have to meet it unaided.
+    if let Some(carried) = carried {
+        let absent = carry_contig_kmers(&mut shards, carried, k, minc);
+        log::info!(
+            "Carried {} contig(s) into k={k} by the {:?} rule; {absent} of their k-mers were not in \
+             the reads",
+            carried.seqs.len(),
+            carried.rule
+        );
+    }
     let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
     if kmers.len() == 0 {
         return Err(PreprocessingError(format!(
@@ -2836,6 +2944,7 @@ where
 }
 
 /// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
+/// `carried`: a multi-k step's previous contigs, put in once the cutoff is chosen.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
 pub fn preprocessing_standalone<IntT, I>(
@@ -2848,6 +2957,7 @@ pub fn preprocessing_standalone<IntT, I>(
     csize: usize,
     do_bloom: bool,
     do_fit: bool,
+    carried: Option<CarriedContigs>,
 ) -> Result<PreprocessedK<IntT>, PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
@@ -2874,6 +2984,7 @@ where
             sketch,
             do_fit,
             do_bloom,
+            carried,
             out_path,
         )?;
 
@@ -3137,6 +3248,7 @@ mod tests {
             sketch,
             true,
             false,
+            None,
             &mut None,
         )
         .err()
@@ -3172,6 +3284,7 @@ mod tests {
             sketch,
             false,
             false,
+            None,
             &mut None,
         )
         .err()
@@ -3208,6 +3321,7 @@ mod tests {
             Some(SpectrumSketch::new()),
             false,
             false,
+            None,
             &mut None,
         )
         .expect("the sketch sample being empty is not proof that the floor has no k-mers");
@@ -3240,6 +3354,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             &mut None,
         )
         .err()
@@ -4393,6 +4508,7 @@ mod tests {
             sketch,
             true,
             do_bloom,
+            None,
             &mut None,
         )
         .expect("fixture should leave k-mers after filtering")
@@ -4740,6 +4856,196 @@ mod tests {
             peak_of(&estimate_by_valley(&empty), &empty),
             PeakSource::Unknown
         );
+    }
+
+    /// The store replays the reads exactly: at the ladder, as the first k counts, and at one floor, as
+    /// the recount and every later k count.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn counting_the_read_store_matches_counting_the_reads() {
+        let reads = counter_test_reads();
+        let ladder = [0u8, 11, 25];
+        let mut store = crate::read_store::ReadStore::new(&ladder);
+        for (seq, qual) in &reads {
+            store.push(seq, qual.as_deref());
+        }
+        store.finish();
+        let counts = |shards: Vec<CountMap<u64>>| -> HashMap<u64, (u32, u64, u8)> {
+            shards
+                .into_iter()
+                .flatten()
+                .map(|(hc, i)| (hc, (i.count, i.hnc, i.b)))
+                .collect()
+        };
+        for (floors, min_qual) in [(Some(&ladder[..]), 25u8), (None, 11), (None, 25)] {
+            let qual = QualOpts {
+                min_count: 2,
+                min_qual,
+            };
+            let streamed = bulk_preprocessing_standalone_cpu::<u64, _>(
+                &mut [reads.clone().into_iter()],
+                11,
+                &qual,
+                floors,
+                false,
+            )
+            .0;
+            let replayed = bulk_preprocessing_standalone_cpu::<u64, _>(
+                &mut [store.records()],
+                11,
+                &qual,
+                floors,
+                false,
+            )
+            .0;
+            assert_eq!(
+                counts(streamed),
+                counts(replayed),
+                "floors={floors:?} min_qual={min_qual}"
+            );
+        }
+    }
+
+    /// Both rules keep every carried k-mer past the cutoff. `Floor` never touches a count the reads
+    /// already clear and is idempotent; `Gatb` adds minc + 1 per occurrence, as GATB-Minia does.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn carried_contig_kmers_survive_the_cutoff_under_either_rule() {
+        let (k, minc) = (11usize, 3u16);
+        let reads = counter_test_reads();
+        let ladder = [0u8, 11, 25];
+        let qual = QualOpts {
+            min_count: minc,
+            min_qual: 25,
+        };
+        let novel = b"TTTTGGGGCCCCAAAATTTGGGCCCAAATGCATGCA".to_vec();
+        let contigs = vec![novel.clone(), reads[0].0.clone(), novel];
+        let records: Vec<OwnedRecord> = contigs.iter().map(|s| (s.clone(), None)).collect();
+        let mut occurrences: HashMap<u64, u32> = HashMap::default();
+        for (hc, ..) in hash_batch::<u64>(&records, k, 0, None, 0) {
+            *occurrences.entry(hc).or_insert(0) += 1;
+        }
+        let as_counts = |shards: &[CountMap<u64>]| -> HashMap<u64, u32> {
+            shards
+                .iter()
+                .flatten()
+                .map(|(h, i)| (*h, i.count))
+                .collect()
+        };
+        for rule in [ContigCountRule::Floor, ContigCountRule::Gatb] {
+            let (mut shards, _, _) = bulk_preprocessing_standalone_cpu::<u64, _>(
+                &mut [reads.clone().into_iter()],
+                k,
+                &qual,
+                Some(&ladder[..]),
+                false,
+            );
+            let before = as_counts(&shards);
+            let absent = carry_contig_kmers(
+                &mut shards,
+                CarriedContigs {
+                    seqs: &contigs,
+                    rule,
+                },
+                k,
+                minc,
+            );
+            let after = as_counts(&shards);
+            let minc = u32::from(minc);
+            assert_eq!(
+                absent,
+                occurrences
+                    .keys()
+                    .filter(|&h| !before.contains_key(h))
+                    .count()
+            );
+            for (h, &count) in &after {
+                let read = before.get(h).copied().unwrap_or(0);
+                let want = match (occurrences.get(h), rule) {
+                    (None, _) => read,
+                    (Some(_), ContigCountRule::Floor) => read.max(minc),
+                    (Some(&n), ContigCountRule::Gatb) => read + n * (minc + 1),
+                };
+                assert_eq!(count, want, "{rule:?}");
+            }
+        }
+    }
+
+    /// Deterministic ACGT, so a 2 kb genome has no repeated 20-mer to branch on.
+    #[cfg(not(target_family = "wasm"))]
+    fn pseudo_genome(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[((state >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    /// The point of multi-k: two tilings overlapping by 30 bases read every 21-mer but miss ten
+    /// 41-mers, so k=41 alone breaks there, and carrying the k=21 contig joins it again. `u128`
+    /// holds both k, as the pipeline would pick it for k=41.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn carrying_the_small_k_contig_bridges_a_seam_the_large_k_reads_miss() {
+        use crate::algorithms::corrector::{CorrectionOpts, CoverageRef};
+        use crate::graph_works::{Assemble, BasicAsm};
+
+        let genome = pseudo_genome(2000);
+        let mut reads: Vec<OwnedRecord> = Vec::new();
+        for start in (0..=915).step_by(5).chain((985..=1900).step_by(5)) {
+            let read = genome[start..start + 100].to_vec();
+            reads.push((read.clone(), None));
+            reads.push((read, None));
+        }
+        let qual = QualOpts {
+            min_count: 2,
+            min_qual: 0,
+        };
+        let correction = CorrectionOpts {
+            do_bubble_collapse: false,
+            do_dead_end_removal: false,
+            pop_ratio: 0.1,
+            tip_nts: 0,
+            tip_rctc_nts: 0,
+            tip_rctc_cutoff: 2.0,
+            coverage: CoverageRef::unknown(),
+            do_ec_removal: false,
+            ec_ratio: 4.0,
+            ec_require_both_flanks: false,
+        };
+        let assemble = |k: usize, carried: Option<CarriedContigs>| -> Vec<Vec<u8>> {
+            let (shards, sketch, present) = bulk_preprocessing_standalone_cpu::<u128, _>(
+                &mut [reads.clone().into_iter()],
+                k,
+                &qual,
+                None,
+                false,
+            );
+            let (mut kmers, ..) = finish_map_counter::<u128>(
+                shards, k, &qual, None, &present, sketch, false, false, carried, &mut None,
+            )
+            .expect("the fixture leaves k-mers after filtering");
+            let contigs =
+                BasicAsm::assemble::<u128>(k, &mut kmers, &mut None, &mut None, correction);
+            crate::save_functions::spell_contigs::<u128>(&contigs, &kmers, k)
+        };
+
+        let small = assemble(21, None);
+        assert_eq!(small.len(), 1, "every 21-mer is read");
+        assert_eq!(assemble(41, None).len(), 2, "ten 41-mers are never read");
+        for rule in [ContigCountRule::Floor, ContigCountRule::Gatb] {
+            let large = assemble(41, Some(CarriedContigs { seqs: &small, rule }));
+            assert_eq!(
+                large.len(),
+                1,
+                "{rule:?}: the carried contig bridges the seam"
+            );
+            assert_eq!(large[0].len(), genome.len());
+        }
     }
 }
 

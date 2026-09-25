@@ -21,6 +21,10 @@ pub mod graph_works;
 #[cfg(not(target_family = "wasm"))]
 pub mod indexed_kmers;
 
+/// Reads packed once in memory, so a multi-k run parses its input a single time.
+#[cfg(not(target_family = "wasm"))]
+pub mod read_store;
+
 /// Preprocessing functions of the reads & k-mers
 pub mod preprocessing;
 
@@ -164,7 +168,6 @@ pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
 #[cfg(not(target_family = "wasm"))]
 struct BuildOpts<'a> {
     input_files: &'a [InputFastx],
-    k: usize,
     quality: &'a QualOpts,
     chunk_size: usize,
     do_bloom: bool,
@@ -177,10 +180,11 @@ struct BuildOpts<'a> {
     /// Fraction of single-copy coverage below which a branch is an error. `None` keeps the default
     /// for however the coverage was established.
     peak_ratio: Option<f32>,
-    /// Dead-end paths shorter than this many bases are pruned. Already resolved against k.
-    tip_nts: usize,
-    /// Upper bound of the coverage-judged tip band, already resolved against k. Zero disables it.
-    tip_rctc_nts: usize,
+    /// Flat dead-end threshold in bases, and the k multiple that may raise it; resolved per k.
+    tip_length: usize,
+    tip_length_kmult: f32,
+    /// k multiple bounding the coverage-judged tip band; `None` under `--no-tip-rctc`.
+    tip_length_rctc_kmult: Option<f32>,
     /// How many times better covered a junction must be than the tip hanging off it.
     tip_rctc_cutoff: f64,
     do_ec_removal: bool,
@@ -188,16 +192,60 @@ struct BuildOpts<'a> {
     ec_require_both_flanks: bool,
     /// Minimum contig sequence length written to FASTA.
     min_contig_length: usize,
+    /// Multi-k: how k-mers carried over from the previous k's contigs are counted.
+    contig_counts: ContigCountRule,
+    /// Multi-k: also write each intermediate k's contigs.
+    keep_intermediate_contigs: bool,
+    no_histo: bool,
+    output_dir: &'a str,
+    output_prefix: &'a str,
     output: PathBuf,
 }
 
-/// Open the inputs and count k-mers at one quality floor. Split out of [`run_build`] so the pipeline
-/// can run it a second time when the spectrum does not resolve at the default floor.
+#[cfg(not(target_family = "wasm"))]
+impl BuildOpts<'_> {
+    /// Correction settings for one k: tip thresholds scale with k, coverage comes from its spectrum.
+    fn correction(
+        &self,
+        k: usize,
+        peak: preprocessing::PeakSource,
+        min_count: u16,
+    ) -> algorithms::corrector::CorrectionOpts {
+        use algorithms::corrector::{tip_length_nts, CorrectionOpts, CoverageRef};
+        CorrectionOpts {
+            do_bubble_collapse: self.do_bubble_collapse,
+            do_dead_end_removal: self.do_dead_end_removal,
+            pop_ratio: self.pop_ratio,
+            tip_nts: tip_length_nts(self.tip_length, self.tip_length_kmult, k),
+            // Zero empties the band: `.max(limit)` in `remove_dead_paths`.
+            tip_rctc_nts: self
+                .tip_length_rctc_kmult
+                .map_or(0, |m| tip_length_nts(self.tip_length, m, k)),
+            tip_rctc_cutoff: self.tip_rctc_cutoff,
+            coverage: CoverageRef::new(peak, min_count).with_error_fraction(self.peak_ratio),
+            do_ec_removal: self.do_ec_removal,
+            ec_ratio: self.ec_ratio,
+            ec_require_both_flanks: self.ec_require_both_flanks,
+        }
+    }
+
+    /// One spectrum plot's path, or `None` under `--no-histo`. `tag` tells the k of a ladder apart.
+    fn histo_path(&self, tag: &str) -> Option<PathBuf> {
+        (!self.no_histo).then(|| {
+            Path::new(self.output_dir).join(format!("{}_kmerspectrum{tag}.png", self.output_prefix))
+        })
+    }
+}
+
+/// Open the inputs and count k-mers at one quality floor. With `store`, every record is also packed
+/// into it as it streams past, which is how a multi-k run's first k reads the files for all of them.
 #[cfg(not(target_family = "wasm"))]
 fn count_reads<IntT>(
     opts: &BuildOpts,
+    k: usize,
     quality: &QualOpts,
     floors: Option<&[u8]>,
+    store: Option<&mut read_store::ReadStore>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
 ) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
@@ -219,25 +267,41 @@ where
         })
         .collect::<Vec<NeedletailIterator>>();
 
-    preprocessing::preprocessing_standalone::<IntT, _>(
-        &mut readers,
-        opts.k,
-        quality,
-        floors,
-        &mut Some(timevec),
-        out_path_histo,
-        opts.chunk_size,
-        opts.do_bloom,
-        opts.do_fit,
-    )
+    match store {
+        // One chained reader, so the single `&mut` store sees every record, in file order.
+        Some(store) => preprocessing::preprocessing_standalone::<IntT, _>(
+            &mut [read_store::Tee::new(readers.into_iter().flatten(), store)],
+            k,
+            quality,
+            floors,
+            &mut Some(timevec),
+            out_path_histo,
+            opts.chunk_size,
+            opts.do_bloom,
+            opts.do_fit,
+            None,
+        ),
+        None => preprocessing::preprocessing_standalone::<IntT, _>(
+            &mut readers,
+            k,
+            quality,
+            floors,
+            &mut Some(timevec),
+            out_path_histo,
+            opts.chunk_size,
+            opts.do_bloom,
+            opts.do_fit,
+            None,
+        ),
+    }
 }
 
 /// Run the whole `build` pipeline, monomorphised on the packed-k-mer width.
 #[cfg(not(target_family = "wasm"))]
 fn run_build<IntT>(
     opts: BuildOpts,
+    k: usize,
     timevec: &mut Vec<Instant>,
-    out_paths_histo: &mut [Option<PathBuf>],
     out_path_graph: &mut Option<PathBuf>,
 ) -> Result<(), preprocessing::PreprocessingError>
 where
@@ -251,12 +315,15 @@ where
     );
     log::info!("Candidate base-quality floors: {ladder:?}");
 
+    let mut out_path_histo = opts.histo_path("");
     let mut assembly = count_reads::<IntT>(
         &opts,
+        k,
         opts.quality,
         Some(&ladder),
+        None,
         timevec,
-        &mut out_paths_histo[0],
+        &mut out_path_histo,
     )?;
     let chosen = assembly.chosen_min_qual;
     if chosen < opts.quality.min_qual {
@@ -272,42 +339,229 @@ where
         };
         // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
         drop(assembly);
-        assembly = count_reads::<IntT>(&opts, &loosened, None, timevec, &mut out_paths_histo[0])?;
+        assembly = count_reads::<IntT>(
+            &opts,
+            k,
+            &loosened,
+            None,
+            None,
+            timevec,
+            &mut out_path_histo,
+        )?;
     }
 
     let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
-        opts.k,
+        k,
         &mut assembly.kmers,
         &mut Some(timevec),
         out_path_graph,
-        algorithms::corrector::CorrectionOpts {
-            do_bubble_collapse: opts.do_bubble_collapse,
-            do_dead_end_removal: opts.do_dead_end_removal,
-            pop_ratio: opts.pop_ratio,
-            tip_nts: opts.tip_nts,
-            tip_rctc_nts: opts.tip_rctc_nts,
-            tip_rctc_cutoff: opts.tip_rctc_cutoff,
-            // The spectrum of the pass that actually produced `themap`: after a recount, pass 2's,
-            // read at the loosened floor the graph's k-mers were counted at.
-            coverage: algorithms::corrector::CoverageRef::new(
-                assembly.genomic_peak,
-                assembly.used_min_count,
-            )
-            .with_error_fraction(opts.peak_ratio),
-            do_ec_removal: opts.do_ec_removal,
-            ec_ratio: opts.ec_ratio,
-            ec_require_both_flanks: opts.ec_require_both_flanks,
-        },
+        // The spectrum of the pass that actually produced the k-mers: after a recount, pass 2's,
+        // read at the loosened floor the graph's k-mers were counted at.
+        opts.correction(k, assembly.genomic_peak, assembly.used_min_count),
     );
 
     save_functions::save_as_fasta_with_min_contig_length::<IntT>(
         &mut contigs,
         &assembly.kmers,
-        opts.k,
+        k,
         opts.min_contig_length,
         opts.output,
     );
     Ok(())
+}
+
+/// What a multi-k run carries from one k to the next.
+#[cfg(not(target_family = "wasm"))]
+struct LadderState {
+    /// The k values to run; a default ladder is settled once the first k has seen every read.
+    ks: Vec<usize>,
+    default_ladder: bool,
+    /// Every read, packed during the first k's pass and replayed by the rest.
+    store: read_store::ReadStore,
+    /// The quality floor, settled at the first k and kept for the rest.
+    quality: QualOpts,
+    /// The previous k's contigs, spelled.
+    contigs: Vec<Vec<u8>>,
+}
+
+/// Iterative multi-k, as SPAdes and GATB-Minia run it: each k is assembled from the reads plus the
+/// previous k's contigs, and the last k's contigs are the output. `None` picks the ladder from the reads.
+#[cfg(not(target_family = "wasm"))]
+fn run_multik(
+    opts: BuildOpts,
+    requested: Option<&[usize]>,
+    timevec: &mut Vec<Instant>,
+    out_path_graph: &mut Option<PathBuf>,
+) -> Result<(), preprocessing::PreprocessingError> {
+    let floors = qual_profile::floors_from(
+        &qual_profile::peek_alphabet(&opts.input_files[0].1[0], qual_profile::PEEK_READS),
+        opts.quality.min_qual,
+    );
+    log::info!("Candidate base-quality floors: {floors:?}");
+    let mut state = LadderState {
+        ks: requested.map_or_else(|| vec![KMER_LADDER_SHORT[0]], <[usize]>::to_vec),
+        default_ladder: requested.is_none(),
+        store: read_store::ReadStore::new(&floors),
+        quality: QualOpts {
+            min_count: opts.quality.min_count,
+            min_qual: opts.quality.min_qual,
+        },
+        contigs: Vec::new(),
+    };
+    let mut step = 0;
+    while step < state.ks.len() {
+        log::info!("Multi-k step {}: k={}", step + 1, state.ks[step]);
+        match state.ks[step] {
+            3..=32 => run_ladder_step::<u64>(&opts, step, &mut state, timevec, out_path_graph)?,
+            33..=64 => run_ladder_step::<u128>(&opts, step, &mut state, timevec, out_path_graph)?,
+            65..=128 => run_ladder_step::<U256>(&opts, step, &mut state, timevec, out_path_graph)?,
+            _ => run_ladder_step::<U512>(&opts, step, &mut state, timevec, out_path_graph)?,
+        }
+        step += 1;
+    }
+    save_functions::save_sequences_as_fasta(&state.contigs, opts.min_contig_length, opts.output);
+    Ok(())
+}
+
+/// One k of a multi-k run: count (from the files at the first k, else from the store), carry the
+/// previous contigs in, assemble, and keep this k's contigs for the next.
+#[cfg(not(target_family = "wasm"))]
+fn run_ladder_step<IntT>(
+    opts: &BuildOpts,
+    step: usize,
+    state: &mut LadderState,
+    timevec: &mut Vec<Instant>,
+    out_path_graph: &mut Option<PathBuf>,
+) -> Result<(), preprocessing::PreprocessingError>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    let k = state.ks[step];
+    let mut out_path_histo = opts.histo_path(&format!("_k{k}"));
+    let mut assembly = if step == 0 {
+        let floors = state.store.floors().to_vec();
+        let pass1 = count_reads::<IntT>(
+            opts,
+            k,
+            &state.quality,
+            Some(&floors),
+            Some(&mut state.store),
+            timevec,
+            &mut out_path_histo,
+        )?;
+        state.store.finish();
+        state.ks = settle_ladder(&state.ks, state.default_ladder, state.store.max_read_len());
+        if pass1.chosen_min_qual < state.quality.min_qual {
+            log::warn!(
+                "Recounting at a base-quality floor of {} instead of {}, for every k — this admits \
+                 more error k-mers.",
+                pass1.chosen_min_qual,
+                state.quality.min_qual
+            );
+            state.quality.min_qual = pass1.chosen_min_qual;
+            // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
+            drop(pass1);
+            count_store::<IntT>(
+                opts,
+                k,
+                &state.quality,
+                &state.store,
+                &[],
+                timevec,
+                &mut out_path_histo,
+            )?
+        } else {
+            pass1
+        }
+    } else {
+        count_store::<IntT>(
+            opts,
+            k,
+            &state.quality,
+            &state.store,
+            &state.contigs,
+            timevec,
+            &mut out_path_histo,
+        )?
+    };
+    // Carried into the count-map by now, so the old contigs are dead weight.
+    state.contigs = Vec::new();
+
+    let last = step + 1 == state.ks.len();
+    let mut graph_path = if last { out_path_graph.take() } else { None };
+    let contigs = graph_works::BasicAsm::assemble::<IntT>(
+        k,
+        &mut assembly.kmers,
+        &mut Some(timevec),
+        &mut graph_path,
+        opts.correction(k, assembly.genomic_peak, assembly.used_min_count),
+    );
+    state.contigs = save_functions::spell_contigs::<IntT>(&contigs, &assembly.kmers, k);
+    log::info!(
+        "k={k}: {} contigs, {} bases",
+        state.contigs.len(),
+        state.contigs.iter().map(Vec::len).sum::<usize>()
+    );
+    if !last && opts.keep_intermediate_contigs {
+        let path =
+            Path::new(opts.output_dir).join(format!("{}_k{k}_contigs.fasta", opts.output_prefix));
+        save_functions::save_sequences_as_fasta(&state.contigs, opts.min_contig_length, path);
+    }
+    Ok(())
+}
+
+/// Count one k from the store at the settled floor, carrying `contigs` in once the reads set the cutoff.
+#[cfg(not(target_family = "wasm"))]
+fn count_store<IntT>(
+    opts: &BuildOpts,
+    k: usize,
+    quality: &QualOpts,
+    store: &read_store::ReadStore,
+    contigs: &[Vec<u8>],
+    timevec: &mut Vec<Instant>,
+    out_path_histo: &mut Option<PathBuf>,
+) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    let carried = (!contigs.is_empty()).then_some(preprocessing::CarriedContigs {
+        seqs: contigs,
+        rule: opts.contig_counts,
+    });
+    preprocessing::preprocessing_standalone::<IntT, _>(
+        &mut [store.records()],
+        k,
+        quality,
+        // No ladder: the floor was settled at the first k.
+        None,
+        &mut Some(timevec),
+        out_path_histo,
+        // `--chunk-size` is a no-op here, and the first k already warned about it.
+        0,
+        opts.do_bloom,
+        opts.do_fit,
+        carried,
+    )
+}
+
+/// The k values to run once every read is known: the SPAdes-style default for this length, or the
+/// requested list less any k not below the longest read. The first k has run, so it always stays.
+#[cfg(not(target_family = "wasm"))]
+fn settle_ladder(ks: &[usize], default_ladder: bool, max_read_len: usize) -> Vec<usize> {
+    let settled: Vec<usize> = if default_ladder {
+        default_kmer_ladder(max_read_len)
+    } else {
+        ks.iter()
+            .enumerate()
+            .filter(|&(i, &k)| i == 0 || k < max_read_len)
+            .map(|(_, &k)| k)
+            .collect()
+    };
+    if settled.len() < ks.len() && !default_ladder {
+        log::warn!("Dropping k values not below the longest read ({max_read_len} bp)");
+    }
+    log::info!("Multi-k ladder for reads up to {max_read_len} bp: k={settled:?}");
+    settled
 }
 
 #[doc(hidden)]
@@ -342,6 +596,8 @@ pub fn main() {
             tip_rctc_cutoff,
             no_tip_rctc,
             min_contig_length,
+            multik_contig_counts,
+            keep_intermediate_contigs,
             no_histo,
             no_graphs,
             no_bubble_collapse,
@@ -380,7 +636,7 @@ pub fn main() {
                 min_count: min_count.unwrap_or(DEFAULT_MINCOUNT),
                 min_qual: min_qual.unwrap_or(DEFAULT_MINQUAL),
             };
-            log::info!("k={k}: minimum base quality used: {}", quality.min_qual);
+            log::info!("Minimum base quality used: {}", quality.min_qual);
 
             // Build, merge
             // let rc = !*single_strand;
@@ -401,12 +657,6 @@ pub fn main() {
                     quality.min_count
                 );
             }
-
-            let mut out_paths_histo: Vec<Option<PathBuf>> = vec![if *no_histo {
-                None
-            } else {
-                Some(Path::new(output_dir).join(format!("{output_prefix}_kmerspectrum.png")))
-            }];
 
             // No extension here: `assemble` sets .dot/.gfa/.gfa2 on this base path later (hence `mut`).
             let mut out_path_graph: Option<PathBuf> = if *no_graphs {
@@ -466,15 +716,15 @@ pub fn main() {
                 );
                 std::process::exit(2);
             }
-            let tip_nts = algorithms::corrector::tip_length_nts(*tip_length, *tip_length_kmult, *k);
-            let tip_rctc_nts = if *no_tip_rctc {
-                0 // `.max(limit)` in `remove_dead_paths` then empties the band
-            } else {
-                algorithms::corrector::tip_length_nts(*tip_length, *tip_length_rctc_kmult, *k)
-            };
+            // Each k is seeded with the contigs of the k before it, so the ladder must climb.
+            if let Some(ks) = k {
+                if ks.windows(2).any(|w| w[1] <= w[0]) {
+                    eprintln!("error: -k values must be strictly ascending (got {ks:?}).");
+                    std::process::exit(2);
+                }
+            }
             let opts = BuildOpts {
                 input_files: &input_files,
-                k: *k,
                 quality: &quality,
                 chunk_size: *chunk_size,
                 do_bloom,
@@ -486,57 +736,48 @@ pub fn main() {
                 do_ec_removal: !no_ec_removal,
                 ec_ratio: *ec_coverage_ratio,
                 ec_require_both_flanks: *ec_require_both_flanks,
-                tip_nts,
-                tip_rctc_nts,
+                tip_length: *tip_length,
+                tip_length_kmult: *tip_length_kmult,
+                tip_length_rctc_kmult: (!no_tip_rctc).then_some(*tip_length_rctc_kmult),
                 tip_rctc_cutoff: *tip_rctc_cutoff,
                 min_contig_length: *min_contig_length,
+                contig_counts: *multik_contig_counts,
+                keep_intermediate_contigs: *keep_intermediate_contigs,
+                no_histo: *no_histo,
+                output_dir,
+                output_prefix,
                 output,
             };
 
-            // The packed k-mer must fit in 2*k bits, so k picks the integer width.
-            if k % 2 == 0 {
-                panic!("Support for even k-mer lengths not implemented");
-            }
-            let width_k = *k;
-            let build_result = match width_k {
-                0..=2 => panic!("kmer length too small (min. 3)"),
-                3..=32 => {
-                    log::info!("k={width_k}: using 64-bit representation");
-                    run_build::<u64>(
-                        opts,
-                        &mut timevec,
-                        &mut out_paths_histo,
-                        &mut out_path_graph,
-                    )
+            let build_result = match k.as_deref() {
+                Some(&[single]) => {
+                    // The packed k-mer must fit in 2*k bits, so k picks the integer width.
+                    if single % 2 == 0 {
+                        panic!("Support for even k-mer lengths not implemented");
+                    }
+                    let width_k = single;
+                    match width_k {
+                        0..=2 => panic!("kmer length too small (min. 3)"),
+                        3..=32 => {
+                            log::info!("k={width_k}: using 64-bit representation");
+                            run_build::<u64>(opts, single, &mut timevec, &mut out_path_graph)
+                        }
+                        33..=64 => {
+                            log::info!("k={width_k}: using 128-bit representation");
+                            run_build::<u128>(opts, single, &mut timevec, &mut out_path_graph)
+                        }
+                        65..=128 => {
+                            log::info!("k={width_k}: using 256-bit representation");
+                            run_build::<U256>(opts, single, &mut timevec, &mut out_path_graph)
+                        }
+                        129..=256 => {
+                            log::info!("k={width_k}: using 512-bit representation");
+                            run_build::<U512>(opts, single, &mut timevec, &mut out_path_graph)
+                        }
+                        _ => panic!("kmer length larger than 256 currently not supported."),
+                    }
                 }
-                33..=64 => {
-                    log::info!("k={width_k}: using 128-bit representation");
-                    run_build::<u128>(
-                        opts,
-                        &mut timevec,
-                        &mut out_paths_histo,
-                        &mut out_path_graph,
-                    )
-                }
-                65..=128 => {
-                    log::info!("k={width_k}: using 256-bit representation");
-                    run_build::<U256>(
-                        opts,
-                        &mut timevec,
-                        &mut out_paths_histo,
-                        &mut out_path_graph,
-                    )
-                }
-                129..=256 => {
-                    log::info!("k={width_k}: using 512-bit representation");
-                    run_build::<U512>(
-                        opts,
-                        &mut timevec,
-                        &mut out_paths_histo,
-                        &mut out_path_graph,
-                    )
-                }
-                _ => panic!("kmer length larger than 256 currently not supported."),
+                requested => run_multik(opts, requested, &mut timevec, &mut out_path_graph),
             };
             if let Err(error) = build_result {
                 eprintln!("error: {error}");

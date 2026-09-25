@@ -117,6 +117,52 @@ pub(crate) fn save_as_fasta_with_min_contig_length<IntT>(
     ingraph.write_fasta(&mut wbuf);
 }
 
+/// Spells every contig. A multi-k step carries all of them to the next k, so none is length-filtered.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn spell_contigs<IntT>(
+    contigs: &Contigs,
+    dict: &impl KmerLookup<IntT>,
+    k: usize,
+) -> Vec<Vec<u8>>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    contigs
+        .serialized_contigs
+        .iter()
+        .enumerate()
+        .map(|(ipc, contig)| {
+            assert_eq!(contig.len(), 1, "contig {ipc} was not shrunk to one node");
+            spell_path(&contig[0].abs_ind, dict, k)
+                .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"))
+        })
+        .collect()
+}
+
+/// Writes spelled contigs of at least `min_contig_length` bases as FASTA, as the single-k path does.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn save_sequences_as_fasta(
+    seqs: &[Vec<u8>],
+    min_contig_length: usize,
+    outfile: PathBuf,
+) {
+    let kept: Vec<Vec<u8>> = seqs
+        .iter()
+        .filter(|s| s.len() >= min_contig_length)
+        .cloned()
+        .collect();
+    log::info!(
+        "Omitted {} contigs shorter than {min_contig_length} nt from FASTA output",
+        seqs.len() - kept.len()
+    );
+    let contigs = Contigs {
+        serialized_contigs: Vec::new(),
+        contig_sequences: Some(kept),
+    };
+    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
+    contigs.write_fasta(&mut wbuf);
+}
+
 /// Writes all the contigs as a fasta file
 #[cfg(not(target_family = "wasm"))]
 pub fn write_as_fasta<IntT, W>(
