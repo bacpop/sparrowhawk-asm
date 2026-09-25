@@ -2914,11 +2914,6 @@ where
         );
     }
     let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
-    if kmers.len() == 0 {
-        return Err(PreprocessingError(format!(
-            "no k-mers survived filtering at k={k}, base-quality floor {chosen_min_qual}, and minimum count {minc}"
-        )));
-    }
 
     if let Some(p) = out_path {
         if do_fit {
@@ -2939,6 +2934,12 @@ where
             p.as_path(),
         );
         write_kmer_spectrum_tsv(&histovec, p.as_path());
+    }
+    // After the plot and TSV, so a k that leaves nothing still says why.
+    if kmers.len() == 0 {
+        return Err(PreprocessingError(format!(
+            "no k-mers survived filtering at k={k}, base-quality floor {chosen_min_qual}, and minimum count {minc}"
+        )));
     }
     Ok((kmers, histovec, minc, chosen_min_qual, genomic_peak))
 }

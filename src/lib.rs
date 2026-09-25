@@ -411,11 +411,25 @@ fn run_multik(
     let mut step = 0;
     while step < state.ks.len() {
         log::info!("Multi-k step {}: k={}", step + 1, state.ks[step]);
-        match state.ks[step] {
-            3..=32 => run_ladder_step::<u64>(&opts, step, &mut state, timevec, out_path_graph)?,
-            33..=64 => run_ladder_step::<u128>(&opts, step, &mut state, timevec, out_path_graph)?,
-            65..=128 => run_ladder_step::<U256>(&opts, step, &mut state, timevec, out_path_graph)?,
-            _ => run_ladder_step::<U512>(&opts, step, &mut state, timevec, out_path_graph)?,
+        let outcome = match state.ks[step] {
+            3..=32 => run_ladder_step::<u64>(&opts, step, &mut state, timevec, out_path_graph),
+            33..=64 => run_ladder_step::<u128>(&opts, step, &mut state, timevec, out_path_graph),
+            65..=128 => run_ladder_step::<U256>(&opts, step, &mut state, timevec, out_path_graph),
+            _ => run_ladder_step::<U512>(&opts, step, &mut state, timevec, out_path_graph),
+        };
+        if let Err(error) = outcome {
+            // Only the empty-k-mer checks fail here, and a k no read reaches is out of reach for every
+            // larger k too, so the ladder ends; the previous k's contigs are still in `state`.
+            if step == 0 {
+                return Err(error);
+            }
+            log::warn!(
+                "Stopping the multi-k ladder at k={}: {error}. Writing the k={} contigs; no graph \
+                 files are written for a stopped ladder.",
+                state.ks[step],
+                state.ks[step - 1]
+            );
+            break;
         }
         step += 1;
     }
