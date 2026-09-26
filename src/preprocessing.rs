@@ -1907,9 +1907,15 @@ fn write_kmer_spectrum_tsv(histovec: &[u32], out_path: &std::path::Path) {
 
 #[cfg(not(target_family = "wasm"))]
 fn quality_floor_path(path: &std::path::Path, floor: u8) -> PathBuf {
-    let mut stem = path.file_stem().unwrap_or_default().to_os_string();
-    stem.push(format!("_q{floor}"));
-    path.with_file_name(stem)
+    suffixed_path(path, &format!("_q{floor}"), "png")
+}
+
+/// `path` with `suffix` appended to its file stem and `extension` set; dots already in the stem stay.
+#[cfg(not(target_family = "wasm"))]
+fn suffixed_path(path: &std::path::Path, suffix: &str, extension: &str) -> PathBuf {
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(format!("{suffix}.{extension}"));
+    path.with_file_name(name)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -2416,11 +2422,7 @@ fn plot_kmer_histogram(
             ("_unbounded", PlotYAxis::UnboundedLinear),
             ("_log", PlotYAxis::UnboundedLog),
         ] {
-            let mut stem = out_path.file_stem().unwrap_or_default().to_os_string();
-            stem.push(suffix);
-            let png_path = out_path.with_file_name(stem);
-            let mut png_path = png_path;
-            png_path.set_extension("png");
+            let png_path = suffixed_path(out_path, suffix, "png");
             draw_kmer_histogram(
                 BitMapBackend::new(&png_path, (1280, 960)).into_drawing_area(),
                 decision_spectrum,
@@ -3320,6 +3322,7 @@ fn bulk_preprocessing_standalone_cpu<IntT, I>(
     qual: &QualOpts,
     floors: Option<&[u8]>,
     do_bloom: bool,
+    do_fit: bool,
 ) -> (
     Vec<CountMap<IntT>>,
     Option<SpectrumSketch>,
@@ -3331,9 +3334,8 @@ where
 {
     // The ladder is ascending, so the last group is the strict floor and `keep` is its index.
     let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
-    // A Bloom table has no count-1 bin, so its spectrum has to come from the sketch whether or not a
-    // ladder was asked for.
-    let mut sketch = (floors.is_some() || do_bloom).then(SpectrumSketch::new);
+    // The sketch only feeds the fit, except under Bloom counting, whose spectrum must come from it.
+    let mut sketch = ((floors.is_some() && do_fit) || do_bloom).then(SpectrumSketch::new);
     let n_shards = countmap_shards();
     log::info!(
         "Counting k-mers into {n_shards} shards on {} thread(s){}",
@@ -3660,8 +3662,6 @@ where
                     diagnostic.fit_attempted,
                 );
                 let path = quality_floor_path(base_path, diagnostic.floor);
-                let mut path = path;
-                path.set_extension("png");
                 plot_kmer_histogram(
                     &diagnostic.spectrum,
                     do_bloom.then_some(histovec.as_slice()),
@@ -3804,8 +3804,14 @@ where
         );
     }
     log::info!("Counting k-mers into a hash map, without sorting");
-    let (shards, sketch, floor_has_kmers) =
-        bulk_preprocessing_standalone_cpu::<IntT, _>(input_iters, k, qual, floors, do_bloom);
+    let (shards, sketch, floor_has_kmers) = bulk_preprocessing_standalone_cpu::<IntT, _>(
+        input_iters,
+        k,
+        qual,
+        floors,
+        do_bloom,
+        do_fit,
+    );
     let (kmers, histovec, used_min_count, chosen_min_qual, genomic_peak) =
         finish_map_counter::<IntT>(
             shards,
@@ -4075,6 +4081,20 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
+    fn plot_paths_keep_dots_in_the_output_prefix() {
+        let base = std::path::Path::new("out/s.v2_kmerspectrum_k21.png");
+        assert_eq!(
+            quality_floor_path(base, 20),
+            std::path::Path::new("out/s.v2_kmerspectrum_k21_q20.png")
+        );
+        assert_eq!(
+            suffixed_path(base, "_log", "png"),
+            std::path::Path::new("out/s.v2_kmerspectrum_k21_log.png")
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
     fn native_diagnostic_plot_renders_exact_and_bloom_spectra() {
         let mut decision = vec![0u32; MAXSIZEHISTO];
         for count in 1..=570 {
@@ -4128,11 +4148,7 @@ mod tests {
                 ("_unbounded", "k-mer spectrum (unbounded Y)"),
                 ("_log", "k-mer spectrum (logarithmic Y)"),
             ] {
-                let mut stem = path.file_stem().unwrap().to_os_string();
-                stem.push(suffix);
-                let png_path = path.with_file_name(stem);
-                let mut png_path = png_path;
-                png_path.set_extension("png");
+                let png_path = suffixed_path(&path, suffix, "png");
                 let mut variant_svg_path = png_path.clone();
                 variant_svg_path.set_extension("svg");
                 assert!(std::fs::metadata(&png_path).is_ok_and(|metadata| metadata.len() > 0));
@@ -4197,6 +4213,7 @@ mod tests {
             &qual,
             Some(&floors),
             false,
+            true,
         );
         let error = finish_map_counter::<u64>(
             shards,
@@ -4232,6 +4249,7 @@ mod tests {
             &qual,
             Some(&floors),
             false,
+            true,
         );
         assert!(!floor_has_kmers[2]);
         assert!(floor_has_kmers[1]);
@@ -4413,6 +4431,7 @@ mod tests {
             &qual,
             Some(&ladder[..]),
             false,
+            true,
         );
 
         let n_shards = shards.len();
@@ -4471,8 +4490,14 @@ mod tests {
         ladder: &[u8],
     ) -> HashMap<u64, u32> {
         let mut iters = [reads.into_iter()];
-        let (shards, _, _) =
-            bulk_preprocessing_standalone_cpu::<u64, _>(&mut iters, k, qual, Some(ladder), true);
+        let (shards, _, _) = bulk_preprocessing_standalone_cpu::<u64, _>(
+            &mut iters,
+            k,
+            qual,
+            Some(ladder),
+            true,
+            true,
+        );
         let mut got: HashMap<u64, u32> = HashMap::default();
         for shard in &shards {
             for (hc, info) in shard {
@@ -5755,6 +5780,7 @@ mod tests {
             qual,
             Some(ladder),
             do_bloom,
+            true,
         );
         finish_map_counter::<u64>(
             shards,
@@ -6238,6 +6264,7 @@ mod tests {
                 &qual,
                 floors,
                 false,
+                true,
             )
             .0;
             let replayed = bulk_preprocessing_standalone_cpu::<u64, _>(
@@ -6246,6 +6273,7 @@ mod tests {
                 &qual,
                 floors,
                 false,
+                true,
             )
             .0;
             assert_eq!(
@@ -6289,6 +6317,7 @@ mod tests {
                 &qual,
                 Some(&ladder[..]),
                 false,
+                true,
             );
             let before = as_counts(&shards);
             let absent = carry_contig_kmers(
@@ -6374,6 +6403,7 @@ mod tests {
                 &qual,
                 None,
                 false,
+                true,
             );
             let (mut kmers, ..) = finish_map_counter::<u128>(
                 shards, k, &qual, None, &present, sketch, false, false, carried, &mut None, false,

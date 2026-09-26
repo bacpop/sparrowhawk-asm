@@ -393,9 +393,10 @@ struct LadderState {
 #[cfg(not(target_family = "wasm"))]
 const MIN_K_FOR_UNRESOLVED_MIN_COUNT_STOP: usize = 71;
 
+/// Stop only once an earlier k's contigs exist to write; the first k assembles with the fallback.
 #[cfg(not(target_family = "wasm"))]
-fn should_stop_ladder_for_unresolved_min_count(k: usize, unresolved: bool) -> bool {
-    k >= MIN_K_FOR_UNRESOLVED_MIN_COUNT_STOP && unresolved
+fn should_stop_ladder_for_unresolved_min_count(step: usize, k: usize, unresolved: bool) -> bool {
+    step > 0 && k >= MIN_K_FOR_UNRESOLVED_MIN_COUNT_STOP && unresolved
 }
 
 /// Iterative multi-k: each k is assembled from reads plus the previous k's contigs. With no explicit
@@ -575,7 +576,7 @@ where
             selection
         }
     };
-    if should_stop_ladder_for_unresolved_min_count(k, assembly.min_count_unresolved) {
+    if should_stop_ladder_for_unresolved_min_count(step, k, assembly.min_count_unresolved) {
         return Err(preprocessing::PreprocessingError::unresolved_high_k_min_count(k));
     }
     // Carried into the count-map by now, so the old contigs are dead weight.
@@ -739,10 +740,15 @@ mod multik_tests {
 
     #[test]
     fn unresolved_min_count_stops_only_at_k_71_or_higher() {
-        assert!(!should_stop_ladder_for_unresolved_min_count(70, true));
-        assert!(should_stop_ladder_for_unresolved_min_count(71, true));
-        assert!(should_stop_ladder_for_unresolved_min_count(131, true));
-        assert!(!should_stop_ladder_for_unresolved_min_count(71, false));
+        assert!(!should_stop_ladder_for_unresolved_min_count(1, 70, true));
+        assert!(should_stop_ladder_for_unresolved_min_count(1, 71, true));
+        assert!(should_stop_ladder_for_unresolved_min_count(1, 131, true));
+        assert!(!should_stop_ladder_for_unresolved_min_count(1, 71, false));
+    }
+
+    #[test]
+    fn unresolved_min_count_never_stops_the_first_k() {
+        assert!(!should_stop_ladder_for_unresolved_min_count(0, 81, true));
     }
 
     #[test]

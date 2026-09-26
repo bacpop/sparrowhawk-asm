@@ -248,7 +248,12 @@ impl Correctable for DbgGraph {
             let externals: Vec<_> = self
                 .externals_bi()
                 .into_iter()
-                .filter(|n| self.out_degree(*n) == 1)
+                // A dead end with several neighbours is its own fan-out; a self-loop has no dead side.
+                .filter(|n| match self.out_degree(*n) {
+                    0 => false,
+                    1 => true,
+                    _ => !self.has_self_loop(*n),
+                })
                 .collect();
 
             logw(
@@ -697,6 +702,28 @@ fn check_dead_path(
 
     let (mut ty, _) = carryedge.get_from_and_to();
 
+    // A dead end that fans out is its own junction, Minia's single-node tip: its successors are the
+    // whole neighbourhood.
+    if ptgraph.out_neighbours_bi(current_vertex, ty).len() > 1 {
+        if cnt < limit {
+            return false;
+        }
+        if cnt < rctc_limit
+            && neighbourhood_outcovers_tip(
+                ptgraph,
+                current_vertex,
+                ty,
+                current_vertex,
+                path_mean_coverage(ptgraph, output_vec),
+                rctc_cutoff,
+            )
+        {
+            return true;
+        }
+        output_vec.clear();
+        return false;
+    }
+
     loop {
         if cnt >= rctc_limit {
             output_vec.clear();
@@ -798,7 +825,7 @@ fn check_dead_path(
             }
 
             // Longer tips retain the existing relative-coverage rule, now measuring the complete
-            // path through its fan-out endpoint. I had this wrong in the past, partially intentional, but I was wrong because I was leaving lots of bad tips here.
+            // path through its fan-out endpoint.
             if cnt < rctc_limit
                 && neighbourhood_outcovers_tip(
                     ptgraph,
@@ -1114,6 +1141,30 @@ mod tests {
             );
             assert_eq!(graph.validate(), Ok(()), "edge orientation {edge:?}");
         }
+    }
+
+    /// A dead end that itself fans out: `tip_at_fanout` with its tip removed.
+    fn fanning_dead_end(kmers: usize, counts: u32, branch_counts: [u32; 2]) -> (DbgGraph, NodeId) {
+        let (mut graph, tip, fanout, _) =
+            tip_at_fanout(EdgeType::MinToMin, 1, 1, kmers, counts, branch_counts);
+        graph.remove_node(tip);
+        (graph, fanout)
+    }
+
+    #[test]
+    fn a_short_dead_end_that_fans_out_is_removed_by_length() {
+        let (graph, dead_end) = fanning_dead_end(2, 999, [1, 1]);
+        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![dead_end], false));
+    }
+
+    #[test]
+    fn a_long_dead_end_that_fans_out_goes_only_when_its_successors_outcover_it() {
+        let (graph, dead_end) = fanning_dead_end(12, 2, [40, 40]);
+        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![dead_end], true));
+        let (graph, dead_end) = fanning_dead_end(12, 10, [20, 20]);
+        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![], false));
+        let (graph, dead_end) = fanning_dead_end(100, 2, [40, 40]);
+        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![], false));
     }
 
     #[test]
