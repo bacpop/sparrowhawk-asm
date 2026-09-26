@@ -383,12 +383,39 @@ struct LadderState {
     default_ladder: bool,
     /// Every read, packed during the first k's pass and replayed by the rest.
     store: read_store::ReadStore,
-    /// Index of the strictest floor currently eligible; selection may only move this towards 0.
+    /// Index of the strictest floor later k may use. Lowered only once two consecutive resolved k chose
+    /// below it (see [`lowered_floor_index`]), and never raised.
     floor_index: usize,
-    /// Current quality/min-count settings. Automatic fitting updates the quality floor after each k.
+    /// The floor the last resolved k chose; unresolved k leave it unchanged.
+    last_choice: Option<u8>,
+    /// Current quality/min-count settings. `min_qual` is the ceiling, `floors[floor_index]`.
     quality: QualOpts,
     /// The previous k's contigs, spelled.
     contigs: Vec<Vec<u8>>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl LadderState {
+    /// Record the floor this k chose. An unresolved k is skipped: its loosest-floor fallback is not a
+    /// selection, so it neither lowers the ceiling nor counts towards a pair.
+    fn record_floor_choice(&mut self, k: usize, chosen: u8, unresolved: bool) {
+        if unresolved {
+            return;
+        }
+        let floors = self.store.floors();
+        let lowered = lowered_floor_index(floors, self.floor_index, self.last_choice, chosen);
+        if lowered != self.floor_index {
+            log::info!(
+                "A floor below {} was chosen at two consecutive k (the last at k={k}); later k values \
+                 will not go above {}.",
+                floors[self.floor_index],
+                floors[lowered]
+            );
+            self.floor_index = lowered;
+            self.quality.min_qual = floors[lowered];
+        }
+        self.last_choice = Some(chosen);
+    }
 }
 
 /// Do not let an unresolved, automatic cutoff at high k replace the last usable assembly.
@@ -420,6 +447,7 @@ fn run_multik(
         default_ladder: requested.is_none(),
         store: read_store::ReadStore::new(&floors),
         floor_index: floors.len() - 1,
+        last_choice: None,
         quality: QualOpts {
             min_count: opts.quality.min_count,
             min_qual: opts.quality.min_qual,
@@ -494,22 +522,13 @@ where
             state.store.max_read_len(),
         );
         if opts.do_fit {
-            state.floor_index = selected_floor_index(
-                state.store.floors(),
-                state.floor_index,
-                pass1.chosen_min_qual,
-            )
-            .expect("the floor selector must choose an active candidate");
-            state.quality.min_qual = pass1.chosen_min_qual;
+            state.record_floor_choice(k, pass1.chosen_min_qual, pass1.min_count_unresolved);
         }
         if opts.do_fit && pass1.chosen_min_qual < strict_floor {
             let selected_floor = pass1.chosen_min_qual;
             let selected_min_count = pass1.used_min_count;
             let selected_peak = pass1.genomic_peak;
-            log::warn!(
-                "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
-                 will use it as their strict floor."
-            );
+            log::warn!("Recounting k={k} at a base-quality floor of {selected_floor}.");
             // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
             drop(pass1);
             count_store_at_selection::<IntT>(
@@ -543,22 +562,13 @@ where
             None,
         )?;
         if opts.do_fit {
-            state.floor_index = selected_floor_index(
-                state.store.floors(),
-                state.floor_index,
-                selection.chosen_min_qual,
-            )
-            .expect("the floor selector must choose an active candidate");
-            state.quality.min_qual = selection.chosen_min_qual;
+            state.record_floor_choice(k, selection.chosen_min_qual, selection.min_count_unresolved);
         }
         if opts.do_fit && selection.chosen_min_qual < strict_floor {
             let selected_floor = selection.chosen_min_qual;
             let selected_min_count = selection.used_min_count;
             let selected_peak = selection.genomic_peak;
-            log::warn!(
-                "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
-                 will use it as their strict floor."
-            );
+            log::warn!("Recounting k={k} at a base-quality floor of {selected_floor}.");
             drop(selection);
             count_store_at_selection::<IntT>(
                 opts,
@@ -686,13 +696,18 @@ fn active_quality_floors(floors: &[u8], strict_index: usize) -> &[u8] {
     &floors[..=strict_index]
 }
 
-/// Locate a selected candidate within the current prefix; this prevents a later k from tightening
-/// the floor after an earlier k relaxed it.
+/// The ceiling for later k: the higher of two consecutive choices once both are below the current
+/// ceiling, otherwise unchanged. The chosen floors come from the ladder, so `position` finds them.
 #[cfg(not(target_family = "wasm"))]
-fn selected_floor_index(floors: &[u8], strict_index: usize, selected: u8) -> Option<usize> {
-    active_quality_floors(floors, strict_index)
-        .iter()
-        .position(|&floor| floor == selected)
+fn lowered_floor_index(floors: &[u8], ceiling: usize, previous: Option<u8>, chosen: u8) -> usize {
+    let top = floors[ceiling];
+    match previous {
+        Some(previous) if previous < top && chosen < top => floors
+            .iter()
+            .position(|&floor| floor == previous.max(chosen))
+            .unwrap_or(ceiling),
+        _ => ceiling,
+    }
 }
 
 /// The k values to run once every read is known: the average-length default or the requested list,
@@ -732,8 +747,8 @@ fn settle_ladder(
 #[cfg(all(test, not(target_family = "wasm")))]
 mod multik_tests {
     use super::{
-        active_quality_floors, selected_floor_index, settle_ladder,
-        should_stop_ladder_for_unresolved_min_count,
+        active_quality_floors, lowered_floor_index, read_store, settle_ladder,
+        should_stop_ladder_for_unresolved_min_count, LadderState, QualOpts,
     };
 
     #[test]
@@ -749,19 +764,49 @@ mod multik_tests {
         assert!(!should_stop_ladder_for_unresolved_min_count(0, 81, true));
     }
 
+    fn state_with(floors: &[u8]) -> LadderState {
+        LadderState {
+            ks: vec![21],
+            default_ladder: true,
+            store: read_store::ReadStore::new(floors),
+            floor_index: floors.len() - 1,
+            last_choice: None,
+            quality: QualOpts {
+                min_count: 0,
+                min_qual: floors[floors.len() - 1],
+            },
+            contigs: Vec::new(),
+        }
+    }
+
     #[test]
-    fn per_k_quality_floor_can_only_stay_or_relax() {
-        let floors = [0, 13, 27];
-        let strict_index = 2;
-        assert_eq!(active_quality_floors(&floors, strict_index), &[0, 13, 27]);
+    fn one_k_below_the_ceiling_does_not_lower_it() {
+        let floors = [0, 14, 21];
+        assert_eq!(active_quality_floors(&floors, 2), &[0, 14, 21]);
+        assert_eq!(lowered_floor_index(&floors, 2, None, 14), 2);
+        assert_eq!(lowered_floor_index(&floors, 2, Some(21), 14), 2);
+        assert_eq!(lowered_floor_index(&floors, 2, Some(14), 21), 2);
+    }
 
-        let intermediate = selected_floor_index(&floors, strict_index, 13).unwrap();
-        assert_eq!(active_quality_floors(&floors, intermediate), &[0, 13]);
-        assert_eq!(selected_floor_index(&floors, intermediate, 27), None);
+    #[test]
+    fn two_consecutive_choices_below_the_ceiling_lower_it_to_the_higher() {
+        let floors = [0, 14, 21];
+        assert_eq!(lowered_floor_index(&floors, 2, Some(14), 14), 1);
+        assert_eq!(lowered_floor_index(&floors, 2, Some(14), 0), 1);
+        assert_eq!(lowered_floor_index(&floors, 2, Some(0), 14), 1);
+        assert_eq!(lowered_floor_index(&floors, 1, Some(0), 0), 0);
+        assert_eq!(active_quality_floors(&floors, 1), &[0, 14]);
+    }
 
-        let lowest = selected_floor_index(&floors, intermediate, 0).unwrap();
-        assert_eq!(active_quality_floors(&floors, lowest), &[0]);
-        assert_eq!(selected_floor_index(&floors, lowest, 13), None);
+    #[test]
+    fn an_unresolved_k_neither_lowers_the_ceiling_nor_breaks_a_pair() {
+        let mut state = state_with(&[0, 14, 21]);
+        state.record_floor_choice(41, 14, false);
+        assert_eq!((state.floor_index, state.quality.min_qual), (2, 21));
+        state.record_floor_choice(55, 0, true);
+        assert_eq!((state.floor_index, state.last_choice), (2, Some(14)));
+        state.record_floor_choice(71, 14, false);
+        assert_eq!((state.floor_index, state.quality.min_qual), (1, 14));
     }
 
     #[test]
