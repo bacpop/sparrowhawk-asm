@@ -389,6 +389,15 @@ struct LadderState {
     contigs: Vec<Vec<u8>>,
 }
 
+/// Do not let an unresolved, automatic cutoff at high k replace the last usable assembly.
+#[cfg(not(target_family = "wasm"))]
+const MIN_K_FOR_UNRESOLVED_MIN_COUNT_STOP: usize = 71;
+
+#[cfg(not(target_family = "wasm"))]
+fn should_stop_ladder_for_unresolved_min_count(k: usize, unresolved: bool) -> bool {
+    k >= MIN_K_FOR_UNRESOLVED_MIN_COUNT_STOP && unresolved
+}
+
 /// Iterative multi-k: each k is assembled from reads plus the previous k's contigs. With no explicit
 /// k list, the ladder is settled from the average read length after the first k has read the inputs.
 #[cfg(not(target_family = "wasm"))]
@@ -424,8 +433,8 @@ fn run_multik(
             _ => run_ladder_step::<U512>(&opts, step, &mut state, timevec, out_path_graph),
         };
         if let Err(error) = outcome {
-            // Only the empty-k-mer checks fail here, and a k no read reaches is out of reach for every
-            // larger k too, so the ladder ends; the previous k's contigs are still in `state`.
+            // A k with no usable k-mers, or an unresolved automatic cutoff at high k, cannot produce
+            // a useful next assembly. In either case the previous contigs are still in `state`.
             if step == 0 {
                 return Err(error);
             }
@@ -494,6 +503,7 @@ where
             let selected_floor = pass1.chosen_min_qual;
             let selected_min_count = pass1.used_min_count;
             let selected_peak = pass1.genomic_peak;
+            let selected_min_count_unresolved = pass1.min_count_unresolved;
             log::warn!(
                 "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
                  will use it as their strict floor."
@@ -510,6 +520,7 @@ where
                 selected_floor,
                 selected_min_count,
                 selected_peak,
+                selected_min_count_unresolved,
             )?
         } else {
             pass1
@@ -542,6 +553,7 @@ where
             let selected_floor = selection.chosen_min_qual;
             let selected_min_count = selection.used_min_count;
             let selected_peak = selection.genomic_peak;
+            let selected_min_count_unresolved = selection.min_count_unresolved;
             log::warn!(
                 "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
                  will use it as their strict floor."
@@ -557,11 +569,15 @@ where
                 selected_floor,
                 selected_min_count,
                 selected_peak,
+                selected_min_count_unresolved,
             )?
         } else {
             selection
         }
     };
+    if should_stop_ladder_for_unresolved_min_count(k, assembly.min_count_unresolved) {
+        return Err(preprocessing::PreprocessingError::unresolved_high_k_min_count(k));
+    }
     // Carried into the count-map by now, so the old contigs are dead weight.
     state.contigs = Vec::new();
 
@@ -637,6 +653,7 @@ fn count_store_at_selection<IntT>(
     floor: u8,
     min_count: u16,
     genomic_peak: preprocessing::PeakSource,
+    min_count_unresolved: bool,
 ) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
@@ -660,6 +677,7 @@ where
     assembly.chosen_min_qual = floor;
     assembly.used_min_count = min_count;
     assembly.genomic_peak = genomic_peak;
+    assembly.min_count_unresolved = min_count_unresolved;
     Ok(assembly)
 }
 
@@ -714,7 +732,18 @@ fn settle_ladder(
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod multik_tests {
-    use super::{active_quality_floors, selected_floor_index, settle_ladder};
+    use super::{
+        active_quality_floors, selected_floor_index, settle_ladder,
+        should_stop_ladder_for_unresolved_min_count,
+    };
+
+    #[test]
+    fn unresolved_min_count_stops_only_at_k_71_or_higher() {
+        assert!(!should_stop_ladder_for_unresolved_min_count(70, true));
+        assert!(should_stop_ladder_for_unresolved_min_count(71, true));
+        assert!(should_stop_ladder_for_unresolved_min_count(131, true));
+        assert!(!should_stop_ladder_for_unresolved_min_count(71, false));
+    }
 
     #[test]
     fn per_k_quality_floor_can_only_stay_or_relax() {

@@ -67,12 +67,24 @@ pub struct PreprocessedK<IntT> {
     /// Single-copy coverage of the spectrum *this* map was filtered against, as a count. Correction
     /// reads it to tell an error branch from a real one.
     pub genomic_peak: PeakSource,
+    /// Whether automatic spectrum selection fell back to the unresolved sentinel without a trusted
+    /// peak. Explicit `--min-count 2`, and a trusted decision that happens to choose 2, do not count.
+    pub min_count_unresolved: bool,
 }
 
-/// A native preprocessing failure that prevents assembly from continuing with no usable k-mers.
+/// A native preprocessing or selection failure that prevents a useful assembly step.
 #[cfg(not(target_family = "wasm"))]
 #[derive(Debug)]
 pub struct PreprocessingError(String);
+
+#[cfg(not(target_family = "wasm"))]
+impl PreprocessingError {
+    pub(crate) fn unresolved_high_k_min_count(k: usize) -> Self {
+        Self(format!(
+            "automatic minimum-count selection at k={k} was unresolved and fell back to {UNRESOLVED_MINCOUNT}"
+        ))
+    }
+}
 
 #[cfg(not(target_family = "wasm"))]
 impl fmt::Display for PreprocessingError {
@@ -258,6 +270,15 @@ const MIN_PEAK_AREA_FRACTION: f64 = 0.05;
 /// Used when the lobes cannot be separated. Not 1: at a genomic peak of 3-4 every singleton error survives and
 /// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
 const UNRESOLVED_MINCOUNT: u16 = 2;
+
+#[cfg(not(target_family = "wasm"))]
+fn min_count_decision_unresolved(
+    automatic: bool,
+    min_count: u16,
+    genomic_peak: PeakSource,
+) -> bool {
+    automatic && min_count == UNRESOLVED_MINCOUNT && !matches!(genomic_peak, PeakSource::Fitted(_))
+}
 
 /// How the raw candidates were turned into the selected empirical valley and peak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -3813,6 +3834,7 @@ where
     }
     log::info!("Minimum count per k-mer used: {used_min_count}");
 
+    let min_count_unresolved = min_count_decision_unresolved(do_fit, used_min_count, genomic_peak);
     Ok(PreprocessedK {
         k,
         kmers,
@@ -3820,6 +3842,7 @@ where
         used_min_count,
         chosen_min_qual,
         genomic_peak,
+        min_count_unresolved,
     })
 }
 
@@ -3834,6 +3857,36 @@ mod tests {
     #[test]
     fn legacy_histogram_range_remains_pinned() {
         assert_eq!(LEGACY_HISTO_RANGE, 500);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn only_automatic_sentinel_min_count_is_unresolved() {
+        assert!(min_count_decision_unresolved(
+            true,
+            UNRESOLVED_MINCOUNT,
+            PeakSource::Fallback(18)
+        ));
+        assert!(min_count_decision_unresolved(
+            true,
+            UNRESOLVED_MINCOUNT,
+            PeakSource::Unknown
+        ));
+        assert!(!min_count_decision_unresolved(
+            false,
+            UNRESOLVED_MINCOUNT,
+            PeakSource::Fallback(18)
+        ));
+        assert!(!min_count_decision_unresolved(
+            true,
+            UNRESOLVED_MINCOUNT + 1,
+            PeakSource::Fallback(18)
+        ));
+        assert!(!min_count_decision_unresolved(
+            true,
+            UNRESOLVED_MINCOUNT,
+            PeakSource::Fitted(18)
+        ));
     }
 
     #[cfg(not(target_family = "wasm"))]
