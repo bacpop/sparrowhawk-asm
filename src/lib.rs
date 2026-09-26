@@ -197,6 +197,7 @@ struct BuildOpts<'a> {
     /// Multi-k: also write each intermediate k's contigs.
     keep_intermediate_contigs: bool,
     no_histo: bool,
+    debug_quality_floors: bool,
     output_dir: &'a str,
     output_prefix: &'a str,
     output: PathBuf,
@@ -231,7 +232,7 @@ impl BuildOpts<'_> {
 
     /// One spectrum plot's path, or `None` under `--no-histo`. `tag` tells the k of a ladder apart.
     fn histo_path(&self, tag: &str) -> Option<PathBuf> {
-        (!self.no_histo).then(|| {
+        (!self.no_histo || self.debug_quality_floors).then(|| {
             Path::new(self.output_dir).join(format!("{}_kmerspectrum{tag}.png", self.output_prefix))
         })
     }
@@ -269,7 +270,7 @@ where
 
     match store {
         // One chained reader, so the single `&mut` store sees every record, in file order.
-        Some(store) => preprocessing::preprocessing_standalone::<IntT, _>(
+        Some(store) => preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
             &mut [read_store::Tee::new(readers.into_iter().flatten(), store)],
             k,
             quality,
@@ -280,8 +281,9 @@ where
             opts.do_bloom,
             opts.do_fit,
             None,
+            opts.debug_quality_floors,
         ),
-        None => preprocessing::preprocessing_standalone::<IntT, _>(
+        None => preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
             &mut readers,
             k,
             quality,
@@ -292,6 +294,7 @@ where
             opts.do_bloom,
             opts.do_fit,
             None,
+            opts.debug_quality_floors,
         ),
     }
 }
@@ -378,14 +381,16 @@ struct LadderState {
     default_ladder: bool,
     /// Every read, packed during the first k's pass and replayed by the rest.
     store: read_store::ReadStore,
-    /// The quality floor, settled at the first k and kept for the rest.
+    /// Index of the strictest floor currently eligible; selection may only move this towards 0.
+    floor_index: usize,
+    /// Current quality/min-count settings. Automatic fitting updates the quality floor after each k.
     quality: QualOpts,
     /// The previous k's contigs, spelled.
     contigs: Vec<Vec<u8>>,
 }
 
-/// Iterative multi-k, as SPAdes and GATB-Minia run it: each k is assembled from the reads plus the
-/// previous k's contigs, and the last k's contigs are the output. `None` picks the ladder from the reads.
+/// Iterative multi-k: each k is assembled from reads plus the previous k's contigs. With no explicit
+/// k list, the ladder is settled from the average read length after the first k has read the inputs.
 #[cfg(not(target_family = "wasm"))]
 fn run_multik(
     opts: BuildOpts,
@@ -399,9 +404,10 @@ fn run_multik(
     );
     log::info!("Candidate base-quality floors: {floors:?}");
     let mut state = LadderState {
-        ks: requested.map_or_else(|| vec![KMER_LADDER_SHORT[0]], <[usize]>::to_vec),
+        ks: requested.map_or_else(|| vec![DEFAULT_KMER_LADDER[0]], <[usize]>::to_vec),
         default_ladder: requested.is_none(),
         store: read_store::ReadStore::new(&floors),
+        floor_index: floors.len() - 1,
         quality: QualOpts {
             min_count: opts.quality.min_count,
             min_qual: opts.quality.min_qual,
@@ -453,50 +459,108 @@ where
     let k = state.ks[step];
     let mut out_path_histo = opts.histo_path(&format!("_k{k}"));
     let mut assembly = if step == 0 {
-        let floors = state.store.floors().to_vec();
+        let active_floors = active_quality_floors(state.store.floors(), state.floor_index).to_vec();
+        let strict_floor = *active_floors
+            .last()
+            .expect("the read store has at least one quality floor");
         let pass1 = count_reads::<IntT>(
             opts,
             k,
             &state.quality,
-            Some(&floors),
+            Some(&active_floors),
             Some(&mut state.store),
             timevec,
             &mut out_path_histo,
         )?;
         state.store.finish();
-        state.ks = settle_ladder(&state.ks, state.default_ladder, state.store.max_read_len());
-        if pass1.chosen_min_qual < state.quality.min_qual {
-            log::warn!(
-                "Recounting at a base-quality floor of {} instead of {}, for every k — this admits \
-                 more error k-mers.",
+        let average_read_len = state.store.average_read_len().unwrap_or(0.0);
+        state.ks = settle_ladder(
+            &state.ks,
+            state.default_ladder,
+            average_read_len,
+            state.store.ninety_percent_average_read_len(),
+            state.store.max_read_len(),
+        );
+        if opts.do_fit {
+            state.floor_index = selected_floor_index(
+                state.store.floors(),
+                state.floor_index,
                 pass1.chosen_min_qual,
-                state.quality.min_qual
-            );
+            )
+            .expect("the floor selector must choose an active candidate");
             state.quality.min_qual = pass1.chosen_min_qual;
+        }
+        if opts.do_fit && pass1.chosen_min_qual < strict_floor {
+            let selected_floor = pass1.chosen_min_qual;
+            let selected_min_count = pass1.used_min_count;
+            let selected_peak = pass1.genomic_peak;
+            log::warn!(
+                "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
+                 will use it as their strict floor."
+            );
             // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
             drop(pass1);
-            count_store::<IntT>(
+            count_store_at_selection::<IntT>(
                 opts,
                 k,
-                &state.quality,
                 &state.store,
                 &[],
                 timevec,
                 &mut out_path_histo,
+                selected_floor,
+                selected_min_count,
+                selected_peak,
             )?
         } else {
             pass1
         }
     } else {
-        count_store::<IntT>(
+        let active_floors = active_quality_floors(state.store.floors(), state.floor_index).to_vec();
+        let strict_floor = state.store.floors()[state.floor_index];
+        let selection = count_store::<IntT>(
             opts,
             k,
             &state.quality,
+            Some(&active_floors),
             &state.store,
             &state.contigs,
             timevec,
             &mut out_path_histo,
-        )?
+            opts.do_fit,
+            opts.debug_quality_floors,
+        )?;
+        if opts.do_fit {
+            state.floor_index = selected_floor_index(
+                state.store.floors(),
+                state.floor_index,
+                selection.chosen_min_qual,
+            )
+            .expect("the floor selector must choose an active candidate");
+            state.quality.min_qual = selection.chosen_min_qual;
+        }
+        if opts.do_fit && selection.chosen_min_qual < strict_floor {
+            let selected_floor = selection.chosen_min_qual;
+            let selected_min_count = selection.used_min_count;
+            let selected_peak = selection.genomic_peak;
+            log::warn!(
+                "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
+                 will use it as their strict floor."
+            );
+            drop(selection);
+            count_store_at_selection::<IntT>(
+                opts,
+                k,
+                &state.store,
+                &state.contigs,
+                timevec,
+                &mut out_path_histo,
+                selected_floor,
+                selected_min_count,
+                selected_peak,
+            )?
+        } else {
+            selection
+        }
     };
     // Carried into the count-map by now, so the old contigs are dead weight.
     state.contigs = Vec::new();
@@ -530,10 +594,13 @@ fn count_store<IntT>(
     opts: &BuildOpts,
     k: usize,
     quality: &QualOpts,
+    floors: Option<&[u8]>,
     store: &read_store::ReadStore,
     contigs: &[Vec<u8>],
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
+    do_fit: bool,
+    debug_quality_floors: bool,
 ) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
@@ -542,28 +609,87 @@ where
         seqs: contigs,
         rule: opts.contig_counts,
     });
-    preprocessing::preprocessing_standalone::<IntT, _>(
+    preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
         &mut [store.records()],
         k,
         quality,
-        // No ladder: the floor was settled at the first k.
-        None,
+        floors,
         &mut Some(timevec),
         out_path_histo,
         // `--chunk-size` is a no-op here, and the first k already warned about it.
         0,
         opts.do_bloom,
-        opts.do_fit,
+        do_fit,
         carried,
+        debug_quality_floors,
     )
 }
 
-/// The k values to run once every read is known: the SPAdes-style default for this length, or the
-/// requested list less any k not below the longest read. The first k has run, so it always stays.
+/// Replay reads at the floor already selected for this k, retaining the fit's cutoff and coverage.
 #[cfg(not(target_family = "wasm"))]
-fn settle_ladder(ks: &[usize], default_ladder: bool, max_read_len: usize) -> Vec<usize> {
+fn count_store_at_selection<IntT>(
+    opts: &BuildOpts,
+    k: usize,
+    store: &read_store::ReadStore,
+    contigs: &[Vec<u8>],
+    timevec: &mut Vec<Instant>,
+    out_path_histo: &mut Option<PathBuf>,
+    floor: u8,
+    min_count: u16,
+    genomic_peak: preprocessing::PeakSource,
+) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    let quality = QualOpts {
+        min_count,
+        min_qual: floor,
+    };
+    let mut assembly = count_store::<IntT>(
+        opts,
+        k,
+        &quality,
+        None,
+        store,
+        contigs,
+        timevec,
+        out_path_histo,
+        false,
+        opts.debug_quality_floors,
+    )?;
+    assembly.chosen_min_qual = floor;
+    assembly.used_min_count = min_count;
+    assembly.genomic_peak = genomic_peak;
+    Ok(assembly)
+}
+
+/// Eligible floors are the current strict floor and all rungs below it.
+#[cfg(not(target_family = "wasm"))]
+fn active_quality_floors(floors: &[u8], strict_index: usize) -> &[u8] {
+    &floors[..=strict_index]
+}
+
+/// Locate a selected candidate within the current prefix; this prevents a later k from tightening
+/// the floor after an earlier k relaxed it.
+#[cfg(not(target_family = "wasm"))]
+fn selected_floor_index(floors: &[u8], strict_index: usize, selected: u8) -> Option<usize> {
+    active_quality_floors(floors, strict_index)
+        .iter()
+        .position(|&floor| floor == selected)
+}
+
+/// The k values to run once every read is known: the average-length default or the requested list,
+/// dropping explicit k values not below the longest read. The first k has run, so it always stays.
+#[cfg(not(target_family = "wasm"))]
+fn settle_ladder(
+    ks: &[usize],
+    default_ladder: bool,
+    average_read_len: f64,
+    max_k_from_average: usize,
+    max_read_len: usize,
+) -> Vec<usize> {
     let settled: Vec<usize> = if default_ladder {
-        default_kmer_ladder(max_read_len)
+        default_kmer_ladder(max_k_from_average)
     } else {
         ks.iter()
             .enumerate()
@@ -574,8 +700,53 @@ fn settle_ladder(ks: &[usize], default_ladder: bool, max_read_len: usize) -> Vec
     if settled.len() < ks.len() && !default_ladder {
         log::warn!("Dropping k values not below the longest read ({max_read_len} bp)");
     }
-    log::info!("Multi-k ladder for reads up to {max_read_len} bp: k={settled:?}");
+    if default_ladder {
+        log::info!(
+            "Multi-k ladder: average_read_len={average_read_len:.1} bp, \
+             90%-average ceiling={max_k_from_average} bp, \
+             longest read={max_read_len} bp, k={settled:?}"
+        );
+    } else {
+        log::info!("Multi-k ladder for reads up to {max_read_len} bp: k={settled:?}");
+    }
     settled
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod multik_tests {
+    use super::{active_quality_floors, selected_floor_index, settle_ladder};
+
+    #[test]
+    fn per_k_quality_floor_can_only_stay_or_relax() {
+        let floors = [0, 13, 27];
+        let strict_index = 2;
+        assert_eq!(active_quality_floors(&floors, strict_index), &[0, 13, 27]);
+
+        let intermediate = selected_floor_index(&floors, strict_index, 13).unwrap();
+        assert_eq!(active_quality_floors(&floors, intermediate), &[0, 13]);
+        assert_eq!(selected_floor_index(&floors, intermediate, 27), None);
+
+        let lowest = selected_floor_index(&floors, intermediate, 0).unwrap();
+        assert_eq!(active_quality_floors(&floors, lowest), &[0]);
+        assert_eq!(selected_floor_index(&floors, lowest, 13), None);
+    }
+
+    #[test]
+    fn default_ladder_uses_the_average_length_ceiling() {
+        assert_eq!(
+            settle_ladder(&[21], true, 150.0, 135, 150),
+            vec![21, 31, 41, 55, 71, 91, 111, 131]
+        );
+        assert_eq!(settle_ladder(&[21], true, 22.2, 20, 22), vec![21]);
+    }
+
+    #[test]
+    fn explicit_ladder_keeps_its_existing_longest_read_filter() {
+        assert_eq!(
+            settle_ladder(&[21, 31, 55], false, 0.0, 0, 55),
+            vec![21, 31]
+        );
+    }
 }
 
 #[doc(hidden)]
@@ -613,6 +784,7 @@ pub fn main() {
             multik_contig_counts,
             keep_intermediate_contigs,
             no_histo,
+            debug_quality_floors,
             no_graphs,
             no_bubble_collapse,
             no_dead_end_removal,
@@ -620,6 +792,12 @@ pub fn main() {
             let do_bloom = !*no_bloom;
             if let Err(message) = cli::validate_bloom_min_count(do_bloom, *min_count) {
                 eprintln!("error: {message}");
+                std::process::exit(2);
+            }
+            if *debug_quality_floors && min_count.is_some() {
+                eprintln!(
+                    "error: --debug-quality-floors requires automatic min-count selection; remove --min-count"
+                );
                 std::process::exit(2);
             }
 
@@ -758,6 +936,7 @@ pub fn main() {
                 contig_counts: *multik_contig_counts,
                 keep_intermediate_contigs: *keep_intermediate_contigs,
                 no_histo: *no_histo,
+                debug_quality_floors: *debug_quality_floors,
                 output_dir,
                 output_prefix,
                 output,

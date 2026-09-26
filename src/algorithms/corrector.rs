@@ -788,6 +788,29 @@ fn check_dead_path(
             output_vec.push(current_vertex);
             cnt += ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
         } else {
+            let before = *output_vec.last().unwrap();
+            output_vec.push(candidate_node);
+            cnt += ptgraph.node_weight(candidate_node).unwrap().abs_ind.len();
+
+            // Keep the existing strict short-tip boundary and remove by topology alone below it.
+            if cnt < limit {
+                return false;
+            }
+
+            // Longer tips retain the existing relative-coverage rule, now measuring the complete
+            // path through its fan-out endpoint. I had this wrong in the past, partially intentional, but I was wrong because I was leaving lots of bad tips here.
+            if cnt < rctc_limit
+                && neighbourhood_outcovers_tip(
+                    ptgraph,
+                    candidate_node,
+                    candidate_ty,
+                    before,
+                    path_mean_coverage(ptgraph, output_vec),
+                    rctc_cutoff,
+                )
+            {
+                return true;
+            }
             output_vec.clear();
             return false;
         }
@@ -944,8 +967,183 @@ mod tests {
         (out, by_rctc)
     }
 
+    /// Build a tip ending at a two-way fan-out. The outgoing branches occupy opposite carry
+    /// orientations, so the helper exercises both sides of the bidirected endpoint.
+    fn tip_at_fanout(
+        edge: EdgeType,
+        tip_kmers: usize,
+        tip_counts: u32,
+        fanout_kmers: usize,
+        fanout_counts: u32,
+        branch_counts: [u32; 2],
+    ) -> (DbgGraph, NodeId, NodeId, [NodeId; 2]) {
+        let mut graph = DbgGraph::new(3);
+        let tip = graph.add_node(NodeStruct {
+            counts: tip_counts,
+            abs_ind: vec![0; tip_kmers],
+            innerdir: None,
+        });
+        let fanout = graph.add_node(NodeStruct {
+            counts: fanout_counts,
+            abs_ind: vec![0; fanout_kmers],
+            innerdir: None,
+        });
+        let branches = branch_counts.map(|counts| {
+            graph.add_node(NodeStruct {
+                counts,
+                abs_ind: vec![0],
+                innerdir: None,
+            })
+        });
+
+        graph.add_bi_edge(tip, fanout, edge);
+        let fanout_carry = edge.get_from_and_to().1;
+        for (branch, branch_carry) in branches.iter().zip([CarryType::Min, CarryType::Max]) {
+            graph.add_bi_edge(
+                fanout,
+                *branch,
+                EdgeType::from_carrytypes(fanout_carry, branch_carry),
+            );
+        }
+        (graph, tip, fanout, branches)
+    }
+
+    #[test]
+    fn a_short_tip_at_a_fanout_includes_and_removes_the_endpoint() {
+        let (mut graph, tip, fanout, _) = tip_at_fanout(EdgeType::MinToMin, 2, 2, 1, 2, [20, 20]);
+        let mut removal_path = Vec::new();
+        let by_rctc = check_dead_path(
+            &graph,
+            tip,
+            &mut removal_path,
+            4,
+            100,
+            2.0,
+            graph.first_outgoing_edge_type(tip).unwrap(),
+        );
+
+        assert!(!by_rctc, "a short fan-out tip is removed by length");
+        assert_eq!(removal_path, vec![tip, fanout]);
+        assert_eq!(removal_path.iter().filter(|&&n| n == fanout).count(), 1);
+
+        remove_paths(&mut graph, removal_path.drain(..));
+        assert!(graph.node_weight(tip).is_none());
+        assert!(graph.node_weight(fanout).is_none());
+        assert_eq!(graph.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_fanout_tip_at_the_short_length_limit_is_not_removed_by_length_alone() {
+        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 3, 2, 1, 2, [40, 40]);
+        let mut removal_path = Vec::new();
+        let by_rctc = check_dead_path(
+            &graph,
+            tip,
+            &mut removal_path,
+            4,
+            4, // disable tier two at the strict boundary
+            2.0,
+            graph.first_outgoing_edge_type(tip).unwrap(),
+        );
+
+        assert!(
+            removal_path.is_empty(),
+            "represented length equal to limit is retained"
+        );
+        assert!(!by_rctc);
+    }
+
+    #[test]
+    fn a_long_low_coverage_tip_at_a_fanout_is_removed_with_its_endpoint() {
+        let (graph, tip, fanout, _) = tip_at_fanout(EdgeType::MinToMin, 12, 2, 1, 2, [40, 40]);
+        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+
+        assert!(by_rctc);
+        assert_eq!(removal_path, vec![tip, fanout]);
+    }
+
+    #[test]
+    fn fanout_tip_coverage_must_be_strictly_above_the_cutoff() {
+        // Equal path-node coverage makes the tip mean exactly 10; its two successors average 20.
+        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 12, 10, 1, 10, [20, 20]);
+        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+        assert!(removal_path.is_empty());
+        assert!(!by_rctc);
+
+        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 12, 10, 1, 10, [19, 19]);
+        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+        assert!(removal_path.is_empty());
+        assert!(!by_rctc);
+    }
+
+    #[test]
+    fn fanout_endpoint_counts_towards_the_rctc_length_limit() {
+        // The tip alone is below 100 k-mers, but including the one-k-mer fan-out endpoint reaches it.
+        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 99, 2, 1, 2, [40, 40]);
+        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+        assert!(removal_path.is_empty());
+        assert!(!by_rctc);
+    }
+
+    #[test]
+    fn fanout_endpoint_removal_works_for_all_edge_orientations() {
+        for edge in [
+            EdgeType::MinToMin,
+            EdgeType::MinToMax,
+            EdgeType::MaxToMin,
+            EdgeType::MaxToMax,
+        ] {
+            let (mut graph, tip, fanout, _) = tip_at_fanout(edge, 2, 2, 1, 2, [20, 20]);
+            let mut removal_path = Vec::new();
+            let by_rctc = check_dead_path(
+                &graph,
+                tip,
+                &mut removal_path,
+                4,
+                100,
+                2.0,
+                graph.first_outgoing_edge_type(tip).unwrap(),
+            );
+
+            assert!(!by_rctc, "{edge:?} short tip should be removed by length");
+            assert_eq!(removal_path, vec![tip, fanout], "edge orientation {edge:?}");
+            remove_paths(&mut graph, removal_path.drain(..));
+            assert!(
+                graph.node_weight(fanout).is_none(),
+                "edge orientation {edge:?}"
+            );
+            assert_eq!(graph.validate(), Ok(()), "edge orientation {edge:?}");
+        }
+    }
+
+    #[test]
+    fn convergence_handling_keeps_precedence_over_fanout_handling() {
+        let (mut graph, tip, fanout, _) = tip_at_fanout(EdgeType::MinToMin, 12, 2, 1, 2, [40, 40]);
+        let other_incoming = graph.add_node(NodeStruct {
+            counts: 40,
+            abs_ind: vec![0],
+            innerdir: None,
+        });
+        graph.add_bi_edge(other_incoming, fanout, EdgeType::MinToMin);
+
+        let mut removal_path = Vec::new();
+        let by_rctc = check_dead_path(
+            &graph,
+            tip,
+            &mut removal_path,
+            10,
+            100,
+            2.0,
+            graph.first_outgoing_edge_type(tip).unwrap(),
+        );
+
+        assert!(by_rctc);
+        assert_eq!(removal_path, vec![tip]);
+        assert!(!removal_path.contains(&fanout));
+    }
+
     /// The point of the tier: a tip too long for the length rule still goes when the junction it
-    /// hangs off is far better covered. Minia's `satisfyRCTC`, `Simplifications.cpp:319`.
+    /// hangs off is far better covered. Taken from Minia!
     #[test]
     fn a_long_tip_goes_when_its_junction_is_far_better_covered() {
         let (graph, tip, _) = tip_at_junction(20, 2, 40);

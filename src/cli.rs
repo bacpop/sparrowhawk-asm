@@ -25,28 +25,34 @@ pub const DEFAULT_OUTPUT_DIR: &str = "./";
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 /// Smallest minimum count supported by Bloom filtering and automatic Bloom fitting.
 pub(crate) const MIN_BLOOM_COUNT: u16 = 2;
-/// SPAdes' default K set for reads under 150 bp (`options_storage.py`, `K_MERS_SHORT`).
-pub const KMER_LADDER_SHORT: [usize; 3] = [21, 33, 55];
-/// SPAdes' default K set from 150 bp (`K_MERS_150`).
-pub const KMER_LADDER_150: [usize; 4] = [21, 33, 55, 77];
-/// SPAdes' default K set from 250 bp (`K_MERS_250`).
-pub const KMER_LADDER_250: [usize; 6] = [21, 33, 55, 77, 99, 127];
+/// Fixed anchors for the automatic multi-k ladder.
+pub const DEFAULT_KMER_LADDER: [usize; 5] = [21, 31, 41, 55, 71];
+/// K increment used to extend the automatic ladder beyond its fixed anchors.
+pub const KMER_LADDER_INCREMENT: usize = 20;
 
-/// The default ladder for reads up to `max_read_len` bases: SPAdes' set for that length, less any k
-/// not below it. The first k always stays: it is counted before the read length is known.
-pub fn default_kmer_ladder(max_read_len: usize) -> Vec<usize> {
-    let set: &[usize] = if max_read_len >= 250 {
-        &KMER_LADDER_250
-    } else if max_read_len >= 150 {
-        &KMER_LADDER_150
-    } else {
-        &KMER_LADDER_SHORT
-    };
-    set.iter()
-        .enumerate()
-        .filter(|&(i, &k)| i == 0 || k < max_read_len)
-        .map(|(_, &k)| k)
-        .collect()
+/// The automatic ladder, bounded by the floor of 90% of the average read length.
+///
+/// `max_k` is measured after the first k has streamed all reads into the read store. The initial 21
+/// is retained as the bootstrap k even when the ceiling is shorter.
+pub fn default_kmer_ladder(max_k: usize) -> Vec<usize> {
+    let mut ladder: Vec<usize> = DEFAULT_KMER_LADDER
+        .into_iter()
+        .filter(|&k| k <= max_k)
+        .collect();
+    if ladder.is_empty() {
+        ladder.push(DEFAULT_KMER_LADDER[0]);
+    }
+
+    let mut next =
+        DEFAULT_KMER_LADDER[DEFAULT_KMER_LADDER.len() - 1].saturating_add(KMER_LADDER_INCREMENT);
+    while next <= max_k {
+        ladder.push(next);
+        let Some(incremented) = next.checked_add(KMER_LADDER_INCREMENT) else {
+            break;
+        };
+        next = incremented;
+    }
+    ladder
 }
 
 /// How a multi-k run counts the k-mers carried over from the previous k's contigs.
@@ -180,9 +186,9 @@ pub enum Commands {
         #[arg(long, default_value_t = DEFAULT_OUTPUT_PREFIX.to_string())]
         output_prefix: String,
 
-        /// K-mer size(s), comma-separated and strictly ascending: `-k 31`, or `-k 21,33,55,77` for an
-        /// iterative multi-k assembly. If omitted, a multi-k ladder is chosen from the read length as
-        /// SPAdes does (21,33,55; +77 from 150 bp; +99,127 from 250 bp).
+        /// K-mer size(s), comma-separated and strictly ascending: `-k 31`, or `-k 21,31,55,91` for an
+        /// iterative multi-k assembly. If omitted, use 21,31,41,55,71, then add 20 at a time up to
+        /// 90% of the average read length.
         #[arg(short, value_parser = valid_kmer, value_delimiter = ',')]
         k: Option<Vec<usize>>,
 
@@ -278,6 +284,11 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_histo: bool,
 
+        /// Evaluate and plot every quality floor for diagnosis. This does not alter floor selection;
+        /// it overrides --no-histo and writes per-floor plots and spectrum TSVs.
+        #[arg(long, default_value_t = false)]
+        debug_quality_floors: bool,
+
         /// By default, Sparrowhawk will extract the graph just before collapse and save it in your output folder
         /// in the DOT, GFAv1.1 and GFAv2 formats. Use this argument if you want it to not do this
         #[arg(long, default_value_t = false)]
@@ -296,4 +307,32 @@ pub enum Commands {
 /// Function to parse command line args into [`Args`] struct
 pub fn cli_args() -> Args {
     Args::parse()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_kmer_ladder;
+
+    #[test]
+    fn default_ladder_uses_fixed_anchors_under_the_ceiling() {
+        assert_eq!(default_kmer_ladder(90), vec![21, 31, 41, 55, 71]);
+        assert_eq!(default_kmer_ladder(70), vec![21, 31, 41, 55]);
+    }
+
+    #[test]
+    fn default_ladder_extends_in_twenty_k_steps_without_crossing_the_ceiling() {
+        assert_eq!(
+            default_kmer_ladder(135),
+            vec![21, 31, 41, 55, 71, 91, 111, 131]
+        );
+        assert_eq!(
+            default_kmer_ladder(270),
+            vec![21, 31, 41, 55, 71, 91, 111, 131, 151, 171, 191, 211, 231, 251]
+        );
+    }
+
+    #[test]
+    fn default_ladder_keeps_the_bootstrap_k_below_the_first_anchor() {
+        assert_eq!(default_kmer_ladder(20), vec![21]);
+    }
 }
