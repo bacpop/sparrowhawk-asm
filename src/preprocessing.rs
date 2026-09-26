@@ -133,7 +133,7 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
 
 /// Sampled hashes held before the threshold halves
 #[cfg(not(target_family = "wasm"))]
-const SKETCH_BUDGET: usize = 250_000;
+const SKETCH_BUDGET: usize = 500_000;
 
 /// The canonical k-mer hash never returns a value below this, so the sample is taken from the interval
 /// above it: halving from zero would put the threshold in a range the hash cannot reach, and the whole
