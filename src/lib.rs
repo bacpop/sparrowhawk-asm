@@ -282,6 +282,7 @@ where
             opts.do_fit,
             None,
             opts.debug_quality_floors,
+            None,
         ),
         None => preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
             &mut readers,
@@ -295,6 +296,7 @@ where
             opts.do_fit,
             None,
             opts.debug_quality_floors,
+            None,
         ),
     }
 }
@@ -504,7 +506,6 @@ where
             let selected_floor = pass1.chosen_min_qual;
             let selected_min_count = pass1.used_min_count;
             let selected_peak = pass1.genomic_peak;
-            let selected_min_count_unresolved = pass1.min_count_unresolved;
             log::warn!(
                 "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
                  will use it as their strict floor."
@@ -521,7 +522,6 @@ where
                 selected_floor,
                 selected_min_count,
                 selected_peak,
-                selected_min_count_unresolved,
             )?
         } else {
             pass1
@@ -540,6 +540,7 @@ where
             &mut out_path_histo,
             opts.do_fit,
             opts.debug_quality_floors,
+            None,
         )?;
         if opts.do_fit {
             state.floor_index = selected_floor_index(
@@ -554,7 +555,6 @@ where
             let selected_floor = selection.chosen_min_qual;
             let selected_min_count = selection.used_min_count;
             let selected_peak = selection.genomic_peak;
-            let selected_min_count_unresolved = selection.min_count_unresolved;
             log::warn!(
                 "Recounting k={k} at a base-quality floor of {selected_floor}; subsequent k values \
                  will use it as their strict floor."
@@ -570,7 +570,6 @@ where
                 selected_floor,
                 selected_min_count,
                 selected_peak,
-                selected_min_count_unresolved,
             )?
         } else {
             selection
@@ -606,6 +605,7 @@ where
 }
 
 /// Count one k from the store at the settled floor, carrying `contigs` in once the reads set the cutoff.
+/// `prior`: the sketch's selection when this is a recount at it.
 #[cfg(not(target_family = "wasm"))]
 fn count_store<IntT>(
     opts: &BuildOpts,
@@ -618,6 +618,7 @@ fn count_store<IntT>(
     out_path_histo: &mut Option<PathBuf>,
     do_fit: bool,
     debug_quality_floors: bool,
+    prior: Option<(u16, preprocessing::PeakSource)>,
 ) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
@@ -639,10 +640,12 @@ where
         do_fit,
         carried,
         debug_quality_floors,
+        prior,
     )
 }
 
-/// Replay reads at the floor already selected for this k, retaining the fit's cutoff and coverage.
+/// Replay reads at the floor already selected for this k and refit the whole spectrum there; the
+/// sketch's cutoff and peak stand only if the refit loses the separation.
 #[cfg(not(target_family = "wasm"))]
 fn count_store_at_selection<IntT>(
     opts: &BuildOpts,
@@ -654,7 +657,6 @@ fn count_store_at_selection<IntT>(
     floor: u8,
     min_count: u16,
     genomic_peak: preprocessing::PeakSource,
-    min_count_unresolved: bool,
 ) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
@@ -663,7 +665,7 @@ where
         min_count,
         min_qual: floor,
     };
-    let mut assembly = count_store::<IntT>(
+    count_store::<IntT>(
         opts,
         k,
         &quality,
@@ -672,14 +674,10 @@ where
         contigs,
         timevec,
         out_path_histo,
-        false,
+        opts.do_fit,
         opts.debug_quality_floors,
-    )?;
-    assembly.chosen_min_qual = floor;
-    assembly.used_min_count = min_count;
-    assembly.genomic_peak = genomic_peak;
-    assembly.min_count_unresolved = min_count_unresolved;
-    Ok(assembly)
+        Some((min_count, genomic_peak)),
+    )
 }
 
 /// Eligible floors are the current strict floor and all rungs below it.

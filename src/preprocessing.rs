@@ -224,6 +224,17 @@ impl SpectrumSketch {
         }
         out
     }
+
+    /// [`Self::spectra`] scaled back to the whole library, since the hole guard budgets in absolute
+    /// k-mers. Counts on the x-axis do not move.
+    fn rescaled_spectra(&self, n: usize) -> Vec<Vec<u32>> {
+        let scale = 1.0 / self.fraction();
+        let mut out = self.spectra(n);
+        for bin in out.iter_mut().flatten() {
+            *bin = ((*bin as f64) * scale).min(u32::MAX as f64) as u32;
+        }
+        out
+    }
 }
 
 /// Single-copy coverage estimate straight from the spectrum: the tallest bin above the error peak.
@@ -1573,7 +1584,9 @@ where
         );
     }
 
-    let spectra = evaluate_other_floors.then(|| sketch.spectra(floors.len()));
+    // At the whole library's scale, as the strict spectrum already is: fitted on the raw sample, the
+    // hole guard would strand 1/fraction genome k-mers instead of one.
+    let spectra = evaluate_other_floors.then(|| sketch.rescaled_spectra(floors.len()));
     let mut candidates = vec![strict];
     let mut diagnostic_floors = Vec::new();
     if debug_all_floors {
@@ -1766,12 +1779,10 @@ fn check_sketch_against_table(histovec: &[u32], sketch: &SpectrumSketch, keep: u
 /// absolute k-mers, so bin heights matter to it; the counts on the x-axis are scale-invariant.
 #[cfg(not(target_family = "wasm"))]
 fn rescaled_strict_spectrum(sketch: &SpectrumSketch, keep: u8) -> Vec<u32> {
-    let scale = 1.0 / sketch.fraction();
-    let mut out = sketch.spectra(keep as usize + 1).pop().unwrap_or_default();
-    for bin in out.iter_mut() {
-        *bin = ((*bin as f64) * scale).min(u32::MAX as f64) as u32;
-    }
-    out
+    sketch
+        .rescaled_spectra(keep as usize + 1)
+        .pop()
+        .unwrap_or_default()
 }
 
 #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
@@ -3534,6 +3545,34 @@ where
     shards.iter().map(HashMap::len).sum::<usize>() - before
 }
 
+/// A recount refits the whole spectrum at the floor the sketch chose. The refit wins unless the
+/// sketch's lobes separated there and the refit's did not, so a recount never loses a resolved cutoff.
+#[cfg(not(target_family = "wasm"))]
+fn keep_refit_or_prior(
+    refit: (u16, PeakSource),
+    prior: Option<(u16, PeakSource)>,
+) -> (u16, PeakSource) {
+    let Some(prior) = prior else { return refit };
+    let separated = |peak: PeakSource| matches!(peak, PeakSource::Fitted(_));
+    if separated(prior.1) && !separated(refit.1) {
+        log::warn!(
+            "The refit at the selected floor did not separate the lobes; keeping the sketch's \
+             minimum count {} and peak {:?}.",
+            prior.0,
+            prior.1
+        );
+        return prior;
+    }
+    log::info!(
+        "Refit at the selected floor: minimum count {} -> {}, peak {:?} -> {:?}",
+        prior.0,
+        refit.0,
+        prior.1,
+        refit.1
+    );
+    refit
+}
+
 /// Choose, filter and plot from a finished sharded count-map.
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -3549,6 +3588,7 @@ fn finish_map_counter<IntT>(
     carried: Option<CarriedContigs>,
     out_path: &mut Option<PathBuf>,
     debug_quality_floors: bool,
+    prior: Option<(u16, PeakSource)>,
 ) -> Result<(IndexedKmers<IntT>, Vec<u32>, u16, u8, PeakSource), PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
@@ -3645,8 +3685,8 @@ where
                 );
             }
             _ => {
-                let diagnostics;
-                (minc, genomic_peak, diagnostics) = choose_min_count_and_peak(spectrum);
+                let (refit_minc, refit_peak, diagnostics) = choose_min_count_and_peak(spectrum);
+                (minc, genomic_peak) = keep_refit_or_prior((refit_minc, refit_peak), prior);
                 plot_diagnostics = Some(diagnostics);
             }
         }
@@ -3772,10 +3812,12 @@ where
         do_fit,
         carried,
         false,
+        None,
     )
 }
 
 /// Native preprocessing entry point with optional diagnostic evaluation of every quality floor.
+/// `prior`: a recount's selection from the sketch; see [`keep_refit_or_prior`].
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn preprocessing_standalone_with_debug<IntT, I>(
@@ -3790,6 +3832,7 @@ pub(crate) fn preprocessing_standalone_with_debug<IntT, I>(
     do_fit: bool,
     carried: Option<CarriedContigs>,
     debug_quality_floors: bool,
+    prior: Option<(u16, PeakSource)>,
 ) -> Result<PreprocessedK<IntT>, PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
@@ -3825,6 +3868,7 @@ where
             carried,
             out_path,
             debug_quality_floors,
+            prior,
         )?;
 
     if let Some(timevec) = timevec.as_mut() {
@@ -4227,6 +4271,7 @@ mod tests {
             None,
             &mut None,
             false,
+            None,
         )
         .err()
         .expect("empty input must stop before assembly");
@@ -4265,6 +4310,7 @@ mod tests {
             None,
             &mut None,
             false,
+            None,
         )
         .err()
         .expect("explicit quality floor must not silently loosen");
@@ -4303,6 +4349,7 @@ mod tests {
             None,
             &mut None,
             false,
+            None,
         )
         .expect("the sketch sample being empty is not proof that the floor has no k-mers");
         assert_eq!(kmers.len(), 1);
@@ -4337,6 +4384,7 @@ mod tests {
             None,
             &mut None,
             false,
+            None,
         )
         .err()
         .expect("do not continue to graph assembly without surviving k-mers");
@@ -5727,6 +5775,35 @@ mod tests {
         assert!(scaled[39] > raw[39], "heights must actually scale");
     }
 
+    /// Lower floors exist only in the sketch, so they must be fitted at the whole library's scale, as
+    /// the strict floor is: the hole guard budgets in absolute k-mers.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn lower_floors_are_fitted_at_the_whole_library_scale() {
+        let mut sketch = sketch_with(1, &bimodal(40));
+        sketch.shrink();
+        sketch.shrink();
+        let scale = 1.0 / sketch.fraction();
+        assert!(scale > 1.5, "the fraction did not fall: scale {scale}");
+        let raw = sketch.spectra(3)[1].clone();
+        let seen = std::cell::RefCell::new(Vec::new());
+        // Every fit fails, so the strict floor is reviewed and both lower floors are fitted.
+        choose_min_count_and_floor_with_fit(
+            &histo(&bimodal(30)),
+            &sketch,
+            &[0u8, 11, 25],
+            |histogram, _| {
+                seen.borrow_mut().push(histogram.to_vec());
+                None
+            },
+            &[true; MAX_GROUPS],
+        );
+        let fitted = &seen.borrow()[1]; // [strict, floor 11, floor 0]
+        for (i, (&a, &b)) in raw.iter().zip(fitted.iter()).enumerate() {
+            assert_eq!(b, (a as f64 * scale).min(u32::MAX as f64) as u32, "bin {i}");
+        }
+    }
+
     // ---- the Bloom path ---------------------------------------------------------------------------
 
     #[cfg(not(target_family = "wasm"))]
@@ -5794,6 +5871,7 @@ mod tests {
             None,
             &mut None,
             false,
+            None,
         )
         .expect("fixture should leave k-mers after filtering")
     }
@@ -6018,6 +6096,20 @@ mod tests {
             floor, 25,
             "a lone usable strict-floor fit remains the decision"
         );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_recount_keeps_its_refit_unless_only_the_sketch_separated() {
+        let (sep, merged) = (PeakSource::Fitted(40), PeakSource::Fallback(12));
+        assert_eq!(keep_refit_or_prior((9, sep), Some((14, sep))), (9, sep));
+        assert_eq!(keep_refit_or_prior((2, merged), Some((14, sep))), (14, sep));
+        assert_eq!(
+            keep_refit_or_prior((2, merged), Some((2, merged))),
+            (2, merged)
+        );
+        assert_eq!(keep_refit_or_prior((9, sep), Some((2, merged))), (9, sep));
+        assert_eq!(keep_refit_or_prior((9, sep), None), (9, sep));
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -6407,6 +6499,7 @@ mod tests {
             );
             let (mut kmers, ..) = finish_map_counter::<u128>(
                 shards, k, &qual, None, &present, sketch, false, false, carried, &mut None, false,
+                None,
             )
             .expect("the fixture leaves k-mers after filtering");
             let contigs =
