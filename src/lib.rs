@@ -320,26 +320,31 @@ where
     );
     log::info!("Candidate base-quality floors: {ladder:?}");
 
+    // The ladder's strict floor, not the default: with `[0]`, no quality filtering.
+    let quality = QualOpts {
+        min_count: opts.quality.min_count,
+        min_qual: ladder[ladder.len() - 1],
+    };
     let mut out_path_histo = opts.histo_path("");
     let mut assembly = count_reads::<IntT>(
         &opts,
         k,
-        opts.quality,
+        &quality,
         Some(&ladder),
         None,
         timevec,
         &mut out_path_histo,
     )?;
     let chosen = assembly.chosen_min_qual;
-    if chosen < opts.quality.min_qual {
+    if chosen < quality.min_qual {
         // Why it loosened is logged by the estimator, which is the only place that knows.
         log::warn!(
             "Recounting at a base-quality floor of {chosen} instead of {} — this admits more error \
              k-mers.",
-            opts.quality.min_qual
+            quality.min_qual
         );
         let loosened = QualOpts {
-            min_count: opts.quality.min_count,
+            min_count: quality.min_count,
             min_qual: chosen,
         };
         // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
@@ -450,7 +455,8 @@ fn run_multik(
         last_choice: None,
         quality: QualOpts {
             min_count: opts.quality.min_count,
-            min_qual: opts.quality.min_qual,
+            // The strict floor, as `record_floor_choice` keeps it: with `[0]`, no quality filtering.
+            min_qual: floors[floors.len() - 1],
         },
         contigs: Vec::new(),
     };
@@ -543,7 +549,10 @@ where
         timevec,
         &mut out_path_histo,
     )?;
-    if should_stop_ladder_for_unresolved_min_count(step, k, assembly.min_count_unresolved) {
+    // EVALUATION ONLY: SPHK_EVAL_NO_STOP assembles unresolved k values instead of stopping.
+    if should_stop_ladder_for_unresolved_min_count(step, k, assembly.min_count_unresolved)
+        && std::env::var_os("SPHK_EVAL_NO_STOP").is_none()
+    {
         return Err(preprocessing::PreprocessingError::unresolved_high_k_min_count(k));
     }
     // Carried into the count-map by now, so the old contigs are dead weight.
