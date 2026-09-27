@@ -47,7 +47,8 @@ pub fn peek_alphabet(path: &str, max_reads: usize) -> Vec<u8> {
 }
 
 /// The A/B/C ladder, ascending in looseness, so a group index is directly "how loose". The loose rung
-/// merges into floor 0 when no called base sits below it.
+/// merges into floor 0 when no called base sits below it; one quality value, or none below the strict
+/// floor, leaves floor 0 alone.
 pub fn floors_from(bins: &[u8], default_floor: u8) -> Vec<u8> {
     // A is not the default itself but the bin the default selects: on 2/11/25/37 a default of 20 keeps
     // Q25 and above, so tagging at 25 and tagging at 20 are the same partition.
@@ -55,6 +56,11 @@ pub fn floors_from(bins: &[u8], default_floor: u8) -> Vec<u8> {
         .iter()
         .find(|b| **b >= default_floor)
         .unwrap_or(&default_floor);
+    // One value carries no information (SRA Lite's constant Q30; FASTA has none), and with no call
+    // below the strict floor every floor keeps the same windows.
+    if bins.len() <= 1 || bins[0] >= strict {
+        return vec![0];
+    }
     match bins
         .iter()
         .rev()
@@ -169,8 +175,13 @@ mod tests {
         // No bin reaches the default, so A admits nothing and the strict pass comes back empty. B is
         // still the top bin, which is what the ladder then loosens to.
         assert_eq!(floors_from(&[2, 11], 20), vec![0, 11, 20]);
-        // No alphabet at all (FASTA): nothing to loosen to.
-        assert_eq!(floors_from(&[], 20), vec![0, 20]);
+        // No alphabet at all (FASTA), or a single value: qualities say nothing, so only floor 0.
+        assert_eq!(floors_from(&[], 20), vec![0]);
+        assert_eq!(floors_from(&[30], 20), vec![0]);
+        assert_eq!(floors_from(&[2], 20), vec![0]);
+        // Every call clears the strict floor, so it keeps the same windows as floor 0.
+        assert_eq!(floors_from(&[30, 37], 20), vec![0]);
+        assert_eq!(floors_from(&[2, 11, 25, 37], 0), vec![0]);
         // A near-continuous alphabet: the bin below the strict floor is one PHRED unit away, so it is
         // the same filter under another name and the ladder must skip it.
         assert_eq!(floors_from(&[2, 19, 20], 20), vec![0, 20]);
