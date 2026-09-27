@@ -38,6 +38,24 @@ const DISPERSION_SEEDS: [f64; 3] = [2.0, 8.0, 15.0];
 /// Counts above this multiple of the peak are not fitted: they are repeats beyond the two-copy lobe.
 const FIT_WINDOW_PEAK_MULT: usize = 6;
 
+#[cfg(not(target_family = "wasm"))]
+const PRIMARY_MODE_RATIO_LOW: f64 = 1.25;
+#[cfg(not(target_family = "wasm"))]
+const PRIMARY_MODE_RATIO_HIGH: f64 = 1.40;
+#[cfg(not(target_family = "wasm"))]
+const PRIMARY_MODE_RATIO_START_PEAK: usize = 100;
+#[cfg(not(target_family = "wasm"))]
+const PRIMARY_MODE_RATIO_END_PEAK: usize = 200;
+
+#[cfg(not(target_family = "wasm"))]
+fn primary_mode_ratio_limit(empirical_peak: usize) -> f64 {
+    let progress = (empirical_peak.saturating_sub(PRIMARY_MODE_RATIO_START_PEAK) as f64
+        / (PRIMARY_MODE_RATIO_END_PEAK - PRIMARY_MODE_RATIO_START_PEAK) as f64)
+        .clamp(0.0, 1.0);
+
+    PRIMARY_MODE_RATIO_LOW + (PRIMARY_MODE_RATIO_HIGH - PRIMARY_MODE_RATIO_LOW) * progress
+}
+
 pub(crate) fn fit_window_end(histogram_len: usize, peak: usize) -> usize {
     (FIT_WINDOW_PEAK_MULT * peak).min(histogram_len.saturating_sub(1))
 }
@@ -1022,7 +1040,8 @@ fn validate_native_fit(
     }
     let mode = fit.primary_mode() as f64;
     let peak = empirical_peak as f64;
-    if mode <= 0.0 || (mode / peak).max(peak / mode) > 1.25 {
+    let ratio_limit = primary_mode_ratio_limit(empirical_peak);
+    if mode <= 0.0 || empirical_peak == 0 || (mode / peak).max(peak / mode) > ratio_limit {
         return Some(FitRejection::PrimaryModeOutsideBand);
     }
     if (fit.repeat_mode() as f64) < 1.4 * mode {
@@ -1673,6 +1692,69 @@ mod tests {
         assert_eq!(outside.primary_mode(), 126);
         assert_eq!(
             validate_native_fit(&outside, 12, 100),
+            Some(FitRejection::PrimaryModeOutsideBand)
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn primary_mode_ratio_limit_ramps_and_clamps() {
+        assert_eq!(primary_mode_ratio_limit(0), 1.25);
+        assert_eq!(primary_mode_ratio_limit(99), 1.25);
+        assert_eq!(primary_mode_ratio_limit(100), 1.25);
+        assert_eq!(primary_mode_ratio_limit(150), 1.325);
+        assert_eq!(primary_mode_ratio_limit(200), 1.40);
+        assert_eq!(primary_mode_ratio_limit(201), 1.40);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn primary_mode_ratio_uses_ramped_limit_symmetrically_and_inclusively() {
+        let make_fit = |mode: usize| {
+            NativeSpectrumFit::for_test(
+                ErrorModel::SingletonPareto,
+                GenomeModel::NegativeBinomial,
+                [0.7, 0.29, 0.01],
+                mode as f64 + 6.0,
+                7.0,
+                ErrorParams {
+                    singleton_probability: 0.85,
+                    tail_exponent: 2.0,
+                    weibull_shape: None,
+                },
+                10.0e6,
+                1_000,
+            )
+        };
+
+        // At peak 150 the limit is 1.325: both sides of the symmetric band are checked.
+        assert_eq!(primary_mode_ratio_limit(150), 1.325);
+        assert_eq!(validate_native_fit(&make_fit(198), 12, 150), None);
+        assert_eq!(
+            validate_native_fit(&make_fit(199), 12, 150),
+            Some(FitRejection::PrimaryModeOutsideBand)
+        );
+        assert_eq!(validate_native_fit(&make_fit(114), 12, 150), None);
+        assert_eq!(
+            validate_native_fit(&make_fit(113), 12, 150),
+            Some(FitRejection::PrimaryModeOutsideBand)
+        );
+
+        // At peak 200 the upper endpoint is inclusive at 1.40, and the limit is capped above it.
+        assert_eq!(validate_native_fit(&make_fit(280), 12, 200), None);
+        assert_eq!(
+            validate_native_fit(&make_fit(281), 12, 200),
+            Some(FitRejection::PrimaryModeOutsideBand)
+        );
+        assert_eq!(validate_native_fit(&make_fit(143), 12, 200), None);
+        assert_eq!(
+            validate_native_fit(&make_fit(142), 12, 200),
+            Some(FitRejection::PrimaryModeOutsideBand)
+        );
+        assert_eq!(validate_native_fit(&make_fit(280), 12, 250), None);
+
+        assert_eq!(
+            validate_native_fit(&make_fit(125), 12, 0),
             Some(FitRejection::PrimaryModeOutsideBand)
         );
     }
