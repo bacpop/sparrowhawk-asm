@@ -79,9 +79,15 @@ pub struct PreprocessingError(String);
 
 #[cfg(not(target_family = "wasm"))]
 impl PreprocessingError {
-    pub(crate) fn unresolved_high_k_min_count(k: usize) -> Self {
+    pub(crate) fn peak_too_low(k: usize, peak: PeakSource) -> Self {
         Self(format!(
-            "automatic minimum-count selection at k={k} was unresolved and fell back to {UNRESOLVED_MINCOUNT}"
+            "the single-copy peak at k={k}, {peak:?}, is too low to assemble"
+        ))
+    }
+
+    pub(crate) fn no_aun_gain(k: usize, new: f64, old: f64) -> Self {
+        Self(format!(
+            "the unresolved cutoff at k={k} gave an auN of {new:.1}, not above the previous {old:.1}"
         ))
     }
 }

@@ -423,14 +423,30 @@ impl LadderState {
     }
 }
 
-/// Do not let an unresolved, automatic cutoff at high k replace the last usable assembly.
+/// A k after the first with a single-copy peak below this, fitted or fallback, is not assembled: the
+/// ladder stops on the previous contigs. At 3, a 13x simulation gained a misassembly.
 #[cfg(not(target_family = "wasm"))]
-const MIN_K_FOR_UNRESOLVED_MIN_COUNT_STOP: usize = 71;
+const MIN_LADDER_PEAK: u32 = 4;
 
-/// Stop only once an earlier k's contigs exist to write; the first k assembles with the fallback.
+/// Whether a k after the first has too little coverage to assemble; an unknown peak counts as too low.
 #[cfg(not(target_family = "wasm"))]
-fn should_stop_ladder_for_unresolved_min_count(step: usize, k: usize, unresolved: bool) -> bool {
-    step > 0 && k >= MIN_K_FOR_UNRESOLVED_MIN_COUNT_STOP && unresolved
+fn peak_too_low_for_ladder(step: usize, peak: preprocessing::PeakSource) -> bool {
+    step > 0 && peak.value().is_none_or(|p| p < MIN_LADDER_PEAK)
+}
+
+/// Length-weighted mean length of the contigs of at least `min_len` bases; 0 when there are none.
+#[cfg(not(target_family = "wasm"))]
+fn aun(contigs: &[Vec<u8>], min_len: usize) -> f64 {
+    let (sum, sum_sq) = contigs
+        .iter()
+        .map(|c| c.len() as u64)
+        .filter(|&l| l >= min_len as u64)
+        .fold((0u64, 0u64), |(s, q), l| (s + l, q + l * l));
+    if sum == 0 {
+        0.0
+    } else {
+        sum_sq as f64 / sum as f64
+    }
 }
 
 /// Iterative multi-k: each k is assembled from reads plus the previous k's contigs. With no explicit
@@ -470,8 +486,8 @@ fn run_multik(
             _ => run_ladder_step::<U512>(&opts, step, &mut state, timevec, out_path_graph),
         };
         if let Err(error) = outcome {
-            // A k with no usable k-mers, or an unresolved automatic cutoff at high k, cannot produce
-            // a useful next assembly. In either case the previous contigs are still in `state`.
+            // A k with no usable k-mers, too low a peak, or an unresolved cutoff that did not raise
+            // auN ends the ladder. In every case the previous contigs are in `state`.
             if step == 0 {
                 return Err(error);
             }
@@ -549,17 +565,25 @@ where
         timevec,
         &mut out_path_histo,
     )?;
-    // EVALUATION ONLY: SPHK_EVAL_NO_STOP assembles unresolved k values instead of stopping.
-    if should_stop_ladder_for_unresolved_min_count(step, k, assembly.min_count_unresolved)
-        && std::env::var_os("SPHK_EVAL_NO_STOP").is_none()
-    {
-        return Err(preprocessing::PreprocessingError::unresolved_high_k_min_count(k));
+    if peak_too_low_for_ladder(step, assembly.genomic_peak) {
+        return Err(preprocessing::PreprocessingError::peak_too_low(
+            k,
+            assembly.genomic_peak,
+        ));
     }
-    // Carried into the count-map by now, so the old contigs are dead weight.
+    // An unresolved cutoff must beat the previous contigs, so they are kept until it has; otherwise
+    // they are carried into the count-map by now and dead weight.
+    let unresolved = step > 0 && assembly.min_count_unresolved;
+    let previous = unresolved.then(|| std::mem::take(&mut state.contigs));
     state.contigs = Vec::new();
 
     let last = step + 1 == state.ks.len();
-    let mut graph_path = if last { out_path_graph.take() } else { None };
+    // A k that may still be rejected writes no graph, as a stopped ladder never has.
+    let mut graph_path = if last && !unresolved {
+        out_path_graph.take()
+    } else {
+        None
+    };
     let contigs = graph_works::BasicAsm::assemble::<IntT>(
         k,
         &mut assembly.kmers,
@@ -577,6 +601,19 @@ where
         let path =
             Path::new(opts.output_dir).join(format!("{}_k{k}_contigs.fasta", opts.output_prefix));
         save_functions::save_sequences_as_fasta(&state.contigs, opts.min_contig_length, path);
+    }
+    if let Some(previous) = previous {
+        let (new, old) = (
+            aun(&state.contigs, opts.min_contig_length),
+            aun(&previous, opts.min_contig_length),
+        );
+        if new <= old {
+            state.contigs = previous;
+            return Err(preprocessing::PreprocessingError::no_aun_gain(k, new, old));
+        }
+        log::info!(
+            "k={k}: kept despite an unresolved cutoff, as auN rose from {old:.1} to {new:.1}."
+        );
     }
     Ok(())
 }
@@ -756,21 +793,28 @@ fn settle_ladder(
 #[cfg(all(test, not(target_family = "wasm")))]
 mod multik_tests {
     use super::{
-        active_quality_floors, lowered_floor_index, read_store, settle_ladder,
-        should_stop_ladder_for_unresolved_min_count, LadderState, QualOpts,
+        active_quality_floors, aun, lowered_floor_index, peak_too_low_for_ladder, read_store,
+        settle_ladder, LadderState, QualOpts,
     };
 
     #[test]
-    fn unresolved_min_count_stops_only_at_k_71_or_higher() {
-        assert!(!should_stop_ladder_for_unresolved_min_count(1, 70, true));
-        assert!(should_stop_ladder_for_unresolved_min_count(1, 71, true));
-        assert!(should_stop_ladder_for_unresolved_min_count(1, 131, true));
-        assert!(!should_stop_ladder_for_unresolved_min_count(1, 71, false));
+    fn the_ladder_needs_a_peak_of_four_after_the_first_k() {
+        use crate::preprocessing::PeakSource::{Fallback, Fitted, Unknown};
+        assert!(!peak_too_low_for_ladder(0, Fallback(2)));
+        for peak in [Fitted(3), Fallback(3), Unknown] {
+            assert!(peak_too_low_for_ladder(1, peak));
+        }
+        for peak in [Fitted(4), Fallback(4)] {
+            assert!(!peak_too_low_for_ladder(1, peak));
+        }
     }
 
     #[test]
-    fn unresolved_min_count_never_stops_the_first_k() {
-        assert!(!should_stop_ladder_for_unresolved_min_count(0, 81, true));
+    fn aun_weights_lengths_over_the_output_filter() {
+        let contigs = vec![vec![b'A'; 600], vec![b'A'; 400], vec![b'A'; 1000]];
+        let want = (600.0 * 600.0 + 1000.0 * 1000.0) / 1600.0;
+        assert!((aun(&contigs, 500) - want).abs() < 1e-9);
+        assert_eq!(aun(&contigs, 2000), 0.0);
     }
 
     fn state_with(floors: &[u8]) -> LadderState {
