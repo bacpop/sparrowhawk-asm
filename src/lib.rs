@@ -498,11 +498,9 @@ where
 {
     let k = state.ks[step];
     let mut out_path_histo = opts.histo_path(&format!("_k{k}"));
-    let mut assembly = if step == 0 {
-        let active_floors = active_quality_floors(state.store.floors(), state.floor_index).to_vec();
-        let strict_floor = *active_floors
-            .last()
-            .expect("the read store has at least one quality floor");
+    let active_floors = active_quality_floors(state.store.floors(), state.floor_index).to_vec();
+    let strict_floor = state.store.floors()[state.floor_index];
+    let first = if step == 0 {
         let pass1 = count_reads::<IntT>(
             opts,
             k,
@@ -521,34 +519,9 @@ where
             state.store.ninety_percent_average_read_len(),
             state.store.max_read_len(),
         );
-        if opts.do_fit {
-            state.record_floor_choice(k, pass1.chosen_min_qual, pass1.min_count_unresolved);
-        }
-        if opts.do_fit && pass1.chosen_min_qual < strict_floor {
-            let selected_floor = pass1.chosen_min_qual;
-            let selected_min_count = pass1.used_min_count;
-            let selected_peak = pass1.genomic_peak;
-            log::warn!("Recounting k={k} at a base-quality floor of {selected_floor}.");
-            // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
-            drop(pass1);
-            count_store_at_selection::<IntT>(
-                opts,
-                k,
-                &state.store,
-                &[],
-                timevec,
-                &mut out_path_histo,
-                selected_floor,
-                selected_min_count,
-                selected_peak,
-            )?
-        } else {
-            pass1
-        }
+        pass1
     } else {
-        let active_floors = active_quality_floors(state.store.floors(), state.floor_index).to_vec();
-        let strict_floor = state.store.floors()[state.floor_index];
-        let selection = count_store::<IntT>(
+        count_store::<IntT>(
             opts,
             k,
             &state.quality,
@@ -560,31 +533,17 @@ where
             opts.do_fit,
             opts.debug_quality_floors,
             None,
-        )?;
-        if opts.do_fit {
-            state.record_floor_choice(k, selection.chosen_min_qual, selection.min_count_unresolved);
-        }
-        if opts.do_fit && selection.chosen_min_qual < strict_floor {
-            let selected_floor = selection.chosen_min_qual;
-            let selected_min_count = selection.used_min_count;
-            let selected_peak = selection.genomic_peak;
-            log::warn!("Recounting k={k} at a base-quality floor of {selected_floor}.");
-            drop(selection);
-            count_store_at_selection::<IntT>(
-                opts,
-                k,
-                &state.store,
-                &state.contigs,
-                timevec,
-                &mut out_path_histo,
-                selected_floor,
-                selected_min_count,
-                selected_peak,
-            )?
-        } else {
-            selection
-        }
+        )?
     };
+    let mut assembly = settle_floor_and_recount::<IntT>(
+        opts,
+        k,
+        state,
+        first,
+        strict_floor,
+        timevec,
+        &mut out_path_histo,
+    )?;
     if should_stop_ladder_for_unresolved_min_count(step, k, assembly.min_count_unresolved) {
         return Err(preprocessing::PreprocessingError::unresolved_high_k_min_count(k));
     }
@@ -651,6 +610,48 @@ where
         carried,
         debug_quality_floors,
         prior,
+    )
+}
+
+/// Record the floor this k's first count chose and, if it is below `strict_floor`, recount there. The
+/// first count is dropped before the recount allocates, so both tables are never resident at once.
+#[cfg(not(target_family = "wasm"))]
+fn settle_floor_and_recount<IntT>(
+    opts: &BuildOpts,
+    k: usize,
+    state: &mut LadderState,
+    first: preprocessing::PreprocessedK<IntT>,
+    strict_floor: u8,
+    timevec: &mut Vec<Instant>,
+    out_path_histo: &mut Option<PathBuf>,
+) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
+where
+    IntT: for<'a> UInt<'a>,
+{
+    if !opts.do_fit {
+        return Ok(first);
+    }
+    state.record_floor_choice(k, first.chosen_min_qual, first.min_count_unresolved);
+    if first.chosen_min_qual >= strict_floor {
+        return Ok(first);
+    }
+    let (floor, min_count, peak) = (
+        first.chosen_min_qual,
+        first.used_min_count,
+        first.genomic_peak,
+    );
+    log::warn!("Recounting k={k} at a base-quality floor of {floor}.");
+    drop(first);
+    count_store_at_selection::<IntT>(
+        opts,
+        k,
+        &state.store,
+        &state.contigs,
+        timevec,
+        out_path_histo,
+        floor,
+        min_count,
+        peak,
     )
 }
 
