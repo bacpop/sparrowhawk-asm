@@ -72,17 +72,6 @@ impl ReadStore {
         (self.reads > 0).then(|| self.bases as f64 / self.reads as f64)
     }
 
-    /// Floor of 90% of the arithmetic mean read length, measured over every stored record.
-    ///
-    /// An empty store returns zero. Integer arithmetic keeps the ladder boundary deterministic.
-    pub fn ninety_percent_average_read_len(&self) -> usize {
-        if self.reads == 0 {
-            return 0;
-        }
-        let target = (u128::from(self.bases) * 9) / (u128::from(self.reads) * 10);
-        usize::try_from(target).unwrap_or(usize::MAX)
-    }
-
     /// Pack one read into the open block. A FASTA read has no qualities and clears every floor, as it
     /// does when streamed.
     pub fn push(&mut self, seq: &[u8], qual: Option<&[u8]>) {
@@ -331,18 +320,16 @@ mod tests {
     }
 
     #[test]
-    fn ninety_percent_average_length_uses_all_records_and_floors_the_result() {
+    fn average_length_uses_all_records() {
         let mut store = ReadStore::new(&[0, 20]);
         store.push(b"ACGTACGTAC", None); // 10 bases
-        store.push(b"ACGTACGTACGT", None); // 12 bases; mean 11, target 9
+        store.push(b"ACGTACGTACGT", None); // 12 bases; mean 11
         assert_eq!(store.average_read_len(), Some(11.0));
-        assert_eq!(store.ninety_percent_average_read_len(), 9);
     }
 
     #[test]
-    fn ninety_percent_average_length_is_zero_for_an_empty_store() {
+    fn average_length_is_none_for_an_empty_store() {
         let store = ReadStore::new(&[0, 20]);
         assert_eq!(store.average_read_len(), None);
-        assert_eq!(store.ninety_percent_average_read_len(), 0);
     }
 }

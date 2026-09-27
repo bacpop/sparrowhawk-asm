@@ -516,7 +516,6 @@ where
             &state.ks,
             state.default_ladder,
             average_read_len,
-            state.store.ninety_percent_average_read_len(),
             state.store.max_read_len(),
         );
         pass1
@@ -711,18 +710,19 @@ fn lowered_floor_index(floors: &[u8], ceiling: usize, previous: Option<u8>, chos
     }
 }
 
-/// The k values to run once every read is known: the average-length default or the requested list,
-/// dropping explicit k values not below the longest read. The first k has run, so it always stays.
+/// The k values to run once every read is known: the default up to the longest read less
+/// [`READ_LEN_MARGIN`], or the requested list without k values not below the longest read. The first k
+/// has run, so it always stays.
 #[cfg(not(target_family = "wasm"))]
 fn settle_ladder(
     ks: &[usize],
     default_ladder: bool,
     average_read_len: f64,
-    max_k_from_average: usize,
     max_read_len: usize,
 ) -> Vec<usize> {
+    let ceiling = max_read_len.saturating_sub(READ_LEN_MARGIN);
     let settled: Vec<usize> = if default_ladder {
-        default_kmer_ladder(max_k_from_average)
+        default_kmer_ladder(ceiling)
     } else {
         ks.iter()
             .enumerate()
@@ -736,8 +736,7 @@ fn settle_ladder(
     if default_ladder {
         log::info!(
             "Multi-k ladder: average_read_len={average_read_len:.1} bp, \
-             90%-average ceiling={max_k_from_average} bp, \
-             longest read={max_read_len} bp, k={settled:?}"
+             longest read={max_read_len} bp, ceiling={ceiling} bp, k={settled:?}"
         );
     } else {
         log::info!("Multi-k ladder for reads up to {max_read_len} bp: k={settled:?}");
@@ -811,20 +810,17 @@ mod multik_tests {
     }
 
     #[test]
-    fn default_ladder_uses_the_average_length_ceiling() {
+    fn default_ladder_stops_ten_bases_under_the_longest_read() {
         assert_eq!(
-            settle_ladder(&[21], true, 150.0, 135, 150),
-            vec![21, 31, 41, 55, 71, 91, 111, 131]
+            settle_ladder(&[21], true, 143.6, 151),
+            vec![21, 31, 41, 55, 71, 91, 111, 131, 141]
         );
-        assert_eq!(settle_ladder(&[21], true, 22.2, 20, 22), vec![21]);
+        assert_eq!(settle_ladder(&[21], true, 22.2, 22), vec![21]);
     }
 
     #[test]
     fn explicit_ladder_keeps_its_existing_longest_read_filter() {
-        assert_eq!(
-            settle_ladder(&[21, 31, 55], false, 0.0, 0, 55),
-            vec![21, 31]
-        );
+        assert_eq!(settle_ladder(&[21, 31, 55], false, 0.0, 55), vec![21, 31]);
     }
 }
 

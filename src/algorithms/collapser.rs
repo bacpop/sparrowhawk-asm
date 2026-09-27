@@ -1,9 +1,7 @@
 //! Create string representation of contigs out of `DbgGraph`.
 
 use super::shrinker::Shrinkable;
-use sparrowhawk_graph::{
-    get_nodelist_kmer_length, CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs,
-};
+use sparrowhawk_graph::{CarryType, DbgGraph, NodeId, NodeStruct, SerializedContigs};
 
 /// Collapse `DbgGraph` into `SerializedContigs`.
 pub trait Collapsable: Shrinkable {
@@ -13,8 +11,6 @@ pub trait Collapsable: Shrinkable {
 
 impl Collapsable for DbgGraph {
     fn collapse(mut self) -> SerializedContigs {
-        let mut contigs: SerializedContigs = vec![];
-
         log::info!("Removing self-loops (temporal restriction)");
         self.remove_self_loops();
 
@@ -24,12 +20,15 @@ impl Collapsable for DbgGraph {
             self.isolated_node_count()
         );
 
-        let removed = erase_junction_nodes(&mut self);
-        log::info!("Removed {removed} branching junction nodes before collapse");
+        // Every contig is kept, however short, and each junction is one of its own: a multi-k step
+        // carries them all to the next k, as GATB-Minia does. Output length filters come later.
+        let mut contigs = erase_junction_nodes(&mut self);
+        log::info!(
+            "Kept {} branching junction nodes as their own contigs",
+            contigs.len()
+        );
 
         log::info!("Starting collapse loop.");
-        // 100 nt, though independent of this value the minimum is always at least k.
-        let limit = crate::algorithms::corrector::short_path_limit(100, self.k());
 
         loop {
             loop {
@@ -46,20 +45,12 @@ impl Collapsable for DbgGraph {
                     if self.contains_node(n) {
                         if self.get_good_connections_degree(n) == 0 {
                             log::debug!("\t\t# Isolated node.");
-                            let thecont = vec![self.node_weight(n).unwrap().clone()];
-                            if get_nodelist_kmer_length(&thecont) > limit {
-                                contigs.push(thecont);
-                            }
+                            contigs.push(vec![self.node_weight(n).unwrap().clone()]);
                             self.remove_node(n);
                         } else {
                             stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
                                 let contigs_ = contigs_from_vertex(&mut self, n);
-                                contigs.extend(
-                                    contigs_
-                                        .into_iter()
-                                        .filter(|c| get_nodelist_kmer_length(c) > limit)
-                                        .collect::<Vec<_>>(),
-                                );
+                                contigs.extend(contigs_.into_iter().filter(|c| !c.is_empty()));
                             });
                         }
                     }
@@ -91,12 +82,7 @@ impl Collapsable for DbgGraph {
 
                     let thecontigs = contigs_from_intermediate_vertex(&mut self, *node_in_cycle);
 
-                    contigs.extend(
-                        thecontigs
-                            .into_iter()
-                            .filter(|c| get_nodelist_kmer_length(c) > limit)
-                            .collect::<Vec<_>>(),
-                    );
+                    contigs.extend(thecontigs.into_iter().filter(|c| !c.is_empty()));
                 });
                 log::debug!("\t\t# Finished creating one contig from starting circle.");
             } else {
@@ -114,22 +100,20 @@ impl Collapsable for DbgGraph {
     }
 }
 
-/// Remove branching junction nodes before collapse walks begin.
+/// Remove branching junction nodes before collapse walks begin, returning each as its own contig.
 #[inline]
-fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> usize {
+fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> SerializedContigs {
     let junctions: Vec<NodeId> = ptgraph
         .ambiguous_nodes()
         .into_iter()
         .filter(|&node| ptgraph.nonself_degree(node) > 1)
         .collect();
 
-    let removed = junctions.len();
-
-    for node in junctions {
-        ptgraph.remove_node(node);
-    }
-
-    removed
+    junctions
+        .into_iter()
+        .filter_map(|node| ptgraph.remove_node(node))
+        .map(|weight| vec![weight])
+        .collect()
 }
 
 // Main collapse function/method
@@ -166,10 +150,14 @@ fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
-            // Junctions delimit contigs and are intentionally discarded.
+            // A junction ends the contig and becomes a contig of its own.
             contigs.push(contig.clone());
             contig.clear();
-            ptgraph.remove_node(current_vertex);
+            contigs.extend(
+                ptgraph
+                    .remove_node(current_vertex)
+                    .map(|weight| vec![weight]),
+            );
             return contigs;
         }
 
@@ -261,10 +249,14 @@ fn contigs_from_intermediate_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> Serial
             ptgraph.remove_node(current_vertex);
             return contigs;
         } else {
-            // Junctions delimit contigs and are intentionally discarded.
+            // A junction ends the contig and becomes a contig of its own.
             contigs.push(contig.clone());
             contig.clear();
-            ptgraph.remove_node(current_vertex);
+            contigs.extend(
+                ptgraph
+                    .remove_node(current_vertex)
+                    .map(|weight| vec![weight]),
+            );
             return contigs;
         }
 
@@ -339,9 +331,9 @@ mod tests {
         assert_eq!(g.node_count(), 0);
     }
 
-    /// External walks discard a branching junction instead of emitting it.
+    /// External walks end at a branching junction and emit it as its own contig.
     #[test]
-    fn external_walk_discards_branching_junction() {
+    fn external_walk_keeps_a_branching_junction_as_its_own_contig() {
         let mut g = DbgGraph::new(3);
         let start = g.add_node(node(0));
         let junction = g.add_node(node(1));
@@ -354,16 +346,17 @@ mod tests {
 
         let contigs = contigs_from_vertex(&mut g, start);
 
-        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs.len(), 2);
         assert_eq!(contigs[0].len(), 1);
         assert_eq!(contigs[0][0].abs_ind, vec![0]);
-        assert!(!contigs.iter().flatten().any(|n| n.abs_ind == vec![1]));
+        assert_eq!(contigs[1].len(), 1);
+        assert_eq!(contigs[1][0].abs_ind, vec![1]);
         assert!(!g.contains_node(junction));
     }
 
-    /// Intermediate walks apply the same junction-discarding rule as external walks.
+    /// Intermediate walks apply the same junction rule as external walks.
     #[test]
-    fn intermediate_walk_discards_branching_junction() {
+    fn intermediate_walk_keeps_a_branching_junction_as_its_own_contig() {
         let mut g = DbgGraph::new(3);
         let start = g.add_node(node(0));
         let junction = g.add_node(node(1));
@@ -376,14 +369,15 @@ mod tests {
 
         let contigs = contigs_from_intermediate_vertex(&mut g, start);
 
-        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs.len(), 2);
         assert_eq!(contigs[0].len(), 1);
         assert_eq!(contigs[0][0].abs_ind, vec![0]);
-        assert!(!contigs.iter().flatten().any(|n| n.abs_ind == vec![1]));
+        assert_eq!(contigs[1].len(), 1);
+        assert_eq!(contigs[1][0].abs_ind, vec![1]);
         assert!(!g.contains_node(junction));
     }
 
-    /// Pre-collapse junction erasure removes the junction and its incident edges only.
+    /// Pre-collapse junction erasure removes the junction and its incident edges only, and returns it.
     #[test]
     fn erase_junction_nodes_removes_branching_node_and_edges() {
         let mut g = DbgGraph::new(3);
@@ -394,7 +388,9 @@ mod tests {
         g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
         g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
 
-        assert_eq!(erase_junction_nodes(&mut g), 1);
+        let kept = erase_junction_nodes(&mut g);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0][0].abs_ind, vec![0]);
         assert!(!g.contains_node(junction));
         assert!(g.contains_node(branch_a));
         assert!(g.contains_node(branch_b));

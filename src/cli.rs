@@ -32,9 +32,12 @@ pub const KMER_LADDER_INCREMENT: usize = 20;
 /// Largest k the packed k-mer types hold: 512 bits fit 256 bases, and k must be odd.
 pub const MAX_K: usize = 255;
 /// Smallest gain a clamped last rung must add over the previous one to be worth an assembly pass.
-pub const MIN_CLAMPED_STEP: usize = 10;
+pub const MIN_CLAMPED_STEP: usize = 8;
+/// Bases the automatic ladder's ceiling stays under the longest read, so a full-length read still
+/// yields 11 k-mers at the last k.
+pub const READ_LEN_MARGIN: usize = 10;
 
-/// The automatic ladder, bounded by the floor of 90% of the average read length and by [`MAX_K`].
+/// The automatic ladder, bounded by `max_k` (the longest read less [`READ_LEN_MARGIN`]) and by [`MAX_K`].
 ///
 /// The rung past the ceiling becomes the largest odd k under it if that adds [`MIN_CLAMPED_STEP`];
 /// one past [`MAX_K`] always does. The initial 21 is retained as the bootstrap k.
@@ -197,8 +200,8 @@ pub enum Commands {
         output_prefix: String,
 
         /// K-mer size(s), comma-separated and strictly ascending: `-k 31`, or `-k 21,31,55,91` for an
-        /// iterative multi-k assembly. If omitted, use 21,31,41,55,71, then add 20 at a time up to 90%
-        /// of the average read length (at most 255), plus a last k clamped to that ceiling.
+        /// iterative multi-k assembly. If omitted, use 21,31,41,55,71, then add 20 at a time up to 10 bases
+        /// under the longest read (at most 255), plus a last k clamped to that ceiling.
         #[arg(short, value_parser = valid_kmer, value_delimiter = ',')]
         k: Option<Vec<usize>>,
 
@@ -325,7 +328,7 @@ mod tests {
 
     #[test]
     fn default_ladder_uses_fixed_anchors_under_the_ceiling() {
-        assert_eq!(default_kmer_ladder(80), vec![21, 31, 41, 55, 71]);
+        assert_eq!(default_kmer_ladder(78), vec![21, 31, 41, 55, 71]);
         assert_eq!(default_kmer_ladder(60), vec![21, 31, 41, 55]);
     }
 
@@ -358,6 +361,16 @@ mod tests {
             vec![21, 31, 41, 55, 71, 91, 111, 131, 151, 171, 191, 211, 231, 251]
         );
         assert_eq!(default_kmer_ladder(1000).last(), Some(&MAX_K));
+    }
+
+    #[test]
+    fn default_ladder_clamps_a_last_rung_at_least_eight_above_the_previous() {
+        assert_eq!(
+            default_kmer_ladder(141),
+            vec![21, 31, 41, 55, 71, 91, 111, 131, 141]
+        );
+        assert_eq!(default_kmer_ladder(240)[11..], [211, 231, 239]);
+        assert_eq!(default_kmer_ladder(138).last(), Some(&131));
     }
 
     #[test]
