@@ -1395,6 +1395,10 @@ const MAX_FIT_ERROR_TAIL_FRACTION: f64 = 0.05;
 /// A very shallow empirical peak is a reason to inspect the lower floors, not a reason to refuse a fit.
 #[cfg(not(target_family = "wasm"))]
 const LOW_COVERAGE_FLOOR_REVIEW: usize = 10;
+/// Peak gain a lower floor needs over a starved one (peak below [`LOW_COVERAGE_FLOOR_REVIEW`]) to be
+/// stepped down to. Well-covered floors never step down: that cost Neisseria 6-8% auN locally.
+#[cfg(not(target_family = "wasm"))]
+const STEP_DOWN_GAIN: f64 = 1.10;
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
@@ -1586,7 +1590,8 @@ where
 
     // At the whole library's scale, as the strict spectrum already is: fitted on the raw sample, the
     // hole guard would strand 1/fraction genome k-mers instead of one.
-    let spectra = evaluate_other_floors.then(|| sketch.rescaled_spectra(floors.len()));
+    let spectra = (strict_index > 0).then(|| sketch.rescaled_spectra(floors.len()));
+    let mut evaluated: Vec<Option<FloorCandidate>> = vec![None; floors.len()];
     let mut candidates = vec![strict];
     let mut diagnostic_floors = Vec::new();
     if debug_all_floors {
@@ -1599,7 +1604,7 @@ where
         });
     }
 
-    if let Some(spectra) = &spectra {
+    if let Some(spectra) = spectra.as_ref().filter(|_| evaluate_other_floors) {
         for index in (0..strict_index).rev() {
             if !floor_has_kmers[index] {
                 logw(
@@ -1612,6 +1617,7 @@ where
                 continue;
             }
             let candidate = evaluate_floor(floors[index], &spectra[index], &mut fit);
+            evaluated[index] = Some(candidate);
             let estimate = &candidate.estimate;
             logw(
                 &format!(
@@ -1683,6 +1689,48 @@ where
         return (min_count, floor, peak, diagnostics, diagnostic_floors);
     };
     let mut selected = candidates[selected_index];
+    // Step down while the current peak is starved and the next lower floor's peak clears
+    // [`STEP_DOWN_GAIN`], never trading a usable fit for none.
+    if let Some(spectra) = &spectra {
+        let mut index = floors
+            .iter()
+            .position(|&floor| floor == selected.floor)
+            .unwrap_or(0);
+        while index > 0
+            && floor_has_kmers[index - 1]
+            && selected.estimate.genomic_peak < LOW_COVERAGE_FLOOR_REVIEW
+        {
+            let lower = index - 1;
+            let peak = evaluated[lower].map_or_else(
+                || estimate_by_valley(&spectra[lower]),
+                |candidate| candidate.estimate,
+            );
+            if !peak.verdict.is_ok()
+                || (peak.genomic_peak as f64)
+                    < STEP_DOWN_GAIN * selected.estimate.genomic_peak as f64
+            {
+                break;
+            }
+            let candidate = evaluated[lower]
+                .unwrap_or_else(|| evaluate_floor(floors[lower], &spectra[lower], &mut fit));
+            if candidate.fit.is_none() && selected.fit.is_some() {
+                break;
+            }
+            logw(
+                &format!(
+                    "Stepping down from base-quality floor {} (peak {}) to {} (peak {}): at least \
+                     {STEP_DOWN_GAIN:.2}x was required.",
+                    selected.floor,
+                    selected.estimate.genomic_peak,
+                    candidate.floor,
+                    candidate.estimate.genomic_peak
+                ),
+                Some("info"),
+            );
+            selected = candidate;
+            index = lower;
+        }
+    }
     if let Some(selected_fit) = selected.fit {
         apply_hole_guard(&mut selected.estimate, Some(&selected_fit));
     }
@@ -6014,10 +6062,10 @@ mod tests {
         assert!(below_floor.verdict.is_ok());
     }
 
-    /// A clean separation at a genomic peak of 18 is still starvation: the floor, not the library, may be what
-    /// made it shallow, so a materially deeper floor wins even though the strict one resolved.
+    /// A clean separation at a genomic peak of 14 stays however deep a lower floor is: floors only
+    /// step down below [`LOW_COVERAGE_FLOOR_REVIEW`].
     #[test]
-    fn a_resolved_peak_of_fourteen_does_not_by_itself_loosen_the_floor() {
+    fn a_resolved_peak_of_fourteen_does_not_step_down() {
         let shallow = histo(&bimodal(14));
         let strict = estimate_by_valley(&shallow);
         assert!(strict.verdict.is_ok());
@@ -6092,10 +6140,49 @@ mod tests {
             &[true; MAX_GROUPS],
         );
         assert_eq!(calls.get(), 3, "a sub-10 peak itself triggers floor review");
-        assert_eq!(
-            floor, 25,
-            "a lone usable strict-floor fit remains the decision"
+        assert_eq!(floor, 11, "a sub-10 peak steps down to a deeper floor");
+    }
+
+    /// A well-covered strict floor stays, whatever a lower floor offers, and costs no extra fit.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_well_covered_strict_floor_does_not_step_down() {
+        let strict = histo(&bimodal(40));
+        let decide = |lower_peak| {
+            let calls = std::cell::Cell::new(0);
+            let (_, floor, _, _) = choose_min_count_and_floor_with_fit(
+                &strict,
+                &sketch_with(1, &bimodal(lower_peak)),
+                &[0u8, 11, 25],
+                |_, estimate| {
+                    calls.set(calls.get() + 1);
+                    Some(native_test_fit(estimate.genomic_peak, 0.0))
+                },
+                &[true; MAX_GROUPS],
+            );
+            (floor, calls.get())
+        };
+        assert_eq!(decide(60), (25, 1), "1.5x stays");
+        assert_eq!(decide(120), (25, 1), "3x stays");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn stepping_down_never_trades_a_usable_fit_for_none() {
+        let calls = std::cell::Cell::new(0);
+        // Peak 9 against 20 would step down, but only the strict floor's fit converges.
+        let (_, floor, _, _) = choose_min_count_and_floor_with_fit(
+            &synthetic_spectrum(9.0),
+            &sketch_with(1, &bimodal(20)),
+            &[0u8, 11, 25],
+            |_, estimate| {
+                let call = calls.get();
+                calls.set(call + 1);
+                (call == 0).then(|| native_test_fit(estimate.genomic_peak, 0.0))
+            },
+            &[true; MAX_GROUPS],
         );
+        assert_eq!(floor, 25);
     }
 
     #[cfg(not(target_family = "wasm"))]
