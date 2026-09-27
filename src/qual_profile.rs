@@ -13,7 +13,9 @@ pub const MIN_RUNG_GAP: u8 = 5;
 /// Tag for a window that clears no floor at all (fewer than k bases, or an N inside it).
 pub const NONE: u8 = u8::MAX;
 
-/// Distinct PHRED values in the head of `path`, ascending. Empty for FASTA, which has no qualities.
+/// Distinct PHRED values on called bases (A, C, G, T) in the head of `path`, ascending. Ns carry
+/// Illumina's Q2 but break every window at every floor, so they say nothing about the ladder. Empty
+/// for FASTA, which has no qualities.
 pub fn peek_alphabet(path: &str, max_reads: usize) -> Vec<u8> {
     let mut seen = [false; 64];
     let Ok(mut reader) = needletail::parse_fastx_file(path) else {
@@ -24,7 +26,10 @@ pub fn peek_alphabet(path: &str, max_reads: usize) -> Vec<u8> {
         let Some(qual) = record.qual() else {
             return Vec::new();
         };
-        for &q in qual {
+        for (&base, &q) in record.seq().iter().zip(qual) {
+            if !matches!(base, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't') {
+                continue;
+            }
             let phred = q.saturating_sub(33) as usize;
             if phred < seen.len() {
                 seen[phred] = true;
@@ -41,7 +46,8 @@ pub fn peek_alphabet(path: &str, max_reads: usize) -> Vec<u8> {
         .collect()
 }
 
-/// The A/B/C ladder, ascending in looseness, so a group index is directly "how loose".
+/// The A/B/C ladder, ascending in looseness, so a group index is directly "how loose". The loose rung
+/// merges into floor 0 when no called base sits below it.
 pub fn floors_from(bins: &[u8], default_floor: u8) -> Vec<u8> {
     // A is not the default itself but the bin the default selects: on 2/11/25/37 a default of 20 keeps
     // Q25 and above, so tagging at 25 and tagging at 20 are the same partition.
@@ -54,8 +60,10 @@ pub fn floors_from(bins: &[u8], default_floor: u8) -> Vec<u8> {
         .rev()
         .find(|b| b.saturating_add(MIN_RUNG_GAP) <= strict && **b > MIN_LOOSE_FLOOR)
     {
-        Some(&loose) => vec![0, loose, strict],
-        None => vec![0, strict],
+        // Floor 0 differs from the loose rung only if some called base sits below it; otherwise the
+        // two are one floor, and the loose rung merges into 0.
+        Some(&loose) if bins[0] < loose => vec![0, loose, strict],
+        _ => vec![0, strict],
     }
 }
 
@@ -147,7 +155,11 @@ mod tests {
         // Gaps of 14, 12 and 7 all clear MIN_RUNG_GAP, so each keeps its middle rung.
         assert_eq!(floors_from(&[2, 11, 25, 37], 20), vec![0, 11, 25]);
         assert_eq!(floors_from(&[2, 12, 24, 40], 20), vec![0, 12, 24]);
-        assert_eq!(floors_from(&[14, 21, 27, 32, 36], 20), vec![0, 14, 21]);
+        // No called base below 14, so floor 0 and the 14 rung admit the same bases and merge.
+        assert_eq!(floors_from(&[14, 21, 27, 32, 36], 20), vec![0, 21]);
+        assert_eq!(floors_from(&[12, 20, 37], 20), vec![0, 20]);
+        assert_eq!(floors_from(&[11, 25, 37], 20), vec![0, 25]);
+        assert_eq!(floors_from(&[3, 7, 16, 23, 28], 20), vec![0, 16, 23]);
         // Exactly MIN_RUNG_GAP is enough; one less is not. A default of 22 so that the bin under test
         // is not itself picked as the strict floor.
         assert_eq!(floors_from(&[2, 20, 25], 22), vec![0, 20, 25]);
@@ -162,6 +174,20 @@ mod tests {
         // A near-continuous alphabet: the bin below the strict floor is one PHRED unit away, so it is
         // the same filter under another name and the ladder must skip it.
         assert_eq!(floors_from(&[2, 19, 20], 20), vec![0, 20]);
+    }
+
+    /// Ns carry Q2 on Illumina, but they are not calls, so the peek leaves them out of the alphabet.
+    #[test]
+    fn the_peek_ignores_the_quality_of_ns() {
+        let path = std::env::temp_dir().join(format!("sphk-peek-{}.fq", std::process::id()));
+        std::fs::write(
+            &path,
+            "@r1\nACGTNNACGT\n+\n-.-.##-.-.\n@r2\nNACG\n+\n#---\n",
+        )
+        .unwrap();
+        let alphabet = peek_alphabet(path.to_str().unwrap(), 10);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(alphabet, vec![12, 13]);
     }
 
     /// An N breaks every run, so no window spanning it clears any floor, not even 0.
