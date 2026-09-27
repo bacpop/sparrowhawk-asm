@@ -1332,9 +1332,25 @@ fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&SpectrumFit>) 
     }
 }
 
+/// The cutoff [`apply_hole_guard`] settles on: the valley capped by the hole guard, then raised to
+/// the 100% error floor.
+#[cfg(not(target_family = "wasm"))]
+fn guarded_min_count(estimate: &SpectrumEstimate, fit: &NativeSpectrumFit) -> u16 {
+    let mut min_count = estimate.min_count;
+    if estimate.verdict.is_ok() {
+        if let Some(guarded) = fit.hole_cutoff(MAX_GENOME_HOLES) {
+            if guarded < min_count {
+                min_count = guarded.max(2);
+            }
+        }
+    }
+    min_count.max(fit.error_floor_cutoff())
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&NativeSpectrumFit>) {
     let Some(fit) = fit else { return };
+    let expected = guarded_min_count(estimate, fit);
     if estimate.verdict.is_ok() {
         if let Some(guarded) = fit.hole_cutoff(MAX_GENOME_HOLES) {
             if guarded < estimate.min_count {
@@ -1353,6 +1369,7 @@ fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&NativeSpectrum
     let error_floor = fit.error_floor_cutoff();
     let genomic_guarded_min = estimate.min_count;
     estimate.min_count = estimate.min_count.max(error_floor);
+    debug_assert_eq!(estimate.min_count, expected);
     let hole_cutoff = fit.hole_cutoff(MAX_GENOME_HOLES);
     logw(
         &format!(
@@ -1386,10 +1403,9 @@ fn warn_unresolved(estimate: &SpectrumEstimate) {
     }
 }
 
-/// A fit whose error component explains more than this share of observed counts above both guards
-/// is considered too error-heavy when comparing multiple usable quality floors. The local sample's
-/// usable fits ranged up to 4.3%, so 5% is a provisional cutoff with a small margin; cluster results
-/// should be used to recalibrate it.
+/// A fit whose error component explains more than this share of observed counts above the applied
+/// cutoff is considered too error-heavy when comparing multiple usable quality floors. Provisional;
+/// cluster results should be used to recalibrate it.
 #[cfg(not(target_family = "wasm"))]
 const MAX_FIT_ERROR_TAIL_FRACTION: f64 = 0.05;
 /// A very shallow empirical peak is a reason to inspect the lower floors, not a reason to refuse a fit.
@@ -1419,15 +1435,11 @@ struct FloorDiagnostic {
     fit_attempted: bool,
 }
 
-/// Fraction of observed counts explained by the fitted error component from the stricter of the
-/// genomic-hole and 100%-error guards through six times the fitted primary mode.
+/// Share of observed counts the fitted error component explains, from the applied cutoff `start`
+/// through six times the fitted primary mode: the error share among the k-mers the cutoff keeps.
 #[cfg(not(target_family = "wasm"))]
-fn fit_error_tail_fraction(histovec: &[u32], fit: &NativeSpectrumFit) -> Option<f64> {
-    let error_floor = fit.error_floor_cutoff();
-    let start = fit
-        .hole_cutoff(MAX_GENOME_HOLES)
-        .map_or(error_floor, |hole| hole.min(error_floor))
-        .max(1) as usize;
+fn fit_error_tail_fraction(histovec: &[u32], fit: &NativeSpectrumFit, start: u16) -> Option<f64> {
+    let start = usize::from(start).max(1);
     let end = fit
         .primary_mode()
         .checked_mul(6)?
@@ -1457,7 +1469,9 @@ where
     let estimate = estimate_by_valley(histovec);
     let fit_attempted = estimate.verdict.is_ok();
     let fitted = fit_attempted.then(|| fit(histovec, &estimate)).flatten();
-    let error_tail_fraction = fitted.and_then(|fit| fit_error_tail_fraction(histovec, &fit));
+    let error_tail_fraction = fitted.and_then(|fit| {
+        fit_error_tail_fraction(histovec, &fit, guarded_min_count(&estimate, &fit))
+    });
     log::info!(
         "Quality-floor fit assessment: floor={floor} empirical_peak={} empirical_verdict={:?} fit_usable={} error_tail_fraction={:?}",
         estimate.genomic_peak,
@@ -6164,6 +6178,21 @@ mod tests {
         };
         assert_eq!(decide(60), (25, 1), "1.5x stays");
         assert_eq!(decide(120), (25, 1), "3x stays");
+    }
+
+    /// The tail is measured from the cutoff the floor would actually apply, so error k-mers that
+    /// cutoff removes anyway do not count against it.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_error_tail_starts_at_the_applied_cutoff() {
+        let histogram = synthetic_spectrum(30.0);
+        let estimate = estimate_by_valley(&histogram);
+        let fit = fit_and_log(&histogram, &estimate).expect("the fixture fits");
+        let cutoff = guarded_min_count(&estimate, &fit);
+        assert!(cutoff > 2, "the fixture must cut above 2, got {cutoff}");
+        let applied = fit_error_tail_fraction(&histogram, &fit, cutoff).unwrap();
+        let from_two = fit_error_tail_fraction(&histogram, &fit, 2).unwrap();
+        assert!(applied < from_two, "{applied} should be below {from_two}");
     }
 
     #[cfg(not(target_family = "wasm"))]
