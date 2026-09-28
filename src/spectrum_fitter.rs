@@ -99,9 +99,17 @@ const NATIVE_SD_TOLERANCE: f64 = 1e-4;
 /// The shelf never holds more than this share of single-copy k-mers, so it cannot swallow the lobe.
 #[cfg(not(target_family = "wasm"))]
 const SHELF_MAX_SHARE: f64 = 0.5;
-/// Starting shapes (a, b) for the shelf: uniform, and ramping up to the lobe.
+/// The shelf's k-mers keep at least this fraction of their coverage on average: below it the shelf
+/// sat on the error tail, at counts 0-1, in the 2026_09_28 sweep.
 #[cfg(not(target_family = "wasm"))]
-const SHELF_SHAPES: [(f64, f64); 2] = [(1.0, 1.0), (3.0, 1.0)];
+const SHELF_MIN_RETAINED: f64 = 0.3;
+/// Bounds on a + b: above the upper one the shelf is a spike, below the lower one it splits into point
+/// masses at zero and at the lobe.
+#[cfg(not(target_family = "wasm"))]
+const SHELF_CONCENTRATION: (f64, f64) = (1.0, 20.0);
+/// Starting (retained fraction, concentration): a uniform shelf, and one ramping up to the lobe.
+#[cfg(not(target_family = "wasm"))]
+const SHELF_SHAPES: [(f64, f64); 2] = [(0.5, 2.0), (0.75, 4.0)];
 /// Three more dimensions need more simplex steps than the NB fit's cap.
 #[cfg(not(target_family = "wasm"))]
 const SHELF_MAX_ITERS: u64 = 2_000;
@@ -114,6 +122,28 @@ pub(crate) struct Shelf {
     pub(crate) share: f64,
     pub(crate) alpha: f64,
     pub(crate) beta: f64,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Shelf {
+    /// From the fit's bounded coordinates: `a = m * kappa`, `b = (1 - m) * kappa`.
+    fn from_retained(share: f64, retained: f64, concentration: f64) -> Self {
+        Self {
+            share,
+            alpha: retained * concentration,
+            beta: (1.0 - retained) * concentration,
+        }
+    }
+
+    /// Mean fraction of coverage the shelf's k-mers keep, `a / (a + b)`.
+    pub(crate) fn retained(self) -> f64 {
+        self.alpha / (self.alpha + self.beta)
+    }
+
+    /// How narrow the shelf is, `a + b`: the variance of the retained fraction is `m(1 - m)/(kappa + 1)`.
+    pub(crate) fn concentration(self) -> f64 {
+        self.alpha + self.beta
+    }
 }
 
 /// A fitted coverage model.
@@ -799,10 +829,13 @@ impl NativeMixtureFit {
             },
         };
         let base = self.error_model.parameter_count();
-        let shelf = (self.genome_model == GenomeModel::ShelfNegativeBinomial).then(|| Shelf {
-            share: SHELF_MAX_SHARE * sigmoid(theta[base]),
-            alpha: theta[base + 1].exp(),
-            beta: theta[base + 2].exp(),
+        let (low, high) = SHELF_CONCENTRATION;
+        let shelf = (self.genome_model == GenomeModel::ShelfNegativeBinomial).then(|| {
+            Shelf::from_retained(
+                SHELF_MAX_SHARE * sigmoid(theta[base]),
+                SHELF_MIN_RETAINED + (1.0 - SHELF_MIN_RETAINED) * sigmoid(theta[base + 1]),
+                low + (high - low) * sigmoid(theta[base + 2]),
+            )
         });
         NativeParams {
             ln_error,
@@ -1148,10 +1181,15 @@ fn native_starts(
                 start.push(shape.ln());
             }
             if problem.genome_model == GenomeModel::ShelfNegativeBinomial {
-                let fraction = shelf_share / SHELF_MAX_SHARE;
-                for &(alpha, beta) in &SHELF_SHAPES {
+                let logit = |p: f64| (p / (1.0 - p)).ln();
+                let (low, high) = SHELF_CONCENTRATION;
+                for &(retained, concentration) in &SHELF_SHAPES {
                     let mut shelf_start = start.clone();
-                    shelf_start.extend([(fraction / (1.0 - fraction)).ln(), alpha.ln(), beta.ln()]);
+                    shelf_start.extend([
+                        logit(shelf_share / SHELF_MAX_SHARE),
+                        logit((retained - SHELF_MIN_RETAINED) / (1.0 - SHELF_MIN_RETAINED)),
+                        logit((concentration - low) / (high - low)),
+                    ]);
                     starts.push(shelf_start);
                 }
             } else {
@@ -1336,15 +1374,21 @@ fn shelf_trials(mean: f64) -> f64 {
     mean.round().max(1.0)
 }
 
-/// A share strictly inside (0, [`SHELF_MAX_SHARE`]) and finite, positive shapes.
+/// A share inside (0, [`SHELF_MAX_SHARE`]), and finite shapes within the retained-fraction and
+/// concentration bounds.
 #[cfg(not(target_family = "wasm"))]
 fn shelf_is_valid(shelf: Shelf) -> bool {
+    let (low, high) = SHELF_CONCENTRATION;
+    // Rounding in `a / (a + b)` may land a hair outside a bound the mapping itself respects.
+    let slack = 1e-9;
     shelf.share > 0.0
         && shelf.share < SHELF_MAX_SHARE
         && shelf.alpha.is_finite()
         && shelf.alpha > 0.0
         && shelf.beta.is_finite()
         && shelf.beta > 0.0
+        && shelf.retained() >= SHELF_MIN_RETAINED - slack
+        && (low - slack..=high + slack).contains(&shelf.concentration())
 }
 
 /// Log density of the single-copy component: its lobe, plus the shelf when the model has one.
@@ -1764,11 +1808,9 @@ mod tests {
         }
     }
 
-    /// A simplex probe at an absurd dispersion (a mean near 1e13) returns promptly, as it did before
-    /// the table: no allocation proportional to the mean.
+    /// The shelf model with a Pareto tail, over the NB-only synthetic spectrum's first 300 counts.
     #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn a_shelf_cost_at_an_extreme_dispersion_stays_bounded() {
+    fn shelf_problem() -> NativeMixtureFit {
         let histogram = native_synthetic(ErrorParams {
             singleton_probability: 0.85,
             tail_exponent: 1.8,
@@ -1781,14 +1823,77 @@ mod tests {
             .map(|(index, &count)| ((index + 1) as f64, f64::from(count)))
             .collect::<Vec<_>>()
             .into();
-        let problem = NativeMixtureFit {
+        NativeMixtureFit {
             observed_total: observed.iter().map(|&(_, count)| count).sum(),
             observed,
             peak: 50.0,
             fit_window_end: 300,
             error_model: ErrorModel::SingletonPareto,
             genome_model: GenomeModel::ShelfNegativeBinomial,
-        };
+        }
+    }
+
+    /// Whatever the simplex tries, the shelf stays off the error tail and never becomes a spike.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn shelf_coordinates_stay_inside_their_bounds() {
+        let problem = shelf_problem();
+        let (low, high) = SHELF_CONCENTRATION;
+        for share in [-50.0, 0.0, 50.0] {
+            for retained in [-50.0, 0.0, 50.0] {
+                for concentration in [-50.0, 0.0, 50.0] {
+                    let theta = [
+                        0.0,
+                        -3.0,
+                        0.0,
+                        1.0,
+                        0.5,
+                        1.7,
+                        share,
+                        retained,
+                        concentration,
+                    ];
+                    let shelf = problem.params(&theta).shelf.expect("the shelf model");
+                    assert!((0.0..=SHELF_MAX_SHARE).contains(&shelf.share), "{shelf:?}");
+                    assert!(
+                        (SHELF_MIN_RETAINED - 1e-12..=1.0).contains(&shelf.retained()),
+                        "{shelf:?}"
+                    );
+                    assert!(
+                        (low - 1e-12..=high + 1e-12).contains(&shelf.concentration()),
+                        "{shelf:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Each shelf start decodes to one of the starting shapes, with the histogram's share.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn shelf_starts_map_to_their_shapes() {
+        let problem = shelf_problem();
+        let starts = native_starts(&problem, 4.0, 0.12);
+        assert_eq!(starts.len(), 4 * 2 * SHELF_SHAPES.len());
+        for start in &starts {
+            let shelf = problem.params(start).shelf.expect("the shelf model");
+            assert!((shelf.share - 0.12).abs() < 1e-9, "{shelf:?}");
+            assert!(
+                SHELF_SHAPES.iter().any(|&(retained, concentration)| {
+                    (shelf.retained() - retained).abs() < 1e-9
+                        && (shelf.concentration() - concentration).abs() < 1e-9
+                }),
+                "{shelf:?}"
+            );
+        }
+    }
+
+    /// A simplex probe at an absurd dispersion (a mean near 1e13) returns promptly, as it did before
+    /// the table: no allocation proportional to the mean.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_shelf_cost_at_an_extreme_dispersion_stays_bounded() {
+        let problem = shelf_problem();
         for log_dispersion in [30.0, 60.0, 700.0] {
             let theta = vec![
                 0.0,
@@ -1898,6 +2003,9 @@ mod tests {
         );
         let fitted = selected.shelf.expect("the shelf model carries a shelf");
         assert!((0.05..=0.15).contains(&fitted.share), "{fitted:?}");
+        let (low, high) = SHELF_CONCENTRATION;
+        assert!(fitted.retained() >= SHELF_MIN_RETAINED, "{fitted:?}");
+        assert!((low..=high).contains(&fitted.concentration()), "{fitted:?}");
         assert_eq!(selected.hole_cutoff(1.0), Some(2));
     }
 
