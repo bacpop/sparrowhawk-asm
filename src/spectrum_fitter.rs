@@ -15,6 +15,8 @@ use argmin::{
 };
 use libm::lgamma;
 #[cfg(not(target_family = "wasm"))]
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(not(target_family = "wasm"))]
 use std::{fmt, sync::Arc};
 
 /// Genome lobes modelled: single-copy and two-copy. The two-copy lobe carries little weight but
@@ -65,6 +67,26 @@ pub(crate) fn fitted_distinct_total(histovec: &[u32], peak: usize) -> f64 {
     histovec[..top].iter().map(|&n| f64::from(n)).sum()
 }
 
+/// Starting shelf share, read off the histogram: k-mers between the valley and half the peak, where
+/// the NB lobe is thin, doubled for the shelf's upper half, over those up to twice the peak.
+#[cfg(not(target_family = "wasm"))]
+fn empirical_shelf_share(histovec: &[u32], valley: usize, peak: usize) -> f64 {
+    // `histovec[i]` holds count `i + 1`, so this sums counts `from..=to`.
+    let mass = |from: usize, to: usize| -> f64 {
+        histovec
+            .iter()
+            .take(to.min(histovec.len()))
+            .skip(from.saturating_sub(1))
+            .map(|&c| f64::from(c))
+            .sum()
+    };
+    let lobe = mass(valley, 2 * peak);
+    if lobe <= 0.0 {
+        return 0.05;
+    }
+    (2.0 * mass(valley, peak / 2) / lobe).clamp(0.01, 0.4)
+}
+
 const MAX_ITERS: u64 = 5_000;
 #[cfg(not(target_family = "wasm"))]
 const NATIVE_MAX_ITERS: u64 = 1_000;
@@ -74,6 +96,25 @@ const SIMPLEX_STEP: f64 = 0.5;
 /// makes an otherwise stationary simplex run to [`NATIVE_MAX_ITERS`].
 #[cfg(not(target_family = "wasm"))]
 const NATIVE_SD_TOLERANCE: f64 = 1e-4;
+/// The shelf never holds more than this share of single-copy k-mers, so it cannot swallow the lobe.
+#[cfg(not(target_family = "wasm"))]
+const SHELF_MAX_SHARE: f64 = 0.5;
+/// Starting shapes (a, b) for the shelf: uniform, and ramping up to the lobe.
+#[cfg(not(target_family = "wasm"))]
+const SHELF_SHAPES: [(f64, f64); 2] = [(1.0, 1.0), (3.0, 1.0)];
+/// Three more dimensions need more simplex steps than the NB fit's cap.
+#[cfg(not(target_family = "wasm"))]
+const SHELF_MAX_ITERS: u64 = 2_000;
+
+/// Single-copy k-mers that lost part of their coverage: a beta-binomial over the single-copy mean,
+/// rounded, holding `share` of the single-copy lobe.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Shelf {
+    pub(crate) share: f64,
+    pub(crate) alpha: f64,
+    pub(crate) beta: f64,
+}
 
 /// A fitted coverage model.
 #[derive(Clone, Copy, Debug)]
@@ -387,6 +428,8 @@ impl ErrorModel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GenomeModel {
     NegativeBinomial,
+    /// Negative-binomial lobes, plus a beta-binomial shelf under the single-copy one.
+    ShelfNegativeBinomial,
     // Retained for distribution helpers and comparison tests; native model selection uses only NB.
     #[allow(dead_code)]
     Normal,
@@ -397,8 +440,28 @@ impl fmt::Display for GenomeModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::NegativeBinomial => "negative_binomial",
+            Self::ShelfNegativeBinomial => "betabinomial_shelf+negative_binomial",
             Self::Normal => "normal",
         })
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl GenomeModel {
+    /// Parameters beyond the lobes' mean and dispersion: the shelf's share, a and b.
+    const fn extra_parameters(self) -> usize {
+        match self {
+            Self::ShelfNegativeBinomial => 3,
+            Self::NegativeBinomial | Self::Normal => 0,
+        }
+    }
+
+    /// The family of each copy-number lobe; a shelf only ever adds to the single-copy one.
+    pub(crate) const fn lobe(self) -> Self {
+        match self {
+            Self::ShelfNegativeBinomial => Self::NegativeBinomial,
+            other => other,
+        }
     }
 }
 
@@ -493,6 +556,8 @@ pub(crate) struct NativeSpectrumFit {
     pub(crate) mean: f64,
     pub(crate) dispersion: f64,
     pub(crate) error_params: ErrorParams,
+    /// The shelf under the single-copy lobe, when the genome model has one.
+    pub(crate) shelf: Option<Shelf>,
     pub(crate) genome_kmers: f64,
     pub(crate) error_kmers: f64,
     pub(crate) log_likelihood: f64,
@@ -519,7 +584,7 @@ impl NativeSpectrumFit {
     ) -> Self {
         let normalisers = [
             error_params.log_window_mass(fit_window_end),
-            native_log_genome_mass(mean, dispersion, genome_model, fit_window_end),
+            single_copy_log_mass(mean, dispersion, genome_model, None, fit_window_end),
             native_log_genome_mass(
                 REPEAT_LOBE_COPIES * mean,
                 dispersion,
@@ -536,10 +601,13 @@ impl NativeSpectrumFit {
             mean,
             dispersion,
             error_params,
+            shelf: None,
             genome_kmers: weights[1] * observed_total / normalisers[1].exp(),
             error_kmers: weights[0] * observed_total / normalisers[0].exp(),
             log_likelihood: -1.0,
-            bic: 2.0 + error_model.parameter_count() as f64 * observed_total.ln(),
+            bic: 2.0
+                + (error_model.parameter_count() + genome_model.extra_parameters()) as f64
+                    * observed_total.ln(),
             deviance: 1.0,
             fit_window_end,
             best_iterations: 1,
@@ -575,7 +643,13 @@ impl NativeSpectrumFit {
         let count = count as f64;
         let logs = [
             self.error_params.log_probability(count),
-            native_ln_genome(count, self.mean, self.dispersion, self.genome_model),
+            ln_single_copy(
+                count,
+                self.mean,
+                self.dispersion,
+                self.genome_model,
+                self.shelf,
+            ),
             native_ln_genome(
                 count,
                 REPEAT_LOBE_COPIES * self.mean,
@@ -596,6 +670,15 @@ impl NativeSpectrumFit {
         ]
     }
 
+    /// Expected in-window height of the shelf alone, the part of the single-copy component it holds.
+    pub(crate) fn shelf_height(&self, count: usize) -> Option<f64> {
+        self.shelf.map(|s| {
+            let ln = s.share.ln()
+                + ln_dbetabinom(count as f64, shelf_trials(self.mean), s.alpha, s.beta);
+            self.observed_total * self.w_single * (ln - self.component_log_normalisers[1]).exp()
+        })
+    }
+
     pub(crate) fn hole_cutoff(&self, budget: f64) -> Option<u16> {
         if self.genome_kmers <= 0.0
             || !self.mean.is_finite()
@@ -606,17 +689,25 @@ impl NativeSpectrumFit {
         }
         let allowed = budget / self.genome_kmers;
         let ceiling = (self.mean.round() as usize).min(self.fit_window_end);
+        let single = |count: f64| {
+            ln_single_copy(
+                count,
+                self.mean,
+                self.dispersion,
+                self.genome_model,
+                self.shelf,
+            )
+            .exp()
+        };
         let mut cdf = match self.genome_model {
-            GenomeModel::NegativeBinomial => ln_dnbinom(0.0, self.mean, self.dispersion).exp(),
+            GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => single(0.0),
             GenomeModel::Normal => {
                 normal_cdf((0.5 - self.mean) / (self.dispersion * self.mean).sqrt())
             }
         };
         let mut cutoff = 1usize;
         while cutoff < ceiling {
-            let next = cdf
-                + native_ln_genome(cutoff as f64, self.mean, self.dispersion, self.genome_model)
-                    .exp();
+            let next = cdf + single(cutoff as f64);
             if next > allowed {
                 return Some((cutoff.min(u16::MAX as usize) as u16).max(2));
             }
@@ -667,7 +758,7 @@ pub(crate) struct FitAttempt {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FitSearchResult {
     pub(crate) selected: Option<NativeSpectrumFit>,
-    pub(crate) attempts: [FitAttempt; 2],
+    pub(crate) attempts: [FitAttempt; 4],
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -690,6 +781,7 @@ struct NativeParams {
     mean: f64,
     dispersion: f64,
     error_params: ErrorParams,
+    shelf: Option<Shelf>,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -706,26 +798,36 @@ impl NativeMixtureFit {
                 ErrorModel::SingletonPareto => None,
             },
         };
+        let base = self.error_model.parameter_count();
+        let shelf = (self.genome_model == GenomeModel::ShelfNegativeBinomial).then(|| Shelf {
+            share: SHELF_MAX_SHARE * sigmoid(theta[base]),
+            alpha: theta[base + 1].exp(),
+            beta: theta[base + 2].exp(),
+        });
         NativeParams {
             ln_error,
             ln_single,
             ln_repeat,
             mean: match self.genome_model {
-                GenomeModel::NegativeBinomial => mode + dispersion - 1.0,
+                GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => {
+                    mode + dispersion - 1.0
+                }
                 GenomeModel::Normal => mode,
             },
             dispersion,
             error_params,
+            shelf,
         }
     }
 
-    fn log_normalisers(&self, params: NativeParams) -> [f64; 3] {
+    fn log_normalisers(&self, params: NativeParams, shelf_table: Option<&[f64]>) -> [f64; 3] {
         [
             params.error_params.log_window_mass(self.fit_window_end),
-            native_log_genome_mass(
+            single_copy_log_mass(
                 params.mean,
                 params.dispersion,
                 self.genome_model,
+                params.shelf.zip(shelf_table),
                 self.fit_window_end,
             ),
             native_log_genome_mass(
@@ -739,7 +841,8 @@ impl NativeMixtureFit {
 
     fn unpack(&self, theta: &[f64], cost: f64, iterations: u64) -> NativeSpectrumFit {
         let params = self.params(theta);
-        let normalisers = self.log_normalisers(params);
+        let table = params.shelf.map(|s| shelf_log_table(params.mean, s));
+        let normalisers = self.log_normalisers(params, table.as_deref());
         let w_error = params.ln_error.exp();
         let w_single = params.ln_single.exp();
         let w_repeat = params.ln_repeat.exp();
@@ -752,10 +855,14 @@ impl NativeMixtureFit {
             mean: params.mean,
             dispersion: params.dispersion,
             error_params: params.error_params,
+            shelf: params.shelf,
             genome_kmers: w_single * self.observed_total / normalisers[1].exp(),
             error_kmers: w_error * self.observed_total / normalisers[0].exp(),
             log_likelihood: -cost,
-            bic: 2.0 * cost + self.error_model.parameter_count() as f64 * self.observed_total.ln(),
+            bic: 2.0 * cost
+                + (self.error_model.parameter_count() + self.genome_model.extra_parameters())
+                    as f64
+                    * self.observed_total.ln(),
             deviance: 0.0,
             fit_window_end: self.fit_window_end,
             best_iterations: iterations,
@@ -799,13 +906,17 @@ impl CostFunction for NativeMixtureFit {
             || params.mean <= 0.0
             || params.error_params.tail_exponent <= 0.0
             || !(0.0..1.0).contains(&params.error_params.singleton_probability)
+            || params.shelf.is_some_and(|s| !shelf_is_valid(s))
         {
             return Ok(f64::INFINITY);
         }
-        let normalisers = self.log_normalisers(params);
+        // Built once per evaluation, then read for the window mass and at every observed count.
+        let table = params.shelf.map(|s| shelf_log_table(params.mean, s));
+        let normalisers = self.log_normalisers(params, table.as_deref());
         if normalisers.iter().any(|value| !value.is_finite()) {
             return Ok(f64::INFINITY);
         }
+        let shelf = params.shelf.zip(table.as_deref());
 
         let likelihood = self
             .observed
@@ -813,9 +924,10 @@ impl CostFunction for NativeMixtureFit {
             .map(|&(count, weight)| {
                 let error =
                     params.ln_error + params.error_params.log_probability(count) - normalisers[0];
-                let single = params.ln_single
-                    + native_ln_genome(count, params.mean, params.dispersion, self.genome_model)
-                    - normalisers[1];
+                let lobe =
+                    native_ln_genome(count, params.mean, params.dispersion, self.genome_model);
+                let single =
+                    params.ln_single + mix_single_copy(lobe, count, shelf) - normalisers[1];
                 let repeat = params.ln_repeat
                     + native_ln_genome(
                         count,
@@ -863,47 +975,151 @@ pub(crate) fn fit_native_spectrum(
         2.0
     };
 
-    let run = |error_model, genome_model| {
-        fit_native_candidate(
-            NativeMixtureFit {
-                observed: Arc::clone(&observed),
-                observed_total,
-                peak: peak as f64,
-                fit_window_end: top,
-                error_model,
-                genome_model,
-            },
-            valley,
-            peak,
-            hint,
-            NATIVE_MAX_ITERS,
-        )
-    };
-    let (pareto_nb, weibull_nb) = rayon::join(
-        || run(ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
-        || {
-            run(
-                ErrorModel::FreeSingletonWeibull,
-                GenomeModel::NegativeBinomial,
-            )
-        },
-    );
-    let attempts = [pareto_nb, weibull_nb];
+    let shelf_share = empirical_shelf_share(histovec, valley, peak);
+    const CONFIGURATIONS: [(ErrorModel, GenomeModel); 4] = [
+        (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
+        (
+            ErrorModel::FreeSingletonWeibull,
+            GenomeModel::NegativeBinomial,
+        ),
+        (
+            ErrorModel::SingletonPareto,
+            GenomeModel::ShelfNegativeBinomial,
+        ),
+        (
+            ErrorModel::FreeSingletonWeibull,
+            GenomeModel::ShelfNegativeBinomial,
+        ),
+    ];
+    let problems: Vec<NativeMixtureFit> = CONFIGURATIONS
+        .iter()
+        .map(|&(error_model, genome_model)| NativeMixtureFit {
+            observed: Arc::clone(&observed),
+            observed_total,
+            peak: peak as f64,
+            fit_window_end: top,
+            error_model,
+            genome_model,
+        })
+        .collect();
+    // Every start of every candidate goes into one pool, so no thread idles while the candidate with
+    // the most starts (the Weibull shelf) is still running.
+    let jobs: Vec<(usize, Vec<f64>)> = problems
+        .iter()
+        .enumerate()
+        .flat_map(|(index, problem)| {
+            native_starts(problem, hint, shelf_share)
+                .into_iter()
+                .map(move |start| (index, start))
+        })
+        .collect();
+    let outcomes: Vec<(usize, NativeRunOutcome)> = jobs
+        .into_par_iter()
+        .filter_map(|(index, start)| {
+            let problem = &problems[index];
+            let max_iters = native_max_iters(problem.genome_model);
+            run_native_one(problem.clone(), start, max_iters)
+                .ok()
+                .map(|outcome| (index, outcome))
+        })
+        .collect();
+    let mut per_problem: Vec<Vec<NativeRunOutcome>> = problems.iter().map(|_| Vec::new()).collect();
+    for (index, outcome) in outcomes {
+        per_problem[index].push(outcome);
+    }
+    let attempts: Vec<FitAttempt> = problems
+        .iter()
+        .zip(per_problem)
+        .map(|(problem, outcomes)| attempt_from(problem, outcomes, valley, peak))
+        .collect();
+    let attempts: [FitAttempt; 4] = attempts.try_into().expect("one attempt per configuration");
     let selected = select_native_fit(&attempts);
     Ok(FitSearchResult { selected, attempts })
 }
 
+/// The shelf's three extra dimensions need more simplex steps than the NB fit.
 #[cfg(not(target_family = "wasm"))]
+fn native_max_iters(model: GenomeModel) -> u64 {
+    if model == GenomeModel::ShelfNegativeBinomial {
+        SHELF_MAX_ITERS
+    } else {
+        NATIVE_MAX_ITERS
+    }
+}
+
+/// One candidate's starts run in turn, as the whole search once did; kept for tests.
+#[cfg(all(test, not(target_family = "wasm")))]
 fn fit_native_candidate(
     problem: NativeMixtureFit,
     valley: usize,
     empirical_peak: usize,
     dispersion_hint: f64,
+    shelf_share: f64,
     max_iters: u64,
+) -> FitAttempt {
+    let outcomes = native_starts(&problem, dispersion_hint, shelf_share)
+        .into_iter()
+        .filter_map(|start| run_native_one(problem.clone(), start, max_iters).ok())
+        .collect();
+    attempt_from(&problem, outcomes, valley, empirical_peak)
+}
+
+/// The best converged start, validated into an attempt; `OptimisationFailed` when none converged.
+/// Outcomes arrive in start order, so ties keep the earliest start.
+#[cfg(not(target_family = "wasm"))]
+fn attempt_from(
+    problem: &NativeMixtureFit,
+    outcomes: Vec<NativeRunOutcome>,
+    valley: usize,
+    empirical_peak: usize,
 ) -> FitAttempt {
     let mut best: Option<(f64, Vec<f64>, u64)> = None;
     let mut total_iterations = 0u64;
     let mut capped_starts = 0u32;
+    for outcome in outcomes {
+        total_iterations = total_iterations.saturating_add(outcome.iterations);
+        capped_starts += u32::from(outcome.hit_cap);
+        let Some((cost, params)) = outcome.converged else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(best_cost, _, _)| cost < *best_cost)
+        {
+            best = Some((cost, params, outcome.iterations));
+        }
+    }
+    let Some((cost, params, best_iterations)) = best else {
+        return FitAttempt {
+            error_model: problem.error_model,
+            genome_model: problem.genome_model,
+            candidate: None,
+            rejection: Some(FitRejection::OptimisationFailed),
+            total_iterations,
+            capped_starts,
+        };
+    };
+    let fit = problem.unpack(&params, cost, best_iterations);
+    let rejection = validate_native_fit(&fit, valley, empirical_peak);
+    FitAttempt {
+        error_model: problem.error_model,
+        genome_model: problem.genome_model,
+        candidate: Some(fit),
+        rejection,
+        total_iterations,
+        capped_starts,
+    }
+}
+
+/// Every start for one candidate: dispersion seeds times error starts, and for the shelf, each of
+/// those with the histogram's plateau share and each starting shape.
+#[cfg(not(target_family = "wasm"))]
+fn native_starts(
+    problem: &NativeMixtureFit,
+    dispersion_hint: f64,
+    shelf_share: f64,
+) -> Vec<Vec<f64>> {
+    let mut starts = Vec::new();
     for seed in DISPERSION_SEEDS
         .iter()
         .copied()
@@ -927,43 +1143,19 @@ fn fit_native_candidate(
             if problem.error_model == ErrorModel::FreeSingletonWeibull {
                 start.push(shape.ln());
             }
-            let Ok(outcome) = run_native_one(problem.clone(), start, max_iters) else {
-                continue;
-            };
-            total_iterations = total_iterations.saturating_add(outcome.iterations);
-            capped_starts += u32::from(outcome.hit_cap);
-            let Some((cost, params)) = outcome.converged else {
-                continue;
-            };
-            if best
-                .as_ref()
-                .is_none_or(|(best_cost, _, _)| cost < *best_cost)
-            {
-                best = Some((cost, params, outcome.iterations));
+            if problem.genome_model == GenomeModel::ShelfNegativeBinomial {
+                let fraction = shelf_share / SHELF_MAX_SHARE;
+                for &(alpha, beta) in &SHELF_SHAPES {
+                    let mut shelf_start = start.clone();
+                    shelf_start.extend([(fraction / (1.0 - fraction)).ln(), alpha.ln(), beta.ln()]);
+                    starts.push(shelf_start);
+                }
+            } else {
+                starts.push(start);
             }
         }
     }
-
-    let Some((cost, params, best_iterations)) = best else {
-        return FitAttempt {
-            error_model: problem.error_model,
-            genome_model: problem.genome_model,
-            candidate: None,
-            rejection: Some(FitRejection::OptimisationFailed),
-            total_iterations,
-            capped_starts,
-        };
-    };
-    let fit = problem.unpack(&params, cost, best_iterations);
-    let rejection = validate_native_fit(&fit, valley, empirical_peak);
-    FitAttempt {
-        error_model: problem.error_model,
-        genome_model: problem.genome_model,
-        candidate: Some(fit),
-        rejection,
-        total_iterations,
-        capped_starts,
-    }
+    starts
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1029,6 +1221,7 @@ fn validate_native_fit(
         || fit.mean <= 0.0
         || !fit.dispersion.is_finite()
         || fit.dispersion <= 1.0
+        || fit.shelf.is_some_and(|s| !shelf_is_valid(s))
     {
         return Some(FitRejection::InvalidComponents);
     }
@@ -1051,12 +1244,12 @@ fn validate_native_fit(
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn select_native_fit(attempts: &[FitAttempt; 2]) -> Option<NativeSpectrumFit> {
+fn select_native_fit(attempts: &[FitAttempt]) -> Option<NativeSpectrumFit> {
     let mut selected: Option<NativeSpectrumFit> = None;
-    // The native search only runs negative-binomial genome candidates.
+    // The native search only runs negative-binomial lobes, with or without a shelf.
     for attempt in attempts
         .iter()
-        .filter(|attempt| attempt.genome_model == GenomeModel::NegativeBinomial)
+        .filter(|attempt| attempt.genome_model != GenomeModel::Normal)
     {
         let Some(candidate) = attempt
             .rejection
@@ -1089,7 +1282,9 @@ fn discrete_nb_mode(mean: f64, dispersion: f64) -> usize {
 #[cfg(not(target_family = "wasm"))]
 fn native_genome_mode(mean: f64, dispersion: f64, model: GenomeModel) -> usize {
     match model {
-        GenomeModel::NegativeBinomial => discrete_nb_mode(mean, dispersion),
+        GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => {
+            discrete_nb_mode(mean, dispersion)
+        }
         GenomeModel::Normal => (mean + 0.5).floor().max(0.0) as usize,
     }
 }
@@ -1097,7 +1292,9 @@ fn native_genome_mode(mean: f64, dispersion: f64, model: GenomeModel) -> usize {
 #[cfg(not(target_family = "wasm"))]
 fn native_ln_genome(count: f64, mean: f64, dispersion: f64, model: GenomeModel) -> f64 {
     match model {
-        GenomeModel::NegativeBinomial => ln_dnbinom(count, mean, dispersion),
+        GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => {
+            ln_dnbinom(count, mean, dispersion)
+        }
         GenomeModel::Normal => {
             ln_normal_between(count - 0.5, count + 0.5, mean, (dispersion * mean).sqrt())
         }
@@ -1107,11 +1304,112 @@ fn native_ln_genome(count: f64, mean: f64, dispersion: f64, model: GenomeModel) 
 #[cfg(not(target_family = "wasm"))]
 fn native_log_genome_mass(mean: f64, dispersion: f64, model: GenomeModel, top: usize) -> f64 {
     match model {
-        GenomeModel::NegativeBinomial => native_log_nb_mass(mean, dispersion, top),
+        GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => {
+            native_log_nb_mass(mean, dispersion, top)
+        }
         GenomeModel::Normal => {
             ln_normal_between(0.5, top as f64 + 0.5, mean, (dispersion * mean).sqrt())
         }
     }
+}
+
+/// Natural log of the beta-binomial density over `trials` trials; minus infinity above them.
+#[cfg(not(target_family = "wasm"))]
+fn ln_dbetabinom(x: f64, trials: f64, alpha: f64, beta: f64) -> f64 {
+    if x > trials {
+        return f64::NEG_INFINITY;
+    }
+    lgamma(trials + 1.0) - lgamma(x + 1.0) - lgamma(trials - x + 1.0)
+        + lgamma(x + alpha)
+        + lgamma(trials - x + beta)
+        - lgamma(trials + alpha + beta)
+        - (lgamma(alpha) + lgamma(beta) - lgamma(alpha + beta))
+}
+
+/// The shelf's trials: the single-copy mean, rounded, as the beta-binomial needs a whole number.
+#[cfg(not(target_family = "wasm"))]
+fn shelf_trials(mean: f64) -> f64 {
+    mean.round().max(1.0)
+}
+
+/// A share strictly inside (0, [`SHELF_MAX_SHARE`]) and finite, positive shapes.
+#[cfg(not(target_family = "wasm"))]
+fn shelf_is_valid(shelf: Shelf) -> bool {
+    shelf.share > 0.0
+        && shelf.share < SHELF_MAX_SHARE
+        && shelf.alpha.is_finite()
+        && shelf.alpha > 0.0
+        && shelf.beta.is_finite()
+        && shelf.beta > 0.0
+}
+
+/// Log density of the single-copy component: its lobe, plus the shelf when the model has one.
+#[cfg(not(target_family = "wasm"))]
+fn ln_single_copy(
+    count: f64,
+    mean: f64,
+    dispersion: f64,
+    model: GenomeModel,
+    shelf: Option<Shelf>,
+) -> f64 {
+    let lobe = native_ln_genome(count, mean, dispersion, model);
+    shelf.map_or(lobe, |s| {
+        lse2(
+            (1.0 - s.share).ln() + lobe,
+            s.share.ln() + ln_dbetabinom(count, shelf_trials(mean), s.alpha, s.beta),
+        )
+    })
+}
+
+/// The shelf's log density at every count `0..=trials`, from the ratio of consecutive terms, so the
+/// fit's hot loop pays four logs per count instead of eight log-gammas.
+#[cfg(not(target_family = "wasm"))]
+fn shelf_log_table(mean: f64, shelf: Shelf) -> Vec<f64> {
+    let trials = shelf_trials(mean);
+    let (alpha, beta) = (shelf.alpha, shelf.beta);
+    let mut ln =
+        lgamma(trials + beta) + lgamma(alpha + beta) - lgamma(trials + alpha + beta) - lgamma(beta);
+    let mut table = Vec::with_capacity(trials as usize + 1);
+    table.push(ln);
+    for x in 0..trials as usize {
+        let x = x as f64;
+        ln +=
+            (trials - x).ln() + (x + alpha).ln() - (x + 1.0).ln() - (trials - x - 1.0 + beta).ln();
+        table.push(ln);
+    }
+    table
+}
+
+/// The single-copy log density from its lobe's, adding the shelf read from its table.
+#[cfg(not(target_family = "wasm"))]
+fn mix_single_copy(lobe: f64, count: f64, shelf: Option<(Shelf, &[f64])>) -> f64 {
+    shelf.map_or(lobe, |(s, table)| {
+        let at = table
+            .get(count as usize)
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY);
+        lse2((1.0 - s.share).ln() + lobe, s.share.ln() + at)
+    })
+}
+
+/// Log of the single-copy component's mass inside `[1, top]`, the shelf read from its table.
+#[cfg(not(target_family = "wasm"))]
+fn single_copy_log_mass(
+    mean: f64,
+    dispersion: f64,
+    model: GenomeModel,
+    shelf: Option<(Shelf, &[f64])>,
+    top: usize,
+) -> f64 {
+    let lobe = native_log_genome_mass(mean, dispersion, model, top);
+    shelf.map_or(lobe, |(s, table)| {
+        let shelf_mass = table
+            .iter()
+            .take(top + 1)
+            .skip(1)
+            .fold(f64::NEG_INFINITY, |acc, &ln| lse2(acc, ln));
+        lse2((1.0 - s.share).ln() + lobe, s.share.ln() + shelf_mass)
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1401,11 +1699,134 @@ mod tests {
             error_model: ErrorModel::SingletonPareto,
             genome_model: GenomeModel::NegativeBinomial,
         };
-        let attempt = fit_native_candidate(problem, 12, 50, 4.0, 1);
+        let attempt = fit_native_candidate(problem, 12, 50, 4.0, 0.05, 1);
         assert_eq!(attempt.capped_starts, 8);
         assert_eq!(attempt.total_iterations, 8);
         assert!(attempt.candidate.is_none());
         assert_eq!(attempt.rejection, Some(FitRejection::OptimisationFailed));
+    }
+
+    /// A(1, 1) beta-binomial is uniform over its trials, and any beta-binomial sums to one.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_beta_binomial_is_normalised_and_uniform_at_one_one() {
+        for x in 0..=50 {
+            assert!((ln_dbetabinom(f64::from(x), 50.0, 1.0, 1.0).exp() - 1.0 / 51.0).abs() < 1e-12);
+        }
+        let total: f64 = (0..=60)
+            .map(|x| ln_dbetabinom(f64::from(x), 60.0, 2.5, 0.7).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-10);
+        assert_eq!(ln_dbetabinom(61.0, 60.0, 2.5, 0.7), f64::NEG_INFINITY);
+    }
+
+    /// The fit's recurrence table agrees with the direct log-gamma density at every count.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_shelf_table_matches_the_direct_density() {
+        for (alpha, beta) in [(1.0, 1.0), (2.5, 0.7), (0.4, 0.8), (3.0, 1.0)] {
+            let shelf = Shelf {
+                share: 0.1,
+                alpha,
+                beta,
+            };
+            let table = shelf_log_table(147.4, shelf);
+            assert_eq!(table.len(), 148);
+            for (count, &ln) in table.iter().enumerate() {
+                let direct = ln_dbetabinom(count as f64, 147.0, alpha, beta);
+                assert!((ln - direct).abs() < 1e-9, "a={alpha} b={beta} x={count}");
+            }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn single_copy_mass_mixes_the_lobe_and_the_shelf() {
+        let shelf = Shelf {
+            share: 0.12,
+            alpha: 2.0,
+            beta: 0.8,
+        };
+        for shelf in [None, Some(shelf)] {
+            let table = shelf.map(|s| shelf_log_table(53.0, s));
+            let direct = (1..=300).fold(f64::NEG_INFINITY, |acc, count| {
+                lse2(
+                    acc,
+                    ln_single_copy(
+                        f64::from(count),
+                        53.0,
+                        4.0,
+                        GenomeModel::ShelfNegativeBinomial,
+                        shelf,
+                    ),
+                )
+            });
+            let mass = single_copy_log_mass(
+                53.0,
+                4.0,
+                GenomeModel::ShelfNegativeBinomial,
+                shelf.zip(table.as_deref()),
+                300,
+            );
+            assert!(
+                (mass - direct).abs() < 1e-9,
+                "{shelf:?}: {mass} != {direct}"
+            );
+        }
+    }
+
+    /// Twice the plateau below half the peak, over everything from the valley to twice the peak.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_empirical_shelf_share_reads_the_plateau() {
+        let plateau = 1_000.0;
+        let mut histogram = vec![0u32; 400];
+        for count in 10..=99 {
+            histogram[count - 1] = plateau as u32;
+        }
+        for count in 100..=120 {
+            histogram[count - 1] = 40_000;
+        }
+        let expected = 2.0 * 41.0 * plateau / (90.0 * plateau + 21.0 * 40_000.0);
+        assert!((empirical_shelf_share(&histogram, 10, 100) - expected).abs() < 1e-12);
+        for count in 10..=99 {
+            histogram[count - 1] = 0;
+        }
+        assert_eq!(empirical_shelf_share(&histogram, 10, 100), 0.01);
+    }
+
+    /// A spectrum with a tenth of its single-copy k-mers in a uniform shelf selects the shelf model,
+    /// and the hole guard then counts the shelf's low counts as genome.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_shelf_model_recovers_a_synthetic_shelf() {
+        let error = ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 1.8,
+            weibull_shape: None,
+        };
+        let (mean, share) = (53.0, 0.1);
+        let mut histogram = vec![0u32; 601];
+        for (index, bin) in histogram.iter_mut().enumerate() {
+            let count = (index + 1) as f64;
+            let error_height = 400_000.0 * error.log_probability(count).exp();
+            let single = 200_000.0
+                * ((1.0 - share) * ln_dnbinom(count, mean, 4.0).exp()
+                    + share * ln_dbetabinom(count, mean, 1.0, 1.0).exp());
+            let repeat = 15_000.0 * ln_dnbinom(count, 2.0 * mean, 4.0).exp();
+            *bin = (error_height + single + repeat).round() as u32;
+        }
+        let result =
+            fit_native_spectrum(&histogram, 12, 50, 4.0).expect("synthetic fit should run");
+        let selected = result.selected.expect("one candidate should survive");
+        assert_eq!(
+            selected.genome_model,
+            GenomeModel::ShelfNegativeBinomial,
+            "{result:?}"
+        );
+        let fitted = selected.shelf.expect("the shelf model carries a shelf");
+        assert!((0.05..=0.15).contains(&fitted.share), "{fitted:?}");
+        assert_eq!(selected.hole_cutoff(1.0), Some(2));
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -1535,11 +1956,30 @@ mod tests {
         };
         let result = fit_native_spectrum(&native_synthetic(error), 12, 50, 4.0)
             .expect("synthetic fit should run");
-        assert_eq!(result.attempts.len(), 2);
-        assert!(result
+        let configurations: Vec<_> = result
             .attempts
             .iter()
-            .all(|attempt| attempt.genome_model == GenomeModel::NegativeBinomial));
+            .map(|attempt| (attempt.error_model, attempt.genome_model))
+            .collect();
+        assert_eq!(
+            configurations,
+            [
+                (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
+                (
+                    ErrorModel::FreeSingletonWeibull,
+                    GenomeModel::NegativeBinomial
+                ),
+                (
+                    ErrorModel::SingletonPareto,
+                    GenomeModel::ShelfNegativeBinomial
+                ),
+                (
+                    ErrorModel::FreeSingletonWeibull,
+                    GenomeModel::ShelfNegativeBinomial
+                ),
+            ]
+        );
+        // No shelf in the spectrum, so BIC must keep the plain NB.
         let selected = result.selected.expect("one candidate should survive");
         assert_eq!(selected.genome_model, GenomeModel::NegativeBinomial);
         assert_eq!(

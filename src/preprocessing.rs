@@ -1173,7 +1173,7 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
             &format!(
                 "Spectrum fit selected: error_model={} genome_model={} log_likelihood={:.6e} bic={:.6e} deviance={:.6e} \
                  mean={:.1} mode={} repeat_mode={} dispersion={:.2} singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} \
-                 w=({:.3}/{:.3}/{:.3}) genome_kmers={:.3e} error_kmers={:.3e} crossover={} \
+                 shelf={} w=({:.3}/{:.3}/{:.3}) genome_kmers={:.3e} error_kmers={:.3e} crossover={} \
                  hole_cutoff={} best_iterations={} elapsed_ms={}",
                 fit.error_model,
                 fit.genome_model,
@@ -1187,6 +1187,7 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
                 fit.error_params.singleton_probability,
                 fit.error_params.tail_exponent,
                 fit.error_params.weibull_shape.map_or_else(|| "n/a".to_string(), |shape| format!("{shape:.6}")),
+                shelf_summary(&fit),
                 fit.w_error,
                 fit.w_single,
                 fit.w_repeat,
@@ -1213,9 +1214,23 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
     }
 }
 
+/// The fitted shelf, or `none` for a model without one.
+#[cfg(not(target_family = "wasm"))]
+fn shelf_summary(fit: &NativeSpectrumFit) -> String {
+    fit.shelf.map_or_else(
+        || "none".to_string(),
+        |s| {
+            format!(
+                "(share={:.4} alpha={:.3} beta={:.3})",
+                s.share, s.alpha, s.beta
+            )
+        },
+    )
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn log_native_fit_attempt(attempt: &FitAttempt) {
-    let selection_eligible = attempt.genome_model == GenomeModel::NegativeBinomial;
+    let selection_eligible = attempt.genome_model != GenomeModel::Normal;
     if let Some(fit) = attempt.candidate {
         let status = attempt.rejection.map_or_else(
             || "accepted".to_string(),
@@ -1225,7 +1240,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
             &format!(
                 "Spectrum fit candidate: error_model={} genome_model={} status={} log_likelihood={:.6e} bic={:.6e} \
                  deviance={:.6e} mode={} repeat_mode={} error_mode={} mean={:.1} dispersion={:.2} \
-                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} total_iterations={} capped_starts={} best_iterations={} selection_eligible={}",
+                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} shelf={} total_iterations={} capped_starts={} best_iterations={} selection_eligible={}",
                 attempt.error_model,
                 attempt.genome_model,
                 status,
@@ -1240,6 +1255,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                 fit.error_params.singleton_probability,
                 fit.error_params.tail_exponent,
                 fit.error_params.weibull_shape.map_or_else(|| "n/a".to_string(), |shape| format!("{shape:.6}")),
+                shelf_summary(&fit),
                 attempt.total_iterations,
                 attempt.capped_starts,
                 fit.best_iterations,
@@ -2380,6 +2396,26 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
                     RGBColor(30, 90, 220).stroke_width(1),
                 )
             });
+        if fit.shelf.is_some() {
+            chart
+                .draw_series(DashedLineSeries::new(
+                    (1..=plot_end.min(fit.fit_window_end))
+                        .filter_map(|count| Some((count as f64, fit.shelf_height(count)?)))
+                        .filter(|&(_, height)| height > 0.0)
+                        .map(|(count, height)| (count, transform_plot_y(height, y_axis))),
+                    3,
+                    3,
+                    RGBColor(30, 90, 220).stroke_width(1),
+                ))
+                .unwrap()
+                .label("Shelf (beta-binomial)")
+                .legend(|(x, y)| {
+                    PathElement::new(
+                        vec![(x, y), (x + 16, y)],
+                        RGBColor(30, 90, 220).stroke_width(1),
+                    )
+                });
+        }
         chart
             .draw_series(DashedLineSeries::new(
                 components
@@ -2391,7 +2427,7 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
                 RGBColor(100, 100, 100).stroke_width(1),
             ))
             .unwrap()
-            .label(format!("Two-copy ({})", fit.genome_model))
+            .label(format!("Two-copy ({})", fit.genome_model.lobe()))
             .legend(|(x, y)| {
                 PathElement::new(
                     vec![(x, y), (x + 16, y)],
