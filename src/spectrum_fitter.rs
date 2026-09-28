@@ -841,7 +841,9 @@ impl NativeMixtureFit {
 
     fn unpack(&self, theta: &[f64], cost: f64, iterations: u64) -> NativeSpectrumFit {
         let params = self.params(theta);
-        let table = params.shelf.map(|s| shelf_log_table(params.mean, s));
+        let table = params
+            .shelf
+            .map(|s| shelf_log_table(params.mean, s, self.fit_window_end));
         let normalisers = self.log_normalisers(params, table.as_deref());
         let w_error = params.ln_error.exp();
         let w_single = params.ln_single.exp();
@@ -911,7 +913,9 @@ impl CostFunction for NativeMixtureFit {
             return Ok(f64::INFINITY);
         }
         // Built once per evaluation, then read for the window mass and at every observed count.
-        let table = params.shelf.map(|s| shelf_log_table(params.mean, s));
+        let table = params
+            .shelf
+            .map(|s| shelf_log_table(params.mean, s, self.fit_window_end));
         let normalisers = self.log_normalisers(params, table.as_deref());
         if normalisers.iter().any(|value| !value.is_finite()) {
             return Ok(f64::INFINITY);
@@ -1361,17 +1365,19 @@ fn ln_single_copy(
     })
 }
 
-/// The shelf's log density at every count `0..=trials`, from the ratio of consecutive terms, so the
-/// fit's hot loop pays four logs per count instead of eight log-gammas.
+/// The shelf's log density at every count `0..=min(trials, top)`, from the ratio of consecutive terms,
+/// so the fit's hot loop pays four logs per count instead of eight log-gammas. Only counts inside the
+/// fit window are ever read, and mid-search the mean (so the trials) is unbounded.
 #[cfg(not(target_family = "wasm"))]
-fn shelf_log_table(mean: f64, shelf: Shelf) -> Vec<f64> {
+fn shelf_log_table(mean: f64, shelf: Shelf, top: usize) -> Vec<f64> {
     let trials = shelf_trials(mean);
+    let last = trials.min(top as f64) as usize;
     let (alpha, beta) = (shelf.alpha, shelf.beta);
     let mut ln =
         lgamma(trials + beta) + lgamma(alpha + beta) - lgamma(trials + alpha + beta) - lgamma(beta);
-    let mut table = Vec::with_capacity(trials as usize + 1);
+    let mut table = Vec::with_capacity(last + 1);
     table.push(ln);
-    for x in 0..trials as usize {
+    for x in 0..last {
         let x = x as f64;
         ln +=
             (trials - x).ln() + (x + alpha).ln() - (x + 1.0).ln() - (trials - x - 1.0 + beta).ln();
@@ -1730,12 +1736,78 @@ mod tests {
                 alpha,
                 beta,
             };
-            let table = shelf_log_table(147.4, shelf);
+            let table = shelf_log_table(147.4, shelf, 1_000);
             assert_eq!(table.len(), 148);
             for (count, &ln) in table.iter().enumerate() {
                 let direct = ln_dbetabinom(count as f64, 147.0, alpha, beta);
                 assert!((ln - direct).abs() < 1e-9, "a={alpha} b={beta} x={count}");
             }
+            // A window shorter than the trials cuts the table without changing its values.
+            let short = shelf_log_table(147.4, shelf, 60);
+            assert_eq!(short.len(), 61);
+            assert_eq!(short[..], table[..61]);
+        }
+    }
+
+    /// Mid-search the mean is unbounded, so the table must stop at the fit window, however large it is.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_shelf_table_never_outgrows_the_fit_window() {
+        let shelf = Shelf {
+            share: 0.1,
+            alpha: 1.0,
+            beta: 1.0,
+        };
+        for mean in [1e6, 1e12, 1e19, 1e300] {
+            let table = shelf_log_table(mean, shelf, 300);
+            assert_eq!(table.len(), 301, "mean {mean}");
+        }
+    }
+
+    /// A simplex probe at an absurd dispersion (a mean near 1e13) returns promptly, as it did before
+    /// the table: no allocation proportional to the mean.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_shelf_cost_at_an_extreme_dispersion_stays_bounded() {
+        let histogram = native_synthetic(ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 1.8,
+            weibull_shape: None,
+        });
+        let observed: Arc<[(f64, f64)]> = histogram[..300]
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(index, &count)| ((index + 1) as f64, f64::from(count)))
+            .collect::<Vec<_>>()
+            .into();
+        let problem = NativeMixtureFit {
+            observed_total: observed.iter().map(|&(_, count)| count).sum(),
+            observed,
+            peak: 50.0,
+            fit_window_end: 300,
+            error_model: ErrorModel::SingletonPareto,
+            genome_model: GenomeModel::ShelfNegativeBinomial,
+        };
+        for log_dispersion in [30.0, 60.0, 700.0] {
+            let theta = vec![
+                0.0,
+                -3.0,
+                0.0,
+                log_dispersion,
+                1.8f64.ln(),
+                1.7,
+                -1.0,
+                0.0,
+                0.0,
+            ];
+            let started = std::time::Instant::now();
+            let cost = problem.cost(&theta).expect("the cost never errors");
+            assert!(cost.is_finite() || cost == f64::INFINITY);
+            assert!(
+                started.elapsed().as_secs() < 5,
+                "log dispersion {log_dispersion}"
+            );
         }
     }
 
@@ -1748,7 +1820,7 @@ mod tests {
             beta: 0.8,
         };
         for shelf in [None, Some(shelf)] {
-            let table = shelf.map(|s| shelf_log_table(53.0, s));
+            let table = shelf.map(|s| shelf_log_table(53.0, s, 300));
             let direct = (1..=300).fold(f64::NEG_INFINITY, |acc, count| {
                 lse2(
                     acc,
