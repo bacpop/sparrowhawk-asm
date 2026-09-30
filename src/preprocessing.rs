@@ -1245,6 +1245,7 @@ fn shelf_summary(fit: &NativeSpectrumFit) -> String {
 fn log_native_fit_attempt(attempt: &FitAttempt) {
     let selection_eligible = attempt.genome_model != GenomeModel::Normal;
     if let Some(fit) = attempt.candidate {
+        let log_window_masses = fit.component_log_window_masses();
         let status = attempt.rejection.map_or_else(
             || "accepted".to_string(),
             |reason| format!("rejected:{reason}"),
@@ -1253,7 +1254,10 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
             &format!(
                 "Spectrum fit candidate: error_model={} genome_model={} status={} log_likelihood={:.6e} bic={:.6e} \
                  deviance={:.6e} mode={} repeat_mode={} repeat_ratio={:.3} error_mode={} mean={:.1} dispersion={:.2} \
-                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} shelf={} total_iterations={} capped_starts={} best_iterations={} selection_eligible={}",
+                 singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} shelf={} \
+                 component_kmers=({:.3e}/{:.3e}/{:.3e}) component_mass_ratio={:.6e} \
+                 log_window_mass=({:.6e}/{:.6e}/{:.6e}) mode_roundtrip_error={:.6e} \
+                 total_iterations={} capped_starts={} best_iterations={} selection_eligible={}",
                 attempt.error_model,
                 attempt.genome_model,
                 status,
@@ -1270,6 +1274,14 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                 fit.error_params.tail_exponent,
                 fit.error_params.weibull_shape.map_or_else(|| "n/a".to_string(), |shape| format!("{shape:.6}")),
                 shelf_summary(&fit),
+                fit.error_kmers,
+                fit.genome_kmers,
+                fit.repeat_kmers,
+                fit.component_total_ratio(),
+                log_window_masses[0],
+                log_window_masses[1],
+                log_window_masses[2],
+                fit.mode_roundtrip_error(),
                 attempt.total_iterations,
                 attempt.capped_starts,
                 fit.best_iterations,
