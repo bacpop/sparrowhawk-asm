@@ -21,7 +21,7 @@ use std::{fmt, sync::Arc};
 
 /// Genome lobes modelled: single-copy and two-copy
 const REPEAT_LOBE_COPIES: f64 = 2.0;
-/// Ratio we allow the second lobe (repeats lobe) to float in 
+/// Ratio we allow the second lobe (repeats lobe) to float in
 #[cfg(not(target_family = "wasm"))]
 const REPEAT_RATIO: (f64, f64) = (1.5, 2.0);
 /// Where the ratio starts: just under a double, so the simplex has room on both sides.
@@ -66,6 +66,11 @@ pub(crate) fn fit_window_end(histogram_len: usize, peak: usize) -> usize {
 pub(crate) fn fitted_distinct_total(histovec: &[u32], peak: usize) -> f64 {
     let top = fit_window_end(histovec.len(), peak);
     histovec[..top].iter().map(|&n| f64::from(n)).sum()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn full_spectrum_distinct_total(histovec: &[u32]) -> f64 {
+    histovec.iter().map(|&n| f64::from(n)).sum()
 }
 
 /// Starting shelf share, read off the histogram: k-mers between the valley and half the peak, where
@@ -121,6 +126,15 @@ fn shelf_concentration_bounds(retained: f64) -> (f64, f64) {
 /// Three more dimensions need more simplex steps than the NB fit's cap.
 #[cfg(not(target_family = "wasm"))]
 const SHELF_MAX_ITERS: u64 = 2_000;
+/// Allow modest fit/sketch error, but not component totals larger than the whole spectrum.
+#[cfg(not(target_family = "wasm"))]
+const COMPONENT_MASS_MAX_RATIO: f64 = 1.10;
+/// A log window mass is a probability and therefore cannot exceed one, apart from round-off.
+#[cfg(not(target_family = "wasm"))]
+const WINDOW_LOG_MASS_TOLERANCE: f64 = 1e-12;
+/// Require the NB mode encoded by mean and dispersion to retain half-count precision.
+#[cfg(not(target_family = "wasm"))]
+const NB_MODE_ROUNDTRIP_TOLERANCE: f64 = 0.5;
 
 /// Struct to hold a beta-binomial distribution to model cases where some k-mers lot part of their reads or weren't
 /// as sequenced as most of the total kmers. This could be the case of e.g. very GC-enriched genome areas, so it has
@@ -564,6 +578,9 @@ pub(crate) enum FitRejection {
     OptimisationFailed,
     NonFiniteLikelihood,
     InvalidComponents,
+    InvalidWindowMass,
+    ComponentMassExceeded,
+    UnstableModeParameterisation,
     GenomeLobeOutsideFitWindow,
     ErrorModePastValley,
     PrimaryModeOutsideBand,
@@ -578,6 +595,9 @@ impl fmt::Display for FitRejection {
             Self::OptimisationFailed => "optimisation_failed",
             Self::NonFiniteLikelihood => "non_finite_likelihood",
             Self::InvalidComponents => "invalid_components",
+            Self::InvalidWindowMass => "invalid_window_mass",
+            Self::ComponentMassExceeded => "component_mass_exceeded",
+            Self::UnstableModeParameterisation => "unstable_mode_parameterisation",
             Self::GenomeLobeOutsideFitWindow => "genome_lobe_outside_fit_window",
             Self::ErrorModePastValley => "error_mode_past_valley",
             Self::PrimaryModeOutsideBand => "primary_mode_outside_band",
@@ -597,6 +617,8 @@ pub(crate) struct NativeSpectrumFit {
     pub(crate) w_repeat: f64,
     pub(crate) mean: f64,
     pub(crate) dispersion: f64,
+    /// The continuous mode used to derive the NB mean, retained to detect cancellation.
+    target_mode: f64,
     pub(crate) error_params: ErrorParams,
     /// The shelf under the single-copy lobe, when the genome model has one.
     pub(crate) shelf: Option<Shelf>,
@@ -604,13 +626,16 @@ pub(crate) struct NativeSpectrumFit {
     pub(crate) repeat_ratio: f64,
     pub(crate) genome_kmers: f64,
     pub(crate) error_kmers: f64,
+    pub(crate) repeat_kmers: f64,
     pub(crate) log_likelihood: f64,
     pub(crate) bic: f64,
     pub(crate) deviance: f64,
     pub(crate) fit_window_end: usize,
     pub(crate) best_iterations: u64,
     component_log_normalisers: [f64; 3],
+    component_log_totals: [f64; 3],
     observed_total: f64,
+    full_distinct_total: f64,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -636,6 +661,18 @@ impl NativeSpectrumFit {
                 fit_window_end,
             ),
         ];
+        let target_mode = match genome_model {
+            GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => {
+                mean - (dispersion - 1.0)
+            }
+            GenomeModel::Normal => mean,
+        };
+        let log_observed_total = observed_total.ln();
+        let component_log_totals = [
+            weights[0].ln() + log_observed_total - normalisers[0],
+            weights[1].ln() + log_observed_total - normalisers[1],
+            weights[2].ln() + log_observed_total - normalisers[2],
+        ];
         Self {
             error_model,
             genome_model,
@@ -644,11 +681,13 @@ impl NativeSpectrumFit {
             w_repeat: weights[2],
             mean,
             dispersion,
+            target_mode,
             error_params,
             shelf: None,
             repeat_ratio: REPEAT_LOBE_COPIES,
-            genome_kmers: weights[1] * observed_total / normalisers[1].exp(),
-            error_kmers: weights[0] * observed_total / normalisers[0].exp(),
+            genome_kmers: component_log_totals[1].exp(),
+            error_kmers: component_log_totals[0].exp(),
+            repeat_kmers: component_log_totals[2].exp(),
             log_likelihood: -1.0,
             bic: 2.0
                 + (error_model.parameter_count() + genome_model.extra_parameters()) as f64
@@ -657,7 +696,35 @@ impl NativeSpectrumFit {
             fit_window_end,
             best_iterations: 1,
             component_log_normalisers: normalisers,
+            component_log_totals,
             observed_total,
+            // Existing hand-built test fits focus on their specific guard. Dedicated mass tests set
+            // this to a realistic whole-spectrum total.
+            full_distinct_total: f64::MAX,
+        }
+    }
+
+    pub(crate) fn component_total_ratio(&self) -> f64 {
+        let log_total = lse3(
+            self.component_log_totals[0],
+            self.component_log_totals[1],
+            self.component_log_totals[2],
+        );
+        (log_total - self.full_distinct_total.ln()).exp()
+    }
+
+    pub(crate) fn component_log_window_masses(&self) -> [f64; 3] {
+        self.component_log_normalisers
+    }
+
+    pub(crate) fn mode_roundtrip_error(&self) -> f64 {
+        if matches!(
+            self.genome_model,
+            GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial
+        ) {
+            (self.mean - (self.dispersion - 1.0) - self.target_mode).abs()
+        } else {
+            0.0
         }
     }
 
@@ -811,6 +878,7 @@ pub(crate) struct FitSearchResult {
 struct NativeMixtureFit {
     observed: Arc<[(f64, f64)]>,
     observed_total: f64,
+    full_distinct_total: f64,
     peak: f64,
     fit_window_end: usize,
     error_model: ErrorModel,
@@ -825,6 +893,7 @@ struct NativeParams {
     ln_error: f64,
     ln_single: f64,
     ln_repeat: f64,
+    target_mode: f64,
     mean: f64,
     dispersion: f64,
     error_params: ErrorParams,
@@ -836,7 +905,7 @@ struct NativeParams {
 impl NativeMixtureFit {
     fn params(&self, theta: &[f64]) -> NativeParams {
         let (ln_error, ln_single, ln_repeat) = ln_softmax3(0.0, theta[0], theta[1]);
-        let mode = self.peak * (MU_LO + MU_SPAN / (1.0 + (-theta[2]).exp()));
+        let target_mode = self.peak * (MU_LO + MU_SPAN / (1.0 + (-theta[2]).exp()));
         let dispersion = 1.0 + theta[3].exp();
         let error_params = ErrorParams {
             tail_exponent: theta[4].exp(),
@@ -864,11 +933,12 @@ impl NativeMixtureFit {
             ln_error,
             ln_single,
             ln_repeat,
+            target_mode,
             mean: match self.genome_model {
                 GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => {
-                    mode + dispersion - 1.0
+                    target_mode + dispersion - 1.0
                 }
-                GenomeModel::Normal => mode,
+                GenomeModel::Normal => target_mode,
             },
             dispersion,
             error_params,
@@ -908,6 +978,11 @@ impl NativeMixtureFit {
         // Totals and heights at library scale, for the hole guard's absolute budget and the plots;
         // BIC's penalty counts the sample that was actually observed.
         let library_total = self.observed_total * self.sample_scale;
+        let component_log_totals = [
+            params.ln_error + library_total.ln() - normalisers[0],
+            params.ln_single + library_total.ln() - normalisers[1],
+            params.ln_repeat + library_total.ln() - normalisers[2],
+        ];
         let mut fit = NativeSpectrumFit {
             error_model: self.error_model,
             genome_model: self.genome_model,
@@ -916,11 +991,13 @@ impl NativeMixtureFit {
             w_repeat,
             mean: params.mean,
             dispersion: params.dispersion,
+            target_mode: params.target_mode,
             error_params: params.error_params,
             shelf: params.shelf,
             repeat_ratio: params.repeat_ratio,
-            genome_kmers: w_single * library_total / normalisers[1].exp(),
-            error_kmers: w_error * library_total / normalisers[0].exp(),
+            genome_kmers: component_log_totals[1].exp(),
+            error_kmers: component_log_totals[0].exp(),
+            repeat_kmers: component_log_totals[2].exp(),
             log_likelihood: -cost,
             bic: 2.0 * cost
                 + (self.error_model.parameter_count() + self.genome_model.extra_parameters())
@@ -930,7 +1007,9 @@ impl NativeMixtureFit {
             fit_window_end: self.fit_window_end,
             best_iterations: iterations,
             component_log_normalisers: normalisers,
+            component_log_totals,
             observed_total: library_total,
+            full_distinct_total: self.full_distinct_total,
         };
         fit.deviance = self.conditional_deviance(&fit);
         fit
@@ -968,6 +1047,7 @@ impl CostFunction for NativeMixtureFit {
         // If the parameters don't make any sense, the cost is infinite
         if !(params.mean.is_finite()
             && params.dispersion.is_finite()
+            && params.target_mode.is_finite()
             && params.error_params.tail_exponent.is_finite()
             && params.error_params.singleton_probability.is_finite()
             && params.error_params.weibull_shape.is_none_or(f64::is_finite))
@@ -978,13 +1058,24 @@ impl CostFunction for NativeMixtureFit {
         {
             return Ok(f64::INFINITY);
         }
+        if matches!(
+            self.genome_model,
+            GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial
+        ) && (params.mean - (params.dispersion - 1.0) - params.target_mode).abs()
+            > NB_MODE_ROUNDTRIP_TOLERANCE
+        {
+            return Ok(f64::INFINITY);
+        }
 
         // Built once per evaluation, then read for the window mass and at every observed count.
         let table = params
             .shelf
             .map(|s| shelf_log_table(params.mean, s, self.fit_window_end));
         let normalisers = self.log_normalisers(params, table.as_deref());
-        if normalisers.iter().any(|value| !value.is_finite()) {
+        if normalisers
+            .iter()
+            .any(|value| !value.is_finite() || *value > WINDOW_LOG_MASS_TOLERANCE)
+        {
             return Ok(f64::INFINITY);
         }
 
@@ -1050,6 +1141,12 @@ pub(crate) fn fit_native_spectrum(
         .iter()
         .map(|&n| (f64::from(n) / sample_scale).round() as u32)
         .collect();
+    // `histovec` is already at library scale and spans the full count range. Keep this separate from
+    // `observed_total`, which is restricted to the fit window and sample scale.
+    let full_distinct_total = full_spectrum_distinct_total(histovec);
+    if !full_distinct_total.is_finite() || full_distinct_total <= 0.0 {
+        return Err(Error::msg("no distinct k-mers in the full spectrum"));
+    }
     let top = fit_window_end(sample.len(), peak);
     let observed: Arc<[(f64, f64)]> = sample[..top]
         .iter()
@@ -1071,9 +1168,7 @@ pub(crate) fn fit_native_spectrum(
     let shelf_share = empirical_shelf_share(&sample, valley, peak);
     // These are the different distributions we're gonna try
     const CONFIGURATIONS: [(ErrorModel, GenomeModel); 4] = [
-        (   ErrorModel::SingletonPareto,
-            GenomeModel::NegativeBinomial
-        ),
+        (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
         (
             ErrorModel::FreeSingletonWeibull,
             GenomeModel::NegativeBinomial,
@@ -1087,13 +1182,14 @@ pub(crate) fn fit_native_spectrum(
             GenomeModel::ShelfNegativeBinomial,
         ),
     ];
-    
+
     // We set them up
     let problems: Vec<NativeMixtureFit> = CONFIGURATIONS
         .iter()
         .map(|&(error_model, genome_model)| NativeMixtureFit {
             observed: Arc::clone(&observed),
             observed_total,
+            full_distinct_total,
             peak: peak as f64,
             fit_window_end: top,
             error_model,
@@ -1130,13 +1226,13 @@ pub(crate) fn fit_native_spectrum(
     for (index, outcome) in outcomes {
         per_problem[index].push(outcome);
     }
-    
+
     let attempts: Vec<FitAttempt> = problems
         .iter()
         .zip(per_problem)
         .map(|(problem, outcomes)| attempt_from(problem, outcomes, valley, peak))
         .collect();
-    
+
     let attempts: [FitAttempt; 4] = attempts.try_into().expect("one attempt per configuration");
     let selected = select_native_fit(&attempts);
     Ok(FitSearchResult { selected, attempts })
@@ -1169,9 +1265,9 @@ fn fit_native_candidate(
     attempt_from(&problem, outcomes, valley, empirical_peak)
 }
 
-/// The best converged start, validated into an attempt; `OptimisationFailed` when none converged.
-/// Outcomes arrive in start order, so ties keep the earliest start. An "attempt" is linked to a single
-/// distribution configuration.
+/// Validates every converged start before choosing the best fit for one configuration. A pathological
+/// low-cost start must not hide a slightly higher-cost valid one. If none are valid, retain the
+/// lowest-cost rejected candidate for diagnostics; `OptimisationFailed` means none converged.
 #[cfg(not(target_family = "wasm"))]
 fn attempt_from(
     problem: &NativeMixtureFit,
@@ -1179,40 +1275,59 @@ fn attempt_from(
     valley: usize,
     empirical_peak: usize,
 ) -> FitAttempt {
-    let mut best: Option<(f64, Vec<f64>, u64)> = None;
     let mut total_iterations = 0u64;
     let mut capped_starts = 0u32;
+    let mut converged = Vec::new();
     for outcome in outcomes {
         total_iterations = total_iterations.saturating_add(outcome.iterations);
         capped_starts += u32::from(outcome.hit_cap);
         let Some((cost, params)) = outcome.converged else {
             continue;
         };
-        if best
-            .as_ref()
-            .is_none_or(|(best_cost, _, _)| cost < *best_cost)
-        {
-            best = Some((cost, params, outcome.iterations));
+        converged.push((cost, params, outcome.iterations));
+    }
+    // The first valid entry in cost order is the best valid fit. If all are rejected, the first
+    // rejected entry is also the best one to retain for diagnostics. Stable sorting preserves start
+    // order for equal costs, as before.
+    converged.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut best_rejected = None;
+    for (cost, params, iterations) in converged {
+        let fit = problem.unpack(&params, cost, iterations);
+        match validate_native_fit(&fit, valley, empirical_peak) {
+            None => {
+                return FitAttempt {
+                    error_model: problem.error_model,
+                    genome_model: problem.genome_model,
+                    candidate: Some(fit),
+                    rejection: None,
+                    total_iterations,
+                    capped_starts,
+                };
+            }
+            Some(rejection) => {
+                if best_rejected.is_none() {
+                    best_rejected = Some((fit, rejection));
+                }
+            }
         }
     }
 
-    let Some((cost, params, best_iterations)) = best else {
+    if let Some((fit, rejection)) = best_rejected {
         return FitAttempt {
             error_model: problem.error_model,
             genome_model: problem.genome_model,
-            candidate: None,
-            rejection: Some(FitRejection::OptimisationFailed),
+            candidate: Some(fit),
+            rejection: Some(rejection),
             total_iterations,
             capped_starts,
         };
-    };
-    let fit = problem.unpack(&params, cost, best_iterations);
-    let rejection = validate_native_fit(&fit, valley, empirical_peak);
+    }
+
     FitAttempt {
         error_model: problem.error_model,
         genome_model: problem.genome_model,
-        candidate: Some(fit),
-        rejection,
+        candidate: None,
+        rejection: Some(FitRejection::OptimisationFailed),
         total_iterations,
         capped_starts,
     }
@@ -1282,7 +1397,6 @@ struct NativeRunOutcome {
     hit_cap: bool,
 }
 
-
 /// Actual fitting method
 #[cfg(not(target_family = "wasm"))]
 fn run_native_one(
@@ -1290,7 +1404,6 @@ fn run_native_one(
     start: Vec<f64>,
     max_iters: u64,
 ) -> Result<NativeRunOutcome, Error> {
-
     // Simplex initialisation
     let mut simplex = vec![start.clone()];
     for index in 0..start.len() {
@@ -1306,13 +1419,14 @@ fn run_native_one(
     let result = Executor::new(problem, solver)
         .configure(|state| state.max_iters(max_iters))
         .run()?;
-    
+
     let state = result.state();
     let termination = state.get_termination_reason();
 
     // We say that it converged if... it converged, plus if the cost function is finite
     let converged = if matches!(termination, Some(reason) if *reason == SolverConverged)
-        && state.get_best_cost().is_finite() && state.get_best_cost() > 0.0
+        && state.get_best_cost().is_finite()
+        && state.get_best_cost() > 0.0
     {
         state
             .get_best_param()
@@ -1326,7 +1440,6 @@ fn run_native_one(
         hit_cap: matches!(termination, Some(reason) if *reason == MaxItersReached),
     })
 }
-
 
 #[cfg(not(target_family = "wasm"))]
 fn validate_native_fit(
@@ -1343,9 +1456,12 @@ fn validate_native_fit(
     let weight_sum = fit.w_error + fit.w_single + fit.w_repeat;
     if !weight_sum.is_finite()
         || (weight_sum - 1.0).abs() > 1e-8
-        || fit.component_log_normalisers.iter().any(|x| !x.is_finite())
-        || !fit.genome_kmers.is_finite()
-        || !fit.error_kmers.is_finite()
+        || fit
+            .component_log_totals
+            .iter()
+            .any(|value| value.is_nan() || *value == f64::INFINITY)
+        || !fit.full_distinct_total.is_finite()
+        || fit.full_distinct_total <= 0.0
     {
         return Some(FitRejection::InvalidComponents);
     }
@@ -1353,9 +1469,36 @@ fn validate_native_fit(
         || fit.mean <= 0.0
         || !fit.dispersion.is_finite()
         || fit.dispersion <= 1.0
+        || !fit.target_mode.is_finite()
         || fit.shelf.is_some_and(|s| !shelf_is_valid(s))
     {
         return Some(FitRejection::InvalidComponents);
+    }
+    if fit
+        .component_log_normalisers
+        .iter()
+        .any(|value| !value.is_finite() || *value > WINDOW_LOG_MASS_TOLERANCE)
+    {
+        return Some(FitRejection::InvalidWindowMass);
+    }
+    let log_component_total = lse3(
+        fit.component_log_totals[0],
+        fit.component_log_totals[1],
+        fit.component_log_totals[2],
+    );
+    let log_component_limit =
+        fit.full_distinct_total.ln() + COMPONENT_MASS_MAX_RATIO.ln() + WINDOW_LOG_MASS_TOLERANCE;
+    if log_component_total > log_component_limit {
+        return Some(FitRejection::ComponentMassExceeded);
+    }
+    if !fit.genome_kmers.is_finite()
+        || !fit.error_kmers.is_finite()
+        || !fit.repeat_kmers.is_finite()
+    {
+        return Some(FitRejection::InvalidComponents);
+    }
+    if fit.mode_roundtrip_error() > NB_MODE_ROUNDTRIP_TOLERANCE {
+        return Some(FitRejection::UnstableModeParameterisation);
     }
     if fit.primary_mode() > fit.fit_window_end || fit.repeat_mode() > fit.fit_window_end {
         return Some(FitRejection::GenomeLobeOutsideFitWindow);
@@ -1832,6 +1975,7 @@ mod tests {
             .into();
         let problem = NativeMixtureFit {
             observed_total: observed.iter().map(|&(_, count)| count).sum(),
+            full_distinct_total: histogram.iter().map(|&n| f64::from(n)).sum(),
             observed,
             peak: 50.0,
             fit_window_end: 300,
@@ -1915,6 +2059,7 @@ mod tests {
             .into();
         NativeMixtureFit {
             observed_total: observed.iter().map(|&(_, count)| count).sum(),
+            full_distinct_total: histogram.iter().map(|&n| f64::from(n)).sum(),
             observed,
             peak: 50.0,
             fit_window_end: 300,
@@ -1922,6 +2067,167 @@ mod tests {
             genome_model: GenomeModel::ShelfNegativeBinomial,
             sample_scale: 1.0,
         }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn valid_fit_for_validation_tests() -> NativeSpectrumFit {
+        NativeSpectrumFit::for_test(
+            ErrorModel::SingletonPareto,
+            GenomeModel::NegativeBinomial,
+            [0.7, 0.29, 0.01],
+            106.0,
+            7.0,
+            ErrorParams {
+                singleton_probability: 0.85,
+                tail_exponent: 2.0,
+                weibull_shape: None,
+            },
+            100.0,
+            600,
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_fit_rejects_a_window_mass_above_one() {
+        let mut fit = valid_fit_for_validation_tests();
+        fit.component_log_normalisers[0] = WINDOW_LOG_MASS_TOLERANCE;
+        assert_eq!(validate_native_fit(&fit, 12, 100), None);
+
+        fit.component_log_normalisers[0] = WINDOW_LOG_MASS_TOLERANCE + 1e-15;
+        assert_eq!(
+            validate_native_fit(&fit, 12, 100),
+            Some(FitRejection::InvalidWindowMass)
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn component_mass_limit_uses_the_full_spectrum_and_includes_its_boundary() {
+        let mut histogram = vec![0u32; 300];
+        histogram[0] = 4;
+        histogram[99] = 3;
+        histogram[299] = 3; // Outside this fit's window, but still part of the full spectrum.
+        let full_distinct_total = full_spectrum_distinct_total(&histogram);
+        assert_eq!(full_distinct_total, 10.0);
+        assert_eq!(
+            histogram[..220].iter().map(|&n| u64::from(n)).sum::<u64>(),
+            7
+        );
+
+        let mut fit = valid_fit_for_validation_tests();
+        fit.fit_window_end = 220;
+        fit.full_distinct_total = full_distinct_total;
+        // 10.9 is permitted by the 10% allowance; a window-only total of 7 would reject it.
+        fit.component_log_totals = [5.0_f64.ln(), 5.0_f64.ln(), 0.9_f64.ln()];
+        fit.error_kmers = 5.0;
+        fit.genome_kmers = 5.0;
+        fit.repeat_kmers = 0.9;
+        assert_eq!(validate_native_fit(&fit, 12, 100), None);
+
+        // Exactly 1.10× is inclusive.
+        fit.component_log_totals = [5.0_f64.ln(), 5.0_f64.ln(), 1.0_f64.ln()];
+        fit.repeat_kmers = 1.0;
+        assert_eq!(validate_native_fit(&fit, 12, 100), None);
+
+        fit.component_log_totals = [5.0_f64.ln(), 5.0_f64.ln(), 1.001_f64.ln()];
+        fit.repeat_kmers = 1.001;
+        assert_eq!(
+            validate_native_fit(&fit, 12, 100),
+            Some(FitRejection::ComponentMassExceeded)
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn nb_mode_roundtrip_must_preserve_half_count_precision() {
+        let mut fit = valid_fit_for_validation_tests();
+        fit.target_mode += NB_MODE_ROUNDTRIP_TOLERANCE;
+        assert_eq!(validate_native_fit(&fit, 12, 100), None);
+
+        fit.target_mode += 1e-6;
+        assert_eq!(
+            validate_native_fit(&fit, 12, 100),
+            Some(FitRejection::UnstableModeParameterisation)
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_lower_cost_rejected_start_does_not_hide_a_valid_start() {
+        let error = ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 1.8,
+            weibull_shape: None,
+        };
+        let histogram = native_synthetic(error);
+        let observed: Arc<[(f64, f64)]> = histogram[..300]
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(index, &count)| ((index + 1) as f64, f64::from(count)))
+            .collect::<Vec<_>>()
+            .into();
+        let observed_total = observed.iter().map(|&(_, count)| count).sum::<f64>();
+        let problem = NativeMixtureFit {
+            observed_total,
+            full_distinct_total: observed_total * 5.0,
+            observed,
+            peak: 50.0,
+            fit_window_end: 300,
+            error_model: ErrorModel::SingletonPareto,
+            genome_model: GenomeModel::NegativeBinomial,
+            sample_scale: 1.0,
+        };
+        let logit = |probability: f64| (probability / (1.0 - probability)).ln();
+        let valid_params = vec![
+            0.0,
+            -3.0,
+            0.0,
+            3.0_f64.ln(),
+            1.8_f64.ln(),
+            logit(0.85),
+            logit(0.8),
+        ];
+        let mut excessive_mass_params = valid_params.clone();
+        excessive_mass_params[4] = 0.01_f64.ln();
+        excessive_mass_params[5] = logit(0.01);
+
+        let attempt = attempt_from(
+            &problem,
+            vec![
+                NativeRunOutcome {
+                    converged: Some((1.0, excessive_mass_params.clone())),
+                    iterations: 10,
+                    hit_cap: false,
+                },
+                NativeRunOutcome {
+                    converged: Some((2.0, valid_params)),
+                    iterations: 12,
+                    hit_cap: false,
+                },
+            ],
+            12,
+            50,
+        );
+        assert_eq!(attempt.rejection, None);
+        assert_eq!(attempt.candidate.unwrap().primary_mode(), 52);
+
+        let all_rejected = attempt_from(
+            &problem,
+            vec![NativeRunOutcome {
+                converged: Some((1.0, excessive_mass_params)),
+                iterations: 10,
+                hit_cap: false,
+            }],
+            12,
+            50,
+        );
+        assert!(all_rejected.candidate.is_some());
+        assert_eq!(
+            all_rejected.rejection,
+            Some(FitRejection::ComponentMassExceeded)
+        );
     }
 
     /// Whatever the simplex tries, the shelf stays off the error tail, keeps a >= 1 (no density piled
