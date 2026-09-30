@@ -19,9 +19,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 #[cfg(not(target_family = "wasm"))]
 use std::{fmt, sync::Arc};
 
-/// Genome lobes modelled: single-copy and two-copy. The two-copy lobe carries little weight but
-/// absorbs the right tail, which otherwise inflates the dispersion by 20-60 %. A third lobe was
-/// measured at a fitted weight of 0.000-0.009 and is not worth its parameter.
+/// Genome lobes modelled: single-copy and two-copy
 const REPEAT_LOBE_COPIES: f64 = 2.0;
 /// Ratio we allow the second lobe (repeats lobe) to float in 
 #[cfg(not(target_family = "wasm"))]
@@ -30,9 +28,7 @@ const REPEAT_RATIO: (f64, f64) = (1.5, 2.0);
 #[cfg(not(target_family = "wasm"))]
 const REPEAT_RATIO_START: f64 = 1.9;
 
-/// The fitted mean is pinned to this window around the peak the valley estimator found. Unpinned, the
-/// model relabels the observed peak as a repeat lobe and puts a near-empty single-copy lobe at half or
-/// a third of the coverage — an identifiability failure that costs nothing in likelihood.
+/// The fitted mean is pinned to this window around the peak the valley estimator found.
 const MU_LO: f64 = 0.75;
 const MU_SPAN: f64 = 0.58;
 
@@ -40,7 +36,6 @@ const MU_SPAN: f64 = 0.58;
 ///
 /// A single start is not enough: `dispersion = 1 + exp(theta)` flattens as `theta` falls, so the
 /// simplex can crawl out to the Poisson boundary and stop there while still reporting convergence.
-/// Measured, that happened in half the spectra tried, once costing 6.7e6 in log-likelihood.
 const DISPERSION_SEEDS: [f64; 3] = [2.0, 8.0, 15.0];
 
 /// Counts above this multiple of the peak are not fitted: they are repeats beyond the two-copy lobe.
@@ -127,8 +122,9 @@ fn shelf_concentration_bounds(retained: f64) -> (f64, f64) {
 #[cfg(not(target_family = "wasm"))]
 const SHELF_MAX_ITERS: u64 = 2_000;
 
-/// Single-copy k-mers that lost part of their coverage: a beta-binomial over the single-copy mean,
-/// rounded, holding `share` of the single-copy lobe.
+/// Struct to hold a beta-binomial distribution to model cases where some k-mers lot part of their reads or weren't
+/// as sequenced as most of the total kmers. This could be the case of e.g. very GC-enriched genome areas, so it has
+/// a biological reason to exist. Also we could have systematic errors :/
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Shelf {
@@ -162,13 +158,13 @@ impl Shelf {
 /// A fitted coverage model.
 #[derive(Clone, Copy, Debug)]
 pub struct SpectrumFit {
-    /// Share of distinct k-mers that are sequencing errors.
+    /// Weight of the distinct k-mers that are sequencing errors.
     pub w_error: f64,
-    /// Share that are single-copy genome.
+    /// Weight that are single-copy genome.
     pub w_single: f64,
-    /// Share that are two-copy repeat.
+    /// Weight that are two-copy repeat.
     pub w_repeat: f64,
-    /// Single-copy coverage: the mean of the genome lobe.
+    /// Mean of the genome lobe/distrib.
     pub mean: f64,
     /// Variance-to-mean ratio of the genome lobe; 1.0 is Poisson.
     pub dispersion: f64,
@@ -248,8 +244,7 @@ impl SpectrumFit {
 
 /// Fit the coverage model to a spectrum, seeded from the valley estimator's peak and dispersion.
 ///
-/// `histovec[c - 1]` is the number of distinct k-mers seen `c` times. Returns `Err` if no start
-/// converged, which the caller should treat as "keep the estimator's own answer".
+/// `histovec[c - 1]` is the number of distinct k-mers seen `c` times. Returns `Err` if no start converged
 pub fn fit_spectrum(
     histovec: &[u32],
     peak: usize,
@@ -470,8 +465,9 @@ impl ErrorModel {
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GenomeModel {
+    /// Two NB lobes, one main, one secondary to fit potential repeats.
     NegativeBinomial,
-    /// Negative-binomial lobes, plus a beta-binomial shelf under the single-copy one.
+    /// Negative-binomial lobes, plus a beta-binomial shelf under the single-copy one to accommodate strong left genomic lobe tails.
     ShelfNegativeBinomial,
     // Retained for distribution helpers and comparison tests; native model selection uses only NB.
     #[allow(dead_code)]
@@ -572,6 +568,7 @@ pub(crate) enum FitRejection {
     ErrorModePastValley,
     PrimaryModeOutsideBand,
     RepeatModeTooEarly,
+    PositiveLogLikelihood,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -585,6 +582,7 @@ impl fmt::Display for FitRejection {
             Self::ErrorModePastValley => "error_mode_past_valley",
             Self::PrimaryModeOutsideBand => "primary_mode_outside_band",
             Self::RepeatModeTooEarly => "repeat_mode_too_early",
+            Self::PositiveLogLikelihood => "positive_loglikelihood",
         })
     }
 }
@@ -958,6 +956,7 @@ impl NativeMixtureFit {
     }
 }
 
+/// This implements the CostFunction trait for our mixture of distributions!
 #[cfg(not(target_family = "wasm"))]
 impl CostFunction for NativeMixtureFit {
     type Param = Vec<f64>;
@@ -965,6 +964,8 @@ impl CostFunction for NativeMixtureFit {
 
     fn cost(&self, theta: &Self::Param) -> Result<Self::Output, Error> {
         let params = self.params(theta);
+
+        // If the parameters don't make any sense, the cost is infinite
         if !(params.mean.is_finite()
             && params.dispersion.is_finite()
             && params.error_params.tail_exponent.is_finite()
@@ -977,6 +978,7 @@ impl CostFunction for NativeMixtureFit {
         {
             return Ok(f64::INFINITY);
         }
+
         // Built once per evaluation, then read for the window mass and at every observed count.
         let table = params
             .shelf
@@ -985,18 +987,25 @@ impl CostFunction for NativeMixtureFit {
         if normalisers.iter().any(|value| !value.is_finite()) {
             return Ok(f64::INFINITY);
         }
+
         let shelf = params.shelf.zip(table.as_deref());
 
-        let likelihood = self
+        let loglikelihood = self
             .observed
             .iter()
             .map(|&(count, weight)| {
+                // Error lobe
                 let error =
                     params.ln_error + params.error_params.log_probability(count) - normalisers[0];
+
+                // Genomic lobe
                 let lobe =
                     native_ln_genome(count, params.mean, params.dispersion, self.genome_model);
+                // Genomic lobe + shelf
                 let single =
                     params.ln_single + mix_single_copy(lobe, count, shelf) - normalisers[1];
+
+                // Second genomic lobe (repeat lobe)
                 let repeat = params.ln_repeat
                     + native_ln_genome(
                         count,
@@ -1008,8 +1017,9 @@ impl CostFunction for NativeMixtureFit {
                 weight * lse3(error, single, repeat)
             })
             .sum::<f64>();
-        Ok(if likelihood.is_finite() {
-            -likelihood
+
+        Ok(if loglikelihood.is_finite() && loglikelihood <= 0.0 {
+            -loglikelihood
         } else {
             f64::INFINITY
         })
@@ -1059,8 +1069,11 @@ pub(crate) fn fit_native_spectrum(
     };
 
     let shelf_share = empirical_shelf_share(&sample, valley, peak);
+    // These are the different distributions we're gonna try
     const CONFIGURATIONS: [(ErrorModel, GenomeModel); 4] = [
-        (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
+        (   ErrorModel::SingletonPareto,
+            GenomeModel::NegativeBinomial
+        ),
         (
             ErrorModel::FreeSingletonWeibull,
             GenomeModel::NegativeBinomial,
@@ -1074,6 +1087,8 @@ pub(crate) fn fit_native_spectrum(
             GenomeModel::ShelfNegativeBinomial,
         ),
     ];
+    
+    // We set them up
     let problems: Vec<NativeMixtureFit> = CONFIGURATIONS
         .iter()
         .map(|&(error_model, genome_model)| NativeMixtureFit {
@@ -1086,8 +1101,8 @@ pub(crate) fn fit_native_spectrum(
             sample_scale,
         })
         .collect();
-    // Every start of every candidate goes into one pool, so no thread idles while the candidate with
-    // the most starts (the Weibull shelf) is still running.
+
+    // All different starts/tries are parallelised with Rayon
     let jobs: Vec<(usize, Vec<f64>)> = problems
         .iter()
         .enumerate()
@@ -1097,6 +1112,8 @@ pub(crate) fn fit_native_spectrum(
                 .map(move |start| (index, start))
         })
         .collect();
+
+    // Here WE RUN THE FITS!
     let outcomes: Vec<(usize, NativeRunOutcome)> = jobs
         .into_par_iter()
         .filter_map(|(index, start)| {
@@ -1107,15 +1124,19 @@ pub(crate) fn fit_native_spectrum(
                 .map(|outcome| (index, outcome))
         })
         .collect();
+
+    // We collect nicely the outcomes per distribution configuration
     let mut per_problem: Vec<Vec<NativeRunOutcome>> = problems.iter().map(|_| Vec::new()).collect();
     for (index, outcome) in outcomes {
         per_problem[index].push(outcome);
     }
+    
     let attempts: Vec<FitAttempt> = problems
         .iter()
         .zip(per_problem)
         .map(|(problem, outcomes)| attempt_from(problem, outcomes, valley, peak))
         .collect();
+    
     let attempts: [FitAttempt; 4] = attempts.try_into().expect("one attempt per configuration");
     let selected = select_native_fit(&attempts);
     Ok(FitSearchResult { selected, attempts })
@@ -1149,7 +1170,8 @@ fn fit_native_candidate(
 }
 
 /// The best converged start, validated into an attempt; `OptimisationFailed` when none converged.
-/// Outcomes arrive in start order, so ties keep the earliest start.
+/// Outcomes arrive in start order, so ties keep the earliest start. An "attempt" is linked to a single
+/// distribution configuration.
 #[cfg(not(target_family = "wasm"))]
 fn attempt_from(
     problem: &NativeMixtureFit,
@@ -1173,6 +1195,7 @@ fn attempt_from(
             best = Some((cost, params, outcome.iterations));
         }
     }
+
     let Some((cost, params, best_iterations)) = best else {
         return FitAttempt {
             error_model: problem.error_model,
@@ -1259,26 +1282,37 @@ struct NativeRunOutcome {
     hit_cap: bool,
 }
 
+
+/// Actual fitting method
 #[cfg(not(target_family = "wasm"))]
 fn run_native_one(
     problem: NativeMixtureFit,
     start: Vec<f64>,
     max_iters: u64,
 ) -> Result<NativeRunOutcome, Error> {
+
+    // Simplex initialisation
     let mut simplex = vec![start.clone()];
     for index in 0..start.len() {
         let mut vertex = start.clone();
         vertex[index] += SIMPLEX_STEP;
         simplex.push(vertex);
     }
+
+    // Setting up optimiser
     let solver = NelderMead::new(simplex).with_sd_tolerance(NATIVE_SD_TOLERANCE)?;
+
+    // Run!
     let result = Executor::new(problem, solver)
         .configure(|state| state.max_iters(max_iters))
         .run()?;
+    
     let state = result.state();
     let termination = state.get_termination_reason();
+
+    // We say that it converged if... it converged, plus if the cost function is finite
     let converged = if matches!(termination, Some(reason) if *reason == SolverConverged)
-        && state.get_best_cost().is_finite()
+        && state.get_best_cost().is_finite() && state.get_best_cost() > 0.0
     {
         state
             .get_best_param()
@@ -1293,6 +1327,7 @@ fn run_native_one(
     })
 }
 
+
 #[cfg(not(target_family = "wasm"))]
 fn validate_native_fit(
     fit: &NativeSpectrumFit,
@@ -1301,6 +1336,9 @@ fn validate_native_fit(
 ) -> Option<FitRejection> {
     if !fit.log_likelihood.is_finite() || !fit.deviance.is_finite() || !fit.bic.is_finite() {
         return Some(FitRejection::NonFiniteLikelihood);
+    }
+    if fit.log_likelihood > 0.0 {
+        return Some(FitRejection::PositiveLogLikelihood);
     }
     let weight_sum = fit.w_error + fit.w_single + fit.w_repeat;
     if !weight_sum.is_finite()
