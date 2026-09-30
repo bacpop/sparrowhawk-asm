@@ -143,7 +143,17 @@ impl fmt::Display for QualOpts {
 #[cfg(not(target_family = "wasm"))]
 /// Sets up logging
 pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
-    fern::Dispatch::new()
+    set_up_logging_with_repeat_debug(level, outfile, false);
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Sets up logging, optionally enabling candidate-level repeat-recovery diagnostics only.
+pub fn set_up_logging_with_repeat_debug(
+    level: log::LevelFilter,
+    outfile: PathBuf,
+    debug_repeat_recovery: bool,
+) {
+    let dispatch = fern::Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
                 "[{} {} {}] {}",
@@ -153,7 +163,21 @@ pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
                 message
             ))
         })
-        .level(level)
+        .level(level);
+    let dispatch = if debug_repeat_recovery {
+        dispatch
+            .level_for(
+                "sparrowhawk_asm::algorithms::repeat_recovery",
+                log::LevelFilter::Debug,
+            )
+            .level_for(
+                "sparrowhawk_asm::algorithms::repeat_surgery",
+                log::LevelFilter::Debug,
+            )
+    } else {
+        dispatch
+    };
+    dispatch
         .chain(std::io::stdout())
         .chain(fern::log_file(outfile).unwrap())
         .apply()
@@ -175,6 +199,7 @@ struct BuildOpts<'a> {
     do_fit: bool,
     do_bubble_collapse: bool,
     do_dead_end_removal: bool,
+    do_repeat_recovery: bool,
     /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is popped.
     pop_ratio: f32,
     /// Fraction of single-copy coverage below which a branch is an error. `None` keeps the default
@@ -368,6 +393,7 @@ where
         // The spectrum of the pass that actually produced the k-mers: after a recount, pass 2's,
         // read at the loosened floor the graph's k-mers were counted at.
         opts.correction(k, assembly.genomic_peak, assembly.used_min_count),
+        opts.do_repeat_recovery,
     );
 
     save_functions::save_as_fasta_with_min_contig_length::<IntT>(
@@ -397,6 +423,8 @@ struct LadderState {
     quality: QualOpts,
     /// The previous k's contigs, spelled.
     contigs: Vec<Vec<u8>>,
+    /// Start of the repeat-recovered contig suffix, whose shared k-mers must not inflate GATB carry.
+    recovered_contig_start: usize,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -475,6 +503,7 @@ fn run_multik(
             min_qual: floors[floors.len() - 1],
         },
         contigs: Vec::new(),
+        recovered_contig_start: 0,
     };
     let mut step = 0;
     while step < state.ks.len() {
@@ -548,7 +577,7 @@ where
             &state.quality,
             Some(&active_floors),
             &state.store,
-            &state.contigs,
+            carried_contigs(opts, &state.contigs, state.recovered_contig_start),
             timevec,
             &mut out_path_histo,
             opts.do_fit,
@@ -574,8 +603,14 @@ where
     // An unresolved cutoff must beat the previous contigs, so they are kept until it has; otherwise
     // they are carried into the count-map by now and dead weight.
     let unresolved = step > 0 && assembly.min_count_unresolved;
-    let previous = unresolved.then(|| std::mem::take(&mut state.contigs));
+    let previous = unresolved.then(|| {
+        (
+            std::mem::take(&mut state.contigs),
+            state.recovered_contig_start,
+        )
+    });
     state.contigs = Vec::new();
+    state.recovered_contig_start = 0;
 
     let last = step + 1 == state.ks.len();
     // A k that may still be rejected writes no graph, as a stopped ladder never has.
@@ -590,8 +625,12 @@ where
         &mut Some(timevec),
         &mut graph_path,
         opts.correction(k, assembly.genomic_peak, assembly.used_min_count),
+        opts.do_repeat_recovery,
     );
     state.contigs = save_functions::spell_contigs::<IntT>(&contigs, &assembly.kmers, k);
+    state.recovered_contig_start = contigs
+        .recovered_contig_start
+        .unwrap_or(state.contigs.len());
     log::info!(
         "k={k}: {} contigs, {} bases",
         state.contigs.len(),
@@ -602,13 +641,14 @@ where
             Path::new(opts.output_dir).join(format!("{}_k{k}_contigs.fasta", opts.output_prefix));
         save_functions::save_sequences_as_fasta(&state.contigs, opts.min_contig_length, path);
     }
-    if let Some(previous) = previous {
+    if let Some((previous, previous_recovered_start)) = previous {
         let (new, old) = (
             aun(&state.contigs, opts.min_contig_length),
             aun(&previous, opts.min_contig_length),
         );
         if new <= old {
             state.contigs = previous;
+            state.recovered_contig_start = previous_recovered_start;
             return Err(preprocessing::PreprocessingError::no_aun_gain(k, new, old));
         }
         log::info!(
@@ -618,7 +658,20 @@ where
     Ok(())
 }
 
-/// Count one k from the store at the settled floor, carrying `contigs` in once the reads set the cutoff.
+#[cfg(not(target_family = "wasm"))]
+fn carried_contigs<'a>(
+    opts: &BuildOpts,
+    seqs: &'a [Vec<u8>],
+    recovered_start: usize,
+) -> Option<preprocessing::CarriedContigs<'a>> {
+    (!seqs.is_empty()).then_some(preprocessing::CarriedContigs {
+        seqs,
+        rule: opts.contig_counts,
+        recovered_start,
+    })
+}
+
+/// Count one k from the store at the settled floor, carrying contigs in once the reads set the cutoff.
 /// `prior`: the sketch's selection when this is a recount at it.
 #[cfg(not(target_family = "wasm"))]
 fn count_store<IntT>(
@@ -627,7 +680,7 @@ fn count_store<IntT>(
     quality: &QualOpts,
     floors: Option<&[u8]>,
     store: &read_store::ReadStore,
-    contigs: &[Vec<u8>],
+    carried: Option<preprocessing::CarriedContigs<'_>>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
     do_fit: bool,
@@ -637,10 +690,6 @@ fn count_store<IntT>(
 where
     IntT: for<'a> UInt<'a>,
 {
-    let carried = (!contigs.is_empty()).then_some(preprocessing::CarriedContigs {
-        seqs: contigs,
-        rule: opts.contig_counts,
-    });
     preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
         &mut [store.records()],
         k,
@@ -691,7 +740,7 @@ where
         opts,
         k,
         &state.store,
-        &state.contigs,
+        carried_contigs(opts, &state.contigs, state.recovered_contig_start),
         timevec,
         out_path_histo,
         floor,
@@ -707,7 +756,7 @@ fn count_store_at_selection<IntT>(
     opts: &BuildOpts,
     k: usize,
     store: &read_store::ReadStore,
-    contigs: &[Vec<u8>],
+    carried: Option<preprocessing::CarriedContigs<'_>>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
     floor: u8,
@@ -727,7 +776,7 @@ where
         &quality,
         None,
         store,
-        contigs,
+        carried,
         timevec,
         out_path_histo,
         opts.do_fit,
@@ -829,6 +878,7 @@ mod multik_tests {
                 min_qual: floors[floors.len() - 1],
             },
             contigs: Vec::new(),
+            recovered_contig_start: 0,
         }
     }
 
@@ -916,6 +966,8 @@ pub fn main() {
             no_graphs,
             no_bubble_collapse,
             no_dead_end_removal,
+            no_repeat_recovery,
+            debug_repeat_recovery,
         } => {
             let do_bloom = !*no_bloom;
             if let Err(message) = cli::validate_bloom_min_count(do_bloom, *min_count) {
@@ -938,9 +990,17 @@ pub fn main() {
                 Path::new(output_dir).join(format!("{output_prefix}_log.txt"));
             if args.verbose {
                 // set_up_logging(log::LevelFilter::Trace, outputlogfile);
-                set_up_logging(log::LevelFilter::Info, outputlogfile);
+                set_up_logging_with_repeat_debug(
+                    log::LevelFilter::Info,
+                    outputlogfile,
+                    *debug_repeat_recovery,
+                );
             } else {
-                set_up_logging(log::LevelFilter::Warn, outputlogfile);
+                set_up_logging_with_repeat_debug(
+                    log::LevelFilter::Warn,
+                    outputlogfile,
+                    *debug_repeat_recovery,
+                );
             }
 
             check_threads(*threads);
@@ -1051,6 +1111,7 @@ pub fn main() {
                 do_fit,
                 do_bubble_collapse: !no_bubble_collapse,
                 do_dead_end_removal: !no_dead_end_removal,
+                do_repeat_recovery: !no_repeat_recovery,
                 pop_ratio: *bubble_pop_ratio,
                 peak_ratio: *bubble_peak_ratio,
                 do_ec_removal: !no_ec_removal,

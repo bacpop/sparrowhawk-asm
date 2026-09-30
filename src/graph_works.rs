@@ -379,6 +379,11 @@ pub struct Contigs {
 
     /// Sequence of the contigs.
     pub contig_sequences: Option<Vec<Vec<u8>>>,
+
+    /// Index at which repeat-recovered routes start in the serialized list, for native multi-k
+    /// carry-counting. Recovered routes can share boundary k-mers by design.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) recovered_contig_start: Option<usize>,
 }
 
 impl Contigs {
@@ -387,6 +392,8 @@ impl Contigs {
         Contigs {
             serialized_contigs: serialized,
             contig_sequences: None,
+            #[cfg(not(target_family = "wasm"))]
+            recovered_contig_start: None,
         }
     }
 
@@ -1075,6 +1082,7 @@ pub trait Assemble {
         timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
         correction: CorrectionOpts,
+        do_repeat_recovery: bool,
     ) -> Contigs;
 
     #[cfg(target_family = "wasm")]
@@ -1100,6 +1108,7 @@ impl Assemble for BasicAsm {
         timevec: &mut Option<&mut Vec<Instant>>,
         path: &mut Option<PathBuf>,
         correction: CorrectionOpts,
+        do_repeat_recovery: bool,
     ) -> Contigs {
         // Unpacked once, so the body below reads exactly as it did when these were parameters.
         let CorrectionOpts {
@@ -1141,6 +1150,8 @@ impl Assemble for BasicAsm {
             );
         }
 
+        // Preserve the aligned per-k-mer counts only when native repeat validation needs them.
+        let repeat_count_snapshot = do_repeat_recovery.then(|| kmers.counts.clone());
         kmers.finish_neighbour_search();
         let (hashes, counts, neighbours, predecessor_counts) = kmers.take_graph_inputs();
         let mut ptgraph =
@@ -1249,12 +1260,22 @@ impl Assemble for BasicAsm {
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
         }
-        let serialized_contigs = ptgraph.collapse();
+        let recovered_contigs = repeat_count_snapshot.map_or_else(Vec::new, |counts| {
+            crate::algorithms::repeat_recovery::recover(&mut ptgraph, kmers, &counts)
+        });
+        let mut serialized_contigs = ptgraph.collapse();
+        let recovered_contig_start = if recovered_contigs.is_empty() {
+            None
+        } else {
+            let start = serialized_contigs.len();
+            serialized_contigs.extend(recovered_contigs);
+            Some(start)
+        };
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
             logw(
                 format!(
-                    "Graph collapse finished in {} s.",
+                    "Repeat extraction and graph collapse finished in {} s.",
                     timevec
                         .last()
                         .unwrap()
@@ -1271,6 +1292,7 @@ impl Assemble for BasicAsm {
         }
 
         let mut contigs = Contigs::new(serialized_contigs);
+        contigs.recovered_contig_start = recovered_contig_start;
 
         // TEMPORAL RESTRICTION, WIP
         contigs.shrink();

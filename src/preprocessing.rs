@@ -9,6 +9,8 @@ use libm::lgamma;
 use nohash_hasher::NoHashHasher;
 #[cfg(target_family = "wasm")]
 use std::cmp::Ordering;
+#[cfg(not(target_family = "wasm"))]
+use std::collections::HashSet;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 use rayon::prelude::*;
@@ -3592,7 +3594,12 @@ pub struct CarriedContigs<'a> {
     pub seqs: &'a [Vec<u8>],
     /// How each carried k-mer's count is set.
     pub rule: ContigCountRule,
+    /// First contig index belonging to recovered routes, whose shared k-mers are deduplicated under GATB.
+    pub recovered_start: usize,
 }
+
+#[cfg(not(target_family = "wasm"))]
+type CarriedKmer<IntT> = (usize, u64, u64, u8, IntT);
 
 /// Put every k-mer of `carried` into the count-map so the `minc` filter keeps it, and return how many
 /// the reads never produced. Each chunk is hashed in parallel, then absorbed one writer per shard.
@@ -3616,6 +3623,8 @@ where
         keep: 0,
     };
     let mut rest = carried.seqs;
+    let mut sequence_index = 0usize;
+    let mut recovered_seen = HashSet::new();
     while !rest.is_empty() {
         let mut take = 1;
         let mut bases = rest[0].len();
@@ -3625,28 +3634,43 @@ where
         }
         let (chunk, tail) = rest.split_at(take);
         rest = tail;
+        let chunk_start = sequence_index;
+        sequence_index += chunk.len();
 
-        let mut kmers: Vec<(u64, u64, u8, IntT)> = chunk
+        let mut kmers: Vec<CarriedKmer<IntT>> = chunk
             .par_iter()
-            .flat_map_iter(|seq| {
+            .enumerate()
+            .flat_map_iter(|(offset, seq)| {
                 let mut local = Vec::new();
                 let mut groups = Vec::new();
                 for_each_kmer::<IntT, _>(seq, None, w, &mut groups, |hc, hnc, b, _, km| {
-                    local.push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
+                    local.push((
+                        chunk_start + offset,
+                        hc,
+                        hnc,
+                        b,
+                        km.expect("a kept k-mer carries its bits"),
+                    ));
                 });
                 local
             })
             .collect();
-        kmers.par_sort_unstable_by_key(|e| shard_of(e.0, n_shards));
-        let mut runs: Vec<&[(u64, u64, u8, IntT)]> = Vec::with_capacity(n_shards);
+        if carried.rule == ContigCountRule::Gatb && carried.recovered_start < sequence_index {
+            kmers.sort_unstable_by_key(|entry| (entry.0, entry.1));
+            kmers.retain(|entry| {
+                entry.0 < carried.recovered_start || recovered_seen.insert(entry.1)
+            });
+        }
+        kmers.par_sort_unstable_by_key(|entry| shard_of(entry.1, n_shards));
+        let mut runs: Vec<&[CarriedKmer<IntT>]> = Vec::with_capacity(n_shards);
         let mut from = 0;
         for s in 0..n_shards {
-            let len = kmers[from..].partition_point(|e| shard_of(e.0, n_shards) == s);
+            let len = kmers[from..].partition_point(|e| shard_of(e.1, n_shards) == s);
             runs.push(&kmers[from..from + len]);
             from += len;
         }
         shards.par_iter_mut().zip(runs).for_each(|(map, run)| {
-            for &(hc, hnc, b, km) in run {
+            for &(_, hc, hnc, b, km) in run {
                 match carried.rule {
                     ContigCountRule::Floor => {
                         map.entry(hc)
@@ -6614,6 +6638,7 @@ mod tests {
                 CarriedContigs {
                     seqs: &contigs,
                     rule,
+                    recovered_start: contigs.len(),
                 },
                 k,
                 minc,
@@ -6636,6 +6661,44 @@ mod tests {
                 };
                 assert_eq!(count, want, "{rule:?}");
             }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn gatb_carry_counts_shared_recovered_routes_once() {
+        let k = 15usize;
+        let min_count = 2u16;
+        let sequence = b"ACGTTGCAAGTCGATCGATGCTAGCTACGTAGGCTAACGTTCGATCGA".to_vec();
+        let records = vec![(sequence.clone(), None)];
+        let mut one_route = HashMap::<u64, u32>::new();
+        for (hash, ..) in hash_batch::<u64>(&records, k, 0, None, 0) {
+            *one_route.entry(hash).or_insert(0) += 1;
+        }
+        let contigs = vec![sequence.clone(), sequence.clone(), sequence];
+        let mut shards: Vec<CountMap<u64>> = (0..64).map(|_| CountMap::default()).collect();
+
+        carry_contig_kmers(
+            &mut shards,
+            CarriedContigs {
+                seqs: &contigs,
+                rule: ContigCountRule::Gatb,
+                recovered_start: 1,
+            },
+            k,
+            min_count,
+        );
+
+        let after = shards
+            .iter()
+            .flat_map(|shard| shard.iter().map(|(&hash, info)| (hash, info.count)))
+            .collect::<HashMap<_, _>>();
+        for (hash, occurrences) in one_route {
+            assert_eq!(
+                after.get(&hash),
+                Some(&(occurrences * 2 * u32::from(min_count + 1))),
+                "recovered copy should contribute once, even when two routes share it"
+            );
         }
     }
 
@@ -6700,7 +6763,7 @@ mod tests {
             )
             .expect("the fixture leaves k-mers after filtering");
             let contigs =
-                BasicAsm::assemble::<u128>(k, &mut kmers, &mut None, &mut None, correction);
+                BasicAsm::assemble::<u128>(k, &mut kmers, &mut None, &mut None, correction, false);
             crate::save_functions::spell_contigs::<u128>(&contigs, &kmers, k)
         };
 
@@ -6708,7 +6771,14 @@ mod tests {
         assert_eq!(small.len(), 1, "every 21-mer is read");
         assert_eq!(assemble(41, None).len(), 2, "ten 41-mers are never read");
         for rule in [ContigCountRule::Floor, ContigCountRule::Gatb] {
-            let large = assemble(41, Some(CarriedContigs { seqs: &small, rule }));
+            let large = assemble(
+                41,
+                Some(CarriedContigs {
+                    seqs: &small,
+                    rule,
+                    recovered_start: small.len(),
+                }),
+            );
             assert_eq!(
                 large.len(),
                 1,

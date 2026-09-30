@@ -158,6 +158,8 @@ pub(crate) fn save_sequences_as_fasta(
     let contigs = Contigs {
         serialized_contigs: Vec::new(),
         contig_sequences: Some(kept),
+        #[cfg(not(target_family = "wasm"))]
+        recovered_contig_start: None,
     };
     let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
     contigs.write_fasta(&mut wbuf);

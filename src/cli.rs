@@ -314,6 +314,15 @@ pub enum Commands {
         /// Do not remove dead endsin the graph
         #[arg(long, default_value_t = false)]
         no_dead_end_removal: bool,
+
+        /// Do not recover coverage-supported repeat routes before graph collapse.
+        #[arg(long, default_value_t = false)]
+        no_repeat_recovery: bool,
+
+        /// Log detailed repeat-candidate topology, graph-node and k-mer coverage, ratios, and rejection reasons.
+        /// This is diagnostic-only and does not alter repeat detection or extraction.
+        #[arg(long, default_value_t = false)]
+        debug_repeat_recovery: bool,
     },
 }
 
@@ -324,7 +333,33 @@ pub fn cli_args() -> Args {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_kmer_ladder, MAX_K};
+    use clap::Parser;
+
+    use super::{default_kmer_ladder, Args, Commands, MAX_K};
+
+    #[test]
+    fn repeat_recovery_debug_flag_is_opt_in() {
+        let default_args = Args::try_parse_from(["sparrowhawk-asm", "build", "reads.fastq"])
+            .expect("build arguments parse");
+        let explicitly_enabled = Args::try_parse_from([
+            "sparrowhawk-asm",
+            "build",
+            "reads.fastq",
+            "--debug-repeat-recovery",
+        ])
+        .expect("repeat debug flag parses");
+
+        let debug_flag = |args: Args| match args.command {
+            Commands::Build {
+                debug_repeat_recovery,
+                ..
+            } => debug_repeat_recovery,
+        };
+        let default_value = debug_flag(default_args);
+        let enabled_value = debug_flag(explicitly_enabled);
+        assert!(!default_value);
+        assert!(enabled_value);
+    }
 
     #[test]
     fn default_ladder_uses_fixed_anchors_under_the_ceiling() {

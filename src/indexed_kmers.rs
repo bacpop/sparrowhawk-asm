@@ -138,6 +138,12 @@ impl<IntT> IndexedKmers<IntT> {
         let entry = self.hash_to_index.get(&hash)?;
         self.packed_kmers.get(entry.index())
     }
+
+    /// Look up the original count for a canonical graph hash in an aligned count snapshot.
+    pub(crate) fn count_from_snapshot(&self, counts: &[u32], hash: u64) -> Option<u32> {
+        let entry = self.hash_to_index.get(&hash)?;
+        counts.get(entry.index()).copied()
+    }
 }
 
 impl<IntT> Default for IndexedKmers<IntT> {
