@@ -1098,8 +1098,13 @@ fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
 /// Fit the spectrum and report it. Seeded from the valley estimator's own peak and dispersion: the
 /// estimator locates the lobe, the fit refines it and separates the error lobe from it explicitly.
 /// `None` when no start converges, which leaves the estimator's answer standing.
+/// The browser counts exactly, so its spectra are never scaled.
 #[cfg(target_family = "wasm")]
-fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<SpectrumFit> {
+fn fit_and_log(
+    histovec: &[u32],
+    estimate: &SpectrumEstimate,
+    _sample_scale: f64,
+) -> Option<SpectrumFit> {
     if !estimate.verdict.is_ok() {
         logw(
             "Spectrum fit skipped because the empirical peak pair is unresolved.",
@@ -1137,8 +1142,13 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<Spectrum
     }
 }
 
+/// `sample_scale`: library k-mers per observed one, 1/fraction for a sketch and 1 for an exact table.
 #[cfg(not(target_family = "wasm"))]
-fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSpectrumFit> {
+fn fit_and_log(
+    histovec: &[u32],
+    estimate: &SpectrumEstimate,
+    sample_scale: f64,
+) -> Option<NativeSpectrumFit> {
     if !estimate.verdict.is_ok() {
         logw(
             "Native spectrum fit skipped because the empirical peak pair is unresolved.",
@@ -1152,6 +1162,7 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
         estimate.valley,
         estimate.genomic_peak,
         estimate.dispersion,
+        sample_scale,
     ) {
         Ok(result) => result,
         Err(error) => {
@@ -1172,9 +1183,9 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
         logw(
             &format!(
                 "Spectrum fit selected: error_model={} genome_model={} log_likelihood={:.6e} bic={:.6e} deviance={:.6e} \
-                 mean={:.1} mode={} repeat_mode={} dispersion={:.2} singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} \
+                 mean={:.1} mode={} repeat_mode={} repeat_ratio={:.3} dispersion={:.2} singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} \
                  shelf={} w=({:.3}/{:.3}/{:.3}) genome_kmers={:.3e} error_kmers={:.3e} crossover={} \
-                 hole_cutoff={} best_iterations={} elapsed_ms={}",
+                 hole_cutoff={} best_iterations={} elapsed_ms={} sample_scale={:.1}",
                 fit.error_model,
                 fit.genome_model,
                 fit.log_likelihood,
@@ -1183,6 +1194,7 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
                 fit.mean,
                 fit.primary_mode(),
                 fit.repeat_mode(),
+                fit.repeat_ratio,
                 fit.dispersion,
                 fit.error_params.singleton_probability,
                 fit.error_params.tail_exponent,
@@ -1198,6 +1210,7 @@ fn fit_and_log(histovec: &[u32], estimate: &SpectrumEstimate) -> Option<NativeSp
                     .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 fit.best_iterations,
                 elapsed.as_millis(),
+                sample_scale,
             ),
             Some("info"),
         );
@@ -1239,7 +1252,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
         logw(
             &format!(
                 "Spectrum fit candidate: error_model={} genome_model={} status={} log_likelihood={:.6e} bic={:.6e} \
-                 deviance={:.6e} mode={} repeat_mode={} error_mode={} mean={:.1} dispersion={:.2} \
+                 deviance={:.6e} mode={} repeat_mode={} repeat_ratio={:.3} error_mode={} mean={:.1} dispersion={:.2} \
                  singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} shelf={} total_iterations={} capped_starts={} best_iterations={} selection_eligible={}",
                 attempt.error_model,
                 attempt.genome_model,
@@ -1249,6 +1262,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                 fit.deviance,
                 fit.primary_mode(),
                 fit.repeat_mode(),
+                fit.repeat_ratio,
                 fit.error_mode(),
                 fit.mean,
                 fit.dispersion,
@@ -1306,19 +1320,23 @@ fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
 /// browser still reaches it from its chunked and Bloom entry points.
 #[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
 fn choose_min_count(histovec: &[u32]) -> u16 {
-    choose_min_count_and_peak(histovec).0
+    choose_min_count_and_peak(histovec, 1.0).0
 }
 
 /// As [`choose_min_count`], and also the single-copy coverage the same estimate found.
 ///
 /// The valley separates the lobes; the fit then says how much genome cutting there would cost. Those
 /// answer different questions, and on deep libraries the valley is far the more aggressive.
-fn choose_min_count_and_peak(histovec: &[u32]) -> (u16, PeakSource, SpectrumPlotDiagnostics) {
+/// `sample_scale` as in [`fit_and_log`].
+fn choose_min_count_and_peak(
+    histovec: &[u32],
+    sample_scale: f64,
+) -> (u16, PeakSource, SpectrumPlotDiagnostics) {
     let mut estimate = estimate_by_valley(histovec);
     log_spectrum(histovec, &estimate);
     let fit_attempted = estimate.verdict.is_ok();
     let fit = fit_attempted
-        .then(|| fit_and_log(histovec, &estimate))
+        .then(|| fit_and_log(histovec, &estimate, sample_scale))
         .flatten();
     apply_hole_guard(&mut estimate, fit.as_ref());
     warn_unresolved(&estimate);
@@ -1484,13 +1502,15 @@ fn fit_error_tail_fraction(histovec: &[u32], fit: &NativeSpectrumFit, start: u16
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn evaluate_floor<F>(floor: u8, histovec: &[u32], fit: &mut F) -> FloorCandidate
+fn evaluate_floor<F>(floor: u8, histovec: &[u32], sample_scale: f64, fit: &mut F) -> FloorCandidate
 where
-    F: FnMut(&[u32], &SpectrumEstimate) -> Option<NativeSpectrumFit>,
+    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
 {
     let estimate = estimate_by_valley(histovec);
     let fit_attempted = estimate.verdict.is_ok();
-    let fitted = fit_attempted.then(|| fit(histovec, &estimate)).flatten();
+    let fitted = fit_attempted
+        .then(|| fit(histovec, &estimate, sample_scale))
+        .flatten();
     let error_tail_fraction = fitted.and_then(|fit| {
         fit_error_tail_fraction(histovec, &fit, guarded_min_count(&estimate, &fit))
     });
@@ -1568,10 +1588,12 @@ fn choose_min_count_and_floor_with_fit<F>(
     floor_has_kmers: &[bool],
 ) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>)
 where
-    F: FnMut(&[u32], &SpectrumEstimate) -> Option<NativeSpectrumFit>,
+    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
 {
+    // Its callers hand it an exact strict-floor spectrum.
     let (min_count, floor, peak, diagnostics, _) = choose_min_count_and_floor_with_debug(
         histovec,
+        1.0,
         sketch,
         floors,
         fit,
@@ -1584,6 +1606,7 @@ where
 #[cfg(not(target_family = "wasm"))]
 fn choose_min_count_and_floor_with_debug<F>(
     histovec: &[u32],
+    strict_scale: f64,
     sketch: &SpectrumSketch,
     floors: &[u8],
     mut fit: F,
@@ -1597,12 +1620,12 @@ fn choose_min_count_and_floor_with_debug<F>(
     Vec<FloorDiagnostic>,
 )
 where
-    F: FnMut(&[u32], &SpectrumEstimate) -> Option<NativeSpectrumFit>,
+    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
 {
     let strict_index = floors.len() - 1;
     let strict_floor = floors[strict_index];
     let strict_present = floor_has_kmers[strict_index];
-    let strict = evaluate_floor(strict_floor, histovec, &mut fit);
+    let strict = evaluate_floor(strict_floor, histovec, strict_scale, &mut fit);
     log_spectrum(histovec, &strict.estimate);
     let strict_needs_review = !strict_present
         || strict.fit.is_none()
@@ -1627,6 +1650,8 @@ where
     // At the whole library's scale, as the strict spectrum already is: fitted on the raw sample, the
     // hole guard would strand 1/fraction genome k-mers instead of one.
     let spectra = (strict_index > 0).then(|| sketch.rescaled_spectra(floors.len()));
+    // Lower floors exist only in the sketch: each observed k-mer stands for 1/fraction of them.
+    let sketch_scale = 1.0 / sketch.fraction();
     let mut evaluated: Vec<Option<FloorCandidate>> = vec![None; floors.len()];
     let mut candidates = vec![strict];
     let mut diagnostic_floors = Vec::new();
@@ -1652,7 +1677,7 @@ where
                 );
                 continue;
             }
-            let candidate = evaluate_floor(floors[index], &spectra[index], &mut fit);
+            let candidate = evaluate_floor(floors[index], &spectra[index], sketch_scale, &mut fit);
             evaluated[index] = Some(candidate);
             let estimate = &candidate.estimate;
             logw(
@@ -1747,8 +1772,9 @@ where
             {
                 break;
             }
-            let candidate = evaluated[lower]
-                .unwrap_or_else(|| evaluate_floor(floors[lower], &spectra[lower], &mut fit));
+            let candidate = evaluated[lower].unwrap_or_else(|| {
+                evaluate_floor(floors[lower], &spectra[lower], sketch_scale, &mut fit)
+            });
             if candidate.fit.is_none() && selected.fit.is_some() {
                 break;
             }
@@ -3747,14 +3773,16 @@ where
     // A Bloom table has no count-1 bin and false positives inflate the rest, so its own histogram is
     // only drawn; every decision is read from the sketch, which is exact on its subsample.
     let sketch_spectrum;
+    // Library k-mers per observed one in `spectrum`, so the fit counts the sample it really has.
+    let spectrum_scale;
     let spectrum: &[u32] = if do_bloom {
         let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
-        sketch_spectrum = rescaled_strict_spectrum(
-            sketch.as_ref().expect("the Bloom path always sketches"),
-            keep,
-        );
+        let bloom_sketch = sketch.as_ref().expect("the Bloom path always sketches");
+        sketch_spectrum = rescaled_strict_spectrum(bloom_sketch, keep);
+        spectrum_scale = 1.0 / bloom_sketch.fraction();
         &sketch_spectrum
     } else {
+        spectrum_scale = 1.0;
         &histovec
     };
 
@@ -3781,6 +3809,7 @@ where
                     debug_floor_diagnostics,
                 ) = choose_min_count_and_floor_with_debug(
                     spectrum,
+                    spectrum_scale,
                     sketch,
                     floors,
                     fit_and_log,
@@ -3789,7 +3818,8 @@ where
                 );
             }
             _ => {
-                let (refit_minc, refit_peak, diagnostics) = choose_min_count_and_peak(spectrum);
+                let (refit_minc, refit_peak, diagnostics) =
+                    choose_min_count_and_peak(spectrum, spectrum_scale);
                 (minc, genomic_peak) = keep_refit_or_prior((refit_minc, refit_peak), prior);
                 plot_diagnostics = Some(diagnostics);
             }
@@ -3858,7 +3888,7 @@ where
                 if !diagnostics.fit_attempted {
                     let estimate = estimate_by_valley(spectrum);
                     if estimate.verdict.is_ok() {
-                        let fit = fit_and_log(spectrum, &estimate);
+                        let fit = fit_and_log(spectrum, &estimate, spectrum_scale);
                         diagnostics.record_fit(&estimate, fit);
                     }
                 }
@@ -5880,7 +5910,8 @@ mod tests {
     }
 
     /// Lower floors exist only in the sketch, so they must be fitted at the whole library's scale, as
-    /// the strict floor is: the hole guard budgets in absolute k-mers.
+    /// the strict floor is: the hole guard budgets in absolute k-mers. The fit is told that scale, so
+    /// its likelihood counts the sample rather than the rescaled bins.
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn lower_floors_are_fitted_at_the_whole_library_scale() {
@@ -5896,13 +5927,19 @@ mod tests {
             &histo(&bimodal(30)),
             &sketch,
             &[0u8, 11, 25],
-            |histogram, _| {
-                seen.borrow_mut().push(histogram.to_vec());
+            |histogram, _, sample_scale| {
+                seen.borrow_mut().push((histogram.to_vec(), sample_scale));
                 None
             },
             &[true; MAX_GROUPS],
         );
-        let fitted = &seen.borrow()[1]; // [strict, floor 11, floor 0]
+        let seen = seen.borrow(); // [strict, floor 11, floor 0]
+        assert_eq!(seen[0].1, 1.0, "the strict spectrum here is exact");
+        let (fitted, fitted_scale) = &seen[1];
+        assert!(
+            (fitted_scale - scale).abs() < 1e-12,
+            "{fitted_scale} against {scale}"
+        );
         for (i, (&a, &b)) in raw.iter().zip(fitted.iter()).enumerate() {
             assert_eq!(b, (a as f64 * scale).min(u32::MAX as f64) as u32, "bin {i}");
         }
@@ -6133,7 +6170,7 @@ mod tests {
             &shallow,
             &sketch,
             &[0, 11, 25],
-            |_, estimate| {
+            |_, estimate, _| {
                 calls.set(calls.get() + 1);
                 Some(native_test_fit(estimate.genomic_peak, 0.0))
             },
@@ -6156,7 +6193,7 @@ mod tests {
             &strict_histogram,
             &sketch,
             &[0u8, 11, 25],
-            |_, estimate| {
+            |_, estimate, _| {
                 let call = calls.get();
                 calls.set(call + 1);
                 (call == 1).then(|| native_test_fit(estimate.genomic_peak, 0.0))
@@ -6189,7 +6226,7 @@ mod tests {
             &histogram,
             &sketch,
             &[0, 11, 25],
-            |_, estimate| {
+            |_, estimate, _| {
                 calls.set(calls.get() + 1);
                 Some(native_test_fit(estimate.genomic_peak, 0.0))
             },
@@ -6210,7 +6247,7 @@ mod tests {
                 &strict,
                 &sketch_with(1, &bimodal(lower_peak)),
                 &[0u8, 11, 25],
-                |_, estimate| {
+                |_, estimate, _| {
                     calls.set(calls.get() + 1);
                     Some(native_test_fit(estimate.genomic_peak, 0.0))
                 },
@@ -6229,7 +6266,7 @@ mod tests {
     fn the_error_tail_starts_at_the_applied_cutoff() {
         let histogram = synthetic_spectrum(30.0);
         let estimate = estimate_by_valley(&histogram);
-        let fit = fit_and_log(&histogram, &estimate).expect("the fixture fits");
+        let fit = fit_and_log(&histogram, &estimate, 1.0).expect("the fixture fits");
         let cutoff = guarded_min_count(&estimate, &fit);
         assert!(cutoff > 2, "the fixture must cut above 2, got {cutoff}");
         let applied = fit_error_tail_fraction(&histogram, &fit, cutoff).unwrap();
@@ -6246,7 +6283,7 @@ mod tests {
             &synthetic_spectrum(9.0),
             &sketch_with(1, &bimodal(20)),
             &[0u8, 11, 25],
-            |_, estimate| {
+            |_, estimate, _| {
                 let call = calls.get();
                 calls.set(call + 1);
                 (call == 0).then(|| native_test_fit(estimate.genomic_peak, 0.0))
@@ -6278,9 +6315,10 @@ mod tests {
         let regular_calls = std::cell::Cell::new(0);
         let regular = choose_min_count_and_floor_with_debug(
             &histogram,
+            1.0,
             &sketch,
             &[0, 11, 25],
-            |_, estimate| {
+            |_, estimate, _| {
                 regular_calls.set(regular_calls.get() + 1);
                 Some(native_test_fit(estimate.genomic_peak, 0.0))
             },
@@ -6290,9 +6328,10 @@ mod tests {
         let debug_calls = std::cell::Cell::new(0);
         let debug = choose_min_count_and_floor_with_debug(
             &histogram,
+            1.0,
             &sketch,
             &[0, 11, 25],
-            |_, estimate| {
+            |_, estimate, _| {
                 debug_calls.set(debug_calls.get() + 1);
                 Some(native_test_fit(estimate.genomic_peak, 0.0))
             },
@@ -6424,7 +6463,7 @@ mod tests {
         assert!(!estimate.verdict.is_ok());
         assert_eq!((estimate.valley, estimate.genomic_peak), (0, 0));
 
-        let (min_count, peak_source, diagnostics) = choose_min_count_and_peak(&h);
+        let (min_count, peak_source, diagnostics) = choose_min_count_and_peak(&h, 1.0);
         assert_eq!(min_count, UNRESOLVED_MINCOUNT);
         assert!(matches!(peak_source, PeakSource::Fallback(_)));
         assert!(

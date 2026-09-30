@@ -23,6 +23,12 @@ use std::{fmt, sync::Arc};
 /// absorbs the right tail, which otherwise inflates the dispersion by 20-60 %. A third lobe was
 /// measured at a fitted weight of 0.000-0.009 and is not worth its parameter.
 const REPEAT_LOBE_COPIES: f64 = 2.0;
+/// Ratio we allow the second lobe (repeats lobe) to float in 
+#[cfg(not(target_family = "wasm"))]
+const REPEAT_RATIO: (f64, f64) = (1.5, 2.0);
+/// Where the ratio starts: just under a double, so the simplex has room on both sides.
+#[cfg(not(target_family = "wasm"))]
+const REPEAT_RATIO_START: f64 = 1.9;
 
 /// The fitted mean is pinned to this window around the peak the valley estimator found. Unpinned, the
 /// model relabels the observed peak as a repeat lobe and puts a near-empty single-copy lobe at half or
@@ -103,13 +109,20 @@ const SHELF_MAX_SHARE: f64 = 0.5;
 /// sat on the error tail, at counts 0-1, in the 2026_09_28 sweep.
 #[cfg(not(target_family = "wasm"))]
 const SHELF_MIN_RETAINED: f64 = 0.3;
-/// Bounds on a + b: above the upper one the shelf is a spike, below the lower one it splits into point
-/// masses at zero and at the lobe.
+/// Upper bound on the shelf's a + b: above it the shelf is a spike.
 #[cfg(not(target_family = "wasm"))]
-const SHELF_CONCENTRATION: (f64, f64) = (1.0, 20.0);
-/// Starting (retained fraction, concentration): a uniform shelf, and one ramping up to the lobe.
+const SHELF_MAX_CONCENTRATION: f64 = 20.0;
+/// Starting (retained fraction, concentration): a broad bump, and one ramping up to the lobe. Both sit
+/// inside the bounds, so the simplex can move either way.
 #[cfg(not(target_family = "wasm"))]
-const SHELF_SHAPES: [(f64, f64); 2] = [(0.5, 2.0), (0.75, 4.0)];
+const SHELF_SHAPES: [(f64, f64); 2] = [(0.5, 3.0), (0.75, 4.0)];
+
+/// Bounds on a + b for a retained fraction `m`. The lower one is a = m * (a + b) >= 1: below it the
+/// density diverges at count 0 and its mass at counts 1-2 pulled the hole guard down (S. aureus, k = 71).
+#[cfg(not(target_family = "wasm"))]
+fn shelf_concentration_bounds(retained: f64) -> (f64, f64) {
+    (1.0 / retained, SHELF_MAX_CONCENTRATION)
+}
 /// Three more dimensions need more simplex steps than the NB fit's cap.
 #[cfg(not(target_family = "wasm"))]
 const SHELF_MAX_ITERS: u64 = 2_000;
@@ -478,11 +491,12 @@ impl fmt::Display for GenomeModel {
 
 #[cfg(not(target_family = "wasm"))]
 impl GenomeModel {
-    /// Parameters beyond the lobes' mean and dispersion: the shelf's share, a and b.
+    /// Parameters beyond the lobes' mean and dispersion: the two-copy lobe's ratio, and for a shelf its
+    /// share, a and b.
     const fn extra_parameters(self) -> usize {
         match self {
-            Self::ShelfNegativeBinomial => 3,
-            Self::NegativeBinomial | Self::Normal => 0,
+            Self::ShelfNegativeBinomial => 4,
+            Self::NegativeBinomial | Self::Normal => 1,
         }
     }
 
@@ -588,6 +602,8 @@ pub(crate) struct NativeSpectrumFit {
     pub(crate) error_params: ErrorParams,
     /// The shelf under the single-copy lobe, when the genome model has one.
     pub(crate) shelf: Option<Shelf>,
+    /// The two-copy lobe's mean as a multiple of the single-copy mean.
+    pub(crate) repeat_ratio: f64,
     pub(crate) genome_kmers: f64,
     pub(crate) error_kmers: f64,
     pub(crate) log_likelihood: f64,
@@ -632,6 +648,7 @@ impl NativeSpectrumFit {
             dispersion,
             error_params,
             shelf: None,
+            repeat_ratio: REPEAT_LOBE_COPIES,
             genome_kmers: weights[1] * observed_total / normalisers[1].exp(),
             error_kmers: weights[0] * observed_total / normalisers[0].exp(),
             log_likelihood: -1.0,
@@ -652,7 +669,7 @@ impl NativeSpectrumFit {
 
     pub(crate) fn repeat_mode(&self) -> usize {
         native_genome_mode(
-            REPEAT_LOBE_COPIES * self.mean,
+            self.repeat_ratio * self.mean,
             self.dispersion,
             self.genome_model,
         )
@@ -682,7 +699,7 @@ impl NativeSpectrumFit {
             ),
             native_ln_genome(
                 count,
-                REPEAT_LOBE_COPIES * self.mean,
+                self.repeat_ratio * self.mean,
                 self.dispersion,
                 self.genome_model,
             ),
@@ -800,6 +817,8 @@ struct NativeMixtureFit {
     fit_window_end: usize,
     error_model: ErrorModel,
     genome_model: GenomeModel,
+    /// Library k-mers each observed one stands for: 1/fraction for a sketch, 1 for an exact table.
+    sample_scale: f64,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -812,6 +831,7 @@ struct NativeParams {
     dispersion: f64,
     error_params: ErrorParams,
     shelf: Option<Shelf>,
+    repeat_ratio: f64,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -829,12 +849,17 @@ impl NativeMixtureFit {
             },
         };
         let base = self.error_model.parameter_count();
-        let (low, high) = SHELF_CONCENTRATION;
+        let (ratio_low, ratio_high) = REPEAT_RATIO;
+        let repeat_ratio = ratio_low + (ratio_high - ratio_low) * sigmoid(theta[base]);
+        let shelf_at = base + 1;
         let shelf = (self.genome_model == GenomeModel::ShelfNegativeBinomial).then(|| {
+            let retained =
+                SHELF_MIN_RETAINED + (1.0 - SHELF_MIN_RETAINED) * sigmoid(theta[shelf_at + 1]);
+            let (low, high) = shelf_concentration_bounds(retained);
             Shelf::from_retained(
-                SHELF_MAX_SHARE * sigmoid(theta[base]),
-                SHELF_MIN_RETAINED + (1.0 - SHELF_MIN_RETAINED) * sigmoid(theta[base + 1]),
-                low + (high - low) * sigmoid(theta[base + 2]),
+                SHELF_MAX_SHARE * sigmoid(theta[shelf_at]),
+                retained,
+                low + (high - low) * sigmoid(theta[shelf_at + 2]),
             )
         });
         NativeParams {
@@ -850,6 +875,7 @@ impl NativeMixtureFit {
             dispersion,
             error_params,
             shelf,
+            repeat_ratio,
         }
     }
 
@@ -864,7 +890,7 @@ impl NativeMixtureFit {
                 self.fit_window_end,
             ),
             native_log_genome_mass(
-                REPEAT_LOBE_COPIES * params.mean,
+                params.repeat_ratio * params.mean,
                 params.dispersion,
                 self.genome_model,
                 self.fit_window_end,
@@ -881,6 +907,9 @@ impl NativeMixtureFit {
         let w_error = params.ln_error.exp();
         let w_single = params.ln_single.exp();
         let w_repeat = params.ln_repeat.exp();
+        // Totals and heights at library scale, for the hole guard's absolute budget and the plots;
+        // BIC's penalty counts the sample that was actually observed.
+        let library_total = self.observed_total * self.sample_scale;
         let mut fit = NativeSpectrumFit {
             error_model: self.error_model,
             genome_model: self.genome_model,
@@ -891,8 +920,9 @@ impl NativeMixtureFit {
             dispersion: params.dispersion,
             error_params: params.error_params,
             shelf: params.shelf,
-            genome_kmers: w_single * self.observed_total / normalisers[1].exp(),
-            error_kmers: w_error * self.observed_total / normalisers[0].exp(),
+            repeat_ratio: params.repeat_ratio,
+            genome_kmers: w_single * library_total / normalisers[1].exp(),
+            error_kmers: w_error * library_total / normalisers[0].exp(),
             log_likelihood: -cost,
             bic: 2.0 * cost
                 + (self.error_model.parameter_count() + self.genome_model.extra_parameters())
@@ -902,7 +932,7 @@ impl NativeMixtureFit {
             fit_window_end: self.fit_window_end,
             best_iterations: iterations,
             component_log_normalisers: normalisers,
-            observed_total: self.observed_total,
+            observed_total: library_total,
         };
         fit.deviance = self.conditional_deviance(&fit);
         fit
@@ -912,10 +942,12 @@ impl NativeMixtureFit {
         self.observed
             .iter()
             .map(|&(count, observed)| {
+                // Heights are at library scale; the deviance compares in the sample's own units.
                 let expected = fit
                     .component_heights(count as usize)
                     .into_iter()
-                    .sum::<f64>();
+                    .sum::<f64>()
+                    / self.sample_scale;
                 if expected > 0.0 {
                     2.0 * observed * (observed / expected).ln()
                 } else {
@@ -968,7 +1000,7 @@ impl CostFunction for NativeMixtureFit {
                 let repeat = params.ln_repeat
                     + native_ln_genome(
                         count,
-                        REPEAT_LOBE_COPIES * params.mean,
+                        params.repeat_ratio * params.mean,
                         params.dispersion,
                         self.genome_model,
                     )
@@ -984,18 +1016,32 @@ impl CostFunction for NativeMixtureFit {
     }
 }
 
+/// `histovec` is at library scale; `sample_scale` is how many library k-mers each observed one stands
+/// for. The likelihood and BIC count the sample itself, so a sketch is not mistaken for millions of
+/// independent k-mers; totals and heights are reported back at library scale.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn fit_native_spectrum(
     histovec: &[u32],
     valley: usize,
     peak: usize,
     dispersion_hint: f64,
+    sample_scale: f64,
 ) -> Result<FitSearchResult, Error> {
     if peak < 2 || valley < 2 || histovec.len() < 2 {
         return Err(Error::msg("no usable genome peak or valley to fit around"));
     }
-    let top = fit_window_end(histovec.len(), peak);
-    let observed: Arc<[(f64, f64)]> = histovec[..top]
+    let sample_scale = if sample_scale.is_finite() && sample_scale >= 1.0 {
+        sample_scale
+    } else {
+        1.0
+    };
+    // A rescaled sketch bin is floor(sampled * scale), so dividing and rounding recovers the sample.
+    let sample: Vec<u32> = histovec
+        .iter()
+        .map(|&n| (f64::from(n) / sample_scale).round() as u32)
+        .collect();
+    let top = fit_window_end(sample.len(), peak);
+    let observed: Arc<[(f64, f64)]> = sample[..top]
         .iter()
         .enumerate()
         .filter(|(_, count)| **count > 0)
@@ -1012,7 +1058,7 @@ pub(crate) fn fit_native_spectrum(
         2.0
     };
 
-    let shelf_share = empirical_shelf_share(histovec, valley, peak);
+    let shelf_share = empirical_shelf_share(&sample, valley, peak);
     const CONFIGURATIONS: [(ErrorModel, GenomeModel); 4] = [
         (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
         (
@@ -1037,6 +1083,7 @@ pub(crate) fn fit_native_spectrum(
             fit_window_end: top,
             error_model,
             genome_model,
+            sample_scale,
         })
         .collect();
     // Every start of every candidate goes into one pool, so no thread idles while the candidate with
@@ -1180,10 +1227,15 @@ fn native_starts(
             if problem.error_model == ErrorModel::FreeSingletonWeibull {
                 start.push(shape.ln());
             }
+            let logit = |p: f64| (p / (1.0 - p)).ln();
+            // Starts near a two-copy lobe; the simplex moves it if the second lobe sits lower.
+            let (ratio_low, ratio_high) = REPEAT_RATIO;
+            start.push(logit(
+                (REPEAT_RATIO_START - ratio_low) / (ratio_high - ratio_low),
+            ));
             if problem.genome_model == GenomeModel::ShelfNegativeBinomial {
-                let logit = |p: f64| (p / (1.0 - p)).ln();
-                let (low, high) = SHELF_CONCENTRATION;
                 for &(retained, concentration) in &SHELF_SHAPES {
+                    let (low, high) = shelf_concentration_bounds(retained);
                     let mut shelf_start = start.clone();
                     shelf_start.extend([
                         logit(shelf_share / SHELF_MAX_SHARE),
@@ -1374,21 +1426,20 @@ fn shelf_trials(mean: f64) -> f64 {
     mean.round().max(1.0)
 }
 
-/// A share inside (0, [`SHELF_MAX_SHARE`]), and finite shapes within the retained-fraction and
-/// concentration bounds.
+/// A share inside (0, [`SHELF_MAX_SHARE`]), and finite shapes with a >= 1 within the retained-fraction
+/// and concentration bounds.
 #[cfg(not(target_family = "wasm"))]
 fn shelf_is_valid(shelf: Shelf) -> bool {
-    let (low, high) = SHELF_CONCENTRATION;
     // Rounding in `a / (a + b)` may land a hair outside a bound the mapping itself respects.
     let slack = 1e-9;
     shelf.share > 0.0
         && shelf.share < SHELF_MAX_SHARE
         && shelf.alpha.is_finite()
-        && shelf.alpha > 0.0
+        && shelf.alpha >= 1.0 - slack
         && shelf.beta.is_finite()
         && shelf.beta > 0.0
         && shelf.retained() >= SHELF_MIN_RETAINED - slack
-        && (low - slack..=high + slack).contains(&shelf.concentration())
+        && shelf.concentration() <= SHELF_MAX_CONCENTRATION + slack
 }
 
 /// Log density of the single-copy component: its lobe, plus the shelf when the model has one.
@@ -1748,6 +1799,7 @@ mod tests {
             fit_window_end: 300,
             error_model: ErrorModel::SingletonPareto,
             genome_model: GenomeModel::NegativeBinomial,
+            sample_scale: 1.0,
         };
         let attempt = fit_native_candidate(problem, 12, 50, 4.0, 0.05, 1);
         assert_eq!(attempt.capped_starts, 8);
@@ -1830,15 +1882,16 @@ mod tests {
             fit_window_end: 300,
             error_model: ErrorModel::SingletonPareto,
             genome_model: GenomeModel::ShelfNegativeBinomial,
+            sample_scale: 1.0,
         }
     }
 
-    /// Whatever the simplex tries, the shelf stays off the error tail and never becomes a spike.
+    /// Whatever the simplex tries, the shelf stays off the error tail, keeps a >= 1 (no density piled
+    /// at count 0) and never becomes a spike.
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn shelf_coordinates_stay_inside_their_bounds() {
         let problem = shelf_problem();
-        let (low, high) = SHELF_CONCENTRATION;
         for share in [-50.0, 0.0, 50.0] {
             for retained in [-50.0, 0.0, 50.0] {
                 for concentration in [-50.0, 0.0, 50.0] {
@@ -1849,6 +1902,7 @@ mod tests {
                         1.0,
                         0.5,
                         1.7,
+                        0.0,
                         share,
                         retained,
                         concentration,
@@ -1859,13 +1913,52 @@ mod tests {
                         (SHELF_MIN_RETAINED - 1e-12..=1.0).contains(&shelf.retained()),
                         "{shelf:?}"
                     );
+                    assert!(shelf.alpha >= 1.0 - 1e-12, "{shelf:?}");
                     assert!(
-                        (low - 1e-12..=high + 1e-12).contains(&shelf.concentration()),
+                        shelf.concentration() <= SHELF_MAX_CONCENTRATION + 1e-12,
                         "{shelf:?}"
                     );
                 }
             }
         }
+    }
+
+    /// However far the simplex pushes its coordinate, the two-copy lobe stays within its bounds.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn the_two_copy_ratio_stays_inside_its_bounds() {
+        let problem = shelf_problem();
+        let (low, high) = REPEAT_RATIO;
+        for ratio in [-50.0, 0.0, 50.0] {
+            let theta = [0.0, -3.0, 0.0, 1.0, 0.5, 1.7, ratio, 0.0, 0.0, 0.0];
+            let fitted = problem.params(&theta).repeat_ratio;
+            assert!((low - 1e-12..=high + 1e-12).contains(&fitted), "{fitted}");
+        }
+    }
+
+    /// A second lobe at 1.7 times the single-copy mean, not 2, is followed by the fit.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_second_lobe_off_the_double_is_followed() {
+        let error = ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 1.8,
+            weibull_shape: None,
+        };
+        let (mean, ratio) = (53.0, 1.7);
+        let mut histogram = vec![0u32; 601];
+        for (index, bin) in histogram.iter_mut().enumerate() {
+            let count = (index + 1) as f64;
+            let error_height = 400_000.0 * error.log_probability(count).exp();
+            let single = 200_000.0 * ln_dnbinom(count, mean, 4.0).exp();
+            let second = 60_000.0 * ln_dnbinom(count, ratio * mean, 4.0).exp();
+            *bin = (error_height + single + second).round() as u32;
+        }
+        let selected = fit_native_spectrum(&histogram, 12, 50, 4.0, 1.0)
+            .expect("the fit runs")
+            .selected
+            .expect("one candidate survives");
+        assert!((1.6..=1.8).contains(&selected.repeat_ratio), "{selected:?}");
     }
 
     /// Each shelf start decodes to one of the starting shapes, with the histogram's share.
@@ -1902,6 +1995,7 @@ mod tests {
                 log_dispersion,
                 1.8f64.ln(),
                 1.7,
+                0.0,
                 -1.0,
                 0.0,
                 0.0,
@@ -1994,7 +2088,7 @@ mod tests {
             *bin = (error_height + single + repeat).round() as u32;
         }
         let result =
-            fit_native_spectrum(&histogram, 12, 50, 4.0).expect("synthetic fit should run");
+            fit_native_spectrum(&histogram, 12, 50, 4.0, 1.0).expect("synthetic fit should run");
         let selected = result.selected.expect("one candidate should survive");
         assert_eq!(
             selected.genome_model,
@@ -2003,10 +2097,47 @@ mod tests {
         );
         let fitted = selected.shelf.expect("the shelf model carries a shelf");
         assert!((0.05..=0.15).contains(&fitted.share), "{fitted:?}");
-        let (low, high) = SHELF_CONCENTRATION;
         assert!(fitted.retained() >= SHELF_MIN_RETAINED, "{fitted:?}");
-        assert!((low..=high).contains(&fitted.concentration()), "{fitted:?}");
+        assert!(shelf_is_valid(fitted), "{fitted:?}");
         assert_eq!(selected.hole_cutoff(1.0), Some(2));
+    }
+
+    /// A spectrum rescaled from a sample fits exactly as the sample does, with genome k-mers, heights
+    /// and so the hole guard at library scale.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_rescaled_sample_fits_as_the_sample_itself() {
+        let error = ErrorParams {
+            singleton_probability: 0.85,
+            tail_exponent: 1.8,
+            weibull_shape: None,
+        };
+        let sample = native_synthetic(error);
+        let scale = 228.0;
+        let rescaled: Vec<u32> = sample
+            .iter()
+            .map(|&n| (f64::from(n) * scale) as u32)
+            .collect();
+        let raw = fit_native_spectrum(&sample, 12, 50, 4.0, 1.0)
+            .unwrap()
+            .selected
+            .unwrap();
+        let fit = fit_native_spectrum(&rescaled, 12, 50, 4.0, scale)
+            .unwrap()
+            .selected
+            .unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs());
+        assert_eq!(fit.genome_model, raw.genome_model);
+        assert!(
+            close(fit.bic, raw.bic) && close(fit.mean, raw.mean),
+            "{fit:?} {raw:?}"
+        );
+        assert!(close(fit.genome_kmers, scale * raw.genome_kmers));
+        assert!(close(
+            fit.component_heights(30)[1],
+            scale * raw.component_heights(30)[1]
+        ));
+        assert_eq!(fit.hole_cutoff(scale), raw.hole_cutoff(1.0));
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -2134,7 +2265,7 @@ mod tests {
             tail_exponent: 1.8,
             weibull_shape: None,
         };
-        let result = fit_native_spectrum(&native_synthetic(error), 12, 50, 4.0)
+        let result = fit_native_spectrum(&native_synthetic(error), 12, 50, 4.0, 1.0)
             .expect("synthetic fit should run");
         let configurations: Vec<_> = result
             .attempts
@@ -2182,7 +2313,7 @@ mod tests {
             tail_exponent: 1.5,
             weibull_shape: Some(0.8),
         };
-        let result = fit_native_spectrum(&native_synthetic(error), 12, 50, 4.0)
+        let result = fit_native_spectrum(&native_synthetic(error), 12, 50, 4.0, 1.0)
             .expect("synthetic fit should run");
         let selected = result.selected.expect("one candidate should survive");
         assert_eq!(
