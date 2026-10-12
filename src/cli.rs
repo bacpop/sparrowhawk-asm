@@ -247,10 +247,8 @@ pub enum Commands {
         #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_EC_COVERAGE_RATIO)]
         ec_coverage_ratio: f64,
 
-        /// Erroneous-connection removal: require *both* flanks over the ratio rather than either.
-        /// Off by default, matching Minia (`Simplifications.cpp:1786` ORs the two sides). Measured,
-        /// the strict variant removes about half as many connectors for no measurable quality gain.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        /// Erroneous-connection removal: require both flanks over the ratio rather than either.
+        #[arg(long, default_value_t = false)]
         ec_require_both_flanks: bool,
 
         /// Tip removal: dead-end paths shorter than this many bases are pruned. The threshold actually
@@ -275,7 +273,7 @@ pub enum Commands {
         tip_rctc_cutoff: f64,
 
         /// Tip removal: keep only the length rule, dropping the coverage tier entirely.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false)]
         no_tip_rctc: bool,
 
         /// Minimum contig sequence length written to FASTA, in nucleotides. Contigs with exactly

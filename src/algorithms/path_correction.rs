@@ -992,8 +992,7 @@ mod tests {
         assert_paired(&overlong);
     }
 
-    /// Minia ORs the two flank tests; we default to AND. Same graph, opposite outcomes — so the flag
-    /// is load-bearing and not decoration.
+    /// We do by default an OR from both flanks with erroneous corrections (from Minia). `--ec-require-both-flanks` switches to removing both. These tests check that the flag does something.
     #[test]
     fn either_flank_removes_what_both_flanks_keeps() {
         // Left flank strong (20 vs connector 2), right flank weak (3): passes on one side only.
