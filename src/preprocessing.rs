@@ -284,6 +284,9 @@ const MIN_GP_TO_V_RATIO: f64 = 1.75;
 const MIN_CAND_KMER_FRAC: f64 = 0.20;
 /// A selected peak's mirrored valley-to-shoulder interval must carry at least this share of all non-singleton bins.
 const MIN_PEAK_AREA_FRACTION: f64 = 0.05;
+/// Bloom filter occupancy (%) from which a warning is shown.
+#[cfg(not(target_family = "wasm"))]
+const BLOOM_WARN_OCCUPANCY_PCT: f64 = 25.0;
 /// Used when the lobes cannot be separated. Not 1: at a genomic peak of 3-4 every singleton error survives and
 /// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
 const UNRESOLVED_MINCOUNT: u16 = 2;
@@ -3552,6 +3555,13 @@ where
         log::info!(
             "Bloom filter occupancy: set_bits={set_bits} capacity_bits={capacity_bits} occupancy_pct={occupancy_pct:.3}"
         );
+        if occupancy_pct > BLOOM_WARN_OCCUPANCY_PCT {
+            log::warn!(
+                "The Bloom filter is {occupancy_pct:.1}% full at k={k}: some k-mers seen once will be \
+                 admitted at count 2. This matters only if the minimum count ends up at 2; --no-bloom \
+                 counts exactly, at the cost of memory for every distinct k-mer."
+            );
+        }
     }
 
     let mut floor_has_kmers = [false; MAX_GROUPS];
