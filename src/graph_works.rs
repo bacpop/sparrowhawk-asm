@@ -52,6 +52,78 @@ impl<IntT: Copy> KmerLookup<IntT> for IndexedKmers<IntT> {
     }
 }
 
+/// ntHash's split-rotate tables for `base` at `k`, ORed: the term that drops or adds the far base.
+#[inline]
+fn ms_tab(base: u8, k: usize) -> u64 {
+    let b = base as usize;
+    nthash::MS_TAB_5LL[b * 5 + k % 5]
+        | nthash::MS_TAB_7L[b * 7 + k % 7]
+        | nthash::MS_TAB_9LC[b * 9 + k % 9]
+        | nthash::MS_TAB_11CR[b * 11 + k % 11]
+        | nthash::MS_TAB_13R[b * 13 + k % 13]
+        | nthash::MS_TAB_19RR[b * 19 + k % 19]
+}
+
+/// A k-mer's eight candidate predecessor hashes, two per base (from the canonical strand, then from
+/// the reverse complement), each with its edge type for a canonical and for a reverse-complement hit.
+#[inline]
+fn bkg_candidates(hc: u64, hnc: u64, k: usize, bases: u8) -> [(u64, EdgeType, EdgeType); 8] {
+    let (canonical_base, reverse_base) = (bases & 3, (bases >> 2) & 3);
+    let mut out = [(0, EdgeType::MinToMin, EdgeType::MinToMin); 8];
+    for i in 0..4u8 {
+        let canonical = nthash::swapbits_18_31_42_51_58_63(
+            (hc ^ nthash::HASH_LOOKUP[canonical_base as usize] ^ ms_tab(i, k)).rotate_right(1),
+        );
+        let reverse = nthash::swapbits_18_31_42_51_58_63(
+            (hnc ^ ms_tab(rc_base(i), k) ^ nthash::RC_HASH_LOOKUP[reverse_base as usize])
+                .rotate_right(1),
+        );
+        out[2 * i as usize] = (canonical, EdgeType::MinToMin, EdgeType::MaxToMin);
+        out[2 * i as usize + 1] = (reverse, EdgeType::MinToMax, EdgeType::MaxToMax);
+    }
+    out
+}
+
+/// The same for a k-mer's eight candidate successors.
+#[inline]
+fn fwd_candidates(hc: u64, hnc: u64, k: usize, bases: u8) -> [(u64, EdgeType, EdgeType); 8] {
+    let (canonical_base, reverse_base) = ((bases >> 2) & 3, bases & 3);
+    let mut out = [(0, EdgeType::MinToMin, EdgeType::MinToMin); 8];
+    for i in 0..4u8 {
+        let canonical = nthash::swapbits_0_19_32_43_52_59(hc.rotate_left(1))
+            ^ nthash::HASH_LOOKUP[i as usize]
+            ^ ms_tab(canonical_base, k);
+        let reverse = nthash::swapbits_0_19_32_43_52_59(hnc.rotate_left(1))
+            ^ nthash::RC_HASH_LOOKUP[i as usize]
+            ^ ms_tab(rc_base(reverse_base), k);
+        out[2 * i as usize] = (canonical, EdgeType::MinToMin, EdgeType::MinToMax);
+        out[2 * i as usize + 1] = (reverse, EdgeType::MaxToMin, EdgeType::MaxToMax);
+    }
+    out
+}
+
+/// The candidates present in the legacy dictionaries: a canonical hit directly, a reverse-complement
+/// one through `maxmindict`.
+fn dict_hits(
+    candidates: [(u64, EdgeType, EdgeType); 8],
+    thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+    maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+) -> Vec<(u64, EdgeType)> {
+    candidates
+        .into_iter()
+        .filter_map(|(hash, canonical, reverse)| {
+            if thedict.contains_key(&hash) {
+                Some((hash, canonical))
+            } else {
+                maxmindict
+                    .get(&hash)
+                    .filter(|h| thedict.contains_key(*h))
+                    .map(|&h| (h, reverse))
+            }
+        })
+        .collect()
+}
+
 /// Get backwards neighbours, i.e. incoming edges to either the canonical or non-canonical hashes
 pub fn check_bkg(
     // backwards here mean INCOMING edges, whether from the rev.-comp. strand, or the direct one
@@ -62,52 +134,7 @@ pub fn check_bkg(
     thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
 ) -> Vec<(u64, EdgeType)> {
-    let mut outvec = Vec::new();
-    let thecbase = bases & 3;
-    let thencbase = (bases >> 2) & 3;
-    for i in 0..4 {
-        let tmphashc = nthash::swapbits_18_31_42_51_58_63(
-            (hc ^ nthash::HASH_LOOKUP[thecbase as usize]
-                ^ (nthash::MS_TAB_5LL[(i as usize * 5) + (k % 5)]
-                    | nthash::MS_TAB_7L[(i as usize * 7) + (k % 7)]
-                    | nthash::MS_TAB_9LC[(i as usize * 9) + (k % 9)]
-                    | nthash::MS_TAB_11CR[(i as usize * 11) + (k % 11)]
-                    | nthash::MS_TAB_13R[(i as usize * 13) + (k % 13)]
-                    | nthash::MS_TAB_19RR[(i as usize * 19) + (k % 19)]))
-                .rotate_right(1u32),
-        );
-
-        if thedict.contains_key(&tmphashc) {
-            outvec.push((tmphashc, EdgeType::MinToMin));
-        } else {
-            let poth = maxmindict.get(&tmphashc);
-            if poth.is_some_and(|x| thedict.contains_key(x)) {
-                outvec.push((*poth.unwrap(), EdgeType::MaxToMin));
-            }
-        }
-
-        let mut tmphashnc = hnc
-            ^ (nthash::MS_TAB_5LL[(rc_base(i) as usize * 5) + (k % 5)]
-                | nthash::MS_TAB_7L[(rc_base(i) as usize * 7) + (k % 7)]
-                | nthash::MS_TAB_9LC[(rc_base(i) as usize * 9) + (k % 9)]
-                | nthash::MS_TAB_11CR[(rc_base(i) as usize * 11) + (k % 11)]
-                | nthash::MS_TAB_13R[(rc_base(i) as usize * 13) + (k % 13)]
-                | nthash::MS_TAB_19RR[(rc_base(i) as usize * 19) + (k % 19)]);
-        tmphashnc ^= nthash::RC_HASH_LOOKUP[thencbase as usize];
-        tmphashnc = tmphashnc.rotate_right(1_u32);
-        tmphashnc = nthash::swapbits_18_31_42_51_58_63(tmphashnc);
-
-        if thedict.contains_key(&tmphashnc) {
-            outvec.push((tmphashnc, EdgeType::MinToMax));
-        } else {
-            let poth = maxmindict.get(&tmphashnc);
-            if poth.is_some_and(|x| thedict.contains_key(x)) {
-                outvec.push((*poth.unwrap(), EdgeType::MaxToMax));
-            }
-        }
-    }
-
-    outvec
+    dict_hits(bkg_candidates(hc, hnc, k, bases), thedict, maxmindict)
 }
 
 /// Get forward neighbours, i.e. outgoing edges from either the canonical or non-canonical hashes
@@ -119,50 +146,7 @@ pub fn check_fwd(
     thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
     maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
 ) -> Vec<(u64, EdgeType)> {
-    let mut outvec = Vec::new();
-
-    let thecbase = (bases >> 2) & 3;
-    let thencbase = bases & 3;
-    for i in 0..4 {
-        let mut tmphashc = hc.rotate_left(1);
-        tmphashc = nthash::swapbits_0_19_32_43_52_59(tmphashc);
-        tmphashc ^= nthash::HASH_LOOKUP[i as usize];
-        tmphashc ^= nthash::MS_TAB_5LL[(thecbase as usize * 5) + (k % 5)]
-            | nthash::MS_TAB_7L[(thecbase as usize * 7) + (k % 7)]
-            | nthash::MS_TAB_9LC[(thecbase as usize * 9) + (k % 9)]
-            | nthash::MS_TAB_11CR[(thecbase as usize * 11) + (k % 11)]
-            | nthash::MS_TAB_13R[(thecbase as usize * 13) + (k % 13)]
-            | nthash::MS_TAB_19RR[(thecbase as usize * 19) + (k % 19)];
-
-        if thedict.contains_key(&tmphashc) {
-            outvec.push((tmphashc, EdgeType::MinToMin));
-        } else {
-            let poth = maxmindict.get(&tmphashc);
-            if poth.is_some_and(|x| thedict.contains_key(x)) {
-                outvec.push((*poth.unwrap(), EdgeType::MinToMax));
-            }
-        }
-
-        let tmphashnc = nthash::swapbits_0_19_32_43_52_59(hnc.rotate_left(1u32))
-            ^ nthash::RC_HASH_LOOKUP[i as usize]
-            ^ (nthash::MS_TAB_5LL[(rc_base(thencbase) as usize * 5) + (k % 5)]
-                | nthash::MS_TAB_7L[(rc_base(thencbase) as usize * 7) + (k % 7)]
-                | nthash::MS_TAB_9LC[(rc_base(thencbase) as usize * 9) + (k % 9)]
-                | nthash::MS_TAB_11CR[(rc_base(thencbase) as usize * 11) + (k % 11)]
-                | nthash::MS_TAB_13R[(rc_base(thencbase) as usize * 13) + (k % 13)]
-                | nthash::MS_TAB_19RR[(rc_base(thencbase) as usize * 19) + (k % 19)]);
-
-        if thedict.contains_key(&tmphashnc) {
-            outvec.push((tmphashnc, EdgeType::MaxToMin));
-        } else {
-            let poth = maxmindict.get(&tmphashnc);
-            if poth.is_some_and(|x| thedict.contains_key(x)) {
-                outvec.push((*poth.unwrap(), EdgeType::MaxToMax));
-            }
-        }
-    }
-
-    outvec
+    dict_hits(fwd_candidates(hc, hnc, k, bases), thedict, maxmindict)
 }
 
 #[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
@@ -241,43 +225,10 @@ fn check_bkg_indexed(
     bases: u8,
     lookup: &OrientedLookup,
 ) -> Vec<IndexedEdge> {
-    let mut output = Vec::new();
-    let canonical_base = bases & 3;
-    let reverse_base = (bases >> 2) & 3;
-
-    for i in 0..4 {
-        let candidate = nthash::swapbits_18_31_42_51_58_63(
-            (hc ^ nthash::HASH_LOOKUP[canonical_base as usize]
-                ^ (nthash::MS_TAB_5LL[(i as usize * 5) + (k % 5)]
-                    | nthash::MS_TAB_7L[(i as usize * 7) + (k % 7)]
-                    | nthash::MS_TAB_9LC[(i as usize * 9) + (k % 9)]
-                    | nthash::MS_TAB_11CR[(i as usize * 11) + (k % 11)]
-                    | nthash::MS_TAB_13R[(i as usize * 13) + (k % 13)]
-                    | nthash::MS_TAB_19RR[(i as usize * 19) + (k % 19)]))
-                .rotate_right(1),
-        );
-        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MinToMin, EdgeType::MaxToMin)
-        {
-            output.push(edge);
-        }
-
-        let mut candidate = hnc
-            ^ (nthash::MS_TAB_5LL[(rc_base(i) as usize * 5) + (k % 5)]
-                | nthash::MS_TAB_7L[(rc_base(i) as usize * 7) + (k % 7)]
-                | nthash::MS_TAB_9LC[(rc_base(i) as usize * 9) + (k % 9)]
-                | nthash::MS_TAB_11CR[(rc_base(i) as usize * 11) + (k % 11)]
-                | nthash::MS_TAB_13R[(rc_base(i) as usize * 13) + (k % 13)]
-                | nthash::MS_TAB_19RR[(rc_base(i) as usize * 19) + (k % 19)]);
-        candidate ^= nthash::RC_HASH_LOOKUP[reverse_base as usize];
-        candidate = candidate.rotate_right(1);
-        candidate = nthash::swapbits_18_31_42_51_58_63(candidate);
-        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MinToMax, EdgeType::MaxToMax)
-        {
-            output.push(edge);
-        }
-    }
-
-    output
+    bkg_candidates(hc, hnc, k, bases)
+        .into_iter()
+        .filter_map(|(hash, canonical, reverse)| indexed_edge(hash, lookup, canonical, reverse))
+        .collect()
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -288,40 +239,10 @@ fn check_fwd_indexed(
     bases: u8,
     lookup: &OrientedLookup,
 ) -> Vec<IndexedEdge> {
-    let mut output = Vec::new();
-    let canonical_base = (bases >> 2) & 3;
-    let reverse_base = bases & 3;
-
-    for i in 0..4 {
-        let mut candidate = hc.rotate_left(1);
-        candidate = nthash::swapbits_0_19_32_43_52_59(candidate);
-        candidate ^= nthash::HASH_LOOKUP[i as usize];
-        candidate ^= nthash::MS_TAB_5LL[(canonical_base as usize * 5) + (k % 5)]
-            | nthash::MS_TAB_7L[(canonical_base as usize * 7) + (k % 7)]
-            | nthash::MS_TAB_9LC[(canonical_base as usize * 9) + (k % 9)]
-            | nthash::MS_TAB_11CR[(canonical_base as usize * 11) + (k % 11)]
-            | nthash::MS_TAB_13R[(canonical_base as usize * 13) + (k % 13)]
-            | nthash::MS_TAB_19RR[(canonical_base as usize * 19) + (k % 19)];
-        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MinToMin, EdgeType::MinToMax)
-        {
-            output.push(edge);
-        }
-
-        let candidate = nthash::swapbits_0_19_32_43_52_59(hnc.rotate_left(1))
-            ^ nthash::RC_HASH_LOOKUP[i as usize]
-            ^ (nthash::MS_TAB_5LL[(rc_base(reverse_base) as usize * 5) + (k % 5)]
-                | nthash::MS_TAB_7L[(rc_base(reverse_base) as usize * 7) + (k % 7)]
-                | nthash::MS_TAB_9LC[(rc_base(reverse_base) as usize * 9) + (k % 9)]
-                | nthash::MS_TAB_11CR[(rc_base(reverse_base) as usize * 11) + (k % 11)]
-                | nthash::MS_TAB_13R[(rc_base(reverse_base) as usize * 13) + (k % 13)]
-                | nthash::MS_TAB_19RR[(rc_base(reverse_base) as usize * 19) + (k % 19)]);
-        if let Some(edge) = indexed_edge(candidate, lookup, EdgeType::MaxToMin, EdgeType::MaxToMax)
-        {
-            output.push(edge);
-        }
-    }
-
-    output
+    fwd_candidates(hc, hnc, k, bases)
+        .into_iter()
+        .filter_map(|(hash, canonical, reverse)| indexed_edge(hash, lookup, canonical, reverse))
+        .collect()
 }
 
 #[cfg(not(target_family = "wasm"))]

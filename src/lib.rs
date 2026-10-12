@@ -550,12 +550,9 @@ where
             k,
             &state.quality,
             Some(&active_floors),
-            &state.store,
-            &state.contigs,
+            state,
             timevec,
             &mut out_path_histo,
-            opts.do_fit,
-            opts.debug_quality_floors,
             None,
         )?
     };
@@ -621,31 +618,29 @@ where
     Ok(())
 }
 
-/// Count one k from the store at the settled floor, carrying `contigs` in once the reads set the cutoff.
+/// Count one k from the ladder's store, carrying the previous contigs in once the reads set the cutoff.
 /// `prior`: the sketch's selection when this is a recount at it.
 #[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
 fn count_store<IntT>(
     opts: &BuildOpts,
     k: usize,
     quality: &QualOpts,
     floors: Option<&[u8]>,
-    store: &read_store::ReadStore,
-    contigs: &[Vec<u8>],
+    state: &LadderState,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
-    do_fit: bool,
-    debug_quality_floors: bool,
     prior: Option<(u16, preprocessing::PeakSource)>,
 ) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
 {
-    let carried = (!contigs.is_empty()).then_some(preprocessing::CarriedContigs {
-        seqs: contigs,
+    let carried = (!state.contigs.is_empty()).then_some(preprocessing::CarriedContigs {
+        seqs: &state.contigs,
         rule: opts.contig_counts,
     });
     preprocessing::preprocessing_standalone::<IntT, _>(
-        &mut [store.records()],
+        &mut [state.store.records()],
         k,
         quality,
         floors,
@@ -654,15 +649,17 @@ where
         // `--chunk-size` is a no-op here, and the first k already warned about it.
         0,
         opts.do_bloom,
-        do_fit,
+        opts.do_fit,
         carried,
-        debug_quality_floors,
+        opts.debug_quality_floors,
         prior,
     )
 }
 
-/// Record the floor this k's first count chose and, if it is below `strict_floor`, recount there. The
-/// first count is dropped before the recount allocates, so both tables are never resident at once.
+/// Record the floor this k's first count chose and, if it is below `strict_floor`, recount there,
+/// refitting the whole spectrum; the sketch's cutoff and peak stand only if the refit loses the
+/// separation. The first count is dropped before the recount allocates, so both tables are never
+/// resident at once.
 #[cfg(not(target_family = "wasm"))]
 fn settle_floor_and_recount<IntT>(
     opts: &BuildOpts,
@@ -690,36 +687,6 @@ where
     );
     log::warn!("Recounting k={k} at a base-quality floor of {floor}.");
     drop(first);
-    count_store_at_selection::<IntT>(
-        opts,
-        k,
-        &state.store,
-        &state.contigs,
-        timevec,
-        out_path_histo,
-        floor,
-        min_count,
-        peak,
-    )
-}
-
-/// Replay reads at the floor already selected for this k and refit the whole spectrum there; the
-/// sketch's cutoff and peak stand only if the refit loses the separation.
-#[cfg(not(target_family = "wasm"))]
-fn count_store_at_selection<IntT>(
-    opts: &BuildOpts,
-    k: usize,
-    store: &read_store::ReadStore,
-    contigs: &[Vec<u8>],
-    timevec: &mut Vec<Instant>,
-    out_path_histo: &mut Option<PathBuf>,
-    floor: u8,
-    min_count: u16,
-    genomic_peak: preprocessing::PeakSource,
-) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
-where
-    IntT: for<'a> UInt<'a>,
-{
     let quality = QualOpts {
         min_count,
         min_qual: floor,
@@ -729,13 +696,10 @@ where
         k,
         &quality,
         None,
-        store,
-        contigs,
+        state,
         timevec,
         out_path_histo,
-        opts.do_fit,
-        opts.debug_quality_floors,
-        Some((min_count, genomic_peak)),
+        Some((min_count, peak)),
     )
 }
 
@@ -989,12 +953,9 @@ pub fn main() {
             let build_result = match k.as_deref() {
                 Some(&[single]) => {
                     // The packed k-mer must fit in 2*k bits, so k picks the integer width.
-                    if single % 2 == 0 {
-                        panic!("Support for even k-mer lengths not implemented");
-                    }
                     let width_k = single;
+                    // `valid_kmer` keeps k odd and within 3..=255.
                     match width_k {
-                        0..=2 => panic!("kmer length too small (min. 3)"),
                         3..=32 => {
                             log::info!("k={width_k}: using 64-bit representation");
                             run_build::<u64>(opts, single, &mut timevec, &mut out_path_graph)
@@ -1007,11 +968,10 @@ pub fn main() {
                             log::info!("k={width_k}: using 256-bit representation");
                             run_build::<U256>(opts, single, &mut timevec, &mut out_path_graph)
                         }
-                        129..=256 => {
+                        _ => {
                             log::info!("k={width_k}: using 512-bit representation");
                             run_build::<U512>(opts, single, &mut timevec, &mut out_path_graph)
                         }
-                        _ => panic!("kmer length larger than 256 currently not supported."),
                     }
                 }
                 requested => run_multik(opts, requested, &mut timevec, &mut out_path_graph),
@@ -1076,7 +1036,6 @@ pub fn init_panic_hook() {
 #[wasm_bindgen]
 /// Main struct that acts as wrapper of the assembler when compiling to wasm
 pub struct AssemblyHelper {
-    verbose: bool,
     k: usize,
     min_count: u16,
     min_qual: u8,
@@ -1111,7 +1070,7 @@ impl AssemblyHelper {
     /// Constructor/initialiser of the wasm assembler. It also performs the preprocessing.
     pub fn new(
         k: u32,
-        verbose: bool,
+        _verbose: bool,
         min_count: u16,
         min_qual: u8,
         chunk_size: u32,
@@ -1139,7 +1098,6 @@ impl AssemblyHelper {
         post_state("initialised");
 
         Self {
-            verbose,
             k,
             min_count,
             min_qual,
