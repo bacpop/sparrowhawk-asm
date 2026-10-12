@@ -98,6 +98,39 @@ fn validate_input_files(input_files: Vec<InputFastx>) -> Vec<InputFastx> {
     input_files
 }
 
+/// Iterator for needletail records
+#[cfg(not(target_family = "wasm"))]
+pub struct NeedletailIterator {
+    reader: Box<dyn needletail::FastxReader>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl NeedletailIterator {
+    /// Construct from needletail readers
+    pub fn new(reader: Box<dyn needletail::FastxReader>) -> Self {
+        Self { reader }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Iterator for NeedletailIterator {
+    type Item = (Vec<u8>, Option<Vec<u8>>);
+
+    fn next(&mut self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let record = self.reader.next()?.expect("Invalid FASTA/Q record");
+        let seq = record.seq();
+        let qual = record.qual().map(|qual| qual.to_vec());
+        Some((seq.to_vec(), qual))
+    }
+}
+
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::{parse_file_list_line, validate_input_files};
@@ -129,31 +162,5 @@ mod tests {
                 vec!["reads_1.fq".to_owned(), "reads_2.fq".to_owned()]
             )
         );
-    }
-}
-
-/// Iterator for needletail records
-#[cfg(not(target_family = "wasm"))]
-pub struct NeedletailIterator {
-    reader: Box<dyn needletail::FastxReader>,
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl NeedletailIterator {
-    /// Construct from needletail readers
-    pub fn new(reader: Box<dyn needletail::FastxReader>) -> Self {
-        Self { reader }
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-impl Iterator for NeedletailIterator {
-    type Item = (Vec<u8>, Option<Vec<u8>>);
-
-    fn next(&mut self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        let record = self.reader.next()?.expect("Invalid FASTA/Q record");
-        let seq = record.seq();
-        let qual = record.qual().map(|qual| qual.to_vec());
-        Some((seq.to_vec(), qual))
     }
 }

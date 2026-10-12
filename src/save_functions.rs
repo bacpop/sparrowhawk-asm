@@ -1,10 +1,6 @@
 //! Some docs should be here
 
 use core::panic;
-#[cfg(test)]
-use nohash_hasher::NoHashHasher;
-#[cfg(test)]
-use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
@@ -222,13 +218,22 @@ where
     out
 }
 
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph_works::Contigs;
     use crate::kmer::Kmer;
+    use nohash_hasher::NoHashHasher;
     use sparrowhawk_graph::NodeStruct;
     use std::borrow::Cow;
+    use std::{collections::HashMap, hash::BuildHasherDefault};
 
     /// A deterministic ACGT sequence. An LCG keeps it reproducible without pulling in a rng crate.
     fn pseudo_seq(len: usize) -> Vec<u8> {

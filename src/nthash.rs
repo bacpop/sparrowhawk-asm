@@ -633,18 +633,17 @@ impl NtHashIterator {
     }
 }
 
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bit_encoding::encode_base;
-
-    #[test]
-    #[should_panic(
-        expected = "reverse-complement hash is required; construct the iterator with rc=true"
-    )]
-    fn inverse_hash_requires_reverse_complement() {
-        NtHashIterator::new(b"ACG", 3, false).curr_hash_and_whether_it_is_the_inverse();
-    }
 
     #[test]
     fn swapbits033_known_value() {

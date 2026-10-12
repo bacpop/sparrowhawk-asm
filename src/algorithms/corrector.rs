@@ -844,12 +844,59 @@ fn check_dead_path(
     }
 }
 
+fn check_backwards_path(
+    ptgraph: &DbgGraph,
+    vertex: NodeId,
+    mut ty: CarryType,
+    output_vec: &mut Vec<NodeId>,
+    kmerlimit: usize,
+) {
+    let mut current_vertex = vertex;
+    output_vec.push(current_vertex);
+    let mut cnt = ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
+
+    loop {
+        if cnt >= kmerlimit {
+            output_vec.clear();
+            return;
+        }
+
+        let bkgneigh = ptgraph.in_neighbours_bi(current_vertex, ty);
+        let bkgneighlen = bkgneigh.len();
+        if bkgneighlen == 0 {
+            if ptgraph.out_neighbours_bi(current_vertex, ty).len() != 1 {
+                output_vec.clear();
+            }
+            return;
+        } else if bkgneighlen == 1 {
+            if ptgraph.out_neighbours_bi(current_vertex, ty).len() != 1 {
+                output_vec.clear();
+                return;
+            }
+
+            current_vertex = bkgneigh[0].0;
+            ty = bkgneigh[0].1.get_from_and_to().0;
+            output_vec.push(current_vertex);
+            cnt += ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
+        } else {
+            output_vec.clear();
+            return;
+        }
+    }
+}
+
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::DEFAULT_TIP_RCTC_CUTOFF;
     use sparrowhawk_graph::{DbgGraph, NodeStruct};
-    use std::cmp::{max, min};
 
     fn make_node() -> NodeStruct {
         NodeStruct {
@@ -861,32 +908,21 @@ mod tests {
 
     // ── dead-path limit formula ──────────────────────────────────────────────
 
-    // These used to re-implement the formula inline instead of calling it, which is precisely why an
-    // integer underflow above k = 100 survived: every case they covered was under the boundary, and a
-    // copy of the code cannot disagree with itself.
-
+    /// Above k = 100 the limit floors at 0 instead of underflowing (`100 - 101 + 1` on `usize` once wrapped
+    /// to ~1.8e19 and emptied every k > 100 assembly), so a single k-mer, already k bases, is never dropped.
     #[test]
-    fn dead_path_limit_k3() {
-        assert_eq!(short_path_limit(100, 3), 98);
-    }
-
-    #[test]
-    fn dead_path_limit_k31() {
-        assert_eq!(short_path_limit(100, 31), 70);
-    }
-
-    #[test]
-    fn dead_path_limit_k100() {
-        assert_eq!(short_path_limit(100, 100), 1);
-    }
-
-    /// The first k that underflowed. `100 - 101 + 1` on `usize` wraps to ~1.8e19, after which every
-    /// contig is dropped and every path is judged dead — a k > 100 assembly came out entirely empty.
-    #[test]
-    fn dead_path_limit_does_not_underflow_above_minnts() {
-        assert_eq!(short_path_limit(100, 101), 0);
-        assert_eq!(short_path_limit(100, 139), 0);
-        assert_eq!(short_path_limit(100, 255), 0);
+    fn short_path_limit_cases() {
+        // (minimum bases, k, limit in k-mers)
+        for (minnts, k, want) in [
+            (100, 3, 98),
+            (100, 31, 70),
+            (100, 100, 1),
+            (100, 101, 0),
+            (100, 139, 0),
+            (100, 255, 0),
+        ] {
+            assert_eq!(short_path_limit(minnts, k), want, "minnts {minnts}, k {k}");
+        }
     }
 
     #[test]
@@ -1280,188 +1316,24 @@ mod tests {
 
     // ── tip_length_nts ───────────────────────────────────────────────────────
 
-    /// Zero keeps the flat floor, which is how the k multiplier is switched off.
+    /// The tip threshold is the larger of the flat floor and the k multiple; a multiple of zero or below
+    /// keeps the flat floor.
     #[test]
-    fn tip_length_nts_zero_kmult_keeps_the_flat_floor() {
-        assert_eq!(tip_length_nts(100, 0.0, 81), 100);
-        assert_eq!(tip_length_nts(100, -1.0, 81), 100);
-    }
-
-    /// The multiple wins once it clears the floor, and the floor wins while it does not.
-    #[test]
-    fn tip_length_nts_takes_the_larger_of_floor_and_multiple() {
-        assert_eq!(tip_length_nts(100, 2.5, 31), 100); // 77.5 rounds under the floor
-        assert_eq!(tip_length_nts(100, 2.5, 81), 203); // 202.5 rounds up
-        assert_eq!(tip_length_nts(100, 10.0, 81), 810);
-    }
-
-    /// A single k-mer already spans k bases, so above the threshold nothing may be filtered for length.
-    #[test]
-    fn a_single_kmer_contig_survives_when_k_exceeds_the_floor() {
-        for k in [101usize, 139, 255] {
-            assert!(
-                1 > short_path_limit(100, k),
-                "one k-mer spans {k} bases, which is over the 100 nt floor"
-            );
-        }
-    }
-
-    // ── bubble_shape_ok ───────────────────────────────────────────────
-
-    /// Build a valid 5-node diamond: S → M1 → E → F
-    ///                                S → M2 → E
-    fn make_valid_bubble() -> (DbgGraph, NodeId, Vec<BubbleStartEdge>) {
-        let mut g = DbgGraph::new(3);
-        let s = g.add_node(make_node());
-        let m1 = g.add_node(make_node());
-        let m2 = g.add_node(make_node());
-        let e = g.add_node(make_node());
-        let f = g.add_node(make_node());
-        g.add_bi_edge(s, m1, EdgeType::MinToMin);
-        g.add_bi_edge(s, m2, EdgeType::MinToMin);
-        g.add_bi_edge(m1, e, EdgeType::MinToMin);
-        g.add_bi_edge(m2, e, EdgeType::MinToMin);
-        g.add_bi_edge(e, f, EdgeType::MinToMin);
-        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        (g, s, edges)
-    }
-
-    // ── the pop rule ─────────────────────────────────────────────────────────
-
-    /// The same diamond, with the two branches given explicit coverages and an **upstream flank**.
-    ///
-    /// The flank matters: `pop_bubbles_by_coverage` filters candidates on `out_degree(start) == 3`,
-    /// which decomposes as the two outgoing `Min` branches plus the one outgoing `Max` back-link that
-    /// `add_bi_edge` installs for the incoming flank edge. Without `f0 -> s` the degree is 2 and the
-    /// bubble is never even offered to the heuristic.
-    fn bubble_with_counts(c0: u32, c1: u32) -> (DbgGraph, NodeId, Vec<(NodeId, EdgeType)>) {
-        let mut g = DbgGraph::new(3);
-        let f0 = g.add_node(make_node());
-        let s = g.add_node(make_node());
-        let m1 = g.add_node(NodeStruct {
-            counts: c0,
-            ..make_node()
-        });
-        let m2 = g.add_node(NodeStruct {
-            counts: c1,
-            ..make_node()
-        });
-        let e = g.add_node(make_node());
-        let f = g.add_node(make_node());
-        g.add_bi_edge(f0, s, EdgeType::MinToMin);
-        g.add_bi_edge(s, m1, EdgeType::MinToMin);
-        g.add_bi_edge(s, m2, EdgeType::MinToMin);
-        g.add_bi_edge(m1, e, EdgeType::MinToMin);
-        g.add_bi_edge(m2, e, EdgeType::MinToMin);
-        g.add_bi_edge(e, f, EdgeType::MinToMin);
-        assert_eq!(
-            g.out_degree(s),
-            3,
-            "fixture must be a candidate for the popper"
-        );
-        let mids = g.out_neighbours_min(s);
-        (g, s, mids)
-    }
-
-    /// Index in `mids` of the branch with the higher count.
-    ///
-    /// `out_neighbours_min` does not promise insertion order, so a test that assumed `mids[0]` is the
-    /// first node it added would be asserting on an artefact of `petgraph`'s edge storage rather than
-    /// on the rule. Ask the graph instead.
-    fn stronger(g: &DbgGraph, mids: &[(NodeId, EdgeType)]) -> usize {
-        let c0 = g.node_weight(mids[0].0).unwrap().counts;
-        let c1 = g.node_weight(mids[1].0).unwrap().counts;
-        if c0 >= c1 {
-            0
-        } else {
-            1
-        }
-    }
-
-    /// **The regression this whole rule exists to prevent.** A collapsed two-copy repeat has branches
-    /// of equal length and equal coverage; the old heuristic fell through to an arbitrary `Keep(1)` and
-    /// deleted one real copy. Nothing may be touched here, however the ratio is set.
-    #[test]
-    fn equal_coverage_bubble_is_left_alone() {
-        let (g, _s, mids) = bubble_with_counts(40, 40);
-        for ratio in [0.01_f32, 0.1, 0.5, 0.99] {
+    fn tip_length_nts_cases() {
+        // (flat bases, k multiple, k, threshold)
+        for (flat, kmult, k, want) in [
+            (100, 0.0, 81, 100),
+            (100, -1.0, 81, 100),
+            (100, 2.5, 31, 100),
+            (100, 2.5, 81, 203),
+            (100, 10.0, 81, 810),
+        ] {
             assert_eq!(
-                choose_branch_by_counts(&g, &mids, ratio, &CoverageRef::unknown()),
-                BubbleChoice::Leave,
-                "equal coverage must never pop, ratio {ratio}"
+                tip_length_nts(flat, kmult, k),
+                want,
+                "flat {flat}, kmult {kmult}, k {k}"
             );
         }
-
-        let (mut g, _s, _) = bubble_with_counts(40, 40);
-        let before = g.node_count();
-        assert!(!pop_bubbles_by_coverage(
-            &mut g,
-            DEFAULT_POP_RATIO,
-            &CoverageRef::unknown()
-        ));
-        assert_eq!(g.node_count(), before, "the graph must be untouched");
-    }
-
-    /// A branch carrying a twentieth of the other is noise, and is popped — whichever way round the
-    /// two are stored.
-    #[test]
-    fn a_noise_branch_is_popped() {
-        for (c0, c1) in [(100u32, 5u32), (5, 100)] {
-            let (g, _s, mids) = bubble_with_counts(c0, c1);
-            assert_eq!(
-                choose_branch_by_counts(&g, &mids, 0.1, &CoverageRef::unknown()),
-                BubbleChoice::Keep(stronger(&g, &mids)),
-                "must keep the stronger branch for ({c0}, {c1})"
-            );
-        }
-
-        let (mut g, _s, _) = bubble_with_counts(100, 5);
-        let before = g.node_count();
-        assert!(pop_bubbles_by_coverage(
-            &mut g,
-            DEFAULT_POP_RATIO,
-            &CoverageRef::unknown()
-        ));
-        assert!(
-            g.node_count() < before,
-            "the popped branch and end node are gone"
-        );
-    }
-
-    /// Pins the boundary: the comparison is a strict `<`, so a branch sitting exactly on the ratio
-    /// survives. Getting this backwards would pop bubbles at exactly 10 %, which is the side of the
-    /// line where two real things start to look alike.
-    #[test]
-    fn a_branch_exactly_on_the_ratio_survives() {
-        let (g, _s, mids) = bubble_with_counts(100, 10);
-        assert_eq!(
-            choose_branch_by_counts(&g, &mids, 0.1, &CoverageRef::unknown()),
-            BubbleChoice::Leave
-        );
-
-        let (g, _s, mids) = bubble_with_counts(100, 9);
-        assert_eq!(
-            choose_branch_by_counts(&g, &mids, 0.1, &CoverageRef::unknown()),
-            BubbleChoice::Keep(stronger(&g, &mids))
-        );
-    }
-
-    /// A `0/0` bubble decides nothing and is left alone — the old code had a floor of 1 on the
-    /// threshold specifically to force a drop here, and that floor is gone.
-    #[test]
-    fn a_zero_coverage_bubble_is_left_alone() {
-        let (g, _s, mids) = bubble_with_counts(0, 0);
-        assert_eq!(
-            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &CoverageRef::unknown()),
-            BubbleChoice::Leave
-        );
-
-        // But zero beside anything real is still noise.
-        let (g, _s, mids) = bubble_with_counts(50, 0);
-        assert_eq!(
-            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &CoverageRef::unknown()),
-            BubbleChoice::Keep(stronger(&g, &mids))
-        );
     }
 
     // ── prune_unpaired_edges ─────────────────────────────────────────────────
@@ -1544,327 +1416,25 @@ mod tests {
         assert_eq!(prune_unpaired_edges(&mut g, node), 0);
     }
 
-    /// The apply-time re-validation: a bubble corrupted between detection and collapse
-    /// must be skipped instead of panicking on `[0]`.
-    #[test]
-    fn a_bubble_that_lost_its_shape_is_skipped() {
-        let (mut g, s, mids) = bubble_with_counts(100, 5);
-        let w = stronger(&g, &mids);
-        let midct = mids[w].1.get_from_and_to().1;
-        let (e, ety) = {
-            let v = g.out_neighbours_bi(mids[w].0, midct);
-            (v[0].0, v[0].1)
-        };
-        let outct = ety.get_from_and_to().1;
-        let f = g.out_neighbours_bi(e, outct)[0].0;
-        for eid in g.edges_between(e, f) {
-            g.remove_edge(eid);
-        }
-        for eid in g.edges_between(f, e) {
-            g.remove_edge(eid);
-        }
-
-        let before = g.node_count();
-        assert!(!apply_bubble_collapse(&mut g, s, &mids, w));
-        assert_eq!(g.node_count(), before);
-    }
-
-    #[test]
-    fn valid_bubble_returns_true() {
-        let (g, s, edges) = make_valid_bubble();
-        assert!(bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    #[test]
-    fn invalid_midnodes_equal() {
-        // Two edges from S to the same node M1 → midnodes[0] == midnodes[1]
-        let mut g = DbgGraph::new(3);
-        let s = g.add_node(make_node());
-        let m1 = g.add_node(make_node());
-        g.add_bi_edge(s, m1, EdgeType::MinToMin);
-        g.add_edge(s, m1, EdgeType::MinToMax); // second edge to same node
-        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        assert_eq!(edges.len(), 2);
-        assert!(!bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    #[test]
-    fn invalid_midnode_is_startn() {
-        // One invec edge is a self-loop on S → midnodes[0] == startn
-        let mut g = DbgGraph::new(3);
-        let s = g.add_node(make_node());
-        let m1 = g.add_node(make_node());
-        g.add_edge(s, s, EdgeType::MinToMin); // self-loop
-        g.add_bi_edge(s, m1, EdgeType::MinToMin);
-        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        assert_eq!(edges.len(), 2);
-        assert!(!bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    #[test]
-    fn invalid_wrong_in_degree_of_middle() {
-        // Add an extra incoming Min edge to M1 → in_degree check fails
-        let (mut g, s, edges) = make_valid_bubble();
-        let extra = g.add_node(make_node());
-        let m1 = edges[0].target;
-        g.add_bi_edge(extra, m1, EdgeType::MinToMin);
-        // Now in_neighbours_bi(M1, Min).len() == 2 != 1, so the structure is invalid.
-        assert!(!bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    #[test]
-    fn invalid_paths_diverge() {
-        // M1 → E1, M2 → E2 (different end nodes) → false
-        let mut g = DbgGraph::new(3);
-        let s = g.add_node(make_node());
-        let m1 = g.add_node(make_node());
-        let m2 = g.add_node(make_node());
-        let e1 = g.add_node(make_node());
-        let e2 = g.add_node(make_node());
-        let f = g.add_node(make_node());
-        g.add_bi_edge(s, m1, EdgeType::MinToMin);
-        g.add_bi_edge(s, m2, EdgeType::MinToMin);
-        g.add_bi_edge(m1, e1, EdgeType::MinToMin);
-        g.add_bi_edge(m2, e2, EdgeType::MinToMin); // different end
-        g.add_bi_edge(e1, f, EdgeType::MinToMin);
-        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        assert!(!bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    // ── stage 1.5: N branches, and ends that carry their own traffic ─────────
-
-    /// An N-way bubble: parallel single-node branches from one entrance to one join, with an
-    /// upstream flank so the entrance looks like a real branch point.
-    fn nway_bubble(counts: &[u32]) -> (DbgGraph, NodeId, Vec<(NodeId, EdgeType)>) {
-        let mut g = DbgGraph::new(3);
-        let f0 = g.add_node(make_node());
-        let s = g.add_node(make_node());
-        let e = g.add_node(make_node());
-        let f1 = g.add_node(make_node());
-        g.add_bi_edge(f0, s, EdgeType::MinToMin);
-        for &c in counts {
-            let m = g.add_node(NodeStruct {
-                counts: c,
-                abs_ind: vec![0u64],
-                innerdir: None,
-            });
-            g.add_bi_edge(s, m, EdgeType::MinToMin);
-            g.add_bi_edge(m, e, EdgeType::MinToMin);
-        }
-        g.add_bi_edge(e, f1, EdgeType::MinToMin);
-        let mids = g.out_neighbours_min(s);
-        (g, s, mids)
-    }
-
-    #[test]
-    fn a_three_way_bubble_is_a_valid_shape() {
-        let (g, s, _) = nway_bubble(&[10, 10, 10]);
-        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        assert_eq!(edges.len(), 3);
-        assert!(bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    /// The join keeping several successors is exactly what 1.5.2 lifts, so it must be rejected under
-    /// the strict rule and accepted under the relaxed one.
-    #[test]
-    fn a_join_with_several_successors_is_only_valid_when_relaxed() {
-        let (mut g, s, _) = nway_bubble(&[10, 10]);
-        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        let e = g.out_neighbours_bi(edges[0].target, edges[0].edge_type.get_from_and_to().1)[0].0;
-        let extra = g.add_node(make_node());
-        g.add_bi_edge(e, extra, EdgeType::MinToMin);
-        assert!(!bubble_shape_ok(&g, s, &edges, false));
-        assert!(bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    /// A join whose successor re-enters the bubble would leave a dangling edge after the surgery.
-    #[test]
-    fn a_join_leading_back_into_the_bubble_is_rejected() {
-        let (mut g, s, mids) = nway_bubble(&[10, 10]);
-        let edges = g.bubble_start_edges_by_carry(s, CarryType::Min);
-        let e = g.out_neighbours_bi(edges[0].target, edges[0].edge_type.get_from_and_to().1)[0].0;
-        g.add_bi_edge(e, mids[1].0, EdgeType::MinToMin);
-        assert!(!bubble_shape_ok(&g, s, &edges, true));
-    }
-
-    /// `out_neighbours_min` does not return branches in insertion order, so tests assert on the
-    /// coverages a decision picked out, never on positions.
-    fn counts_at(g: &DbgGraph, mids: &[(NodeId, EdgeType)], idx: &[usize]) -> Vec<u32> {
-        let mut v: Vec<u32> = idx
-            .iter()
-            .map(|i| g.node_weight(mids[*i].0).unwrap().counts)
-            .collect();
-        v.sort_unstable();
-        v
-    }
-
-    /// Three branches, only one of them weak: the weak one goes and the other two stay, so the next
-    /// round sees an ordinary two-way bubble.
-    #[test]
-    fn a_three_way_bubble_prunes_only_the_qualifying_branch() {
-        let (g, _, mids) = nway_bubble(&[100, 5, 90]);
-        match choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &CoverageRef::unknown()) {
-            BubbleChoice::Prune(losers) => assert_eq!(counts_at(&g, &mids, &losers), vec![5]),
-            other => panic!("expected a partial prune, got {other:?}"),
-        }
-    }
-
-    /// With every loser weak it collapses outright, as the two-way case always has.
-    #[test]
-    fn a_three_way_bubble_with_all_losers_weak_collapses() {
-        let (g, _, mids) = nway_bubble(&[100, 5, 4]);
-        match choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &CoverageRef::unknown()) {
-            BubbleChoice::Keep(w) => assert_eq!(counts_at(&g, &mids, &[w]), vec![100]),
-            other => panic!("expected an outright collapse, got {other:?}"),
-        }
-    }
-
-    /// The N=2 path must be untouched by all of the above: one loser can never be a partial prune.
-    #[test]
-    fn two_branches_never_produce_a_partial_prune() {
-        for (a, b) in [(100u32, 5u32), (100, 90), (10, 10)] {
-            let (g, _, mids) = nway_bubble(&[a, b]);
-            let choice =
-                choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &CoverageRef::unknown());
-            assert!(
-                !matches!(choice, BubbleChoice::Prune(_)),
-                "({a}, {b}) produced {choice:?}"
-            );
-        }
-    }
-
     // ---- CoverageRef: the absolute rule, and how it degrades ----
 
-    /// With no peak the new rule must be invisible: every pair decides exactly as the ratio alone did.
+    /// The error ceiling is a fraction of the peak (0.25 fitted; 0.15 for a fallback median, which repeats
+    /// bias upward), floored at min_count + 1 so it never falls under a cutoff every node already clears.
     #[test]
-    fn an_unknown_peak_reproduces_the_ratio_rule() {
-        let unknown = CoverageRef::unknown();
-        for (c0, c1) in [(10, 10), (100, 5), (100, 11), (50, 4), (7, 7), (1, 100)] {
-            let (g, _s, mids) = bubble_with_counts(c0, c1);
-            let expected = if (min(c0, c1) as f32) < DEFAULT_POP_RATIO * max(c0, c1) as f32 {
-                BubbleChoice::Keep(stronger(&g, &mids))
-            } else {
-                BubbleChoice::Leave
-            };
+    fn error_ceiling_cases() {
+        // (peak, min_count, ceiling)
+        for (peak, min_count, want) in [
+            (PeakSource::Fitted(60), 20, Some(21)),
+            (PeakSource::Fitted(60), 5, Some(15)),
+            (PeakSource::Fitted(100), 2, Some(25)),
+            (PeakSource::Fallback(100), 2, Some(15)),
+        ] {
             assert_eq!(
-                choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &unknown),
-                expected,
-                "counts {c0}/{c1}"
+                CoverageRef::new(peak, min_count).error_ceiling(),
+                want,
+                "{peak:?}, min_count {min_count}"
             );
         }
-    }
-
-    /// The case the ratio cannot reach. At peak 60 the ceiling is 15, so a branch at 12 beside one at
-    /// 60 is an error — but 12 is well above `0.1 * 60`, so the ratio leaves it alone.
-    #[test]
-    fn a_branch_far_under_the_genomic_peak_is_popped() {
-        let coverage = CoverageRef::new(PeakSource::Fitted(60), 5);
-        let (g, _s, mids) = bubble_with_counts(60, 12);
-        assert_eq!(
-            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &CoverageRef::unknown()),
-            BubbleChoice::Leave,
-            "the ratio alone must not reach this"
-        );
-        assert_eq!(
-            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &coverage),
-            BubbleChoice::Keep(stronger(&g, &mids))
-        );
-    }
-
-    /// The collapsed-repeat regression, restated with a peak set: `is_error_like` and `is_genomic` are
-    /// exact complements, so equal counts can never satisfy both however the peak is chosen.
-    #[test]
-    fn equal_coverage_is_left_alone_even_under_a_peak() {
-        for peak in [1u32, 10, 40, 60, 1000] {
-            for counts in [3u32, 20, 60] {
-                let coverage = CoverageRef::new(PeakSource::Fitted(peak), 2);
-                let (g, _s, mids) = bubble_with_counts(counts, counts);
-                assert_eq!(
-                    choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &coverage),
-                    BubbleChoice::Leave,
-                    "peak {peak}, counts {counts}"
-                );
-            }
-        }
-    }
-
-    /// Two branches of a real two-copy repeat both sit at genomic depth, so neither is error-like.
-    #[test]
-    fn two_genomic_branches_are_left_alone() {
-        let coverage = CoverageRef::new(PeakSource::Fitted(60), 5);
-        let (g, _s, mids) = bubble_with_counts(55, 48);
-        assert_eq!(
-            choose_branch_by_counts(&g, &mids, DEFAULT_POP_RATIO, &coverage),
-            BubbleChoice::Leave
-        );
-    }
-
-    /// Where `min_count` is a large share of the peak, a bare fraction would land under a cutoff every
-    /// surviving node already clears, leaving the rule unsatisfiable. The floor is what prevents that.
-    #[test]
-    fn the_ceiling_never_falls_to_the_cutoff() {
-        // 0.25 * 60 = 15, below the cutoff of 20, so the floor binds at 21.
-        assert_eq!(
-            CoverageRef::new(PeakSource::Fitted(60), 20).error_ceiling(),
-            Some(21)
-        );
-        // With room to spare the fraction binds instead.
-        assert_eq!(
-            CoverageRef::new(PeakSource::Fitted(60), 5).error_ceiling(),
-            Some(15)
-        );
         assert_eq!(CoverageRef::unknown().error_ceiling(), None);
-    }
-
-    /// A fallback peak is an occurrence-weighted median, biased upward by repeats, so it must buy a
-    /// lower ceiling than the same number fitted — overstating the peak is what deletes real sequence.
-    #[test]
-    fn a_fallback_peak_is_used_more_conservatively() {
-        let fitted = CoverageRef::new(PeakSource::Fitted(100), 2);
-        let fallback = CoverageRef::new(PeakSource::Fallback(100), 2);
-        assert!(fallback.error_ceiling() < fitted.error_ceiling());
-        assert_eq!(fitted.error_ceiling(), Some(25));
-        assert_eq!(fallback.error_ceiling(), Some(15));
-    }
-}
-
-fn check_backwards_path(
-    ptgraph: &DbgGraph,
-    vertex: NodeId,
-    mut ty: CarryType,
-    output_vec: &mut Vec<NodeId>,
-    kmerlimit: usize,
-) {
-    let mut current_vertex = vertex;
-    output_vec.push(current_vertex);
-    let mut cnt = ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
-
-    loop {
-        if cnt >= kmerlimit {
-            output_vec.clear();
-            return;
-        }
-
-        let bkgneigh = ptgraph.in_neighbours_bi(current_vertex, ty);
-        let bkgneighlen = bkgneigh.len();
-        if bkgneighlen == 0 {
-            if ptgraph.out_neighbours_bi(current_vertex, ty).len() != 1 {
-                output_vec.clear();
-            }
-            return;
-        } else if bkgneighlen == 1 {
-            if ptgraph.out_neighbours_bi(current_vertex, ty).len() != 1 {
-                output_vec.clear();
-                return;
-            }
-
-            current_vertex = bkgneigh[0].0;
-            ty = bkgneigh[0].1.get_from_and_to().0;
-            output_vec.push(current_vertex);
-            cnt += ptgraph.node_weight(current_vertex).unwrap().abs_ind.len();
-        } else {
-            output_vec.clear();
-            return;
-        }
     }
 }

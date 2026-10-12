@@ -240,13 +240,16 @@ impl BuildOpts<'_> {
 
 /// Open the inputs and count k-mers at one quality floor. With `store`, every record is also packed
 /// into it as it streams past, which is how a multi-k run's first k reads the files for all of them.
+/// `prior`: the first count's selection when this is a recount at it; see `keep_refit_or_prior`.
 #[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
 fn count_reads<IntT>(
     opts: &BuildOpts,
     k: usize,
     quality: &QualOpts,
     floors: Option<&[u8]>,
     store: Option<&mut read_store::ReadStore>,
+    prior: Option<(u16, preprocessing::PeakSource)>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
 ) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
@@ -282,7 +285,7 @@ where
             opts.do_fit,
             None,
             opts.debug_quality_floors,
-            None,
+            prior,
         ),
         None => preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
             &mut readers,
@@ -296,7 +299,7 @@ where
             opts.do_fit,
             None,
             opts.debug_quality_floors,
-            None,
+            prior,
         ),
     }
 }
@@ -332,6 +335,7 @@ where
         &quality,
         Some(&ladder),
         None,
+        None,
         timevec,
         &mut out_path_histo,
     )?;
@@ -347,6 +351,8 @@ where
             min_count: quality.min_count,
             min_qual: chosen,
         };
+        // The sketch's selection stands if the refit at this floor loses the separation, as in multi-k.
+        let prior = Some((assembly.used_min_count, assembly.genomic_peak));
         // Drop pass 1 before pass 2 allocates, or both tables are resident at once.
         drop(assembly);
         assembly = count_reads::<IntT>(
@@ -355,6 +361,7 @@ where
             &loosened,
             None,
             None,
+            prior,
             timevec,
             &mut out_path_histo,
         )?;
@@ -529,6 +536,7 @@ where
             &state.quality,
             Some(&active_floors),
             Some(&mut state.store),
+            None,
             timevec,
             &mut out_path_histo,
         )?;
@@ -788,93 +796,6 @@ fn settle_ladder(
         log::info!("Multi-k ladder for reads up to {max_read_len} bp: k={settled:?}");
     }
     settled
-}
-
-#[cfg(all(test, not(target_family = "wasm")))]
-mod multik_tests {
-    use super::{
-        active_quality_floors, aun, lowered_floor_index, peak_too_low_for_ladder, read_store,
-        settle_ladder, LadderState, QualOpts,
-    };
-
-    #[test]
-    fn the_ladder_needs_a_peak_of_four_after_the_first_k() {
-        use crate::preprocessing::PeakSource::{Fallback, Fitted, Unknown};
-        assert!(!peak_too_low_for_ladder(0, Fallback(2)));
-        for peak in [Fitted(3), Fallback(3), Unknown] {
-            assert!(peak_too_low_for_ladder(1, peak));
-        }
-        for peak in [Fitted(4), Fallback(4)] {
-            assert!(!peak_too_low_for_ladder(1, peak));
-        }
-    }
-
-    #[test]
-    fn aun_weights_lengths_over_the_output_filter() {
-        let contigs = vec![vec![b'A'; 600], vec![b'A'; 400], vec![b'A'; 1000]];
-        let want = (600.0 * 600.0 + 1000.0 * 1000.0) / 1600.0;
-        assert!((aun(&contigs, 500) - want).abs() < 1e-9);
-        assert_eq!(aun(&contigs, 2000), 0.0);
-    }
-
-    fn state_with(floors: &[u8]) -> LadderState {
-        LadderState {
-            ks: vec![21],
-            default_ladder: true,
-            store: read_store::ReadStore::new(floors),
-            floor_index: floors.len() - 1,
-            last_choice: None,
-            quality: QualOpts {
-                min_count: 0,
-                min_qual: floors[floors.len() - 1],
-            },
-            contigs: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn one_k_below_the_ceiling_does_not_lower_it() {
-        let floors = [0, 14, 21];
-        assert_eq!(active_quality_floors(&floors, 2), &[0, 14, 21]);
-        assert_eq!(lowered_floor_index(&floors, 2, None, 14), 2);
-        assert_eq!(lowered_floor_index(&floors, 2, Some(21), 14), 2);
-        assert_eq!(lowered_floor_index(&floors, 2, Some(14), 21), 2);
-    }
-
-    #[test]
-    fn two_consecutive_choices_below_the_ceiling_lower_it_to_the_higher() {
-        let floors = [0, 14, 21];
-        assert_eq!(lowered_floor_index(&floors, 2, Some(14), 14), 1);
-        assert_eq!(lowered_floor_index(&floors, 2, Some(14), 0), 1);
-        assert_eq!(lowered_floor_index(&floors, 2, Some(0), 14), 1);
-        assert_eq!(lowered_floor_index(&floors, 1, Some(0), 0), 0);
-        assert_eq!(active_quality_floors(&floors, 1), &[0, 14]);
-    }
-
-    #[test]
-    fn an_unresolved_k_neither_lowers_the_ceiling_nor_breaks_a_pair() {
-        let mut state = state_with(&[0, 14, 21]);
-        state.record_floor_choice(41, 14, false);
-        assert_eq!((state.floor_index, state.quality.min_qual), (2, 21));
-        state.record_floor_choice(55, 0, true);
-        assert_eq!((state.floor_index, state.last_choice), (2, Some(14)));
-        state.record_floor_choice(71, 14, false);
-        assert_eq!((state.floor_index, state.quality.min_qual), (1, 14));
-    }
-
-    #[test]
-    fn default_ladder_stops_ten_bases_under_the_longest_read() {
-        assert_eq!(
-            settle_ladder(&[21], true, 143.6, 151),
-            vec![21, 31, 41, 55, 71, 91, 111, 131, 141]
-        );
-        assert_eq!(settle_ladder(&[21], true, 22.2, 22), vec![21]);
-    }
-
-    #[test]
-    fn explicit_ladder_keeps_its_existing_longest_read_filter() {
-        assert_eq!(settle_ladder(&[21, 31, 55], false, 0.0, 55), vec![21, 31]);
-    }
 }
 
 #[doc(hidden)]
@@ -1547,5 +1468,93 @@ impl AssemblyHelper {
         logw(results.dump().as_str(), Some("debug"));
 
         results.dump()
+    }
+}
+
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
+#[cfg(all(test, not(target_family = "wasm")))]
+mod multik_tests {
+    use super::{
+        active_quality_floors, aun, lowered_floor_index, read_store, settle_ladder, LadderState,
+        QualOpts,
+    };
+
+    #[test]
+    fn aun_weights_lengths_over_the_output_filter() {
+        let contigs = vec![vec![b'A'; 600], vec![b'A'; 400], vec![b'A'; 1000]];
+        let want = (600.0 * 600.0 + 1000.0 * 1000.0) / 1600.0;
+        assert!((aun(&contigs, 500) - want).abs() < 1e-9);
+        assert_eq!(aun(&contigs, 2000), 0.0);
+    }
+
+    fn state_with(floors: &[u8]) -> LadderState {
+        LadderState {
+            ks: vec![21],
+            default_ladder: true,
+            store: read_store::ReadStore::new(floors),
+            floor_index: floors.len() - 1,
+            last_choice: None,
+            quality: QualOpts {
+                min_count: 0,
+                min_qual: floors[floors.len() - 1],
+            },
+            contigs: Vec::new(),
+        }
+    }
+
+    /// The ceiling for later k falls only once two consecutive k chose below it, and then to the higher of
+    /// the two choices.
+    #[test]
+    fn the_floor_ceiling_needs_two_consecutive_choices_below_it() {
+        let floors = [0u8, 14, 21];
+        // (ceiling index, previous choice, this choice, new ceiling index)
+        for (ceiling, previous, chosen, want) in [
+            (2, None, 14, 2),
+            (2, Some(21), 14, 2),
+            (2, Some(14), 21, 2),
+            (2, Some(14), 14, 1),
+            (2, Some(14), 0, 1),
+            (2, Some(0), 14, 1),
+            (1, Some(0), 0, 0),
+        ] {
+            assert_eq!(
+                lowered_floor_index(&floors, ceiling, previous, chosen),
+                want,
+                "{previous:?} then {chosen} under index {ceiling}"
+            );
+        }
+        assert_eq!(active_quality_floors(&floors, 2), &[0, 14, 21]);
+        assert_eq!(active_quality_floors(&floors, 1), &[0, 14]);
+    }
+
+    #[test]
+    fn an_unresolved_k_neither_lowers_the_ceiling_nor_breaks_a_pair() {
+        let mut state = state_with(&[0, 14, 21]);
+        state.record_floor_choice(41, 14, false);
+        assert_eq!((state.floor_index, state.quality.min_qual), (2, 21));
+        state.record_floor_choice(55, 0, true);
+        assert_eq!((state.floor_index, state.last_choice), (2, Some(14)));
+        state.record_floor_choice(71, 14, false);
+        assert_eq!((state.floor_index, state.quality.min_qual), (1, 14));
+    }
+
+    #[test]
+    fn default_ladder_stops_ten_bases_under_the_longest_read() {
+        assert_eq!(
+            settle_ladder(&[21], true, 143.6, 151),
+            vec![21, 31, 41, 55, 71, 91, 111, 131, 141]
+        );
+        assert_eq!(settle_ladder(&[21], true, 22.2, 22), vec![21]);
+    }
+
+    #[test]
+    fn explicit_ladder_keeps_its_existing_longest_read_filter() {
+        assert_eq!(settle_ladder(&[21, 31, 55], false, 0.0, 55), vec![21, 31]);
     }
 }

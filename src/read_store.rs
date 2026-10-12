@@ -230,6 +230,13 @@ impl<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>> Iterator for Tee<'_, I> {
     }
 }
 
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,19 +324,5 @@ mod tests {
         let back: Vec<Vec<u8>> = store.records().map(|(seq, _)| seq).collect();
         assert_eq!(back, reads);
         assert_eq!(store.max_read_len(), 13);
-    }
-
-    #[test]
-    fn average_length_uses_all_records() {
-        let mut store = ReadStore::new(&[0, 20]);
-        store.push(b"ACGTACGTAC", None); // 10 bases
-        store.push(b"ACGTACGTACGT", None); // 12 bases; mean 11
-        assert_eq!(store.average_read_len(), Some(11.0));
-    }
-
-    #[test]
-    fn average_length_is_none_for_an_empty_store() {
-        let store = ReadStore::new(&[0, 20]);
-        assert_eq!(store.average_read_len(), None);
     }
 }

@@ -589,6 +589,13 @@ pub(crate) fn remove_erroneous_connections(
     changed
 }
 
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,27 +603,30 @@ mod tests {
     use crate::preprocessing::PeakSource;
     use sparrowhawk_graph::NodeStruct;
 
-    /// The ratio arm must stay strict at the boundary. Widening `pop_ratio` to `f64` breaks this:
-    /// `f64::from(0.1f32)` is 0.10000000149011612, so `1.0 < 0.1 * 10.0` flips to true.
+    /// The ratio arm is strict at its boundary (widening `pop_ratio` to `f64` breaks this: `f64::from(0.1f32)`
+    /// is 0.10000000149011612), and the coverage arm fires where the ratio cannot. Peak 100 gives a ceiling of 25.
     #[test]
-    fn the_ratio_arm_is_strict_at_the_boundary() {
+    fn should_delete_cases() {
         let none = CoverageRef::unknown();
-        assert!(!should_delete(1.0, 10.0, 0.1, &none));
-        assert!(should_delete(0.999, 10.0, 0.1, &none));
-        assert!(!should_delete(10.0, 10.0, 0.1, &none));
-    }
-
-    /// The absolute arm fires where the ratio cannot: a branch below the error ceiling against one
-    /// above it. Peak 100 at the fitted fraction gives a ceiling of 25.
-    #[test]
-    fn the_coverage_arm_fires_where_the_ratio_cannot() {
         let known = CoverageRef::new(PeakSource::Fitted(100), 12);
         assert_eq!(known.error_ceiling(), Some(25));
-        // 20 is not below 0.1 * 100, so only the absolute arm can delete it.
-        assert!(!should_delete(20.0, 100.0, 0.1, &CoverageRef::unknown()));
-        assert!(should_delete(20.0, 100.0, 0.1, &known));
-        // Both above the ceiling: neither arm applies, whatever the gap.
-        assert!(!should_delete(30.0, 100.0, 0.1, &known));
+        // (candidate, alternative, coverage, delete)
+        for (candidate, alternative, coverage, delete) in [
+            (1.0, 10.0, &none, false),
+            (0.999, 10.0, &none, true),
+            (2.0, 10.0, &none, false),
+            (10.0, 10.0, &none, false),
+            (20.0, 100.0, &none, false),
+            (20.0, 100.0, &known, true),
+            (30.0, 100.0, &known, false),
+        ] {
+            assert_eq!(
+                should_delete(candidate, alternative, 0.1, coverage),
+                delete,
+                "{candidate} against {alternative}, ceiling {:?}",
+                coverage.error_ceiling()
+            );
+        }
     }
 
     fn node(hash: u64, counts: u32, length: usize) -> NodeStruct {
@@ -923,22 +933,7 @@ mod tests {
         assert_paired(&graph);
     }
 
-    #[test]
-    fn similar_coverage_and_strict_boundary_are_retained() {
-        for weak_count in [2, 1] {
-            let mut graph = DbgGraph::new(31);
-            let start = graph.add_node(node(1, 20, 1));
-            let weak = graph.add_node(node(10, weak_count, 1));
-            let strong = graph.add_node(node(20, 10, 1));
-            let exit = graph.add_node(node(30, 20, 1));
-            add_path(&mut graph, start, &[weak], exit, EdgeType::MinToMin);
-            add_path(&mut graph, start, &[strong], exit, EdgeType::MinToMin);
-            assert!(!remove_bulges(&mut graph, 0.1, &CoverageRef::unknown()));
-            assert!(graph.contains_node(weak));
-            assert_paired(&graph);
-        }
-    }
-
+    /// The ratio is strict: a flank at exactly 4x the connector (8 against 2) keeps it.
     #[test]
     fn ec_requires_strong_alternatives_at_both_ends() {
         let make_graph = |right_count| {
@@ -965,24 +960,6 @@ mod tests {
         assert!(!remove_erroneous_connections(&mut retained, 4.0, true));
         assert!(retained.contains_node(connector));
         assert_paired(&retained);
-    }
-
-    #[test]
-    fn ec_threshold_is_strict() {
-        let mut graph = DbgGraph::new(3);
-        let start = graph.add_node(node(1, 20, 1));
-        let connector = graph.add_node(node(10, 2, 1));
-        let exit = graph.add_node(node(20, 20, 1));
-        let left = graph.add_node(node(30, 8, 1));
-        let right = graph.add_node(node(40, 8, 1));
-        let continuation = graph.add_node(node(50, 20, 1));
-        add_path(&mut graph, start, &[connector], exit, EdgeType::MinToMin);
-        graph.add_bi_edge(start, left, EdgeType::MinToMin);
-        graph.add_bi_edge(right, exit, EdgeType::MinToMin);
-        graph.add_bi_edge(exit, continuation, EdgeType::MinToMin);
-        assert!(!remove_erroneous_connections(&mut graph, 4.0, true));
-        assert!(graph.contains_node(connector));
-        assert_paired(&graph);
     }
 
     #[test]

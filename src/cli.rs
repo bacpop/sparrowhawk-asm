@@ -322,59 +322,46 @@ pub fn cli_args() -> Args {
     Args::parse()
 }
 
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
-    use super::{default_kmer_ladder, MAX_K};
+    use super::default_kmer_ladder;
 
+    /// The default ladder: fixed anchors under the ceiling, then steps of 20, then a last rung clamped to
+    /// the largest odd k under the ceiling when it adds at least 8 (always at MAX_K); 21 always stays.
     #[test]
-    fn default_ladder_uses_fixed_anchors_under_the_ceiling() {
-        assert_eq!(default_kmer_ladder(78), vec![21, 31, 41, 55, 71]);
-        assert_eq!(default_kmer_ladder(60), vec![21, 31, 41, 55]);
-    }
-
-    #[test]
-    fn default_ladder_extends_in_twenty_k_steps_without_crossing_the_ceiling() {
-        assert_eq!(
-            default_kmer_ladder(135),
-            vec![21, 31, 41, 55, 71, 91, 111, 131]
-        );
-        assert_eq!(
-            default_kmer_ladder(270),
-            vec![21, 31, 41, 55, 71, 91, 111, 131, 151, 171, 191, 211, 231, 251, 255]
-        );
-    }
-
-    #[test]
-    fn default_ladder_clamps_its_last_rung_to_the_ceiling() {
-        assert_eq!(
-            default_kmer_ladder(135),
-            vec![21, 31, 41, 55, 71, 91, 111, 131]
-        );
-        assert_eq!(default_kmer_ladder(90), vec![21, 31, 41, 55, 71, 89]);
-        assert_eq!(
-            default_kmer_ladder(225),
-            vec![21, 31, 41, 55, 71, 91, 111, 131, 151, 171, 191, 211, 225]
-        );
-        assert_eq!(default_kmer_ladder(65), vec![21, 31, 41, 55, 65]);
-        assert_eq!(
-            default_kmer_ladder(254),
-            vec![21, 31, 41, 55, 71, 91, 111, 131, 151, 171, 191, 211, 231, 251]
-        );
-        assert_eq!(default_kmer_ladder(1000).last(), Some(&MAX_K));
-    }
-
-    #[test]
-    fn default_ladder_clamps_a_last_rung_at_least_eight_above_the_previous() {
-        assert_eq!(
-            default_kmer_ladder(141),
-            vec![21, 31, 41, 55, 71, 91, 111, 131, 141]
-        );
-        assert_eq!(default_kmer_ladder(240)[11..], [211, 231, 239]);
-        assert_eq!(default_kmer_ladder(138).last(), Some(&131));
-    }
-
-    #[test]
-    fn default_ladder_keeps_the_bootstrap_k_below_the_first_anchor() {
-        assert_eq!(default_kmer_ladder(20), vec![21]);
+    fn default_ladder_cases() {
+        const ANCHORS: [usize; 5] = [21, 31, 41, 55, 71];
+        let with = |tail: &[usize]| [&ANCHORS[..], tail].concat();
+        // (ceiling, ladder)
+        for (ceiling, want) in [
+            (20, vec![21]),
+            (60, vec![21, 31, 41, 55]),
+            (65, vec![21, 31, 41, 55, 65]),
+            (78, with(&[])),
+            (90, with(&[89])),
+            (135, with(&[91, 111, 131])),
+            (138, with(&[91, 111, 131])),
+            (141, with(&[91, 111, 131, 141])),
+            (225, with(&[91, 111, 131, 151, 171, 191, 211, 225])),
+            (240, with(&[91, 111, 131, 151, 171, 191, 211, 231, 239])),
+            (254, with(&[91, 111, 131, 151, 171, 191, 211, 231, 251])),
+            (
+                270,
+                with(&[91, 111, 131, 151, 171, 191, 211, 231, 251, 255]),
+            ),
+            (
+                1000,
+                with(&[91, 111, 131, 151, 171, 191, 211, 231, 251, 255]),
+            ),
+        ] {
+            assert_eq!(default_kmer_ladder(ceiling), want, "ceiling {ceiling}");
+        }
     }
 }

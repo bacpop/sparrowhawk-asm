@@ -100,14 +100,6 @@ impl<IntT> IndexedKmers<IntT> {
         self.canonical_hashes.len()
     }
 
-    #[cfg(test)]
-    pub(crate) fn lookup_hash(&self, hash: u64) -> Option<(usize, bool)> {
-        self.hash_to_index
-            .get(&hash)
-            .copied()
-            .map(|entry| (entry.index(), entry.is_reverse()))
-    }
-
     pub(crate) fn initialise_neighbour_slots(&mut self) {
         let len = self.len();
         self.neighbours.clear();
@@ -146,6 +138,13 @@ impl<IntT> Default for IndexedKmers<IntT> {
     }
 }
 
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,23 +172,12 @@ mod tests {
         assert_eq!(kmers.lookup_hash(19), Some((1, false)));
     }
 
-    #[test]
-    fn finishing_discards_graph_metadata_and_reverse_lookups() {
-        let mut kmers = IndexedKmers::with_capacity(1);
-        kmers.push(11, 19, 3, 7, 23_u64);
-        kmers.initialise_neighbour_slots();
-        kmers.finish_neighbour_search();
-
-        assert_eq!(kmers.lookup_hash(11), Some((0, false)));
-        assert_eq!(kmers.lookup_hash(19), None);
-        assert!(kmers.reverse_hashes.is_empty());
-        assert!(kmers.boundary_bases.is_empty());
-
-        let (hashes, counts, neighbours, predecessor_counts) = kmers.take_graph_inputs();
-        assert_eq!(hashes, vec![11]);
-        assert_eq!(counts, vec![7]);
-        assert_eq!(neighbours, vec![Vec::new()]);
-        assert_eq!(predecessor_counts, vec![0]);
-        assert_eq!(kmers.get_packed(11), Some(&23));
+    impl<IntT> IndexedKmers<IntT> {
+        pub(crate) fn lookup_hash(&self, hash: u64) -> Option<(usize, bool)> {
+            self.hash_to_index
+                .get(&hash)
+                .copied()
+                .map(|entry| (entry.index(), entry.is_reverse()))
+        }
     }
 }

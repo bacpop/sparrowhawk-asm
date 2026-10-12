@@ -16,7 +16,6 @@ zstd = ["needletail/zstd"]
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
-ahash = { version = "=0.8.11" }
 num-traits = { version = "0.2.19" }
 log = { version = "0.4.27" }
 clap = { version = "4.5.35", features = ["derive"] }

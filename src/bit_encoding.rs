@@ -895,6 +895,13 @@ pub const RC_IUPAC: [u8; 256] = [
     b'-', // 240-255
 ];
 
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,63 +949,28 @@ mod tests {
         assert_eq!(overlap(&n, &empty), 0.0);
     }
 
+    /// The 2-bit code (A=0, C=1, T=2, G=3, either case) round-trips and complements A<->T and C<->G; only
+    /// A, C, G and T are valid, while IUPAC codes other than U count as ambiguous.
     #[test]
-    fn test_encode_base() {
-        assert_eq!(encode_base(b'A'), 0);
-        assert_eq!(encode_base(b'C'), 1);
-        assert_eq!(encode_base(b'T'), 2);
-        assert_eq!(encode_base(b'G'), 3);
-        // Lowercase gives same encoding
-        assert_eq!(encode_base(b'a'), 0);
-        assert_eq!(encode_base(b'c'), 1);
-        assert_eq!(encode_base(b't'), 2);
-        assert_eq!(encode_base(b'g'), 3);
-    }
-
-    #[test]
-    fn test_decode_base() {
-        assert_eq!(decode_base(0), b'A');
-        assert_eq!(decode_base(1), b'C');
-        assert_eq!(decode_base(2), b'T');
-        assert_eq!(decode_base(3), b'G');
-    }
-
-    #[test]
-    fn test_rc_base() {
-        // A (0) <-> T (2)
-        assert_eq!(rc_base(0), 2);
-        assert_eq!(rc_base(2), 0);
-        // C (1) <-> G (3)
-        assert_eq!(rc_base(1), 3);
-        assert_eq!(rc_base(3), 1);
-        // Double complement is identity
-        for base in 0u8..4 {
-            assert_eq!(rc_base(rc_base(base)), base);
+    fn base_codes() {
+        // (base, code, complement's code)
+        for (base, code, complement) in [(b'A', 0, 2), (b'C', 1, 3), (b'T', 2, 0), (b'G', 3, 1)] {
+            assert_eq!(encode_base(base), code);
+            assert_eq!(encode_base(base.to_ascii_lowercase()), code);
+            assert_eq!(decode_base(code), base);
+            assert_eq!(rc_base(code), complement);
+            assert!(valid_base(base));
+            assert!(!is_ambiguous(base));
         }
-    }
-
-    #[test]
-    fn test_valid_base() {
-        assert!(valid_base(b'A'));
-        assert!(valid_base(b'C'));
-        assert!(valid_base(b'G'));
-        assert!(valid_base(b'T'));
-        assert!(!valid_base(b'N'));
-        assert!(!valid_base(b'n'));
-    }
-
-    #[test]
-    fn test_is_ambiguous() {
-        assert!(!is_ambiguous(b'A'));
-        assert!(!is_ambiguous(b'C'));
-        assert!(!is_ambiguous(b'G'));
-        assert!(!is_ambiguous(b'T'));
-        assert!(!is_ambiguous(b'U'));
-        assert!(!is_ambiguous(b'-'));
-        assert!(is_ambiguous(b'R'));
-        assert!(is_ambiguous(b'Y'));
-        assert!(is_ambiguous(b'N'));
-        assert!(is_ambiguous(b'B'));
+        for &base in b"Nn" {
+            assert!(!valid_base(base));
+        }
+        for &base in b"U-" {
+            assert!(!is_ambiguous(base));
+        }
+        for &base in b"RYNB" {
+            assert!(is_ambiguous(base));
+        }
     }
 
     #[test]

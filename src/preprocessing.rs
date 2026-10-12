@@ -116,8 +116,8 @@ use wasm_bindgen_file_reader::WebSysFile;
 // For the fitting, we'll use actually MAXSIZEHISTO - 1
 const MAXSIZEHISTO: usize = 8000;
 
-/// Historical window used by [`coverage_peak`] and returned through the WASM preprocessing JSON. It
-/// does not limit the current valley or mixture fit.
+/// Window of the k-mer spectrum returned through the WASM preprocessing JSON. It does not limit
+/// the current valley or mixture fit.
 pub(crate) const LEGACY_HISTO_RANGE: usize = 500;
 
 /// Smallest useful horizontal range for a native diagnostic with no empirical genomic peak.
@@ -241,28 +241,6 @@ impl SpectrumSketch {
         }
         out
     }
-}
-
-/// Single-copy coverage estimate straight from the spectrum: the tallest bin above the error peak.
-///
-/// Scans counts 3..=499 and returns a **count, not an index**; the range is pinned to
-/// [`LEGACY_HISTO_RANGE`], so above ~500x the true genomic peak is invisible here. It is also a *global* argmax,
-/// so on a deep library the error lobe outvotes the genome lobe.
-///
-/// This now has no production callers; it remains as the pinned legacy estimator exercised by the
-/// compatibility tests below. The browser independently keeps returning the same first 500 bins.
-#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
-fn coverage_peak(histovec: &[u32]) -> usize {
-    let mut best_count = 2usize; // nothing above the error peak; the caller's floor of 2 then applies
-    let mut best_n = 0u32;
-    for (i, &n) in histovec[2..(LEGACY_HISTO_RANGE - 1)].iter().enumerate() {
-        if n > best_n {
-            // Strict, so ties keep the lowest count and the result is deterministic.
-            best_n = n;
-            best_count = i + 3; // slice index 0 is count 3
-        }
-    }
-    best_count
 }
 
 // =====================================================================================================
@@ -1316,11 +1294,11 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
 /// bridge, so it severs a contig: what predicts contiguity is their number, not their share. One
 /// percent of a 4.6 Mb genome is 46 000 severed paths, which is why a loss-fraction bound never binds.
 const MAX_GENOME_HOLES: f64 = 1.0;
-#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 const AUTO_FIT_INITIAL_MIN_COUNT: u16 = crate::cli::MIN_BLOOM_COUNT;
 
 /// Natively the sharded filter has no threshold of its own; the browser's `KmerFilter` still does.
-#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 #[inline]
 fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
     if do_fit {
@@ -1331,9 +1309,9 @@ fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
 }
 
 /// Choose the minimum k-mer count from the spectrum, as an **inclusive** minimum: both filter sites
-/// keep k-mers with `count >= min_count`. Natively this has no callers outside the tests now; the
-/// browser still reaches it from its chunked and Bloom entry points.
-#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
+/// keep k-mers with `count >= min_count`. Natively this has no callers; the browser reaches it from
+/// its chunked and Bloom entry points.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 fn choose_min_count(histovec: &[u32]) -> u16 {
     choose_min_count_and_peak(histovec, 1.0).0
 }
@@ -1579,43 +1557,6 @@ fn select_usable_fit(candidates: &[FloorCandidate]) -> Option<usize> {
             }
         }
     }
-}
-
-/// The min-count, and the floor it was read at. Every candidate floor is evaluated and only then
-/// compared, all against one reference fixed beforehand, so the answer cannot depend on the order the
-/// floors happen to be visited in.
-#[cfg(not(target_family = "wasm"))]
-#[cfg_attr(not(test), allow(dead_code))]
-fn choose_min_count_and_floor(
-    histovec: &[u32],
-    sketch: &SpectrumSketch,
-    floors: &[u8],
-) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>) {
-    choose_min_count_and_floor_with_fit(histovec, sketch, floors, fit_and_log, &[true; MAX_GROUPS])
-}
-
-#[cfg(not(target_family = "wasm"))]
-fn choose_min_count_and_floor_with_fit<F>(
-    histovec: &[u32],
-    sketch: &SpectrumSketch,
-    floors: &[u8],
-    fit: F,
-    floor_has_kmers: &[bool],
-) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>)
-where
-    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
-{
-    // Its callers hand it an exact strict-floor spectrum.
-    let (min_count, floor, peak, diagnostics, _) = choose_min_count_and_floor_with_debug(
-        histovec,
-        1.0,
-        sketch,
-        floors,
-        fit,
-        floor_has_kmers,
-        false,
-    );
-    (min_count, floor, peak, diagnostics)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1920,7 +1861,7 @@ fn build_histogram_from_countmap(
     }
 }
 
-#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 fn drain_countmap_into_themap<IntT>(
     countmap: &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
     themap: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
@@ -3075,9 +3016,9 @@ where
     (outdict, minmaxdict, themap, histovec, minc)
 }
 
-/// Natively this now has no callers outside the tests: the map counter never materialises a list of
+/// Natively this has no callers: the map counter never materialises a list of
 /// occurrences to run-length count. The browser still reaches it through `chunked_processing_wasm`.
-#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 fn update_countmap(
     invec: &[(u64, u64, u8)],
     countmap: &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
@@ -3166,42 +3107,6 @@ fn for_each_kmer<IntT, F>(
             }
         }
     }
-}
-
-/// Hash one batch into one flat vector, in record order. The counting path no longer materialises this
-/// -- it writes straight into per-shard buckets -- so this is the tests' independent reference.
-#[cfg(all(not(target_family = "wasm"), test))]
-fn hash_batch<IntT>(
-    batch: &[OwnedRecord],
-    k: usize,
-    min_qual: u8,
-    floors: Option<&[u8]>,
-    keep: u8,
-) -> Vec<(u64, u64, u8, u8, Option<IntT>)>
-where
-    IntT: for<'a> UInt<'a>,
-{
-    batch
-        .par_iter()
-        .flat_map_iter(|(seq, qual_bytes)| {
-            let mut local = Vec::new();
-            let mut groups: Vec<u8> = Vec::new();
-            let w = KmerWalk {
-                k,
-                min_qual,
-                floors,
-                keep,
-            };
-            for_each_kmer::<IntT, _>(
-                seq,
-                qual_bytes.as_deref(),
-                w,
-                &mut groups,
-                |hc, hnc, b, g, km| local.push((hc, hnc, b, g, km)),
-            );
-            local
-        })
-        .collect()
 }
 
 /// One distinct k-mer, accumulated while counting in bulk.
@@ -4052,232 +3957,68 @@ where
     })
 }
 
+#[cfg(target_family = "wasm")]
+/// Main preprocessing function for wasm
+pub fn preprocessing_wasm<IntT>(
+    file1: &mut WebSysFile,
+    file2: Option<&mut WebSysFile>,
+    k: usize,
+    qual: &QualOpts,
+    csize: usize,
+    do_bloom: bool,
+    do_fit: bool,
+) -> (
+    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
+    Option<HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>>,
+    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+    Vec<u32>,
+    u16,
+)
+where
+    IntT: for<'a> UInt<'a>,
+{
+    if do_bloom {
+        // Build indexes
+        logw("Processing using a Bloom filter", Some("info"));
+
+        let (thedict, maxmindict, themap, histovec, used_min_count) =
+            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit);
+        (themap, Some(thedict), maxmindict, histovec, used_min_count)
+    } else {
+        // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
+        // record, so passing 0 through would sort and count after every single read.
+        let csize = if csize == 0 { usize::MAX } else { csize };
+        if csize == usize::MAX {
+            logw("Counting k-mers by sorting, without chunking", Some("info"));
+        } else {
+            logw(
+                format!("Counting k-mers by sorting, in chunks of {csize} records").as_str(),
+                Some("info"),
+            );
+        }
+
+        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
+        let (thedict, maxmindict, themap, mut histovec, used_min_count) =
+            chunked_processing_wasm::<IntT>(file1, file2, k, qual, &mut tmpvec, csize, do_fit);
+        drop(tmpvec);
+        histovec.shrink_to_fit();
+        (themap, Some(thedict), maxmindict, histovec, used_min_count)
+    }
+}
+
+//
+//
+//
+//
+// ===================================================================
+// ============================================================= TESTS
+// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(not(target_family = "wasm"))]
     use crate::spectrum_fitter::{ErrorModel, ErrorParams, GenomeModel};
-    use nohash_hasher::NoHashHasher;
     use std::{collections::HashMap, hash::BuildHasherDefault};
-
-    #[test]
-    fn legacy_histogram_range_remains_pinned() {
-        assert_eq!(LEGACY_HISTO_RANGE, 500);
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn only_automatic_sentinel_min_count_is_unresolved() {
-        assert!(min_count_decision_unresolved(
-            true,
-            UNRESOLVED_MINCOUNT,
-            PeakSource::Fallback(18)
-        ));
-        assert!(min_count_decision_unresolved(
-            true,
-            UNRESOLVED_MINCOUNT,
-            PeakSource::Unknown
-        ));
-        assert!(!min_count_decision_unresolved(
-            false,
-            UNRESOLVED_MINCOUNT,
-            PeakSource::Fallback(18)
-        ));
-        assert!(!min_count_decision_unresolved(
-            true,
-            UNRESOLVED_MINCOUNT + 1,
-            PeakSource::Fallback(18)
-        ));
-        assert!(!min_count_decision_unresolved(
-            true,
-            UNRESOLVED_MINCOUNT,
-            PeakSource::Fitted(18)
-        ));
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn explicit_cutoff_diagnostics_do_not_contain_a_fit() {
-        let estimate = SpectrumEstimate {
-            valley: 12,
-            genomic_peak: 95,
-            ..SpectrumEstimate::default()
-        };
-        let diagnostics = SpectrumPlotDiagnostics::new(&estimate, None, false);
-        assert_eq!(diagnostics.valley, Some(12));
-        assert_eq!(diagnostics.empirical_peak, Some(95));
-        assert!(!diagnostics.fit_attempted);
-        assert!(diagnostics.fit.is_none());
-        assert!(diagnostics.genomic_guard.is_none());
-        assert!(diagnostics.error_floor.is_none());
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn native_plot_range_tracks_fit_data_and_markers() {
-        let spectrum = vec![0u32; MAXSIZEHISTO];
-        let estimate = SpectrumEstimate {
-            genomic_peak: 95,
-            ..SpectrumEstimate::default()
-        };
-        let diagnostics = SpectrumPlotDiagnostics::new(&estimate, None, true);
-        assert_eq!(native_plot_end(spectrum.len(), &diagnostics, 12), 570);
-
-        let estimate = SpectrumEstimate {
-            genomic_peak: 15,
-            ..SpectrumEstimate::default()
-        };
-        let diagnostics = SpectrumPlotDiagnostics::new(&estimate, None, true);
-        assert_eq!(native_plot_end(spectrum.len(), &diagnostics, 2), 90);
-        assert_eq!(native_plot_end(spectrum.len(), &diagnostics, 150), 150);
-
-        let fit = NativeSpectrumFit::for_test(
-            ErrorModel::SingletonPareto,
-            GenomeModel::NegativeBinomial,
-            [0.7, 0.29, 0.01],
-            95.0,
-            6.6,
-            ErrorParams {
-                singleton_probability: 0.85,
-                tail_exponent: 2.0,
-                weibull_shape: None,
-            },
-            10.0e6,
-            321,
-        );
-        let diagnostics = SpectrumPlotDiagnostics::new(&estimate, Some(fit), true);
-        assert_eq!(native_plot_end(spectrum.len(), &diagnostics, 2), 321);
-
-        let empty_diagnostics = SpectrumPlotDiagnostics::default();
-        assert_eq!(
-            native_plot_end(spectrum.len(), &empty_diagnostics, 2),
-            MIN_NATIVE_PLOT_RANGE
-        );
-        assert_eq!(
-            native_plot_end(20, &diagnostics, u16::MAX),
-            19,
-            "the saturating terminal histogram bin is not plotted"
-        );
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn unbounded_plot_ranges_include_visible_data_and_fit_curve() {
-        let mut spectrum = vec![0u32; MAXSIZEHISTO];
-        spectrum[19] = 300_000;
-        let estimate = SpectrumEstimate {
-            genomic_peak: 95,
-            ..SpectrumEstimate::default()
-        };
-        let fit = NativeSpectrumFit::for_test(
-            ErrorModel::SingletonPareto,
-            GenomeModel::NegativeBinomial,
-            [0.7, 0.29, 0.01],
-            95.0,
-            6.6,
-            ErrorParams {
-                singleton_probability: 0.85,
-                tail_exponent: 2.0,
-                weibull_shape: None,
-            },
-            10.0e6,
-            321,
-        );
-        let diagnostics = SpectrumPlotDiagnostics::new(&estimate, Some(fit), true);
-        let plot_end = native_plot_end(spectrum.len(), &diagnostics, 12);
-        let data_max = native_plot_y_max(&spectrum, None, &diagnostics, plot_end);
-
-        assert!(data_max >= 300_000.0);
-        let linear_max = plot_axis_y_max(
-            PlotYAxis::UnboundedLinear,
-            &spectrum,
-            None,
-            &diagnostics,
-            plot_end,
-        );
-        assert!(linear_max > 300_000.0);
-        assert_eq!(
-            plot_axis_y_max(
-                PlotYAxis::CappedLinear,
-                &spectrum,
-                None,
-                &diagnostics,
-                plot_end,
-            ),
-            200_000.0
-        );
-
-        let log_max = plot_axis_y_max(
-            PlotYAxis::UnboundedLog,
-            &spectrum,
-            None,
-            &diagnostics,
-            plot_end,
-        );
-        assert!(log_max > 5.0, "the logarithmic axis must cover 300,000+");
-        assert_eq!(
-            transform_plot_y(0.0, PlotYAxis::UnboundedLog),
-            0.5f64.log10()
-        );
-        assert_eq!(
-            transform_plot_y(0.5, PlotYAxis::UnboundedLog),
-            0.5f64.log10()
-        );
-        assert_eq!(plot_axis_y_min(PlotYAxis::CappedLinear), 0.0);
-        assert_eq!(plot_axis_y_min(PlotYAxis::UnboundedLinear), 0.0);
-        assert_eq!(plot_axis_y_min(PlotYAxis::UnboundedLog), 0.5f64.log10());
-        assert!(transform_plot_y(1.0, PlotYAxis::UnboundedLog) > 0.5f64.log10());
-        assert!(transform_plot_y(10.0, PlotYAxis::UnboundedLog) > 0.0);
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn plot_markers_show_genomic_and_active_error_guards_without_shadows() {
-        let estimate = SpectrumEstimate {
-            genomic_peak: 95,
-            min_count: 12,
-            verdict: Verdict::Ok,
-            ..SpectrumEstimate::default()
-        };
-        let fit = NativeSpectrumFit::for_test(
-            ErrorModel::SingletonPareto,
-            GenomeModel::NegativeBinomial,
-            [0.9, 0.09, 0.01],
-            95.0,
-            6.0,
-            ErrorParams {
-                singleton_probability: 0.85,
-                tail_exponent: 2.0,
-                weibull_shape: None,
-            },
-            10.0e6,
-            570,
-        );
-        let diagnostics = SpectrumPlotDiagnostics::new(&estimate, Some(fit), true);
-        let markers = plot_markers(&diagnostics, 17);
-        let cutoff = markers.last().expect("the cutoff marker is always last");
-        assert_eq!(cutoff.x, 17.0);
-        assert_eq!(cutoff.colour, BLACK);
-        assert_eq!(cutoff.line_style, MarkerLineStyle::Solid);
-        assert_eq!(cutoff.label, "Minimum count used = 17");
-
-        assert!(!markers
-            .iter()
-            .any(|marker| marker.label.starts_with("Shadow error floor")));
-        let genomic = markers
-            .iter()
-            .find(|marker| marker.label.starts_with("Genomic hole guard"))
-            .expect("the active genomic guard is plotted");
-        assert_eq!(Some(genomic.x as u16), diagnostics.genomic_guard);
-        assert_eq!(genomic.colour, RGBColor(20, 135, 65));
-        assert_eq!(genomic.line_style, MarkerLineStyle::Dashed);
-        let enforced = markers
-            .iter()
-            .find(|marker| marker.label.starts_with("Enforced 100% error floor"))
-            .expect("the full error floor is shown separately");
-        assert_eq!(enforced.colour, RGBColor(105, 105, 105));
-        assert_eq!(enforced.line_style, MarkerLineStyle::Dashed);
-    }
 
     #[cfg(not(target_family = "wasm"))]
     #[test]
@@ -4335,34 +4076,15 @@ mod tests {
                 std::process::id()
             ));
             let svg_path = path.with_extension("svg");
-            plot_kmer_histogram(&decision, raw, &diagnostics, 12, &path, true);
+            plot_kmer_histogram(&decision, raw, &diagnostics, 12, &path, false);
             assert!(std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0));
             assert!(std::fs::metadata(&svg_path).is_ok_and(|metadata| metadata.len() > 0));
             let svg = std::fs::read_to_string(&svg_path).expect("read spectrum SVG");
             assert!(svg.contains("<svg"));
             assert!(svg.contains("Counts"));
             assert!(svg.contains("k-mer frequency"));
+            assert!(svg.contains("k-mer spectrum (unbounded Y)"));
             assert!(svg.contains("Minimum count used = 12"));
-
-            for (suffix, caption) in [
-                ("_unbounded", "k-mer spectrum (unbounded Y)"),
-                ("_log", "k-mer spectrum (logarithmic Y)"),
-            ] {
-                let png_path = suffixed_path(&path, suffix, "png");
-                let mut variant_svg_path = png_path.clone();
-                variant_svg_path.set_extension("svg");
-                assert!(std::fs::metadata(&png_path).is_ok_and(|metadata| metadata.len() > 0));
-                assert!(
-                    std::fs::metadata(&variant_svg_path).is_ok_and(|metadata| metadata.len() > 0)
-                );
-                let variant_svg =
-                    std::fs::read_to_string(&variant_svg_path).expect("read variant spectrum SVG");
-                assert!(variant_svg.contains(caption));
-                assert!(variant_svg.contains("Minimum count used = 12"));
-                std::fs::remove_file(png_path).expect("remove variant spectrum plot");
-                std::fs::remove_file(variant_svg_path)
-                    .expect("remove vector variant spectrum plot");
-            }
             std::fs::remove_file(path).expect("remove temporary spectrum plot");
             std::fs::remove_file(svg_path).expect("remove temporary vector spectrum plot");
         }
@@ -4545,10 +4267,6 @@ mod tests {
         .err()
         .expect("do not continue to graph assembly without surviving k-mers");
         assert!(error.to_string().contains("no k-mers survived filtering"));
-    }
-
-    fn empty_countmap() -> HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
-        HashMap::with_hasher(BuildHasherDefault::default())
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -4740,21 +4458,8 @@ mod tests {
             want.values().any(|&n| n >= 2),
             "the fixture has no repeated k-mer to count"
         );
-    }
-
-    /// Shard assignment is fixed and each shard replays in record order, so rayon's scheduling cannot
-    /// change the answer.
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn sharded_bloom_counting_is_reproducible() {
-        let ladder = [0u8, 11, 25];
-        let qual = QualOpts {
-            min_count: 2,
-            min_qual: 25,
-        };
-        let first = bloom_shards(counter_test_reads(), 11, &qual, &ladder);
-        let second = bloom_shards(counter_test_reads(), 11, &qual, &ladder);
-        assert_eq!(first, second);
+        // Shard assignment is fixed and each shard replays in record order, so scheduling cannot change it.
+        assert_eq!(got, bloom_shards(counter_test_reads(), 11, &qual, &ladder));
     }
 
     /// Canonical-minimum hashes for the sharding tests: `min(fwd, rc)` has a triangular density, which
@@ -4789,238 +4494,6 @@ mod tests {
         }
     }
 
-    /// Whatever the count, every k-mer must land in the shard `shard_of` claims, or the lock-free
-    /// accumulate is unsound.
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn the_live_shard_count_partitions_the_key_space() {
-        let n = countmap_shards();
-        assert!(n.is_power_of_two() && n >= MIN_COUNTMAP_SHARDS);
-        let mut seen = vec![0usize; n];
-        for h in canonical_minimum_hashes(200_000) {
-            let s = shard_of(h, n);
-            assert!(s < n);
-            seen[s] += 1;
-        }
-        assert!(
-            seen.iter().all(|&c| c > 0),
-            "some shard never receives a key"
-        );
-    }
-
-    fn empty_themap() -> HashMap<u64, crate::HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>
-    {
-        HashMap::with_hasher(BuildHasherDefault::default())
-    }
-
-    fn empty_dict() -> HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> {
-        HashMap::with_hasher(BuildHasherDefault::default())
-    }
-
-    #[test]
-    fn initial_bloom_min_count_is_shared_between_modes() {
-        let qual = QualOpts {
-            min_count: 7,
-            min_qual: 0,
-        };
-
-        assert_eq!(initial_bloom_min_count(&qual, true), 2);
-        assert_eq!(initial_bloom_min_count(&qual, false), 7);
-    }
-
-    #[test]
-    fn histogram_zero_count_uses_first_bin() {
-        let mut histovec = vec![0u32; MAXSIZEHISTO];
-        add_to_histogram(&mut histovec, 0);
-        assert_eq!(histovec[0], 1);
-    }
-
-    #[test]
-    fn update_countmap_single_entry() {
-        let input = vec![(100u64, 200u64, 1u8)];
-        let mut cmap = empty_countmap();
-        update_countmap(&input, &mut cmap);
-        assert_eq!(cmap[&100].0, 1);
-        assert_eq!(cmap[&100].1, 200u64);
-        assert_eq!(cmap[&100].2, 1u8);
-    }
-
-    #[test]
-    fn update_countmap_two_same_hash() {
-        let input = vec![(100u64, 200u64, 1u8), (100u64, 200u64, 1u8)];
-        let mut cmap = empty_countmap();
-        update_countmap(&input, &mut cmap);
-        assert_eq!(cmap[&100].0, 2);
-    }
-
-    #[test]
-    fn update_countmap_two_different_hashes() {
-        let input = vec![(100u64, 200u64, 1u8), (200u64, 100u64, 2u8)];
-        let mut cmap = empty_countmap();
-        update_countmap(&input, &mut cmap);
-        assert_eq!(cmap[&100].0, 1);
-        assert_eq!(cmap[&200].0, 1);
-    }
-
-    #[test]
-    fn update_countmap_accumulates_across_calls() {
-        // Two calls: first adds 2, second adds 1 → total 3
-        let input1 = vec![(42u64, 0u64, 0u8), (42u64, 0u64, 0u8)];
-        let input2 = vec![(42u64, 0u64, 0u8)];
-        let mut cmap = empty_countmap();
-        update_countmap(&input1, &mut cmap);
-        update_countmap(&input2, &mut cmap);
-        assert_eq!(cmap[&42].0, 3);
-    }
-
-    #[test]
-    fn update_countmap_run_of_five() {
-        let input: Vec<_> = (0..5).map(|_| (7u64, 8u64, 0u8)).collect();
-        let mut cmap = empty_countmap();
-        update_countmap(&input, &mut cmap);
-        assert_eq!(cmap[&7].0, 5);
-    }
-
-    #[test]
-    fn drain_countmap_above_threshold_included() {
-        let mut cmap = empty_countmap();
-        cmap.insert(1u64, (5u32, 2u64, 0u8)); // count=5 >= minc=3 → in themap
-        let mut themap = empty_themap();
-        let mut outdict = empty_dict();
-        let mut minmaxdict = empty_dict();
-        drain_countmap_into_themap::<u64>(
-            &mut cmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            3,
-            None,
-        );
-        assert!(themap.contains_key(&1));
-    }
-
-    #[test]
-    fn drain_countmap_below_threshold_excluded() {
-        let mut cmap = empty_countmap();
-        cmap.insert(2u64, (2u32, 3u64, 0u8)); // count=2 < minc=3 → removed from outdict
-        let mut themap = empty_themap();
-        let mut outdict = empty_dict();
-        outdict.insert(2u64, 99u64); // should be removed
-        let mut minmaxdict = empty_dict();
-        minmaxdict.insert(3u64, 2u64); // hnc → hc, should be removed
-        drain_countmap_into_themap::<u64>(
-            &mut cmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            3,
-            None,
-        );
-        assert!(!themap.contains_key(&2));
-        assert!(!outdict.contains_key(&2));
-        assert!(!minmaxdict.contains_key(&3));
-    }
-
-    #[test]
-    fn drain_countmap_boundary_equal_minc() {
-        // count == minc → included (>= check)
-        let mut cmap = empty_countmap();
-        cmap.insert(5u64, (3u32, 0u64, 0u8));
-        let mut themap = empty_themap();
-        let mut outdict = empty_dict();
-        let mut minmaxdict = empty_dict();
-        drain_countmap_into_themap::<u64>(
-            &mut cmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            3,
-            None,
-        );
-        assert!(themap.contains_key(&5));
-    }
-
-    #[test]
-    fn drain_countmap_with_histogram() {
-        let mut cmap = empty_countmap();
-        cmap.insert(1u64, (5u32, 0u64, 0u8)); // count=5 → histovec[4]
-        cmap.insert(2u64, (10u32, 0u64, 0u8)); // count=10 → histovec[9]
-        let mut themap = empty_themap();
-        let mut outdict = empty_dict();
-        let mut minmaxdict = empty_dict();
-        let mut histovec = vec![0u32; MAXSIZEHISTO];
-        drain_countmap_into_themap::<u64>(
-            &mut cmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            1,
-            Some(&mut histovec),
-        );
-        assert!(histovec[4] > 0, "count=5 should be at histovec[4]");
-        assert!(histovec[9] > 0, "count=10 should be at histovec[9]");
-    }
-
-    /// A bimodal spectrum: a tall error peak at count 1-2 and the real single-copy peak further out.
-    /// `coverage_peak` must return the *count* of the second peak, ignoring the first.
-    #[test]
-    fn coverage_peak_finds_the_mode_above_the_error_peak() {
-        for expected in [3usize, 10, 30, 113, 498] {
-            let mut h = vec![0u32; MAXSIZEHISTO];
-            h[0] = 1_000_000; // count 1: errors, must be ignored
-            h[1] = 200_000; // count 2: still errors
-            h[expected - 1] = 50_000; // the genuine single-copy peak
-            assert_eq!(
-                coverage_peak(&h),
-                expected,
-                "genomic_peak planted at count {expected}"
-            );
-        }
-    }
-
-    /// Ties keep the lowest count, and a spectrum with nothing above the error peak falls back to 2 —
-    /// so the peak-derived floor stays well defined even for a degenerate histogram.
-    #[test]
-    fn coverage_peak_is_deterministic_and_has_a_floor() {
-        let mut h = vec![0u32; MAXSIZEHISTO];
-        h[9] = 42;
-        h[19] = 42; // equal height: the lower count wins
-        assert_eq!(coverage_peak(&h), 10);
-
-        let mut only_errors = vec![0u32; MAXSIZEHISTO];
-        only_errors[0] = 99;
-        only_errors[1] = 7;
-        assert_eq!(coverage_peak(&only_errors), 2);
-    }
-
-    /// The last bin saturates (it absorbs every count >= MAXSIZEHISTO), so it must not be mistaken for
-    /// a peak — the current mixture fit excludes it for the same reason.
-    #[test]
-    fn coverage_peak_ignores_the_edge_of_its_pinned_window() {
-        let mut h = vec![0u32; MAXSIZEHISTO];
-        h[LEGACY_HISTO_RANGE - 1] = 1_000_000;
-        h[29] = 10;
-        assert_eq!(coverage_peak(&h), 30);
-    }
-
-    /// Widening the histogram must not move the legacy readers: they see counts 1..=499, and
-    /// `add_to_histogram` puts count `c` at index `c-1` regardless of how long the vector is.
-    #[test]
-    fn widening_the_histogram_leaves_the_pinned_window_alone() {
-        let mut narrow = vec![0u32; LEGACY_HISTO_RANGE];
-        let mut wide = vec![0u32; MAXSIZEHISTO];
-        for c in [1u32, 2, 3, 47, 163, 499] {
-            add_to_histogram(&mut narrow[..], c);
-            add_to_histogram(&mut wide[..], c);
-        }
-        // Counts below the old ceiling land identically; only what used to saturate now moves.
-        assert_eq!(
-            narrow[..LEGACY_HISTO_RANGE - 1],
-            wide[..LEGACY_HISTO_RANGE - 1]
-        );
-        assert_eq!(coverage_peak(&narrow), coverage_peak(&wide));
-    }
-
     // ---------------------------------------------------------------------------------------------
     // The valley estimator. Spectra are built from the same model the plan was simulated with: a
     // genome lobe at Poisson(lambda) over 4.6 Mb, errors at Poisson(lambda * p / 3) over 3k slots.
@@ -5047,33 +4520,6 @@ mod tests {
             h[c - 1] = n as u32;
         }
         h
-    }
-
-    #[test]
-    fn smoothed_refinement_reports_raw_bin_heights() {
-        let mut histogram = vec![0u32; 40];
-        histogram[19] = 100;
-        let smoothed = smooth_histogram(&histogram);
-        assert_eq!(
-            smoothed[19], 20,
-            "the single-bin spike is averaged over five bins"
-        );
-        assert_eq!(smoothed[17], 20);
-        assert_eq!(smoothed[21], 20);
-
-        let estimate = estimate_by_valley(&synthetic_spectrum(30.0));
-        let raw = synthetic_spectrum(30.0);
-        assert_eq!(estimate.peak_search, PeakSearch::SmoothedRefinement);
-        assert_eq!(
-            estimate.genomic_peak_n,
-            raw[estimate.genomic_peak - 1],
-            "reported peak height must be the observed bin, not its local average"
-        );
-        assert_eq!(
-            estimate.valley_n,
-            raw[estimate.valley - 1],
-            "reported valley height must be the observed bin, not its local average"
-        );
     }
 
     #[test]
@@ -5151,10 +4597,9 @@ mod tests {
 
     #[test]
     fn srr26931854_20x_k81_rejects_the_weak_empirical_area() {
-        // Captured from this real sample's exact-count (no-Bloom) spectrum. The former global
-        // smoothed search selected a tiny tail fluctuation at 52/60; raw-first candidates and the
-        // anchored refinement stay at the earlier shoulder. It still correctly fails the support
-        // guard, so this changes the empirical location without making the spectrum trustworthy.
+        // Captured from this real sample's exact-count (no-Bloom) spectrum. Raw-first candidates and
+        // the anchored refinement stay at the earlier shoulder, which still correctly fails the
+        // support guard, so the spectrum is not trusted.
         let observed = [
             683_875, 350_296, 360_089, 310_003, 235_672, 163_282, 105_683, 64_315, 38_723, 21_767,
             12_405, 7_342, 4_149, 2_454, 1_551, 1_014, 785, 584, 484, 395, 342, 305, 279, 249, 256,
@@ -5163,32 +4608,6 @@ mod tests {
         ];
         let mut histogram = vec![0u32; MAXSIZEHISTO];
         histogram[..observed.len()].copy_from_slice(&observed);
-
-        // Pin the failure mode too: the previous global-smoothed walk finds a false turn-up at 53
-        // and its largest later smooth bin is 60.
-        let smooth = smooth_histogram(&histogram);
-        let mut old_seed = 2;
-        let mut old_min = smooth[1];
-        let mut rising = 0;
-        for count in 3..smooth.len() - 1 {
-            if smooth[count - 1] < old_min {
-                old_seed = count;
-                old_min = smooth[count - 1];
-                rising = 0;
-            } else {
-                rising += 1;
-                if rising >= RISE_RUN {
-                    break;
-                }
-            }
-        }
-        let mut old_peak = old_seed;
-        for count in old_seed..smooth.len() - 1 {
-            if smooth[count - 1] > smooth[old_peak - 1] {
-                old_peak = count;
-            }
-        }
-        assert_eq!((old_seed, old_peak), (53, 60));
 
         let estimate = estimate_by_valley(&histogram);
         assert_eq!(estimate.raw_valley, Some(31));
@@ -5399,130 +4818,57 @@ mod tests {
         (0..min_count as usize).map(|c| poisson(c, lam)).sum()
     }
 
-    /// At extreme depth the genome lobe can be real but occupy less than 5 % of non-singleton
-    /// histogram mass. The area rule intentionally refuses to claim a resolved peak in that case.
+    /// At extreme depth the genome lobe is real but under 5 % of the non-singleton bins, so the area rule
+    /// refuses it: no pair is published, nothing is fitted, and the cutoff is the sentinel.
+    #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn area_guard_refuses_a_deep_but_error_dominated_spectrum() {
-        let h = synthetic_spectrum(500.0);
-        let distinct_total: u64 = h.iter().map(|&n| u64::from(n)).sum();
-        let genome_distinct: u64 = h[100..].iter().map(|&n| u64::from(n)).sum();
+    fn deep_error_dominated_spectra_are_refused_by_the_area_guard() {
+        let deepest = synthetic_spectrum(500.0);
+        let distinct_total: u64 = deepest.iter().map(|&n| u64::from(n)).sum();
+        let genome_distinct: u64 = deepest[100..].iter().map(|&n| u64::from(n)).sum();
         assert!(
             genome_distinct * 50 < distinct_total,
-            "the genome lobe is under 2 % of distinct-bin mass despite high sequence depth"
+            "the genome lobe is under 2 % of distinct-bin mass"
         );
-        assert!(
-            coverage_peak(&h) < 10,
-            "the raw mode lies in the error lobe"
-        );
-        let e = estimate_by_valley(&h);
-        assert!(e
-            .primary_area_fraction
-            .is_some_and(|fraction| { fraction < MIN_PEAK_AREA_FRACTION }));
-        assert_eq!(e.retry_reason, Some(PeakRetryReason::AreaBelowThreshold));
-        assert!(e.fallback_attempted);
-        assert_eq!(e.verdict, Verdict::NoLocalValley);
-        assert_eq!((e.valley, e.genomic_peak), (0, 0));
-        assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
-    }
 
-    /// On model-generated spectra, candidates are retained when supported; at 500x the 5 % area
-    /// rule rejects the error-dominated lobe and the flat inter-lobe gap has no strict local minimum.
-    #[test]
-    fn raw_anchored_estimator_finds_the_separated_lobes_across_the_working_range() {
-        for lam in [20.0, 60.0, 150.0] {
+        for lam in [250.0, 500.0] {
             let h = synthetic_spectrum(lam);
-            let estimate = estimate_by_valley(&h);
+            let e = estimate_by_valley(&h);
             assert!(
-                estimate.raw_valley.is_some() && estimate.raw_genomic_peak.is_some(),
-                "lambda {lam}: raw candidates missing ({:?})",
-                estimate.peak_search
+                e.primary_area_fraction
+                    .is_some_and(|f| f < MIN_PEAK_AREA_FRACTION),
+                "lambda {lam}"
             );
-            assert!(estimate.valley < estimate.genomic_peak, "lambda {lam}");
-            if estimate.verdict.is_ok() {
-                assert_eq!(
-                    estimate.genomic_peak_n,
-                    h[estimate.genomic_peak - 1],
-                    "lambda {lam}: selected peak height must come from its raw bin"
-                );
-                assert_eq!(
-                    estimate.valley_n,
-                    h[estimate.valley - 1],
-                    "lambda {lam}: selected valley height must come from its raw bin"
-                );
-            }
-        }
-    }
-
-    /// A library with no separable lobe must still bail: widening the search must not manufacture a
-    /// valley where the spectrum is one monotone slide.
-    #[test]
-    fn a_flat_library_still_bails() {
-        let h = synthetic_spectrum(4.0);
-        let e = estimate_by_valley(&h);
-        assert_ne!(e.verdict, Verdict::Ok, "min_count was {}", e.min_count);
-        assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
-    }
-
-    /// Where the lobes merge the cutoff must not eat the genome, whether the refusal comes from a
-    /// verdict or from the loss guard clamping it. This is the invariant that matters.
-    #[test]
-    fn valley_estimator_does_not_cut_when_the_lobes_merge() {
-        for lam in [3.0, 5.0, 8.0] {
-            let e = estimate_by_valley(&synthetic_spectrum(lam));
             assert_eq!(
-                e.min_count, UNRESOLVED_MINCOUNT,
-                "lambda {lam} cut at {} ({:?})",
-                e.min_count, e.verdict
+                e.retry_reason,
+                Some(PeakRetryReason::AreaBelowThreshold),
+                "lambda {lam}"
+            );
+            assert!(e.fallback_attempted, "lambda {lam}");
+            assert_eq!(e.verdict, Verdict::NoLocalValley, "lambda {lam}");
+            assert_eq!(
+                (e.valley, e.genomic_peak, e.min_count),
+                (0, 0, UNRESOLVED_MINCOUNT),
+                "lambda {lam}"
+            );
+
+            let (min_count, peak, diagnostics) = choose_min_count_and_peak(&h, 1.0);
+            assert_eq!(min_count, UNRESOLVED_MINCOUNT, "lambda {lam}");
+            assert!(matches!(peak, PeakSource::Fallback(_)), "lambda {lam}");
+            assert!(
+                !diagnostics.fit_attempted,
+                "lambda {lam}: an unresolved pair must not be fitted"
             );
         }
-        let e = estimate_by_valley(&synthetic_spectrum(9.0));
-        assert_eq!(
-            e.verdict,
-            Verdict::Ok,
-            "smoothing resolves the shallow 9x lobe"
-        );
-        assert!(
-            genome_loss(9.0, e.min_count) < MAX_GENOME_LOSS,
-            "the newly resolved spectrum remains within the genome-loss budget"
-        );
     }
 
-    /// Every refusal must name itself, and the resolved case must still explain itself when the guard
-    /// is what collapsed the cutoff — that clause is the one the old string could not express.
+    /// Up to 5x the lobes merge and the cutoff stays at the sentinel; at 6-7x they resolve at the observed
+    /// modal count; at 8x the cutoff still must not move; by 9x it resolves inside the genome-loss budget.
     #[test]
-    fn every_verdict_has_a_distinct_reason() {
-        let all = [
-            Verdict::NeverTurnsUp,
-            Verdict::NoLocalValley,
-            Verdict::NoPeakAboveValley,
-            Verdict::PeakTailNotDecreasing,
-            Verdict::PeakAreaNotMeasurable,
-            Verdict::PeakAreaTooSmall,
-            Verdict::TooFewCandidateKmers,
-            Verdict::PeakNotClearOfValley,
-            Verdict::Ok,
-        ];
-        for (i, a) in all.iter().enumerate() {
-            assert!(!a.reason().is_empty(), "{a:?} has no reason");
-            for b in &all[i + 1..] {
-                assert_ne!(a.reason(), b.reason(), "{a:?} and {b:?} share a reason");
-            }
-        }
-        assert_eq!(all.iter().filter(|v| v.is_ok()).count(), 1);
-        assert!(!Verdict::default().is_ok(), "the default must fail closed");
-    }
-
-    /// Raw-bin refinement keeps a weak lobe from being accepted just because smoothing created a broad hump,
-    /// while supported low-coverage peaks resolve at their observed modal count.
-    #[test]
-    fn low_coverage_peak_refinement_uses_observed_bins() {
+    fn low_coverage_spectra_resolve_only_once_the_lobes_separate() {
         for lam in [3.0, 4.0, 5.0] {
             let e = estimate_by_valley(&synthetic_spectrum(lam));
-            assert_ne!(
-                e.verdict,
-                Verdict::Ok,
-                "lambda {lam} should not treat the weak genome tail as a resolved lobe"
-            );
+            assert_ne!(e.verdict, Verdict::Ok, "lambda {lam}");
             assert_eq!(e.min_count, UNRESOLVED_MINCOUNT, "lambda {lam}");
         }
         for lam in [6.0, 7.0] {
@@ -5530,10 +4876,21 @@ mod tests {
             assert_eq!(e.verdict, Verdict::Ok, "lambda {lam}");
             assert!(
                 e.genomic_peak.abs_diff(lam as usize) <= 1,
-                "lambda {lam}: observed raw-bin peak was {}",
+                "lambda {lam}: peak {}",
                 e.genomic_peak
             );
         }
+        assert_eq!(
+            estimate_by_valley(&synthetic_spectrum(8.0)).min_count,
+            UNRESOLVED_MINCOUNT
+        );
+        let e = estimate_by_valley(&synthetic_spectrum(9.0));
+        assert_eq!(
+            e.verdict,
+            Verdict::Ok,
+            "smoothing resolves the shallow 9x lobe"
+        );
+        assert!(genome_loss(9.0, e.min_count) < MAX_GENOME_LOSS);
     }
 
     /// A monotone spectrum has no genome lobe, so the walk runs off into the tail and locks onto a noise
@@ -5587,25 +4944,48 @@ mod tests {
         );
     }
 
-    /// Through moderate depth the cutoff clears errors without eating the genome. At 250x the
-    /// explicit 5 % area guard refuses the error-dominated distinct-k-mer spectrum.
+    /// Through moderate depth the lobes separate inside the genome-loss budget, from raw candidates, and
+    /// the reported heights are the observed bins rather than their five-bin averages.
     #[test]
-    fn valley_estimator_is_safe_through_the_working_range() {
+    fn the_working_range_resolves_from_raw_bins_within_the_loss_budget() {
+        let mut spike = vec![0u32; 40];
+        spike[19] = 100;
+        let smooth = smooth_histogram(&spike);
+        assert_eq!(
+            (smooth[17], smooth[19], smooth[21]),
+            (20, 20, 20),
+            "a spike is averaged over five bins"
+        );
+        assert_eq!(
+            estimate_by_valley(&synthetic_spectrum(30.0)).peak_search,
+            PeakSearch::SmoothedRefinement
+        );
+
         for lam in [10.0, 15.0, 20.0, 50.0, 100.0] {
             let e = estimate_by_valley(&synthetic_spectrum(lam));
             assert_eq!(e.verdict, Verdict::Ok, "lambda {lam}");
-            assert!(e.min_count >= 2, "lambda {lam}");
             assert!(
-                genome_loss(lam, e.min_count) < 0.01,
-                "lambda {lam} lost {:.2} % of the genome at min_count {}",
-                genome_loss(lam, e.min_count) * 100.0,
+                e.min_count >= 2 && genome_loss(lam, e.min_count) < MAX_GENOME_LOSS,
+                "lambda {lam} cut at {}",
                 e.min_count
             );
         }
-        let deep = estimate_by_valley(&synthetic_spectrum(250.0));
-        assert_eq!(deep.retry_reason, Some(PeakRetryReason::AreaBelowThreshold));
-        assert_eq!(deep.verdict, Verdict::NoLocalValley);
-        assert_eq!(deep.min_count, UNRESOLVED_MINCOUNT);
+        for lam in [20.0, 30.0, 60.0, 150.0] {
+            let h = synthetic_spectrum(lam);
+            let e = estimate_by_valley(&h);
+            assert!(
+                e.raw_valley.is_some() && e.raw_genomic_peak.is_some(),
+                "lambda {lam}"
+            );
+            assert!(e.valley < e.genomic_peak, "lambda {lam}");
+            if e.verdict.is_ok() {
+                assert_eq!(
+                    (e.valley_n, e.genomic_peak_n),
+                    (h[e.valley - 1], h[e.genomic_peak - 1]),
+                    "lambda {lam}: heights must be the observed bins"
+                );
+            }
+        }
     }
 
     /// A peak beyond the old 500-bin ceiling is measurable when the histogram also extends far
@@ -5626,7 +5006,6 @@ mod tests {
             "genomic_peak was {}",
             e.genomic_peak
         );
-        assert!(coverage_peak(&h) < LEGACY_HISTO_RANGE);
     }
 
     /// What cutting at `m` costs, as a fraction of the k-mers above `valley` — the quantity the guard
@@ -5666,57 +5045,28 @@ mod tests {
         }
     }
 
-    /// Neither half is safe alone, so the guard takes the tighter: the Poisson bound binds at low
-    /// coverage, where errors above the valley loosen the measured one, and the measured bound binds at
-    /// depth, where the lobe is far too wide for a Poisson tail.
+    /// Neither half of the guard is safe alone: the Poisson bound binds at low coverage, where errors above
+    /// the valley loosen the measured one, and the measured bound at depth, where a lobe as wide as the
+    /// real ones (mean 200, sd 45) would let a Poisson tail cut near 168.
     #[test]
-    fn loss_guard_takes_the_tighter_of_its_two_bounds() {
-        // Low coverage: the Poisson bound is the strict one.
+    fn the_loss_guard_takes_the_tighter_of_its_two_bounds() {
         let h = synthetic_spectrum(10.0);
-        let estimate = estimate_by_valley(&h);
-        let valley = estimate.valley;
-        let genomic_peak = estimate.genomic_peak;
-        assert!(poisson_guard(genomic_peak) < measured_guard(&h, valley, genomic_peak));
-        assert_eq!(
-            measured_guard(&h, valley, genomic_peak).min(poisson_guard(genomic_peak)),
-            poisson_guard(genomic_peak)
-        );
+        let e = estimate_by_valley(&h);
+        assert!(poisson_guard(e.genomic_peak) < measured_guard(&h, e.valley, e.genomic_peak));
 
-        // Depth, with a lobe as wide as the real libraries: the measured bound is the strict one.
         let mut wide = vec![0u32; MAXSIZEHISTO];
         for c in 1..MAXSIZEHISTO {
             let z = (c as f64 - 200.0) / 45.0;
             wide[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
         }
-        assert!(measured_guard(&wide, 60, 200) < poisson_guard(200));
-        assert_eq!(
-            measured_guard(&wide, 60, 200).min(poisson_guard(200)),
-            measured_guard(&wide, 60, 200)
-        );
-    }
-
-    /// The reason the Poisson tail was dropped: on a lobe as wide as the real ones it permits a cutoff
-    /// far above what the data can afford. Mean 200, sd ~45, against a Poisson sd of 14.
-    #[test]
-    fn loss_guard_is_tighter_than_a_poisson_tail_on_an_overdispersed_lobe() {
-        let mut h = vec![0u32; MAXSIZEHISTO];
-        let (mu, sd) = (200.0f64, 45.0f64);
-        for c in 1..MAXSIZEHISTO {
-            let z = (c as f64 - mu) / sd;
-            h[c - 1] = (1_000_000.0 * (-0.5 * z * z).exp()) as u32;
-        }
-        let valley = 60;
-        let m = measured_guard(&h, valley, 200).min(poisson_guard(200)) as usize;
-        // A Poisson(200) tail would allow ~168; the measured 1 % quantile of this lobe is far lower.
+        let measured = measured_guard(&wide, 60, 200);
+        assert!(measured < poisson_guard(200));
         assert!(
-            m < 150,
-            "guard returned {m}, no tighter than a Poisson tail"
+            measured < 150,
+            "guard {measured} is no tighter than a Poisson tail"
         );
-        assert!(
-            measured_loss(&h, valley, m) <= MAX_GENOME_LOSS,
-            "guard {m} cost {:.4}",
-            measured_loss(&h, valley, m)
-        );
+        let cost = measured_loss(&wide, 60, usize::from(measured));
+        assert!(cost <= MAX_GENOME_LOSS, "guard {measured} cost {cost:.4}");
     }
 
     /// Dispersion is what tells us whether the mixture fit's Poisson genome component is defensible,
@@ -5739,23 +5089,6 @@ mod tests {
             dispersion_above(&wide, 60, 200) > 5.0,
             "wide lobe read {:.2}",
             dispersion_above(&wide, 60, 200)
-        );
-    }
-
-    /// On a supported deep library, the valley-derived cutoff—not the legacy global-mode heuristic—
-    /// comes out of `choose_min_count`.
-    #[test]
-    fn choose_min_count_returns_the_valley_not_the_fit() {
-        let h = synthetic_spectrum(100.0);
-        let e = estimate_by_valley(&h);
-        assert_eq!(e.verdict, Verdict::Ok);
-        assert_eq!(choose_min_count(&h), e.min_count);
-        // ...and that is emphatically not what the old path would have produced.
-        let floor = ((coverage_peak(&h) as f64 / 8.0).round() as u16).max(2);
-        assert!(
-            e.min_count > floor,
-            "the old floor was {floor} and the valley {}; the swap changes nothing here",
-            e.min_count
         );
     }
 
@@ -5818,7 +5151,7 @@ mod tests {
     /// drops every entry and, both gates being `hash < threshold`, nothing is ever admitted again.
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn shrinking_at_the_hash_floor_halves_the_sample_rather_than_erasing_it() {
+    fn shrinking_halves_the_sample_and_keeps_survivors_exact() {
         let mut st = 0x9E37_79B9_7F4A_7C15u64;
         let mut sketch = SpectrumSketch::new();
         // One halving above the floor: the old code stepped from here to exactly `HASH_FLOOR`, which
@@ -5847,6 +5180,21 @@ mod tests {
         assert!(
             sketch.fraction() > 0.0,
             "a zero fraction divides by zero when rescaling"
+        );
+        // Survivors keep the counts they had, which is why the spectrum survives the subsampling.
+        let mut exact = SpectrumSketch::new();
+        let (low, high) = (HASH_FLOOR + 1, u64::MAX - 1);
+        for _ in 0..5 {
+            exact.observe(low, 0);
+        }
+        for _ in 0..9 {
+            exact.observe(high, 0);
+        }
+        exact.shrink();
+        assert_eq!(exact.counts[&low][0], 5, "a survivor must keep its count");
+        assert!(
+            !exact.counts.contains_key(&high),
+            "a hash above the threshold must go"
         );
     }
     /// The core invariant: a sampled spectrum has the same shape as the full one, because subsampling
@@ -5881,28 +5229,6 @@ mod tests {
         assert!(
             (rescaled / ft as f64 - 1.0).abs() < 0.1,
             "rescaled {rescaled:.0} against {ft}"
-        );
-    }
-
-    #[test]
-    fn shrinking_keeps_survivors_exact() {
-        let mut s = SpectrumSketch::new();
-        // Both sit in the range the hash can actually reach: subsampling is of the interval above
-        // [`HASH_FLOOR`], so a fixture below it would never be admitted in the first place.
-        let low = HASH_FLOOR + 1;
-        let high = u64::MAX - 1;
-        for _ in 0..5 {
-            s.observe(low, 0);
-        }
-        for _ in 0..9 {
-            s.observe(high, 0);
-        }
-        assert_eq!(s.counts[&low][0], 5);
-        s.shrink();
-        assert_eq!(s.counts[&low][0], 5, "a survivor must keep its count");
-        assert!(
-            !s.counts.contains_key(&high),
-            "a hash above the threshold must go"
         );
     }
 
@@ -6165,41 +5491,36 @@ mod tests {
         assert_eq!(b.distinct_above, 2 * a.distinct_above, "breadth is not");
     }
 
+    /// Floors only step down below [`LOW_COVERAGE_FLOOR_REVIEW`]: a resolved strict floor at 14 or 40 stays,
+    /// however deep a lower floor is, and costs no extra fit.
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn low_coverage_cutoff_is_ten_and_peak_fifteen_is_not_a_fit_gate() {
-        assert_eq!(LOW_COVERAGE_FLOOR_REVIEW, 10);
-        let at_floor = estimate_by_valley(&histo(&bimodal(15)));
-        let below_floor = estimate_by_valley(&histo(&bimodal(14)));
-        assert_eq!(at_floor.genomic_peak, 15);
-        assert_eq!(below_floor.genomic_peak, 14);
-        assert!(at_floor.verdict.is_ok());
-        assert!(below_floor.verdict.is_ok());
-    }
-
-    /// A clean separation at a genomic peak of 14 stays however deep a lower floor is: floors only
-    /// step down below [`LOW_COVERAGE_FLOOR_REVIEW`].
-    #[test]
-    fn a_resolved_peak_of_fourteen_does_not_step_down() {
-        let shallow = histo(&bimodal(14));
-        let strict = estimate_by_valley(&shallow);
-        assert!(strict.verdict.is_ok());
-        assert_eq!(strict.genomic_peak, 14);
-
-        let sketch = sketch_with(1, &bimodal(40));
-        let calls = std::cell::Cell::new(0);
-        let (_, floor, _, _) = choose_min_count_and_floor_with_fit(
-            &shallow,
-            &sketch,
-            &[0, 11, 25],
-            |_, estimate, _| {
-                calls.set(calls.get() + 1);
-                Some(native_test_fit(estimate.genomic_peak, 0.0))
-            },
-            &[true; MAX_GROUPS],
-        );
-        assert_eq!(floor, 25);
-        assert_eq!(calls.get(), 1);
+    fn a_resolved_strict_floor_at_or_above_the_review_peak_does_not_step_down() {
+        assert_eq!(estimate_by_valley(&histo(&bimodal(14))).genomic_peak, 14);
+        // (strict floor's peak, lower floor's peak)
+        for (strict_peak, lower_peak) in [(14, 40), (40, 60), (40, 120)] {
+            let strict = histo(&bimodal(strict_peak));
+            assert!(
+                estimate_by_valley(&strict).verdict.is_ok(),
+                "strict peak {strict_peak}"
+            );
+            let calls = std::cell::Cell::new(0);
+            let (_, floor, _, _) = choose_min_count_and_floor_with_fit(
+                &strict,
+                &sketch_with(1, &bimodal(lower_peak)),
+                &[0, 11, 25],
+                |_, estimate, _| {
+                    calls.set(calls.get() + 1);
+                    Some(native_test_fit(estimate.genomic_peak, 0.0))
+                },
+                &[true; MAX_GROUPS],
+            );
+            assert_eq!(
+                (floor, calls.get()),
+                (25, 1),
+                "strict {strict_peak} against lower {lower_peak}"
+            );
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -6256,29 +5577,6 @@ mod tests {
         );
         assert_eq!(calls.get(), 3, "a sub-10 peak itself triggers floor review");
         assert_eq!(floor, 11, "a sub-10 peak steps down to a deeper floor");
-    }
-
-    /// A well-covered strict floor stays, whatever a lower floor offers, and costs no extra fit.
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn a_well_covered_strict_floor_does_not_step_down() {
-        let strict = histo(&bimodal(40));
-        let decide = |lower_peak| {
-            let calls = std::cell::Cell::new(0);
-            let (_, floor, _, _) = choose_min_count_and_floor_with_fit(
-                &strict,
-                &sketch_with(1, &bimodal(lower_peak)),
-                &[0u8, 11, 25],
-                |_, estimate, _| {
-                    calls.set(calls.get() + 1);
-                    Some(native_test_fit(estimate.genomic_peak, 0.0))
-                },
-                &[true; MAX_GROUPS],
-            );
-            (floor, calls.get())
-        };
-        assert_eq!(decide(60), (25, 1), "1.5x stays");
-        assert_eq!(decide(120), (25, 1), "3x stays");
     }
 
     /// The tail is measured from the cutoff the floor would actually apply, so error k-mers that
@@ -6434,19 +5732,6 @@ mod tests {
         assert_eq!(select_usable_fit(&no_area_passes), Some(2));
     }
 
-    /// Order must not matter: the floor chosen is a property of the candidates, not of the walk that
-    /// visits them.
-    #[test]
-    fn a_deep_enough_floor_is_taken_at_its_strictest() {
-        let flat = vec![1000u32; MAXSIZEHISTO];
-        let sketch = sketch_with(1, &bimodal(40));
-        let (_, floor, _, _) = choose_min_count_and_floor(&flat, &sketch, &[0u8, 11, 25]);
-        assert_eq!(
-            floor, 11,
-            "among multiple acceptable fits, the strictest quality floor wins"
-        );
-    }
-
     /// Nothing resolves anywhere, so the quality filter is dropped entirely rather than trusting an
     /// estimate that by definition did not resolve.
     #[test]
@@ -6477,72 +5762,29 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    /// The occurrence-weighted median names the genomic lobe even when error k-mers outnumber it, reads
+    /// counts rather than indices, and is what a merged spectrum falls back to; an empty one claims nothing.
     #[test]
-    fn an_area_rejected_pair_is_not_published_or_fitted() {
-        let h = synthetic_spectrum(500.0);
-        let estimate = estimate_by_valley(&h);
-        assert!(!estimate.verdict.is_ok());
-        assert_eq!((estimate.valley, estimate.genomic_peak), (0, 0));
-
-        let (min_count, peak_source, diagnostics) = choose_min_count_and_peak(&h, 1.0);
-        assert_eq!(min_count, UNRESOLVED_MINCOUNT);
-        assert!(matches!(peak_source, PeakSource::Fallback(_)));
-        assert!(
-            !diagnostics.fit_attempted,
-            "an unresolved empirical candidate must not launch mixture fitting"
-        );
-    }
-
-    /// The case this fallback exists for. A merged spectrum must never report `Fitted`, because
-    /// `genomic_peak` is then an argmax above a valley that was never found: the error lobe.
-    #[test]
-    fn an_unresolved_spectrum_falls_back_to_the_median() {
-        let flat = vec![1000u32; MAXSIZEHISTO];
-        assert!(
-            !estimate_by_valley(&flat).verdict.is_ok(),
-            "fixture must not resolve"
-        );
-        assert!(
-            matches!(
-                peak_of(&estimate_by_valley(&flat), &flat),
-                PeakSource::Fallback(_)
-            ),
-            "a merged spectrum must fall back, never report a fitted peak"
-        );
-    }
-
-    /// The median must land in the genomic lobe, not the error lobe, even though error k-mers vastly
-    /// outnumber genomic ones: each carries only a few occurrences, so they hold little of the mass.
-    ///
-    /// This also pins the indexing. `histovec[c - 1]` is the count-`c` bin, and an estimator reading
-    /// the index as the count would report one less here.
-    #[test]
-    fn the_occurrence_weighted_median_ignores_the_error_lobe() {
-        let mut h = vec![0u32; MAXSIZEHISTO];
-        h[0] = 5_000_000; // 5M singleton error k-mers: many, but one occurrence each
-        h[39] = 1_000_000; // 1M genomic k-mers at 40x: fewer, but 40 occurrences each
-        let median = occurrence_weighted_median(&h).expect("a non-empty spectrum has a median");
-        assert_eq!(median, 40, "the median must name the genomic lobe's count");
-    }
-
-    /// A single bin, so the answer is forced and the off-by-one has nowhere to hide.
-    #[test]
-    fn the_median_of_one_bin_is_that_bins_count() {
-        let mut h = vec![0u32; MAXSIZEHISTO];
-        h[6] = 10; // ten k-mers seen 7 times each
-        assert_eq!(occurrence_weighted_median(&h), Some(7));
-    }
-
-    /// Nothing counted at all: no coverage can be claimed, fitted or otherwise.
-    #[test]
-    fn an_empty_spectrum_reports_unknown() {
+    fn the_occurrence_weighted_median_stands_in_for_an_unresolved_peak() {
+        let mut lobes = vec![0u32; MAXSIZEHISTO];
+        lobes[0] = 5_000_000; // many singleton errors, one occurrence each
+        lobes[39] = 1_000_000; // fewer genomic k-mers, 40 occurrences each
+        let mut one_bin = vec![0u32; MAXSIZEHISTO];
+        one_bin[6] = 10;
         let empty = vec![0u32; MAXSIZEHISTO];
-        assert_eq!(occurrence_weighted_median(&empty), None);
+        // (spectrum, median count)
+        for (h, want) in [(&lobes, Some(40)), (&one_bin, Some(7)), (&empty, None)] {
+            assert_eq!(occurrence_weighted_median(h), want);
+        }
         assert_eq!(
             peak_of(&estimate_by_valley(&empty), &empty),
             PeakSource::Unknown
         );
+
+        let flat = vec![1000u32; MAXSIZEHISTO];
+        let estimate = estimate_by_valley(&flat);
+        assert!(!estimate.verdict.is_ok(), "fixture must not resolve");
+        assert!(matches!(peak_of(&estimate, &flat), PeakSource::Fallback(_)));
     }
 
     /// The store replays the reads exactly: at the ladder, as the first k counts, and at one floor, as
@@ -6739,53 +5981,82 @@ mod tests {
             assert_eq!(large[0].len(), genome.len());
         }
     }
-}
 
-#[cfg(target_family = "wasm")]
-/// Main preprocessing function for wasm
-pub fn preprocessing_wasm<IntT>(
-    file1: &mut WebSysFile,
-    file2: Option<&mut WebSysFile>,
-    k: usize,
-    qual: &QualOpts,
-    csize: usize,
-    do_bloom: bool,
-    do_fit: bool,
-) -> (
-    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    Option<HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>>,
-    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    Vec<u32>,
-    u16,
-)
-where
-    IntT: for<'a> UInt<'a>,
-{
-    if do_bloom {
-        // Build indexes
-        logw("Processing using a Bloom filter", Some("info"));
+    /// The min-count, and the floor it was read at. Every candidate floor is evaluated and only then
+    /// compared, all against one reference fixed beforehand, so the answer cannot depend on the order the
+    /// floors happen to be visited in.
+    #[cfg(not(target_family = "wasm"))]
+    fn choose_min_count_and_floor(
+        histovec: &[u32],
+        sketch: &SpectrumSketch,
+        floors: &[u8],
+    ) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>) {
+        choose_min_count_and_floor_with_fit(
+            histovec,
+            sketch,
+            floors,
+            fit_and_log,
+            &[true; MAX_GROUPS],
+        )
+    }
 
-        let (thedict, maxmindict, themap, histovec, used_min_count) =
-            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit);
-        (themap, Some(thedict), maxmindict, histovec, used_min_count)
-    } else {
-        // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
-        // record, so passing 0 through would sort and count after every single read.
-        let csize = if csize == 0 { usize::MAX } else { csize };
-        if csize == usize::MAX {
-            logw("Counting k-mers by sorting, without chunking", Some("info"));
-        } else {
-            logw(
-                format!("Counting k-mers by sorting, in chunks of {csize} records").as_str(),
-                Some("info"),
-            );
-        }
+    #[cfg(not(target_family = "wasm"))]
+    fn choose_min_count_and_floor_with_fit<F>(
+        histovec: &[u32],
+        sketch: &SpectrumSketch,
+        floors: &[u8],
+        fit: F,
+        floor_has_kmers: &[bool],
+    ) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>)
+    where
+        F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
+    {
+        // Its callers hand it an exact strict-floor spectrum.
+        let (min_count, floor, peak, diagnostics, _) = choose_min_count_and_floor_with_debug(
+            histovec,
+            1.0,
+            sketch,
+            floors,
+            fit,
+            floor_has_kmers,
+            false,
+        );
+        (min_count, floor, peak, diagnostics)
+    }
 
-        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
-        let (thedict, maxmindict, themap, mut histovec, used_min_count) =
-            chunked_processing_wasm::<IntT>(file1, file2, k, qual, &mut tmpvec, csize, do_fit);
-        drop(tmpvec);
-        histovec.shrink_to_fit();
-        (themap, Some(thedict), maxmindict, histovec, used_min_count)
+    /// Hash one batch into one flat vector, in record order. The counting path no longer materialises this
+    /// -- it writes straight into per-shard buckets -- so this is the tests' independent reference.
+    #[cfg(not(target_family = "wasm"))]
+    fn hash_batch<IntT>(
+        batch: &[OwnedRecord],
+        k: usize,
+        min_qual: u8,
+        floors: Option<&[u8]>,
+        keep: u8,
+    ) -> Vec<(u64, u64, u8, u8, Option<IntT>)>
+    where
+        IntT: for<'a> UInt<'a>,
+    {
+        batch
+            .par_iter()
+            .flat_map_iter(|(seq, qual_bytes)| {
+                let mut local = Vec::new();
+                let mut groups: Vec<u8> = Vec::new();
+                let w = KmerWalk {
+                    k,
+                    min_qual,
+                    floors,
+                    keep,
+                };
+                for_each_kmer::<IntT, _>(
+                    seq,
+                    qual_bytes.as_deref(),
+                    w,
+                    &mut groups,
+                    |hc, hnc, b, g, km| local.push((hc, hnc, b, g, km)),
+                );
+                local
+            })
+            .collect()
     }
 }
