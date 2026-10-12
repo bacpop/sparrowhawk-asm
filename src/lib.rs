@@ -273,7 +273,7 @@ where
 
     match store {
         // One chained reader, so the single `&mut` store sees every record, in file order.
-        Some(store) => preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
+        Some(store) => preprocessing::preprocessing_standalone::<IntT, _>(
             &mut [read_store::Tee::new(readers.into_iter().flatten(), store)],
             k,
             quality,
@@ -287,7 +287,7 @@ where
             opts.debug_quality_floors,
             prior,
         ),
-        None => preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
+        None => preprocessing::preprocessing_standalone::<IntT, _>(
             &mut readers,
             k,
             quality,
@@ -367,7 +367,7 @@ where
         )?;
     }
 
-    let mut contigs = graph_works::BasicAsm::assemble::<IntT>(
+    let contigs = graph_works::BasicAsm::assemble::<IntT>(
         k,
         &mut assembly.kmers,
         &mut Some(timevec),
@@ -377,13 +377,8 @@ where
         opts.correction(k, assembly.genomic_peak, assembly.used_min_count),
     );
 
-    save_functions::save_as_fasta_with_min_contig_length::<IntT>(
-        &mut contigs,
-        &assembly.kmers,
-        k,
-        opts.min_contig_length,
-        opts.output,
-    );
+    let sequences = save_functions::spell_contigs::<IntT>(&contigs, &assembly.kmers, k);
+    save_functions::save_sequences_as_fasta(&sequences, opts.min_contig_length, opts.output);
     Ok(())
 }
 
@@ -649,7 +644,7 @@ where
         seqs: contigs,
         rule: opts.contig_counts,
     });
-    preprocessing::preprocessing_standalone_with_debug::<IntT, _>(
+    preprocessing::preprocessing_standalone::<IntT, _>(
         &mut [store.records()],
         k,
         quality,

@@ -410,17 +410,6 @@ impl SpectrumPlotDiagnostics {
             error_floor: fit.map(|fit| fit.error_floor_cutoff()),
         }
     }
-
-    fn record_fit(&mut self, estimate: &SpectrumEstimate, fit: Option<NativeSpectrumFit>) {
-        self.fit = fit;
-        self.fit_attempted = true;
-        self.genomic_guard = estimate
-            .verdict
-            .is_ok()
-            .then(|| fit.and_then(|fit| fit.hole_cutoff(MAX_GENOME_HOLES)))
-            .flatten();
-        self.error_floor = fit.map(|fit| fit.error_floor_cutoff());
-    }
 }
 
 #[cfg(target_family = "wasm")]
@@ -1369,48 +1358,41 @@ fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&SpectrumFit>) 
 /// the 100% error floor.
 #[cfg(not(target_family = "wasm"))]
 fn guarded_min_count(estimate: &SpectrumEstimate, fit: &NativeSpectrumFit) -> u16 {
-    let mut min_count = estimate.min_count;
-    if estimate.verdict.is_ok() {
-        if let Some(guarded) = fit.hole_cutoff(MAX_GENOME_HOLES) {
-            if guarded < min_count {
-                min_count = guarded.max(2);
-            }
-        }
+    hole_guarded_min_count(estimate, fit).max(fit.error_floor_cutoff())
+}
+
+/// The valley lowered to what strands at most [`MAX_GENOME_HOLES`] single-copy k-mers, never below 2,
+/// and only for a resolved spectrum.
+#[cfg(not(target_family = "wasm"))]
+fn hole_guarded_min_count(estimate: &SpectrumEstimate, fit: &NativeSpectrumFit) -> u16 {
+    match fit.hole_cutoff(MAX_GENOME_HOLES) {
+        Some(cutoff) if estimate.verdict.is_ok() && cutoff < estimate.min_count => cutoff.max(2),
+        _ => estimate.min_count,
     }
-    min_count.max(fit.error_floor_cutoff())
 }
 
 #[cfg(not(target_family = "wasm"))]
 fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&NativeSpectrumFit>) {
     let Some(fit) = fit else { return };
-    let expected = guarded_min_count(estimate, fit);
-    if estimate.verdict.is_ok() {
-        if let Some(guarded) = fit.hole_cutoff(MAX_GENOME_HOLES) {
-            if guarded < estimate.min_count {
-                logw(
-                    &format!(
-                        "Cutting at {} would strand more than {} single-copy k-mers; using {} instead.",
-                        estimate.min_count, MAX_GENOME_HOLES, guarded
-                    ),
-                    Some("info"),
-                );
-                estimate.min_count = guarded.max(2);
-            }
-        }
+    let hole_guarded = hole_guarded_min_count(estimate, fit);
+    if hole_guarded < estimate.min_count {
+        logw(
+            &format!(
+                "Cutting at {} would strand more than {MAX_GENOME_HOLES} single-copy k-mers; using \
+                 {hole_guarded} instead.",
+                estimate.min_count
+            ),
+            Some("info"),
+        );
     }
-
     let error_floor = fit.error_floor_cutoff();
-    let genomic_guarded_min = estimate.min_count;
-    estimate.min_count = estimate.min_count.max(error_floor);
-    debug_assert_eq!(estimate.min_count, expected);
+    estimate.min_count = hole_guarded.max(error_floor);
     let hole_cutoff = fit.hole_cutoff(MAX_GENOME_HOLES);
     logw(
         &format!(
-            "Spectrum 100% error floor enforced: floor={} previous_min_count={} final_min_count={} hole_cutoff={:?} conflict={}",
-            error_floor,
-            genomic_guarded_min,
+            "Spectrum 100% error floor enforced: floor={error_floor} previous_min_count={hole_guarded} \
+             final_min_count={} hole_cutoff={hole_cutoff:?} conflict={}",
             estimate.min_count,
-            hole_cutoff,
             hole_cutoff.is_some_and(|cutoff| error_floor > cutoff),
         ),
         Some("info"),
@@ -3718,7 +3700,7 @@ where
     let mut chosen_min_qual = qual.min_qual;
     // Single-copy coverage of the spectrum this very map is filtered against.
     let genomic_peak;
-    let mut plot_diagnostics;
+    let plot_diagnostics;
     let mut debug_floor_diagnostics = Vec::new();
     if do_fit {
         log::info!("Counting finished. Choosing the minimum count...");
@@ -3810,17 +3792,6 @@ where
     let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
 
     if let Some(p) = out_path {
-        if do_fit {
-            if let Some(diagnostics) = plot_diagnostics.as_mut() {
-                if !diagnostics.fit_attempted {
-                    let estimate = estimate_by_valley(spectrum);
-                    if estimate.verdict.is_ok() {
-                        let fit = fit_and_log(spectrum, &estimate, spectrum_scale);
-                        diagnostics.record_fit(&estimate, fit);
-                    }
-                }
-            }
-        }
         let diagnostics = plot_diagnostics.unwrap_or_default();
         plot_kmer_histogram(
             spectrum,
@@ -3841,47 +3812,12 @@ where
     Ok((kmers, histovec, minc, chosen_min_qual, genomic_peak))
 }
 
-/// Read fastq files, get the reads, get the k-mers, count them, filter them by count, and get some way of recovering the sequence later.
-/// `carried`: a multi-k step's previous contigs, put in once the cutoff is chosen.
+/// Read the records, count their k-mers, choose the cutoff and filter by it. `carried`: a multi-k
+/// step's previous contigs, put in once the cutoff is chosen. `debug_quality_floors` also evaluates
+/// and plots every floor; `prior`: a recount's selection from the sketch, see [`keep_refit_or_prior`].
 #[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
 pub fn preprocessing_standalone<IntT, I>(
-    input_iters: &mut [I],
-    k: usize,
-    qual: &QualOpts,
-    floors: Option<&[u8]>,
-    timevec: &mut Option<&mut Vec<Instant>>,
-    out_path: &mut Option<PathBuf>,
-    csize: usize,
-    do_bloom: bool,
-    do_fit: bool,
-    carried: Option<CarriedContigs>,
-) -> Result<PreprocessedK<IntT>, PreprocessingError>
-where
-    IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + Send,
-{
-    preprocessing_standalone_with_debug(
-        input_iters,
-        k,
-        qual,
-        floors,
-        timevec,
-        out_path,
-        csize,
-        do_bloom,
-        do_fit,
-        carried,
-        false,
-        None,
-    )
-}
-
-/// Native preprocessing entry point with optional diagnostic evaluation of every quality floor.
-/// `prior`: a recount's selection from the sketch; see [`keep_refit_or_prior`].
-#[cfg(not(target_family = "wasm"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn preprocessing_standalone_with_debug<IntT, I>(
     input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,

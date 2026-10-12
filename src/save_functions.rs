@@ -10,13 +10,14 @@ use super::io_utils::*;
 // use std::process::exit;
 
 use crate::bit_encoding::UInt;
+#[cfg(target_family = "wasm")]
 use crate::cli::DEFAULT_MIN_CONTIG_LENGTH_NTS;
 use crate::graph_works::{spell_path, Contigs, KmerLookup};
 #[cfg(target_family = "wasm")]
 use crate::logw;
 
-/// Writes the full sequence each contig's k-mer path spells, and hopefully their average
-/// counts/coverage in the future.
+/// Spells each contig and keeps those of at least `DEFAULT_MIN_CONTIG_LENGTH_NTS` bases.
+#[cfg(target_family = "wasm")]
 pub fn write_sequences_and_coverages<IntT>(
     invec: &mut Contigs,
     inmap: &impl KmerLookup<IntT>,
@@ -24,97 +25,19 @@ pub fn write_sequences_and_coverages<IntT>(
 ) where
     IntT: for<'a> UInt<'a>,
 {
-    write_sequences_and_coverages_with_min_contig_length(
-        invec,
-        inmap,
-        k,
-        DEFAULT_MIN_CONTIG_LENGTH_NTS,
-    );
-}
-
-fn write_sequences_and_coverages_with_min_contig_length<IntT>(
-    invec: &mut Contigs,
-    inmap: &impl KmerLookup<IntT>,
-    k: usize,
-    min_contig_length: usize,
-) where
-    IntT: for<'a> UInt<'a>,
-{
-    // TODO: implement coverages somehow...
-    invec.contig_sequences = Some(Vec::with_capacity(invec.serialized_contigs.len()));
-    let mut omitted = 0;
-
-    for (ipc, contig) in invec.serialized_contigs.iter().enumerate() {
-        if contig.len() > 1 {
-            panic!("MORE THAN ONE ENTRY!!")
-        };
-
-        // A contig is always a walk, so a failure here is an upstream orientation bug, not a bad base.
-        let full = spell_path(&contig[0].abs_ind, inmap, k)
-            .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"));
-
-        if full.len() >= min_contig_length {
-            invec.contig_sequences.as_mut().unwrap().push(full);
-        } else {
-            omitted += 1;
-        }
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    log::info!("Omitted {omitted} contigs shorter than {min_contig_length} nt from FASTA output");
-    #[cfg(target_family = "wasm")]
+    let sequences = spell_contigs(invec, inmap, k);
+    let kept = at_least(&sequences, DEFAULT_MIN_CONTIG_LENGTH_NTS);
     logw(
-        format!("Omitted {omitted} contigs shorter than {min_contig_length} nt from FASTA output")
-            .as_str(),
+        &format!(
+            "Omitted {} contigs shorter than {DEFAULT_MIN_CONTIG_LENGTH_NTS} nt from FASTA output",
+            sequences.len() - kept.len()
+        ),
         Some("info"),
     );
-}
-
-/// Stores all the contigs as a fasta file
-#[cfg(not(target_family = "wasm"))]
-pub fn save_as_fasta<IntT>(
-    ingraph: &mut Contigs,
-    inmap: &impl KmerLookup<IntT>,
-    k: usize,
-    outfile: PathBuf,
-) where
-    IntT: for<'a> UInt<'a>,
-{
-    // First, we write the sequences and the coverages
-    write_sequences_and_coverages(ingraph, inmap, k);
-
-    log::debug!("Starting to save");
-    log::debug!("{:?}", outfile);
-    // Now, we just write all the contigs. We get our writing buffer with this:
-    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
-    // And simply, contig per contig, we write the file
-
-    log::debug!("\tLen.\tMean\tSD\tMedian");
-    ingraph.write_fasta(&mut wbuf);
-}
-
-/// Stores all contigs at a configurable minimum length as a FASTA file.
-#[cfg(not(target_family = "wasm"))]
-pub(crate) fn save_as_fasta_with_min_contig_length<IntT>(
-    ingraph: &mut Contigs,
-    inmap: &impl KmerLookup<IntT>,
-    k: usize,
-    min_contig_length: usize,
-    outfile: PathBuf,
-) where
-    IntT: for<'a> UInt<'a>,
-{
-    write_sequences_and_coverages_with_min_contig_length(ingraph, inmap, k, min_contig_length);
-
-    log::debug!("Starting to save");
-    log::debug!("{:?}", outfile);
-    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
-    log::debug!("\tLen.\tMean\tSD\tMedian");
-    ingraph.write_fasta(&mut wbuf);
+    invec.contig_sequences = Some(kept);
 }
 
 /// Spells every contig. A multi-k step carries all of them to the next k, so none is length-filtered.
-#[cfg(not(target_family = "wasm"))]
 pub(crate) fn spell_contigs<IntT>(
     contigs: &Contigs,
     dict: &impl KmerLookup<IntT>,
@@ -135,6 +58,14 @@ where
         .collect()
 }
 
+/// The contigs of at least `min_contig_length` bases (inclusive), the only ones written to FASTA.
+pub(crate) fn at_least(seqs: &[Vec<u8>], min_contig_length: usize) -> Vec<Vec<u8>> {
+    seqs.iter()
+        .filter(|s| s.len() >= min_contig_length)
+        .cloned()
+        .collect()
+}
+
 /// Writes spelled contigs of at least `min_contig_length` bases as FASTA, as the single-k path does.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn save_sequences_as_fasta(
@@ -142,11 +73,7 @@ pub(crate) fn save_sequences_as_fasta(
     min_contig_length: usize,
     outfile: PathBuf,
 ) {
-    let kept: Vec<Vec<u8>> = seqs
-        .iter()
-        .filter(|s| s.len() >= min_contig_length)
-        .cloned()
-        .collect();
+    let kept = at_least(seqs, min_contig_length);
     log::info!(
         "Omitted {} contigs shorter than {min_contig_length} nt from FASTA output",
         seqs.len() - kept.len()
@@ -157,21 +84,6 @@ pub(crate) fn save_sequences_as_fasta(
     };
     let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
     contigs.write_fasta(&mut wbuf);
-}
-
-/// Writes all the contigs as a fasta file
-#[cfg(not(target_family = "wasm"))]
-pub fn write_as_fasta<IntT, W>(
-    ingraph: &mut Contigs,
-    inmap: &impl KmerLookup<IntT>,
-    k: usize,
-    writer: &mut W,
-) where
-    IntT: for<'a> UInt<'a>,
-    W: std::io::Write,
-{
-    write_sequences_and_coverages(ingraph, inmap, k);
-    ingraph.write_fasta(writer);
 }
 
 /// Stores all the contigs in fasta format, but exports it as JSON for javascript
@@ -272,6 +184,14 @@ mod tests {
         (dict, path)
     }
 
+    fn one_contig(path: Vec<u64>) -> Contigs {
+        Contigs::new(vec![vec![NodeStruct {
+            counts: 1,
+            abs_ind: path,
+            innerdir: None,
+        }]])
+    }
+
     /// A contig is the whole sequence its k-mer path spells, so it must come back as `S` itself.
     #[test]
     fn contig_preserves_the_full_spelled_path() {
@@ -281,14 +201,8 @@ mod tests {
         let (dict, path) = dict_and_path(&seq, k);
         assert_eq!(path.len(), n);
 
-        let mut contigs = Contigs::new(vec![vec![NodeStruct {
-            counts: 1,
-            abs_ind: path,
-            innerdir: None,
-        }]]);
-        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 0);
-
-        let got = &contigs.contig_sequences.as_ref().unwrap()[0];
+        let sequences = spell_contigs(&one_contig(path), &dict, k);
+        let got = &sequences[0];
         assert_eq!(got.len(), seq.len(), "contig length");
         assert_eq!(got, &seq, "contig sequence");
     }
@@ -301,14 +215,8 @@ mod tests {
         let seq = pseudo_seq(300);
         let (dict, path) = dict_and_path(&seq, k);
 
-        let mut contigs = Contigs::new(vec![vec![NodeStruct {
-            counts: 1,
-            abs_ind: path,
-            innerdir: None,
-        }]]);
-        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 0);
-
-        let got = &contigs.contig_sequences.as_ref().unwrap()[0];
+        let sequences = spell_contigs(&one_contig(path), &dict, k);
+        let got = &sequences[0];
         assert_eq!(&got[..k], &seq[..k], "the first terminal k-mer");
         assert_eq!(&got[got.len() - k..], &seq[seq.len() - k..], "the last one");
     }
@@ -322,40 +230,16 @@ mod tests {
         let (dict, path) = dict_and_path(&seq, k);
         assert!(path.len() < k, "fixture must have fewer than k k-mers");
 
-        let mut contigs = Contigs::new(vec![vec![NodeStruct {
-            counts: 1,
-            abs_ind: path,
-            innerdir: None,
-        }]]);
-        write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, 0);
-
-        let sequences = contigs.contig_sequences.as_ref().unwrap();
+        let sequences = spell_contigs(&one_contig(path), &dict, k);
         assert_eq!(sequences.len(), 1, "the short path must still be written");
         assert_eq!(sequences[0], seq);
     }
 
     #[test]
     fn minimum_contig_length_is_inclusive_and_configurable() {
-        let k = 31;
-        let minimum = 500;
-
         // The threshold applies to the sequence written, not to a trimmed body, so it means what it says.
-        for (sequence_length, expected_contigs) in [(500, 1), (499, 0)] {
-            let seq = pseudo_seq(sequence_length);
-            let (dict, path) = dict_and_path(&seq, k);
-            let mut contigs = Contigs::new(vec![vec![NodeStruct {
-                counts: 1,
-                abs_ind: path,
-                innerdir: None,
-            }]]);
-
-            write_sequences_and_coverages_with_min_contig_length(&mut contigs, &dict, k, minimum);
-
-            let sequences = contigs.contig_sequences.as_ref().unwrap();
-            assert_eq!(sequences.len(), expected_contigs);
-            if expected_contigs == 1 {
-                assert_eq!(sequences[0].len(), sequence_length);
-            }
-        }
+        let sequences = [pseudo_seq(500), pseudo_seq(499)];
+        assert_eq!(at_least(&sequences, 500), vec![sequences[0].clone()]);
+        assert_eq!(at_least(&sequences, 499).len(), 2);
     }
 }
