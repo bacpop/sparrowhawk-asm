@@ -23,14 +23,6 @@ fn bulge_max_kmers(k: usize) -> usize {
     max_bases.saturating_sub(k.saturating_sub(1)).max(1)
 }
 const EC_LEN_K_MULT: usize = 9;
-/// Loop guard on the neighbour walk, not a modelling choice.
-///
-/// Minia walks consecutive unitigs to the next branching node with no bound at all
-/// (`GraphUnitigs.cpp:1716-1733`); the "first 100 kmers" this was ported from is a *stale comment* in
-/// `Simplifications.cpp:207`, describing a `getSimplePathCoverage` that has no definition anywhere in
-/// its tree. Bounding at 100 made a connector's flanks look far weaker than Minia judges them, which
-/// suppressed removals. Kept only so a pathological graph cannot spin.
-const EC_NEIGHBOUR_LOOKAHEAD_KMERS: usize = usize::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OrientedNode {
@@ -460,20 +452,13 @@ pub(crate) fn remove_bulges(graph: &mut DbgGraph, pop_ratio: f32, coverage: &Cov
 
 fn bounded_coverage(graph: &DbgGraph, first: OrientedNode, forward: bool) -> Option<PathCoverage> {
     let mut current = first;
-    let mut remaining = EC_NEIGHBOUR_LOOKAHEAD_KMERS;
     let mut coverage = PathCoverage::default();
     let mut seen = HashSet::new();
-    while remaining > 0 {
+    loop {
         if !seen.insert(current.node) {
             return None;
         }
-        let node = graph.node_weight(current.node)?;
-        let consumed = remaining.min(node.abs_ind.len());
-        coverage.add_part(node, consumed);
-        remaining -= consumed;
-        if consumed < node.abs_ind.len() || remaining == 0 {
-            break;
-        }
+        coverage.add_node(graph.node_weight(current.node)?);
         let neighbours = if forward {
             sorted_forward(graph, current)
         } else {
