@@ -23,7 +23,7 @@ use bnum::BUint;
 use num_traits::{PrimInt, Unsigned};
 
 /// Table from bits 0-3 to ASCII (use [`decode_base()`] not this table).
-const LETTER_CODE: [u8; 4] = [b'A', b'C', b'T', b'G'];
+const LETTER_CODE: [u8; 4] = *b"ACTG";
 
 /// Encode an ASCII char to bits 0-3.
 #[inline(always)]

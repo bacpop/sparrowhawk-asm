@@ -2624,6 +2624,7 @@ mod tests {
 
     #[cfg(not(target_family = "wasm"))]
     impl NativeSpectrumFit {
+        #[allow(clippy::too_many_arguments)]
         pub(crate) fn for_test(
             error_model: ErrorModel,
             genome_model: GenomeModel,

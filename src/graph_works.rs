@@ -449,7 +449,6 @@ where
 pub trait Assemble {
     #[cfg(not(target_family = "wasm"))]
     /// Assembles given data and writes results into the output file.
-    #[allow(clippy::too_many_arguments)]
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         kmers: &mut IndexedKmers<IntT>,
@@ -474,7 +473,6 @@ pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
     #[cfg(not(target_family = "wasm"))]
-    #[allow(clippy::too_many_arguments)]
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         kmers: &mut IndexedKmers<IntT>,
@@ -869,7 +867,7 @@ mod tests {
     /// A deterministic ACGT sequence, with a repeat planted twice so the graph actually branches
     /// rather than being one long chain.
     fn seq_with_repeat(k: usize) -> Vec<u8> {
-        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        const BASES: [u8; 4] = *b"ACGT";
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = |n: usize| -> Vec<u8> {
             (0..n)
@@ -1005,11 +1003,9 @@ mod tests {
     }
 
     // ── spelling ─────────────────────────────────────────────────────────
-
-    // ── spelling ─────────────────────────────────────────────────────────
     /// A deterministic ACGT sequence; an LCG keeps it reproducible without pulling in an rng crate.
     fn pseudo_seq(len: usize, seed: u64) -> Vec<u8> {
-        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        const BASES: [u8; 4] = *b"ACGT";
         let mut state = seed;
         (0..len)
             .map(|_| {

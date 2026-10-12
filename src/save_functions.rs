@@ -1,4 +1,4 @@
-//! Some docs should be here
+//! Spelling contigs and writing them as FASTA.
 
 use core::panic;
 
@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 #[cfg(not(target_family = "wasm"))]
 use super::io_utils::*;
-// use std::process::exit;
 
 use crate::bit_encoding::UInt;
 #[cfg(target_family = "wasm")]
@@ -149,7 +148,7 @@ mod tests {
 
     /// A deterministic ACGT sequence. An LCG keeps it reproducible without pulling in a rng crate.
     fn pseudo_seq(len: usize) -> Vec<u8> {
-        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        const BASES: [u8; 4] = *b"ACGT";
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         (0..len)
             .map(|_| {
@@ -161,16 +160,13 @@ mod tests {
             .collect()
     }
 
+    /// Canonical hash -> packed k-mer, as preprocessing stores it.
+    type PackedDict = HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
+
     /// The (dict, abs_ind) pair preprocessing would produce: canonical hash -> packed k-mer, plus the
     /// ordered hashes along the walk.
-    fn dict_and_path(
-        seq: &[u8],
-        k: usize,
-    ) -> (
-        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        Vec<u64>,
-    ) {
-        let mut dict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> = HashMap::default();
+    fn dict_and_path(seq: &[u8], k: usize) -> (PackedDict, Vec<u64>) {
+        let mut dict = PackedDict::default();
         let mut path: Vec<u64> = Vec::new();
 
         let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();

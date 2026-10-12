@@ -140,7 +140,7 @@ mod tests {
             .map(|i| {
                 33 + match i % 9 {
                     0 | 1 => 2u8,
-                    2 | 3 | 4 => 11,
+                    2..=4 => 11,
                     _ => 25,
                 }
             })
@@ -218,8 +218,8 @@ mod tests {
         let mut groups = Vec::new();
         window_groups(seq, &qual, k, &floors, &mut groups);
         let n_at = 8;
-        for i in n_at..(n_at + k).min(groups.len()) {
-            assert_eq!(groups[i], NONE, "window ending at {i} spans the N");
+        for (i, &group) in groups.iter().enumerate().take(n_at + k).skip(n_at) {
+            assert_eq!(group, NONE, "window ending at {i} spans the N");
         }
         assert_eq!(groups[n_at + k], 2, "the first clean window after the N");
     }

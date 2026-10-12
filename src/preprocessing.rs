@@ -1,4 +1,4 @@
-//! Some docs should be here
+//! K-mer counting, the spectrum's cutoff and quality floor, and the native spectrum plots.
 
 #[cfg(not(target_family = "wasm"))]
 use std::{error::Error, fmt};
@@ -12,7 +12,6 @@ use std::cmp::Ordering;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 use rayon::prelude::*;
-// use std::process::exit;
 
 #[cfg(not(target_family = "wasm"))]
 use plotters::coord::Shift;
@@ -23,9 +22,6 @@ use plotters::style::text_anchor::{HPos, Pos, VPos};
 
 use super::HashInfoSimple;
 use super::QualOpts;
-
-// #[cfg(not(target_family = "wasm"))]
-// use super::bit_encoding::{encode_base, rc_base};
 
 use crate::bit_encoding::UInt;
 #[cfg(not(target_family = "wasm"))]
@@ -102,8 +98,6 @@ impl fmt::Display for PreprocessingError {
 #[cfg(not(target_family = "wasm"))]
 impl Error for PreprocessingError {}
 
-// #[cfg(target_family = "wasm")]
-// use wasm_bindgen::prelude::*;
 #[cfg(target_family = "wasm")]
 use crate::fastx_wasm::open_fastq;
 #[cfg(target_family = "wasm")]
@@ -2292,9 +2286,9 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
                 raw.iter()
                     .take(plot_end)
                     .enumerate()
-                    .filter_map(|(i, &height)| {
-                        (height > 0)
-                            .then(|| ((i + 1) as f64, transform_plot_y(f64::from(height), y_axis)))
+                    .filter(|&(_, &height)| height > 0)
+                    .map(|(i, &height)| {
+                        ((i + 1) as f64, transform_plot_y(f64::from(height), y_axis))
                     }),
                 RGBColor(95, 95, 95).stroke_width(1),
             ))
@@ -2547,70 +2541,6 @@ fn plot_kmer_histogram(
 
 // =====================================================================================================
 
-// NOTE: these two functions were implemented to save the whole sequence in memory for GPGPU processing.
-// This might be useful again in the future, but now it was just meaning that we were wasting memory!
-// I'm disabling them for the moment
-//
-// #[cfg(not(target_family = "wasm"))]
-// fn put_these_nts_into_an_efficient_vector(charseq : &[u8], compseq : &mut Vec<u64>, occ : u8) {
-//     let mut tmpu64 : u64 = 0;
-//     let mut tmpind : u8  = 0;
-//
-//     if occ != 0 {
-//         tmpind = occ;
-//         tmpu64 = compseq.pop().unwrap();
-//     }
-// //     log::debug!("{}", tmpind);
-//
-//     for nt in charseq {
-// //         log::debug!("\n{:#010b}\n{}\n{:#066b}\n{:#066b}", *nt, tmpind, tmpu64, (encode_base(*nt) as u64));
-//         tmpu64 <<= 2;
-//         tmpu64 |= encode_base(*nt) as u64;
-// //         log::debug!("{:#066b}", tmpu64);
-//         if tmpind == 31 {
-//             compseq.push(tmpu64);
-//             tmpu64 = 0;
-//             tmpind = 0;
-//         } else {
-//             tmpind += 1;
-//         }
-// //         log::debug!("{}", tmpind);
-//     }
-//
-//     if tmpind != 0 {
-//         compseq.push(tmpu64);
-//     }
-// }
-
-// #[cfg(not(target_family = "wasm"))]
-// fn put_these_nts_into_an_efficient_vector_rc(charseq : &[u8], compseq : &mut Vec<u64>, occ : u8) {
-//     let mut tmpu64 : u64 = 0;
-//     let mut tmpind : u8  = 0;
-//
-//     if occ != 0 {
-//         tmpind = occ;
-//         tmpu64 = compseq.pop().unwrap();
-//     }
-// //     log::debug!("{}", tmpind);
-//     for nt in charseq.iter().rev() {
-// //         log::debug!("\n{:#010b}\n{}\n{:#066b}\n{:#066b}", *nt, tmpind, tmpu64, (rc_base(encode_base(*nt)) as u64));
-//         tmpu64 <<= 2;
-//         tmpu64 |= rc_base(encode_base(*nt)) as u64;
-// //         log::debug!("{:#066b}", tmpu64);
-//         if tmpind == 31 {
-//             compseq.push(tmpu64);
-//             tmpu64 = 0;
-//             tmpind = 0;
-//         } else {
-//             tmpind += 1;
-//         }
-//     }
-//
-//     if tmpind != 0 {
-//         compseq.push(tmpu64);
-//     }
-// }
-
 #[cfg(target_family = "wasm")]
 fn chunked_processing_wasm<IntT>(
     file1: &mut WebSysFile,
@@ -2709,7 +2639,6 @@ where
         // Filling the seq of the second file!
         while let Some(record) = reader.next() {
             let seqrec = record.expect("Invalid FASTQ record");
-            // put_these_nts_into_an_efficient_vector_rc(&seqrec.seq(), &mut theseq, (itrecord % 32) as u8);
             let rl = seqrec.seq().len();
             let kmer_opt = Kmer::<IntT>::new(
                 std::borrow::Cow::Borrowed(seqrec.seq()),
@@ -2907,7 +2836,6 @@ where
         // Filling the seq of the second file!
         while let Some(record) = reader.next() {
             let seqrec = record.expect("Invalid FASTQ record");
-            // put_these_nts_into_an_efficient_vector_rc(&seqrec.seq(), &mut theseq, (itrecord % 32) as u8);
             let rl = seqrec.seq().len();
             let kmer_opt = Kmer::<IntT>::new(
                 std::borrow::Cow::Borrowed(seqrec.seq()),
@@ -5243,7 +5171,7 @@ mod tests {
     /// of single-base errors, so the spectrum has a singleton lobe as well as a deep one.
     #[cfg(not(target_family = "wasm"))]
     fn deep_library(depth: usize, phred: u8) -> Vec<OwnedRecord> {
-        const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+        const BASES: [u8; 4] = *b"ACGT";
         const GENOME: usize = 3000;
         const READ: usize = 100;
         let mut st = 0x2545_F491_4F6C_DD1Du64;

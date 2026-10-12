@@ -62,6 +62,3 @@ stacker = "0.1.20"
 
 [profile.release]
 lto = true
-
-[rust]
-lld = true

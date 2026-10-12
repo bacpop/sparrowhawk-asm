@@ -6,8 +6,6 @@ use std::borrow::Cow;
 use super::bit_encoding::*;
 use super::nthash::NtHashIterator;
 
-// use std::process::exit;
-
 /// Struct to generate all k-mers from an input sequence
 ///
 /// Holds reference to input sequence, current encoded k-mer, and other

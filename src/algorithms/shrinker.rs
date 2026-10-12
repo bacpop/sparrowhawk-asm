@@ -65,12 +65,12 @@ impl Shrinkable for DbgGraph {
                     let outn = self.out_neighbours_bi(neigh[0].0, tmpty);
                     if outn.len() == 1 && (outn[0].0 == *an || ambnodes.contains(&outn[0].0)) {
                         continue;
-                    } else if outn.len() <= 1 && self.in_neighbours_bi(neigh[0].0, tmpty).len() == 1
+                    } else if outn.len() <= 1
+                        && self.in_neighbours_bi(neigh[0].0, tmpty).len() == 1
+                        && self.shrink_single_path(*an, neigh[0].0, &ambnodes, neigh[0].1)
                     {
-                        if self.shrink_single_path(*an, neigh[0].0, &ambnodes, neigh[0].1) {
-                            graph_changed = true;
-                            pass_changed = true;
-                        }
+                        graph_changed = true;
+                        pass_changed = true;
                     }
                 } else {
                     for n in neigh {
@@ -94,11 +94,11 @@ impl Shrinkable for DbgGraph {
                                 || self.get_good_neighbours_bi(*an).len() == 1)
                         {
                             let incn = self.in_neighbours_bi(n.0, tmpty);
-                            if incn.len() == 1 {
-                                if self.shrink_single_path(n.0, outn[0].0, &ambnodes, outn[0].1) {
-                                    graph_changed = true;
-                                    pass_changed = true;
-                                }
+                            if incn.len() == 1
+                                && self.shrink_single_path(n.0, outn[0].0, &ambnodes, outn[0].1)
+                            {
+                                graph_changed = true;
+                                pass_changed = true;
                             }
                         }
                     }

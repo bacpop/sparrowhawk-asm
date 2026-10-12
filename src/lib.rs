@@ -50,7 +50,7 @@ pub mod algorithms;
 /// Defines a bloom filter (taken from ska.rust!)
 pub mod bloom_filter;
 
-/// Fits the k-mer spectrum to automatically get a min_count (taken from ska.rust!
+/// Fits the k-mer spectrum to automatically get a min_count (taken from ska.rust!)
 pub mod spectrum_fitter;
 
 #[cfg(target_family = "wasm")]
