@@ -1,5 +1,4 @@
 //! Corrects parts of the provided graph, if needed
-use crate::logw;
 use crate::preprocessing::PeakSource;
 use sparrowhawk_graph::{
     BubbleStartEdge, CarryType, DbgGraph, EdgeId, EdgeType, NodeId, NodeStruct,
@@ -221,14 +220,14 @@ impl Correctable for DbgGraph {
     }
 
     fn remove_dead_paths(&mut self, tip_nts: usize, tip_rctc_nts: usize, rctc_cutoff: f64) -> bool {
-        logw(
+        log::info!(
+            "{}",
             format!(
                 "Before pruning: {} nodes and {} edges",
                 self.node_count(),
                 self.edge_count()
             )
-            .as_str(),
-            Some("info"),
+            .as_str()
         );
 
         // Hoisted out of the walk: it only depends on k and the threshold, both fixed for this call.
@@ -238,9 +237,9 @@ impl Correctable for DbgGraph {
         let rctc_limit = short_path_limit(tip_rctc_nts, self.k()).max(limit);
         let (mut topo_tips, mut rctc_tips) = (0usize, 0usize);
         let mut dididoanything = false;
-        logw(format!("Starting graph pruning. Graph has {} externals, {} alone nodes, the remaining are internal.",
+        log::info!("Starting graph pruning. Graph has {} externals, {} alone nodes, the remaining are internal.",
             self.externals_bi().len(),
-            self.node_indices().filter(|n| self.out_degree(*n) == 0 && self.in_degree(*n) == 0).count()).as_str(), Some("info"));
+            self.node_indices().filter(|n| self.out_degree(*n) == 0 && self.in_degree(*n) == 0).count());
 
         let mut to_remove: Vec<NodeId> = vec![];
         loop {
@@ -256,10 +255,7 @@ impl Correctable for DbgGraph {
                 })
                 .collect();
 
-            logw(
-                format!("Detected {} externals", externals.len()).as_str(),
-                Some("trace"),
-            );
+            log::trace!("Detected {} externals", externals.len());
 
             for v in externals {
                 let carryedge = self.first_outgoing_edge_type(v).unwrap();
@@ -285,14 +281,14 @@ impl Correctable for DbgGraph {
 
             // if there are no dead paths left pruning is done
             if to_remove.is_empty() {
-                logw(
+                log::info!(
+                    "{}",
                     format!(
                         "Graph is pruned: {topo_tips} tips by length (threshold {tip_nts} nt, \
                          {limit} k-mers), {rctc_tips} by coverage (up to {tip_rctc_nts} nt, \
                          {rctc_limit} k-mers, cutoff {rctc_cutoff})"
                     )
-                    .as_str(),
-                    Some("info"),
+                    .as_str()
                 );
                 return dididoanything;
             }
@@ -391,7 +387,7 @@ fn edges_are_paired(
 pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32, coverage: &CoverageRef) -> bool {
     let mut dididoanything = false;
 
-    logw("Starting resolution of standard bubbles", Some("info"));
+    log::info!("Starting resolution of standard bubbles");
 
     let bubbles = g
         .node_indices()
@@ -415,11 +411,8 @@ pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32, coverage: &Cove
     if bubbles.is_empty() {
         return false;
     } else {
-        logw(
-            format!("Found {examined:?} potential bubbles (they might be less). Starting to collapse them ")
-                .as_str(),
-            Some("info"),
-        );
+        log::info!("{}", format!("Found {examined:?} potential bubbles (they might be less). Starting to collapse them ")
+                .as_str());
         for n in bubbles {
             if g.contains_node(n) {
                 let tmpb = collapse_bubble(g, n, pop_ratio, coverage);
@@ -433,7 +426,8 @@ pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32, coverage: &Cove
 
     // Examined vs collapsed, because the two diverge badly: the ratio rule alone leaves nearly every
     // candidate standing, and a candidate count on its own hides that.
-    logw(
+    log::info!(
+        "{}",
         format!(
             "Bubble correction ended: {collapsed}/{examined} candidates collapsed (ceiling {:?}). \
              Corrected graph has {} nodes and {} edges",
@@ -441,8 +435,7 @@ pub fn pop_bubbles_by_coverage(g: &mut DbgGraph, pop_ratio: f32, coverage: &Cove
             g.node_count(),
             g.edge_count()
         )
-        .as_str(),
-        Some("info"),
+        .as_str()
     );
 
     dididoanything

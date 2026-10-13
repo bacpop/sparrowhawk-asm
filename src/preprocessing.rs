@@ -1,9 +1,12 @@
 //! K-mer counting, the spectrum's cutoff and quality floor, and the native spectrum plots.
 
 #[cfg(not(target_family = "wasm"))]
-use std::{error::Error, fmt};
+use std::path::PathBuf;
 #[cfg(not(target_family = "wasm"))]
-use std::{path::PathBuf, time::Instant};
+use std::{error::Error, fmt};
+
+#[cfg(not(target_family = "wasm"))]
+use crate::clock::Instant;
 
 use libm::lgamma;
 use nohash_hasher::NoHashHasher;
@@ -33,7 +36,6 @@ use crate::cli::ContigCountRule;
 #[cfg(not(target_family = "wasm"))]
 use crate::indexed_kmers::IndexedKmers;
 use crate::kmer::Kmer;
-use crate::logw;
 #[cfg(not(target_family = "wasm"))]
 use crate::qual_profile::{window_groups, MAX_GROUPS, NONE};
 #[cfg(not(target_family = "wasm"))]
@@ -985,29 +987,26 @@ fn estimate_by_valley(histovec: &[u32]) -> SpectrumEstimate {
 /// The whole derivation, as `key=value` pairs so a directory of logs parses into a table. The prose a
 /// user reads is the warning in [`choose_min_count`], not this.
 fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
-    logw(
-        &format!(
-            "K-mer spectrum: seed={} valley={} genomic_peak={} valley_n={} genomic_peak_n={} \
+    log::info!(
+        "K-mer spectrum: seed={} valley={} genomic_peak={} valley_n={} genomic_peak_n={} \
              gp_to_v_ratio={:.2} valley_to_peak_xratio={:.3} cand_kmer_frac={:.4} \
              guard_measured={} guard_poisson={} dispersion={:.1} min_count={} distinct_above={} \
              saturates={} verdict={:?}",
-            estimate.valley_seed,
-            estimate.valley,
-            estimate.genomic_peak,
-            estimate.valley_n,
-            estimate.genomic_peak_n,
-            estimate.gp_to_v_ratio,
-            estimate.valley_to_peak_xratio,
-            estimate.cand_kmer_frac,
-            estimate.guard_measured,
-            estimate.guard_poisson,
-            estimate.dispersion,
-            estimate.min_count,
-            estimate.distinct_above,
-            histovec[histovec.len() - 1] > 0,
-            estimate.verdict
-        ),
-        Some("info"),
+        estimate.valley_seed,
+        estimate.valley,
+        estimate.genomic_peak,
+        estimate.valley_n,
+        estimate.genomic_peak_n,
+        estimate.gp_to_v_ratio,
+        estimate.valley_to_peak_xratio,
+        estimate.cand_kmer_frac,
+        estimate.guard_measured,
+        estimate.guard_poisson,
+        estimate.dispersion,
+        estimate.min_count,
+        estimate.distinct_above,
+        histovec[histovec.len() - 1] > 0,
+        estimate.verdict
     );
     #[cfg(not(target_family = "wasm"))]
     {
@@ -1017,9 +1016,7 @@ fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
                 .and_then(|index| histovec.get(index))
                 .copied()
         };
-        logw(
-            &format!(
-                "Spectrum peak search: raw_valley={:?} raw_valley_n={:?} genomic_peak_seed={:?} genomic_peak_seed_n={:?} \
+        log::info!("Spectrum peak search: raw_valley={:?} raw_valley_n={:?} genomic_peak_seed={:?} genomic_peak_seed_n={:?} \
                  refined_valley={:?} refined_valley_n={:?} refined_peak={:?} refined_peak_n={:?} \
                  primary_valley={:?} primary_peak={:?} primary_method={:?} \
                  area_denominator={} primary_area_sum={:?} primary_area_pct={:?} primary_area_failure={:?} \
@@ -1052,10 +1049,7 @@ fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
                 estimate.retry_reason,
                 estimate.valley,
                 estimate.genomic_peak,
-                estimate.peak_search
-            ),
-            Some("info"),
-        );
+                estimate.peak_search);
     }
 }
 
@@ -1070,37 +1064,28 @@ fn fit_and_log(
     _sample_scale: f64,
 ) -> Option<SpectrumFit> {
     if !estimate.verdict.is_ok() {
-        logw(
-            "Spectrum fit skipped because the empirical peak pair is unresolved.",
-            Some("info"),
-        );
+        log::info!("Spectrum fit skipped because the empirical peak pair is unresolved.");
         return None;
     }
     match fit_spectrum(histovec, estimate.genomic_peak, estimate.dispersion) {
         Ok(fit) => {
-            logw(
-                &format!(
-                    "Spectrum fit: mean={:.1} dispersion={:.2} error_mean={:.2} w=({:.3}/{:.3}/{:.3}) \
+            log::info!(
+                "Spectrum fit: mean={:.1} dispersion={:.2} error_mean={:.2} w=({:.3}/{:.3}/{:.3}) \
                      genome_kmers={:.3e} crossover={} hole_cutoff={}",
-                    fit.mean,
-                    fit.dispersion,
-                    fit.error_mean,
-                    fit.w_error,
-                    fit.w_single,
-                    fit.w_repeat,
-                    fit.genome_kmers,
-                    fit.crossover(),
-                    fit.hole_cutoff(MAX_GENOME_HOLES),
-                ),
-                Some("info"),
+                fit.mean,
+                fit.dispersion,
+                fit.error_mean,
+                fit.w_error,
+                fit.w_single,
+                fit.w_repeat,
+                fit.genome_kmers,
+                fit.crossover(),
+                fit.hole_cutoff(MAX_GENOME_HOLES)
             );
             Some(fit)
         }
         Err(e) => {
-            logw(
-                &format!("Spectrum fit did not converge ({e}); keeping the valley estimate."),
-                Some("info"),
-            );
+            log::info!("Spectrum fit did not converge ({e}); keeping the valley estimate.");
             None
         }
     }
@@ -1114,10 +1099,7 @@ fn fit_and_log(
     sample_scale: f64,
 ) -> Option<NativeSpectrumFit> {
     if !estimate.verdict.is_ok() {
-        logw(
-            "Native spectrum fit skipped because the empirical peak pair is unresolved.",
-            Some("info"),
-        );
+        log::info!("Native spectrum fit skipped because the empirical peak pair is unresolved.");
         return None;
     }
     let started = Instant::now();
@@ -1130,11 +1112,8 @@ fn fit_and_log(
     ) {
         Ok(result) => result,
         Err(error) => {
-            logw(
-                &format!(
-                    "Native spectrum fits could not start ({error}); keeping the valley estimate."
-                ),
-                Some("info"),
+            log::info!(
+                "Native spectrum fits could not start ({error}); keeping the valley estimate."
             );
             return None;
         }
@@ -1144,9 +1123,7 @@ fn fit_and_log(
     }
     let elapsed = started.elapsed();
     if let Some(fit) = result.selected {
-        logw(
-            &format!(
-                "Spectrum fit selected: error_model={} genome_model={} log_likelihood={:.6e} bic={:.6e} deviance={:.6e} \
+        log::info!("Spectrum fit selected: error_model={} genome_model={} log_likelihood={:.6e} bic={:.6e} deviance={:.6e} \
                  mean={:.1} mode={} repeat_mode={} repeat_ratio={:.3} dispersion={:.2} singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} \
                  shelf={} w=({:.3}/{:.3}/{:.3}) genome_kmers={:.3e} error_kmers={:.3e} crossover={} \
                  hole_cutoff={} best_iterations={} elapsed_ms={} sample_scale={:.1}",
@@ -1174,18 +1151,12 @@ fn fit_and_log(
                     .map_or_else(|| "none".to_string(), |value| value.to_string()),
                 fit.best_iterations,
                 elapsed.as_millis(),
-                sample_scale,
-            ),
-            Some("info"),
-        );
+                sample_scale);
         Some(fit)
     } else {
-        logw(
-            &format!(
-                "All native spectrum fits were rejected; keeping the valley estimate. elapsed_ms={}",
-                elapsed.as_millis()
-            ),
-            Some("info"),
+        log::info!(
+            "All native spectrum fits were rejected; keeping the valley estimate. elapsed_ms={}",
+            elapsed.as_millis()
         );
         None
     }
@@ -1214,9 +1185,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
             || "accepted".to_string(),
             |reason| format!("rejected:{reason}"),
         );
-        logw(
-            &format!(
-                "Spectrum fit candidate: error_model={} genome_model={} status={} log_likelihood={:.6e} bic={:.6e} \
+        log::info!("Spectrum fit candidate: error_model={} genome_model={} status={} log_likelihood={:.6e} bic={:.6e} \
                  deviance={:.6e} mode={} repeat_mode={} repeat_ratio={:.3} error_mode={} mean={:.1} dispersion={:.2} \
                  singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} shelf={} \
                  component_kmers=({:.3e}/{:.3e}/{:.3e}) component_mass_ratio={:.6e} \
@@ -1249,14 +1218,9 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                 attempt.total_iterations,
                 attempt.capped_starts,
                 fit.best_iterations,
-                selection_eligible,
-            ),
-            Some("info"),
-        );
+                selection_eligible);
     } else {
-        logw(
-            &format!(
-                "Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={} capped_starts={} selection_eligible={}",
+        log::info!("Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={} capped_starts={} selection_eligible={}",
                 attempt.error_model,
                 attempt.genome_model,
                 attempt
@@ -1264,10 +1228,7 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
                     .expect("an absent candidate always has a rejection reason"),
                 attempt.total_iterations,
                 attempt.capped_starts,
-                selection_eligible,
-            ),
-            Some("info"),
-        );
+                selection_eligible);
     }
 }
 
@@ -1337,12 +1298,11 @@ fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&SpectrumFit>) 
 
     let guarded = fit.hole_cutoff(MAX_GENOME_HOLES);
     if guarded < estimate.min_count {
-        logw(
-            &format!(
-                "Cutting at {} would strand more than {} single-copy k-mers; using {} instead.",
-                estimate.min_count, MAX_GENOME_HOLES, guarded
-            ),
-            Some("info"),
+        log::info!(
+            "Cutting at {} would strand more than {} single-copy k-mers; using {} instead.",
+            estimate.min_count,
+            MAX_GENOME_HOLES,
+            guarded
         );
         estimate.min_count = guarded.max(2);
     }
@@ -1370,27 +1330,19 @@ fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&NativeSpectrum
     let Some(fit) = fit else { return };
     let hole_guarded = hole_guarded_min_count(estimate, fit);
     if hole_guarded < estimate.min_count {
-        logw(
-            &format!(
-                "Cutting at {} would strand more than {MAX_GENOME_HOLES} single-copy k-mers; using \
+        log::info!(
+            "Cutting at {} would strand more than {MAX_GENOME_HOLES} single-copy k-mers; using \
                  {hole_guarded} instead.",
-                estimate.min_count
-            ),
-            Some("info"),
+            estimate.min_count
         );
     }
     let error_floor = fit.error_floor_cutoff();
     estimate.min_count = hole_guarded.max(error_floor);
     let hole_cutoff = fit.hole_cutoff(MAX_GENOME_HOLES);
-    logw(
-        &format!(
-            "Spectrum 100% error floor enforced: floor={error_floor} previous_min_count={hole_guarded} \
+    log::info!("Spectrum 100% error floor enforced: floor={error_floor} previous_min_count={hole_guarded} \
              final_min_count={} hole_cutoff={hole_cutoff:?} conflict={}",
             estimate.min_count,
-            hole_cutoff.is_some_and(|cutoff| error_floor > cutoff),
-        ),
-        Some("info"),
-    );
+            hole_cutoff.is_some_and(|cutoff| error_floor > cutoff));
 }
 
 /// The warning for a spectrum that yielded no usable cutoff. Shared, so the one-pass and the sketch
@@ -1399,16 +1351,11 @@ fn warn_unresolved(estimate: &SpectrumEstimate) {
     // Keyed on the outcome, not only the verdict: a spectrum can be called `ok` and still have the loss
     // guard collapse the cutoff to `UNRESOLVED_MINCOUNT`, which is the same thin-spectrum situation.
     if !estimate.verdict.is_ok() || estimate.min_count == UNRESOLVED_MINCOUNT {
-        logw(
-            &format!(
-                "The k-mer spectrum's error and genome lobes are not separated ({}), so no reliable \
+        log::warn!("The k-mer spectrum's error and genome lobes are not separated ({}), so no reliable \
                  minimum count exists and {} will be used — k-mers seen once are discarded and nothing \
                  else is. Expect a fragmented assembly if this is a deep library. This usually means \
                  the spectrum is thin: low coverage, or a large k. Check the k-mer spectrum histogram.",
-                estimate.verdict.reason(), estimate.min_count
-            ),
-            Some("warn"),
-        );
+                estimate.verdict.reason(), estimate.min_count);
     }
 }
 
@@ -1568,15 +1515,9 @@ where
 
     let evaluate_other_floors = strict_needs_review || debug_all_floors;
     if strict_needs_review {
-        logw(
-            "Strict quality floor needs review (unusable fit, excessive fitted error tail, or peak below 10); checking lower quality floors.",
-            Some("info"),
-        );
+        log::info!("Strict quality floor needs review (unusable fit, excessive fitted error tail, or peak below 10); checking lower quality floors.");
     } else if debug_all_floors {
-        logw(
-            "Debug quality-floor mode: evaluating other floors for diagnostics only; the selected floor will be decided from the strict-floor result.",
-            Some("info"),
-        );
+        log::info!("Debug quality-floor mode: evaluating other floors for diagnostics only; the selected floor will be decided from the strict-floor result.");
     }
 
     // At the whole library's scale, as the strict spectrum already is: fitted on the raw sample, the
@@ -1600,21 +1541,16 @@ where
     if let Some(spectra) = spectra.as_ref().filter(|_| evaluate_other_floors) {
         for index in (0..strict_index).rev() {
             if !floor_has_kmers[index] {
-                logw(
-                    &format!(
-                        "No k-mer windows passed the candidate base-quality floor of {}; skipping it.",
-                        floors[index]
-                    ),
-                    Some("info"),
+                log::info!(
+                    "No k-mer windows passed the candidate base-quality floor of {}; skipping it.",
+                    floors[index]
                 );
                 continue;
             }
             let candidate = evaluate_floor(floors[index], &spectra[index], sketch_scale, &mut fit);
             evaluated[index] = Some(candidate);
             let estimate = &candidate.estimate;
-            logw(
-                &format!(
-                    "Sketch at a base-quality floor of {}: valley={} genomic_peak={} gp_to_v_ratio={:.2} \
+            log::info!("Sketch at a base-quality floor of {}: valley={} genomic_peak={} gp_to_v_ratio={:.2} \
                      min_count={} distinct_above={} verdict={:?} primary_method={:?} \
                      primary_area_pct={:?} fallback_attempted={} fallback_valley={:?} \
                      fallback_peak={:?} fallback_area_pct={:?} retry_reason={:?}",
@@ -1631,10 +1567,7 @@ where
                     estimate.fallback_valley,
                     estimate.fallback_peak,
                     estimate.fallback_area_fraction.map(|fraction| fraction * 100.0),
-                    estimate.retry_reason
-                ),
-                Some("info"),
-            );
+                    estimate.retry_reason);
             if debug_all_floors {
                 diagnostic_floors.push(FloorDiagnostic {
                     floor: candidate.floor,
@@ -1710,16 +1643,13 @@ where
             if candidate.fit.is_none() && selected.fit.is_some() {
                 break;
             }
-            logw(
-                &format!(
-                    "Stepping down from base-quality floor {} (peak {}) to {} (peak {}): at least \
+            log::info!(
+                "Stepping down from base-quality floor {} (peak {}) to {} (peak {}): at least \
                      {STEP_DOWN_GAIN:.2}x was required.",
-                    selected.floor,
-                    selected.estimate.genomic_peak,
-                    candidate.floor,
-                    candidate.estimate.genomic_peak
-                ),
-                Some("info"),
+                selected.floor,
+                selected.estimate.genomic_peak,
+                candidate.floor,
+                candidate.estimate.genomic_peak
             );
             selected = candidate;
             index = lower;
@@ -1735,9 +1665,7 @@ where
     let diagnostics = (selected.floor == strict_floor).then(|| {
         SpectrumPlotDiagnostics::new(&selected.estimate, selected.fit, selected.fit_attempted)
     });
-    logw(
-        &format!(
-            "Quality floor selected: floor={} min_count={} peak={} fit_usable={} error_tail_fraction={:?} decision_candidates={} debug_only_floor_records={}",
+    log::info!("Quality floor selected: floor={} min_count={} peak={} fit_usable={} error_tail_fraction={:?} decision_candidates={} debug_only_floor_records={}",
             selected.floor,
             selected.estimate.min_count,
             peak.value().unwrap_or_default(),
@@ -1748,10 +1676,7 @@ where
                 diagnostic_floors.len().saturating_sub(1)
             } else {
                 0
-            }
-        ),
-        Some("info"),
-    );
+            });
     (
         selected.estimate.min_count,
         selected.floor,
@@ -1775,14 +1700,9 @@ fn unresolved(
         .position(|&present| present)
         .expect("empty floor ladders are rejected before quality selection");
     let loosest = floors[loosest_index];
-    logw(
-        &format!(
-            "The k-mer spectrum does not separate at any candidate base-quality floor ({floors:?}), so \
+    log::warn!("The k-mer spectrum does not separate at any candidate base-quality floor ({floors:?}), so \
              the floor will be dropped to {loosest} and {UNRESOLVED_MINCOUNT} used as the minimum \
-             count. Expect a fragmented assembly. Check the k-mer spectrum histogram.",
-        ),
-        Some("warn"),
-    );
+             count. Expect a fragmented assembly. Check the k-mer spectrum histogram.");
     // Nothing separated, so there is no fitted peak to report — only the median standing in.
     (
         UNRESOLVED_MINCOUNT,
@@ -1804,16 +1724,13 @@ fn check_sketch_against_table(histovec: &[u32], sketch: &SpectrumSketch, keep: u
     let expected = table as f64 * sketch.fraction();
     // The table size is reported alongside the strict-group total: a sketch that has emptied itself
     // used to be indistinguishable here from a library with no strict-floor k-mers.
-    logw(
-        &format!(
-            "Sketch: {sample} distinct k-mers sampled from {table} at a hash fraction of {:.3e} \
+    log::info!(
+        "Sketch: {sample} distinct k-mers sampled from {table} at a hash fraction of {:.3e} \
              (expected {expected:.0}; table holds {} after {} halvings{})",
-            sketch.fraction(),
-            sketch.counts.len(),
-            sketch.shrinks,
-            if sketch.saturated { ", saturated" } else { "" }
-        ),
-        Some("info"),
+        sketch.fraction(),
+        sketch.counts.len(),
+        sketch.shrinks,
+        if sketch.saturated { ", saturated" } else { "" }
     );
 }
 
@@ -2561,10 +2478,7 @@ where
     IntT: for<'a> UInt<'a>,
 {
     post_state("preprocess:chunked:start");
-    logw(
-        "Getting kmers from first file. Creating reader...",
-        Some("info"),
-    );
+    log::info!("Getting kmers from first file. Creating reader...");
 
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
     let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
@@ -2575,7 +2489,7 @@ where
     let mut reader = open_fastq(file1);
     let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
 
-    logw("Entering while loop...", Some("info"));
+    log::info!("Entering while loop...");
 
     // todo: use the same counter and is_multiple_of
     let mut i_record = 0;
@@ -2611,9 +2525,9 @@ where
         if i_record >= csize {
             // Processssssss! And reset.
             if !outvec.is_empty() {
-                logw("Processing chunk. Sorting k-mers...", Some("debug"));
+                log::debug!("Processing chunk. Sorting k-mers...");
                 outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                logw("k-mers sorted. Counting k-mers...", Some("debug"));
+                log::debug!("k-mers sorted. Counting k-mers...");
                 // Then, do a counting of everything and save the results in a dictionary and return it
 
                 update_countmap(outvec, &mut countmap);
@@ -2625,10 +2539,7 @@ where
             i_record = 0;
         }
     }
-    logw(
-        "Finished getting kmers from first file. Starting with the second...",
-        Some("info"),
-    );
+    log::info!("Finished getting kmers from first file. Starting with the second...");
 
     post_state(&format!("preprocess:chunked:loop:{:?}:50", count));
     let percentageblock = (count as f64 / 10_f64) as usize;
@@ -2666,9 +2577,9 @@ where
             if i_record >= csize {
                 // Processssssss! And reset.
                 if !outvec.is_empty() {
-                    logw("Processing chunk. Sorting k-mers...", Some("info"));
+                    log::info!("Processing chunk. Sorting k-mers...");
                     outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                    logw("k-mers sorted. Counting k-mers...", Some("info"));
+                    log::info!("k-mers sorted. Counting k-mers...");
                     // Then, do a counting of everything and save the results in a dictionary and return it
 
                     update_countmap(outvec, &mut countmap);
@@ -2690,23 +2601,20 @@ where
         }
     }
 
-    logw(
-        "Finished getting kmers from the input file(s)",
-        Some("info"),
-    );
+    log::info!("Finished getting kmers from the input file(s)");
 
     // The residual chunk. This MUST stay outside the `if let Some(file2)` block above, or single-file
     // input silently loses the k-mers of its trailing partial chunk.
     if !outvec.is_empty() {
-        logw("Processing last chunk. Sorting k-mers...", Some("info"));
+        log::info!("Processing last chunk. Sorting k-mers...");
         outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        logw("k-mers sorted. Counting k-mers...", Some("info"));
+        log::info!("k-mers sorted. Counting k-mers...");
         update_countmap(outvec, &mut countmap);
         outvec.clear();
     }
 
     post_state("preprocess:chunked:loop:end");
-    logw("Filtering...", Some("info"));
+    log::info!("Filtering...");
 
     // Now, get themap, histovec, and filter outdict and minmaxdict
     countmap.shrink_to_fit();
@@ -2720,15 +2628,9 @@ where
 
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
-        logw(
-            "Counting finished. Choosing the minimum count...",
-            Some("info"),
-        );
+        log::info!("Counting finished. Choosing the minimum count...");
         minc = choose_min_count(&histovec);
-        logw(
-            format!("Minimum count chosen: {}. Starting filtering...", minc).as_str(),
-            Some("info"),
-        );
+        log::info!("Minimum count chosen: {}. Starting filtering...", minc);
 
         post_state("preprocess:chunked:filtering");
         drain_countmap_into_themap(
@@ -2777,7 +2679,7 @@ where
     IntT: for<'a> UInt<'a>,
 {
     post_state("preprocess:bloom:start");
-    logw("Getting kmers from first file with Bloom filter. Creating reader and initialising filter...", Some("info"));
+    log::info!("Getting kmers from first file with Bloom filter. Creating reader and initialising filter...");
 
     let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
     let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
@@ -2788,7 +2690,7 @@ where
     let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
     kmer_filter.init();
 
-    logw("Entering while loop for the first file...", Some("info"));
+    log::info!("Entering while loop for the first file...");
     post_state("preprocess:bloom:loop:start");
 
     let mut count: usize = 0;
@@ -2823,10 +2725,7 @@ where
             post_state(&format!("preprocess:bloom:loop:{:?}", count));
         }
     }
-    logw(
-        "Finished getting kmers from first file. Starting with the second...",
-        Some("info"),
-    );
+    log::info!("Finished getting kmers from first file. Starting with the second...");
     post_state(&format!("preprocess:bloom:loop:{:?}:50", count));
     let percentageblock = (count as f64 / 10_f64) as usize;
 
@@ -2872,8 +2771,8 @@ where
     }
 
     post_state("preprocess:bloom:loop:end");
-    logw("Finished getting kmers from the second file", Some("info"));
-    logw("Second part of filtering...", Some("info"));
+    log::info!("Finished getting kmers from the second file");
+    log::info!("Second part of filtering...");
 
     // // Now, get themap, histovec, and filter outdict and minmaxdict
     let mut countmap = kmer_filter.get_counts_map();
@@ -2888,15 +2787,9 @@ where
 
         // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
         // large (and so that we can detect it).
-        logw(
-            "Counting finished. Choosing the minimum count...",
-            Some("info"),
-        );
+        log::info!("Counting finished. Choosing the minimum count...");
         minc = choose_min_count(&histovec);
-        logw(
-            format!("Minimum count chosen: {}. Starting filtering...", minc).as_str(),
-            Some("info"),
-        );
+        log::info!("Minimum count chosen: {}. Starting filtering...", minc);
 
         post_state("preprocess:bloom:filtering");
         drain_countmap_into_themap(
@@ -3843,7 +3736,7 @@ where
 {
     if do_bloom {
         // Build indexes
-        logw("Processing using a Bloom filter", Some("info"));
+        log::info!("Processing using a Bloom filter");
 
         let (thedict, maxmindict, themap, histovec, used_min_count) =
             bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit);
@@ -3853,12 +3746,9 @@ where
         // record, so passing 0 through would sort and count after every single read.
         let csize = if csize == 0 { usize::MAX } else { csize };
         if csize == usize::MAX {
-            logw("Counting k-mers by sorting, without chunking", Some("info"));
+            log::info!("Counting k-mers by sorting, without chunking");
         } else {
-            logw(
-                format!("Counting k-mers by sorting, in chunks of {csize} records").as_str(),
-                Some("info"),
-            );
+            log::info!("Counting k-mers by sorting, in chunks of {csize} records");
         }
 
         let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();

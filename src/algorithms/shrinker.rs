@@ -1,6 +1,5 @@
 //! Shrink the given graph
 use crate::algorithms::corrector::prune_unpaired_edges;
-use crate::logw;
 use sparrowhawk_graph::{CarryType, DbgGraph, EdgeId, EdgeType, NodeId};
 
 use std::collections::BTreeSet;
@@ -42,10 +41,10 @@ impl Shrinkable for DbgGraph {
         loop {
             let mut pass_changed = false;
             let ambnodes = self.get_ambiguous_nodes_bi(); // Just in case we hadn't got them yet
-            logw(format!("Starting shrinking the graph with {} nodes and {} edges, beginning from {} ambiguous nodes",
+            log::info!("Starting shrinking the graph with {} nodes and {} edges, beginning from {} ambiguous nodes",
                   self.node_count(),
                   self.edge_count(),
-                  ambnodes.len()).as_str(), Some("info"));
+                  ambnodes.len());
             for an in ambnodes.iter() {
                 if !self.contains_node(*an) {
                     continue;

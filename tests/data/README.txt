@@ -9,3 +9,8 @@ ecoli_window_1.fastq.gz, ecoli_window_2.fastq.gz
   The 2,072 read pairs of the Mason simulation simreads_mason_150_350_30_30_13478 (150 bp reads,
   ~30x) in which either mate has a 31-mer, sampled every 10 bases, that occurs in the window.
   Reads, qualities and order are unchanged from the simulation.
+
+Expected contigs
+  sparrowhawk-asm build ecoli_window_1.fastq.gz ecoli_window_2.fastq.gz --threads 2 --no-graphs
+  --no-histo (CLI defaults otherwise): FASTA at 80 bases per line, md5
+  6ec5c2b95ed2080067608ae058d12a77.

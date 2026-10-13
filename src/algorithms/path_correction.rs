@@ -435,16 +435,13 @@ pub(crate) fn remove_bulges(graph: &mut DbgGraph, pop_ratio: f32, coverage: &Cov
 
     // Examined vs collapsed, as EC reports: the shape test admits far more candidates than the
     // coverage test removes, and only the second number says whether the rule is doing anything.
-    crate::logw(
-        &format!(
-            "Bulge removal: {collapsed}/{examined} bulges collapsed ({stale} stale, {no_alt} no \
+    log::info!(
+        "Bulge removal: {collapsed}/{examined} bulges collapsed ({stale} stale, {no_alt} no \
              alternative, {capped} search capped, ratio {pop_ratio}, ceiling {:?}). Graph has {} \
              nodes and {} edges",
-            coverage.error_ceiling(),
-            graph.node_count(),
-            graph.edge_count()
-        ),
-        Some("info"),
+        coverage.error_ceiling(),
+        graph.node_count(),
+        graph.edge_count()
     );
 
     changed
@@ -561,15 +558,16 @@ pub(crate) fn remove_erroneous_connections(
 
     // Examined vs removed, because the two diverge: the shape test admits far more candidates than
     // the coverage test removes, and only the second number says whether the rule is doing anything.
-    crate::logw(
-        &format!(
-            "Erroneous-connection removal: {removed}/{examined} connectors removed (ratio {ratio}, \
+    log::info!(
+        "Erroneous-connection removal: {removed}/{examined} connectors removed (ratio {ratio}, \
              {} flanks). Graph has {} nodes and {} edges",
-            if require_both_flanks { "both" } else { "either" },
-            graph.node_count(),
-            graph.edge_count()
-        ),
-        Some("info"),
+        if require_both_flanks {
+            "both"
+        } else {
+            "either"
+        },
+        graph.node_count(),
+        graph.edge_count()
     );
     changed
 }

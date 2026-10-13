@@ -4,13 +4,13 @@ use rayon::prelude::*;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
-use std::{io::Write, path::PathBuf, time::Instant};
+use std::path::PathBuf;
+
+#[cfg(not(target_family = "wasm"))]
+use crate::clock::Instant;
 
 #[cfg(not(target_family = "wasm"))]
 use super::io_utils::*;
-
-#[cfg(not(target_family = "wasm"))]
-use needletail::parser::write_fasta;
 
 use crate::algorithms::collapser::Collapsable;
 use crate::algorithms::corrector::Correctable;
@@ -25,7 +25,6 @@ use crate::nthash;
 use std::fmt;
 
 use crate::bit_encoding::rc_base;
-use crate::logw;
 #[cfg(target_family = "wasm")]
 use crate::post_state;
 
@@ -323,19 +322,6 @@ impl Contigs {
             self.serialized_contigs[ic].drain(1..);
         }
     }
-
-    /// Save contigs in a file
-    #[cfg(not(target_family = "wasm"))]
-    pub fn write_fasta<W: Write>(&self, f: &mut W) {
-        for i in 0..self.contig_sequences.as_ref().unwrap().len() {
-            let _ = write_fasta(
-                i.to_string().as_bytes(),
-                &self.contig_sequences.as_ref().unwrap()[i][..],
-                f,
-                needletail::parser::LineEnding::Unix,
-            );
-        }
-    }
 }
 
 /// Why a walk could not be spelled.
@@ -494,10 +480,7 @@ impl Assemble for BasicAsm {
             ec_require_both_flanks,
         } = correction;
 
-        logw(
-            "Constructing graph. Searching for neighbours...",
-            Some("info"),
-        );
+        log::info!("Constructing graph. Searching for neighbours...");
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
         }
@@ -506,7 +489,8 @@ impl Assemble for BasicAsm {
 
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
-            logw(
+            log::info!(
+                "{}",
                 format!(
                     "Neighbours searched for in {} s. Creating graph...",
                     timevec
@@ -515,8 +499,7 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                .as_str(),
-                Some("info"),
+                .as_str()
             );
         }
 
@@ -527,7 +510,8 @@ impl Assemble for BasicAsm {
 
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
-            logw(
+            log::info!(
+                "{}",
                 format!(
                     "Graph created in {} s.",
                     timevec
@@ -536,14 +520,13 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                .as_str(),
-                Some("info"),
+                .as_str()
             )
         }
 
-        logw("Starting graph correction", Some("info"));
+        log::info!("Starting graph correction");
 
-        logw("Removing self-loops", Some("info"));
+        log::info!("Removing self-loops");
         ptgraph.remove_self_loops();
 
         let t_phase1 = Instant::now();
@@ -588,7 +571,8 @@ impl Assemble for BasicAsm {
 
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
-            logw(
+            log::info!(
+                "{}",
                 format!(
                     "Graph correction finished in {} s.",
                     timevec
@@ -597,13 +581,12 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                .as_str(),
-                Some("info"),
+                .as_str()
             );
         }
 
         if path.is_some() {
-            logw("Saving graph (post-shrink, pre-collapse, w/o one-node contigs) as DOT, GFAv1.1, and GFAv2 files...", Some("info"));
+            log::info!("Saving graph (post-shrink, pre-collapse, w/o one-node contigs) as DOT, GFAv1.1, and GFAv2 files...");
             let pathmutref = path.as_mut().unwrap();
             pathmutref.set_extension("dot");
             let mut wbufdot = set_ostream(&Some(
@@ -622,7 +605,7 @@ impl Assemble for BasicAsm {
                 pathmutref.clone().into_os_string().into_string().unwrap(),
             ));
             ptgraph.write_to_gfa2(&mut wbufgfa2);
-            logw("Done.", Some("info"));
+            log::info!("Done.");
         }
 
         if let Some(timevec) = timevec.as_mut() {
@@ -631,7 +614,8 @@ impl Assemble for BasicAsm {
         let serialized_contigs = ptgraph.collapse();
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
-            logw(
+            log::info!(
+                "{}",
                 format!(
                     "Graph collapse finished in {} s.",
                     timevec
@@ -640,13 +624,9 @@ impl Assemble for BasicAsm {
                         .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
                         .as_secs()
                 )
-                .as_str(),
-                Some("info"),
+                .as_str()
             );
-            logw(
-                format!("I created {} contigs", serialized_contigs.len()).as_str(),
-                Some("info"),
-            );
+            log::info!("I created {} contigs", serialized_contigs.len());
         }
 
         let mut contigs = Contigs::new(serialized_contigs);
@@ -679,7 +659,7 @@ impl Assemble for BasicAsm {
             ec_require_both_flanks: _,
         } = correction;
 
-        logw("Starting assembler!", Some("info"));
+        log::info!("Starting assembler!");
 
         post_state("assembly:starting");
         post_state("assembly:create_graph");
@@ -690,21 +670,15 @@ impl Assemble for BasicAsm {
             (nalone as f64) / (nkmers as f64) * 100.0
         };
 
-        logw(
-            format!("Prop. of alone kmers: {:.1} %", alone_pct).as_str(),
-            Some("trace"),
-        );
-        logw(
-            format!("Number of edges {}", (directed_edge_refs as f64) / 2_f64).as_str(),
-            Some("trace"),
-        );
+        log::trace!("Prop. of alone kmers: {:.1} %", alone_pct);
+        log::trace!("Number of edges {}", (directed_edge_refs as f64) / 2_f64);
 
         let mut ptgraph = DbgGraph::from_kmer_map(k, indict);
 
         post_state("assembly:correct_graph");
-        logw("Starting graph correction", Some("info"));
+        log::info!("Starting graph correction");
 
-        logw("Removing self-loops", Some("info"));
+        log::info!("Removing self-loops");
         ptgraph.remove_self_loops();
 
         loop {
@@ -733,7 +707,7 @@ impl Assemble for BasicAsm {
             }
         }
 
-        logw("Shrinkage and pruning finished", Some("info"));
+        log::info!("Shrinkage and pruning finished");
 
         let outdot = ptgraph.get_dot_string();
         let outgfa = ptgraph.get_gfa_string();
@@ -742,10 +716,7 @@ impl Assemble for BasicAsm {
         post_state("assembly:collapse_graph");
 
         let serialized_contigs = ptgraph.collapse();
-        logw(
-            format!("I created {} contigs", serialized_contigs.len()).as_str(),
-            Some("info"),
-        );
+        log::info!("I created {} contigs", serialized_contigs.len());
         let mut contigs = Contigs::new(serialized_contigs);
 
         // TEMPORAL RESTRICTION, WIP

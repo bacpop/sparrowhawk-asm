@@ -1,6 +1,7 @@
 //! Spelling contigs and writing them as FASTA.
 
 use core::panic;
+use std::io::Write;
 
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
@@ -12,8 +13,6 @@ use crate::bit_encoding::UInt;
 #[cfg(target_family = "wasm")]
 use crate::cli::DEFAULT_MIN_CONTIG_LENGTH_NTS;
 use crate::graph_works::{spell_path, Contigs, KmerLookup};
-#[cfg(target_family = "wasm")]
-use crate::logw;
 
 /// Spells each contig and keeps those of at least `DEFAULT_MIN_CONTIG_LENGTH_NTS` bases.
 #[cfg(target_family = "wasm")]
@@ -26,12 +25,9 @@ pub fn write_sequences_and_coverages<IntT>(
 {
     let sequences = spell_contigs(invec, inmap, k);
     let kept = at_least(&sequences, DEFAULT_MIN_CONTIG_LENGTH_NTS);
-    logw(
-        &format!(
-            "Omitted {} contigs shorter than {DEFAULT_MIN_CONTIG_LENGTH_NTS} nt from FASTA output",
-            sequences.len() - kept.len()
-        ),
-        Some("info"),
+    log::info!(
+        "Omitted {} contigs shorter than {DEFAULT_MIN_CONTIG_LENGTH_NTS} nt from FASTA output",
+        sequences.len() - kept.len()
     );
     invec.contig_sequences = Some(kept);
 }
@@ -65,6 +61,29 @@ pub(crate) fn at_least(seqs: &[Vec<u8>], min_contig_length: usize) -> Vec<Vec<u8
         .collect()
 }
 
+/// Bases per FASTA line.
+const FASTA_LINE_WIDTH: usize = 80;
+
+/// Writes `seqs` as FASTA, named by their index, `FASTA_LINE_WIDTH` bases per line.
+pub(crate) fn write_fasta<W: Write>(seqs: &[Vec<u8>], out: &mut W) -> std::io::Result<()> {
+    for (i, seq) in seqs.iter().enumerate() {
+        writeln!(out, ">{i}")?;
+        for line in seq.chunks(FASTA_LINE_WIDTH) {
+            out.write_all(line)?;
+            out.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+/// The same FASTA as text, for the page to offer as a download.
+#[cfg(target_family = "wasm")]
+pub(crate) fn fasta_string(seqs: &[Vec<u8>]) -> String {
+    let mut out = Vec::new();
+    write_fasta(seqs, &mut out).expect("writing to memory cannot fail");
+    String::from_utf8(out).expect("contigs are ASCII")
+}
+
 /// Writes spelled contigs of at least `min_contig_length` bases as FASTA, as the single-k path does.
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn save_sequences_as_fasta(
@@ -77,12 +96,8 @@ pub(crate) fn save_sequences_as_fasta(
         "Omitted {} contigs shorter than {min_contig_length} nt from FASTA output",
         seqs.len() - kept.len()
     );
-    let contigs = Contigs {
-        serialized_contigs: Vec::new(),
-        contig_sequences: Some(kept),
-    };
     let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
-    contigs.write_fasta(&mut wbuf);
+    write_fasta(&kept, &mut wbuf).expect("cannot write the contigs");
 }
 
 /// Stores all the contigs in fasta format, but exports it as JSON for javascript
@@ -96,37 +111,10 @@ where
     IntT: for<'a> UInt<'a>,
 {
     // First, we write the sequences and the coverages
-    logw("Preparing to export contigs...", Some("info"));
+    log::info!("Preparing to export contigs...");
 
     write_sequences_and_coverages(ingraph, inmap, k);
-
-    logw("Saving in FASTA format as a JSON", Some("info"));
-    // Now, we just write all the contigs. We get our writing buffer with this:
-    let mut out = "".to_string();
-    let mut tmpvec: Vec<u8> = Vec::with_capacity(80);
-    let mut tmpcounter: usize;
-
-    for i in 0..ingraph.contig_sequences.as_ref().unwrap().len() {
-        out += (">".to_owned() + i.to_string().as_str() + "\n").as_str();
-        tmpcounter = 0;
-        tmpvec.clear();
-
-        for j in &ingraph.contig_sequences.as_ref().unwrap()[i][..] {
-            tmpvec.push(*j);
-            tmpcounter += 1;
-            if tmpcounter >= 80 {
-                out += &(String::from_utf8(tmpvec.clone()).unwrap() + "\n");
-                tmpcounter = 0;
-                tmpvec.clear();
-            }
-        }
-
-        if !tmpvec.is_empty() {
-            out += &(String::from_utf8(tmpvec.clone()).unwrap() + "\n");
-        }
-    }
-
-    out
+    fasta_string(ingraph.contig_sequences.as_ref().unwrap())
 }
 
 //
@@ -237,5 +225,22 @@ mod tests {
         let sequences = [pseudo_seq(500), pseudo_seq(499)];
         assert_eq!(at_least(&sequences, 500), vec![sequences[0].clone()]);
         assert_eq!(at_least(&sequences, 499).len(), 2);
+    }
+
+    /// Headers are the contigs' indices, and sequences wrap every `FASTA_LINE_WIDTH` bases.
+    #[test]
+    fn fasta_wraps_sequences_at_the_line_width() {
+        let seqs = vec![
+            vec![b'A'; 2 * FASTA_LINE_WIDTH + 5],
+            vec![b'C'; FASTA_LINE_WIDTH],
+        ];
+        let mut out = Vec::new();
+        write_fasta(&seqs, &mut out).unwrap();
+        let a = "A".repeat(FASTA_LINE_WIDTH);
+        let c = "C".repeat(FASTA_LINE_WIDTH);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(">0\n{a}\n{a}\nAAAAA\n>1\n{c}\n")
+        );
     }
 }

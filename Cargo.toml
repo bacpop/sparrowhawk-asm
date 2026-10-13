@@ -32,8 +32,6 @@ argmin-math = { version = "0.4" }
 clap = { version = "4.5.35", features = ["derive"] }
 needletail = { version = "0.7.3", default-features = false, features = ["flate2"] }
 plotters = { version = "0.3.7", default-features = false, features = ["ab_glyph", "bitmap_backend", "bitmap_encoder", "svg_backend", "line_series"] }
-fern = { version = "0.7.1" }
-humantime = { version = "2.2.0" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 argmin = { version = "0.10.0", default-features = false, features = ["wasm-bindgen"] }

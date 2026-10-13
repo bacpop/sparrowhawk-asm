@@ -6,11 +6,16 @@ use std::fmt;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 #[cfg(not(target_family = "wasm"))]
-use std::{
-    path::{Path, PathBuf},
-    time::Instant,
-    time::SystemTime,
-};
+use std::path::{Path, PathBuf};
+
+#[cfg(not(target_family = "wasm"))]
+use crate::clock::Instant;
+
+/// A monotonic clock that also works in the browser
+pub mod clock;
+
+/// The logger, natively to stdout and the log file, in the browser to the console
+pub mod logging;
 
 /// Construction, assembly, shrinkage, pruning, and collapse of DNA de Bruijn graphs
 pub mod graph_works;
@@ -86,38 +91,6 @@ pub mod fastx_wasm;
 #[cfg(target_family = "wasm")]
 use crate::graph_works::Contigs;
 
-/// Logging wrapper function for the WebAssembly version
-#[cfg(target_family = "wasm")]
-pub fn logw(text: &str, typ: Option<&str>) {
-    if let Some(thetyp) = typ {
-        log((String::from("Sparrowhawk::") + thetyp + "::" + text).as_str());
-    } else {
-        log(text);
-    }
-}
-
-/// Logging wrapper function for the standalone version
-#[cfg(not(target_family = "wasm"))]
-pub fn logw(text: &str, typ: Option<&str>) {
-    if let Some(realtyp) = typ {
-        if realtyp == "info" {
-            log::info!("{}", text);
-        } else if realtyp == "debug" {
-            log::debug!("{}", text);
-        } else if realtyp == "trace" {
-            log::trace!("{}", text);
-        } else if realtyp == "warn" {
-            log::warn!("{}", text);
-        } else if realtyp == "error" {
-            log::error!("{}", text);
-        } else {
-            println!("{}", text);
-        }
-    } else {
-        println!("{}", text);
-    }
-}
-
 /// Quality filtering options for FASTQ files
 pub struct QualOpts {
     /// Minimum k-mer count across reads to be added
@@ -136,26 +109,6 @@ impl fmt::Display for QualOpts {
             self.min_qual.saturating_add(33) as char,
         )
     }
-}
-
-#[cfg(not(target_family = "wasm"))]
-/// Sets up logging
-pub fn set_up_logging(level: log::LevelFilter, outfile: PathBuf) {
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{} {} {}] {}",
-                humantime::format_rfc3339_seconds(SystemTime::now()),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
-        .level(level)
-        .chain(std::io::stdout())
-        .chain(fern::log_file(outfile).unwrap())
-        .apply()
-        .unwrap();
 }
 
 /// Everything the `build` pipeline needs, once `IntT` has been chosen.
@@ -815,10 +768,9 @@ pub fn main() {
             let outputlogfile: PathBuf =
                 Path::new(output_dir).join(format!("{output_prefix}_log.txt"));
             if args.verbose {
-                // set_up_logging(log::LevelFilter::Trace, outputlogfile);
-                set_up_logging(log::LevelFilter::Info, outputlogfile);
+                logging::init(log::LevelFilter::Info, &outputlogfile);
             } else {
-                set_up_logging(log::LevelFilter::Warn, outputlogfile);
+                logging::init(log::LevelFilter::Warn, &outputlogfile);
             }
 
             check_threads(*threads);
@@ -1004,11 +956,16 @@ pub fn main() {
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 extern "C" {
-    #[wasm_bindgen(js_namespace = console)]
-    fn log(s: &str);
-
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn console_log(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = warn)]
+    fn console_warn(s: &str);
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(s: &str);
     #[wasm_bindgen(js_name = postMessage)]
     fn post_message(data: &JsValue);
+    #[wasm_bindgen(js_namespace = performance, js_name = now)]
+    fn performance_now() -> f64;
 }
 
 #[cfg(target_family = "wasm")]
@@ -1068,7 +1025,7 @@ impl AssemblyHelper {
     /// Constructor/initialiser of the wasm assembler. It also performs the preprocessing.
     pub fn new(
         k: u32,
-        _verbose: bool,
+        verbose: bool,
         min_count: u16,
         min_qual: u8,
         chunk_size: u32,
@@ -1090,9 +1047,12 @@ impl AssemblyHelper {
             init_panic_hook();
         }
 
-        // TODO: improve verbose with the creation of a logging class and object that carries the verbose level and affects the logw functions, or something similar.
-
-        logw("Beginning processing", Some("info"));
+        logging::init(if verbose {
+            log::LevelFilter::Info
+        } else {
+            log::LevelFilter::Warn
+        });
+        log::info!("Beginning processing");
         post_state("initialised");
 
         Self {
@@ -1135,7 +1095,7 @@ impl AssemblyHelper {
             min_qual: self.min_qual,
         };
 
-        logw("Beginning processing", Some("info"));
+        log::info!("Beginning processing");
 
         let preprocessed_data: HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>;
         let maxmindict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
@@ -1151,10 +1111,7 @@ impl AssemblyHelper {
         } else if self.k < 3 {
             panic!("kmer length too small (min. 3)");
         } else if self.k <= 32 {
-            logw(
-                format!("k={}: using 64-bit representation", self.k).as_str(),
-                Some("info"),
-            );
+            log::info!("k={}: using 64-bit representation", self.k);
 
             (
                 preprocessed_data,
@@ -1172,12 +1129,9 @@ impl AssemblyHelper {
                 self.do_fit,
             );
 
-            logw("Preprocessing done!", Some("info"));
+            log::info!("Preprocessing done!");
         } else if self.k <= 64 {
-            logw(
-                format!("k={}: using 128-bit representation", self.k).as_str(),
-                Some("info"),
-            );
+            log::info!("k={}: using 128-bit representation", self.k);
 
             (
                 preprocessed_data,
@@ -1195,12 +1149,9 @@ impl AssemblyHelper {
                 self.do_fit,
             );
 
-            logw("Preprocessing done!", Some("info"));
+            log::info!("Preprocessing done!");
         } else if self.k <= 128 {
-            logw(
-                format!("k={}: using 256-bit representation", self.k).as_str(),
-                Some("info"),
-            );
+            log::info!("k={}: using 256-bit representation", self.k);
 
             (
                 preprocessed_data,
@@ -1218,12 +1169,9 @@ impl AssemblyHelper {
                 self.do_fit,
             );
 
-            logw("Preprocessing done!", Some("info"));
+            log::info!("Preprocessing done!");
         } else if self.k <= 256 {
-            logw(
-                format!("k={}: using 512-bit representation", self.k).as_str(),
-                Some("info"),
-            );
+            log::info!("k={}: using 512-bit representation", self.k);
 
             (
                 preprocessed_data,
@@ -1241,7 +1189,7 @@ impl AssemblyHelper {
                 self.do_fit,
             );
 
-            logw("Preprocessing done!", Some("info"));
+            log::info!("Preprocessing done!");
         } else {
             panic!("kmer length larger than 256 currently not supported.");
         }
@@ -1265,14 +1213,14 @@ impl AssemblyHelper {
         if ratio > 0.0 && ratio < 1.0 {
             self.bubble_pop_ratio = ratio;
         } else {
-            logw(
+            log::warn!(
+                "{}",
                 format!(
                     "Ignoring --bubble-pop-ratio {ratio}: it must be strictly between 0 and 1. \
                      Keeping {}.",
                     self.bubble_pop_ratio
                 )
-                .as_str(),
-                Some("warn"),
+                .as_str()
             );
         }
     }
@@ -1282,20 +1230,20 @@ impl AssemblyHelper {
         if kmult >= 0.0 {
             self.tip_length_kmult = kmult;
         } else {
-            logw(
+            log::warn!(
+                "{}",
                 format!(
                     "Ignoring --tip-length-kmult {kmult}: it must be >= 0. Keeping {}.",
                     self.tip_length_kmult
                 )
-                .as_str(),
-                Some("warn"),
+                .as_str()
             );
         }
     }
 
     /// Assemble method of the wasm version
     pub fn assemble(&mut self) {
-        logw("Starting assembly...", Some("info"));
+        log::info!("Starting assembly...");
         let (mut outcontigs, outdot, outgfa, outgfav2) = graph_works::BasicAsm::assemble_wasm(
             self.k,
             self.preprocessed_data.as_mut().unwrap(),
@@ -1327,7 +1275,7 @@ impl AssemblyHelper {
         );
 
         post_state("assembly:saving");
-        logw("Assembly done!", Some("info"));
+        log::info!("Assembly done!");
 
         let outfasta: String;
 
@@ -1363,7 +1311,7 @@ impl AssemblyHelper {
             panic!("kmer length larger than 256 currently not supported.");
         }
 
-        logw("Sparrowhawk done!", Some("info"));
+        log::info!("Sparrowhawk done!");
 
         self.contigs = outcontigs;
         self.outfasta = outfasta;
@@ -1391,14 +1339,14 @@ impl AssemblyHelper {
     pub fn get_preprocessing_info(&self) -> String {
         let mut results = json::JsonValue::new_array();
 
-        logw(
+        log::info!(
+            "{}",
             format!(
                 "{} {}",
                 self.preprocessed_data.as_ref().unwrap().len(),
                 self.histovec.as_ref().unwrap().len()
             )
-            .as_str(),
-            Some("info"),
+            .as_str()
         );
 
         results["nkmers"] =
@@ -1416,7 +1364,7 @@ impl AssemblyHelper {
         );
         results["used_min_count"] = json::JsonValue::Number(self.used_min_count.into());
 
-        logw(results.dump().as_str(), Some("debug"));
+        log::debug!("{}", results.dump().as_str());
 
         results.dump()
     }
