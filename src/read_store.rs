@@ -29,9 +29,51 @@ pub struct ReadStore {
     class_of: [u8; 256],
     /// Full blocks, shrunk to fit, then the one being filled.
     blocks: Vec<Block>,
+    stats: ReadStats,
+}
+
+/// How many reads a pass saw and how long they were: what a multi-k ladder is settled from.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadStats {
     reads: u64,
     bases: u64,
     max_read_len: usize,
+}
+
+impl ReadStats {
+    fn record(&mut self, seq: &[u8]) {
+        self.reads += 1;
+        self.bases += seq.len() as u64;
+        self.max_read_len = self.max_read_len.max(seq.len());
+    }
+
+    /// Longest read seen, in bases.
+    pub fn max_read_len(&self) -> usize {
+        self.max_read_len
+    }
+
+    /// Arithmetic mean read length, or `None` before any read.
+    pub fn average_read_len(&self) -> Option<f64> {
+        (self.reads > 0).then(|| self.bases as f64 / self.reads as f64)
+    }
+}
+
+/// What a first pass leaves behind of every read: the whole read, or only its length.
+pub trait RecordSink {
+    /// Take note of one read.
+    fn take(&mut self, seq: &[u8], qual: Option<&[u8]>);
+}
+
+impl RecordSink for ReadStore {
+    fn take(&mut self, seq: &[u8], qual: Option<&[u8]>) {
+        self.push(seq, qual);
+    }
+}
+
+impl RecordSink for ReadStats {
+    fn take(&mut self, seq: &[u8], _qual: Option<&[u8]>) {
+        self.record(seq);
+    }
 }
 
 impl ReadStore {
@@ -51,9 +93,7 @@ impl ReadStore {
             floors: floors.to_vec(),
             class_of,
             blocks: Vec::new(),
-            reads: 0,
-            bases: 0,
-            max_read_len: 0,
+            stats: ReadStats::default(),
         }
     }
 
@@ -64,12 +104,17 @@ impl ReadStore {
 
     /// Longest read seen, in bases.
     pub fn max_read_len(&self) -> usize {
-        self.max_read_len
+        self.stats.max_read_len()
     }
 
     /// Arithmetic mean read length over all stored records, or `None` for an empty store.
     pub fn average_read_len(&self) -> Option<f64> {
-        (self.reads > 0).then(|| self.bases as f64 / self.reads as f64)
+        self.stats.average_read_len()
+    }
+
+    /// The reads' count and lengths.
+    pub fn stats(&self) -> ReadStats {
+        self.stats
     }
 
     /// Pack one read into the open block. A FASTA read has no qualities and clears every floor, as it
@@ -124,9 +169,7 @@ impl ReadStore {
         block
             .ends
             .push(u32::try_from(pos).expect("a read block exceeds 4 Gbases"));
-        self.reads += 1;
-        self.bases += seq.len() as u64;
-        self.max_read_len = self.max_read_len.max(seq.len());
+        self.stats.record(seq);
     }
 
     /// Shrink the last, partial block to fit and report the store's size. Call once the first k's
@@ -143,8 +186,8 @@ impl ReadStore {
             .sum();
         log::info!(
             "Read store: {} reads, {} bases, {:.1} MB",
-            self.reads,
-            self.bases,
+            self.stats.reads,
+            self.stats.bases,
             heap as f64 / 1e6
         );
     }
@@ -207,25 +250,25 @@ impl Iterator for Records<'_> {
     }
 }
 
-/// Passes records through unchanged, packing each into the store on the way.
-pub struct Tee<'s, I> {
+/// Passes records through unchanged, leaving each in `sink` on the way.
+pub struct Tee<'s, I, S> {
     inner: I,
-    store: &'s mut ReadStore,
+    sink: &'s mut S,
 }
 
-impl<'s, I> Tee<'s, I> {
-    /// Wrap `inner`, packing its records into `store`.
-    pub fn new(inner: I, store: &'s mut ReadStore) -> Self {
-        Self { inner, store }
+impl<'s, I, S> Tee<'s, I, S> {
+    /// Wrap `inner`, leaving its records in `sink`.
+    pub fn new(inner: I, sink: &'s mut S) -> Self {
+        Self { inner, sink }
     }
 }
 
-impl<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>> Iterator for Tee<'_, I> {
+impl<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>, S: RecordSink> Iterator for Tee<'_, I, S> {
     type Item = I::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
         let record = self.inner.next()?;
-        self.store.push(&record.0, record.1.as_deref());
+        self.sink.take(&record.0, record.1.as_deref());
         Some(record)
     }
 }

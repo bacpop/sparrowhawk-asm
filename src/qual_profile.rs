@@ -13,20 +13,19 @@ pub const MIN_RUNG_GAP: u8 = 5;
 /// Tag for a window that clears no floor at all (fewer than k bases, or an N inside it).
 pub const NONE: u8 = u8::MAX;
 
-/// Distinct PHRED values on called bases (A, C, G, T) in the head of `path`, ascending. Ns carry
-/// Illumina's Q2 but break every window at every floor, so they say nothing about the ladder. Empty
-/// for FASTA, which has no qualities.
-pub fn peek_alphabet(path: &str, max_reads: usize) -> Vec<u8> {
+/// Distinct PHRED values on called bases (A, C, G, T) in the first `max_reads` of `records`, ascending.
+/// Ns carry Illumina's Q2 but break every window at every floor, so they say nothing about the ladder.
+/// Empty for FASTA, which has no qualities.
+pub fn peek_alphabet<I: Iterator<Item = crate::reads::OwnedRecord>>(
+    records: I,
+    max_reads: usize,
+) -> Vec<u8> {
     let mut seen = [false; 64];
-    let Ok(mut reader) = needletail::parse_fastx_file(path) else {
-        return Vec::new();
-    };
-    let mut n = 0;
-    while let Some(Ok(record)) = reader.next() {
-        let Some(qual) = record.qual() else {
+    for (seq, qual) in records.take(max_reads) {
+        let Some(qual) = qual else {
             return Vec::new();
         };
-        for (&base, &q) in record.seq().iter().zip(qual) {
+        for (&base, &q) in seq.iter().zip(&qual) {
             if !matches!(base, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't') {
                 continue;
             }
@@ -34,10 +33,6 @@ pub fn peek_alphabet(path: &str, max_reads: usize) -> Vec<u8> {
             if phred < seen.len() {
                 seen[phred] = true;
             }
-        }
-        n += 1;
-        if n >= max_reads {
-            break;
         }
     }
     (0..seen.len())
@@ -197,15 +192,11 @@ mod tests {
     /// Ns carry Q2 on Illumina, but they are not calls, so the peek leaves them out of the alphabet.
     #[test]
     fn the_peek_ignores_the_quality_of_ns() {
-        let path = std::env::temp_dir().join(format!("sphk-peek-{}.fq", std::process::id()));
-        std::fs::write(
-            &path,
-            "@r1\nACGTNNACGT\n+\n-.-.##-.-.\n@r2\nNACG\n+\n#---\n",
-        )
-        .unwrap();
-        let alphabet = peek_alphabet(path.to_str().unwrap(), 10);
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(alphabet, vec![12, 13]);
+        let records = vec![
+            (b"ACGTNNACGT".to_vec(), Some(b"-.-.##-.-.".to_vec())),
+            (b"NACG".to_vec(), Some(b"#---".to_vec())),
+        ];
+        assert_eq!(peek_alphabet(records.into_iter(), 10), vec![12, 13]);
     }
 
     /// An N breaks every run, so no window spanning it clears any floor, not even 0.

@@ -1,36 +1,21 @@
 use nohash_hasher::NoHashHasher;
-#[cfg(not(target_family = "wasm"))]
 use rayon::prelude::*;
 use std::{collections::HashMap, hash::BuildHasherDefault};
-
-#[cfg(not(target_family = "wasm"))]
-use std::path::PathBuf;
-
-#[cfg(not(target_family = "wasm"))]
-use crate::clock::Instant;
-
-#[cfg(not(target_family = "wasm"))]
-use super::io_utils::*;
 
 use crate::algorithms::collapser::Collapsable;
 use crate::algorithms::corrector::Correctable;
 use crate::algorithms::corrector::CorrectionOpts;
-#[cfg(not(target_family = "wasm"))]
 use crate::algorithms::path_correction::{remove_bulges, remove_erroneous_connections};
 use crate::algorithms::shrinker::Shrinkable;
 use crate::bit_encoding::UInt;
-#[cfg(not(target_family = "wasm"))]
+use crate::clock::Instant;
 use crate::indexed_kmers::{IndexedKmers, OrientedKmerIndex};
 use crate::nthash;
 use std::fmt;
 
 use crate::bit_encoding::rc_base;
-#[cfg(target_family = "wasm")]
-use crate::post_state;
 
-#[cfg(not(target_family = "wasm"))]
-use sparrowhawk_graph::IndexedEdge;
-use sparrowhawk_graph::{DbgGraph, EdgeType, HashInfoSimple, SerializedContigs};
+use sparrowhawk_graph::{DbgGraph, EdgeType, IndexedEdge, SerializedContigs};
 
 /// Retrieves a packed canonical k-mer by its hash.
 pub trait KmerLookup<IntT> {
@@ -38,13 +23,6 @@ pub trait KmerLookup<IntT> {
     fn get_kmer(&self, hash: u64) -> Option<IntT>;
 }
 
-impl<IntT: Copy> KmerLookup<IntT> for HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>> {
-    fn get_kmer(&self, hash: u64) -> Option<IntT> {
-        self.get(&hash).copied()
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
 impl<IntT: Copy> KmerLookup<IntT> for IndexedKmers<IntT> {
     fn get_kmer(&self, hash: u64) -> Option<IntT> {
         self.get_packed(hash).copied()
@@ -101,105 +79,8 @@ fn fwd_candidates(hc: u64, hnc: u64, k: usize, bases: u8) -> [(u64, EdgeType, Ed
     out
 }
 
-/// The candidates present in the legacy dictionaries: a canonical hit directly, a reverse-complement
-/// one through `maxmindict`.
-fn dict_hits(
-    candidates: [(u64, EdgeType, EdgeType); 8],
-    thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-) -> Vec<(u64, EdgeType)> {
-    candidates
-        .into_iter()
-        .filter_map(|(hash, canonical, reverse)| {
-            if thedict.contains_key(&hash) {
-                Some((hash, canonical))
-            } else {
-                maxmindict
-                    .get(&hash)
-                    .filter(|h| thedict.contains_key(*h))
-                    .map(|&h| (h, reverse))
-            }
-        })
-        .collect()
-}
-
-/// Get backwards neighbours, i.e. incoming edges to either the canonical or non-canonical hashes
-pub fn check_bkg(
-    // backwards here mean INCOMING edges, whether from the rev.-comp. strand, or the direct one
-    hc: u64,
-    hnc: u64,
-    k: usize,
-    bases: u8,
-    thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-) -> Vec<(u64, EdgeType)> {
-    dict_hits(bkg_candidates(hc, hnc, k, bases), thedict, maxmindict)
-}
-
-/// Get forward neighbours, i.e. outgoing edges from either the canonical or non-canonical hashes
-pub fn check_fwd(
-    hc: u64,
-    hnc: u64,
-    k: usize,
-    bases: u8,
-    thedict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-) -> Vec<(u64, EdgeType)> {
-    dict_hits(fwd_candidates(hc, hnc, k, bases), thedict, maxmindict)
-}
-
-#[cfg_attr(all(not(target_family = "wasm"), not(test)), allow(dead_code))]
-#[allow(clippy::type_complexity)]
-pub(crate) fn populate_neighbours(
-    k: usize,
-    indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    maxmindict: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-) -> (usize, usize, usize) {
-    // Serial on wasm: rayon there falls back to a single-threaded registry, so `par_iter` buys nothing,
-    // and its unindexed `collect` builds an intermediate linked list of `Vec`s — allocation we cannot
-    // afford under the 4 GiB linear-memory cap.
-    let updates: Vec<(u64, Vec<(u64, EdgeType)>, Vec<(u64, EdgeType)>)> = {
-        let dict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> = indict;
-        let search = |(h, hi): (&u64, &HashInfoSimple)| {
-            let pre = check_bkg(*h, hi.hnc, k, hi.b, dict, maxmindict);
-            let post = check_fwd(*h, hi.hnc, k, hi.b, dict, maxmindict);
-            (*h, pre, post)
-        };
-
-        // Serial on wasm: rayon there falls back to a single-threaded registry, so `par_iter` buys nothing, and its unindexed `collect` builds an intermediate linked list of `Vec`s, so just add the gate to avoid consuming more memory.
-        #[cfg(not(target_family = "wasm"))]
-        {
-            dict.par_iter().map(search).collect()
-        }
-        #[cfg(target_family = "wasm")]
-        {
-            dict.iter().map(search).collect()
-        }
-    };
-
-    let mut nkmers = 0;
-    let mut nalone = 0;
-    let mut directed_edge_refs = 0;
-
-    for (h, pre, post) in updates {
-        nkmers += 1;
-        directed_edge_refs += pre.len() + post.len();
-        if pre.is_empty() && post.is_empty() {
-            nalone += 1;
-        }
-
-        let entry = indict.get_mut(&h).unwrap();
-        entry.pre = pre;
-        entry.post = post;
-    }
-
-    (nkmers, nalone, directed_edge_refs)
-}
-
-#[cfg(not(target_family = "wasm"))]
 type OrientedLookup = HashMap<u64, OrientedKmerIndex, BuildHasherDefault<NoHashHasher<u64>>>;
 
-#[cfg(not(target_family = "wasm"))]
 fn indexed_edge(
     hash: u64,
     lookup: &OrientedLookup,
@@ -216,7 +97,6 @@ fn indexed_edge(
     })
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn check_bkg_indexed(
     hc: u64,
     hnc: u64,
@@ -230,7 +110,6 @@ fn check_bkg_indexed(
         .collect()
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn check_fwd_indexed(
     hc: u64,
     hnc: u64,
@@ -244,7 +123,6 @@ fn check_fwd_indexed(
         .collect()
 }
 
-#[cfg(not(target_family = "wasm"))]
 pub(crate) fn populate_indexed_neighbours<IntT>(
     k: usize,
     kmers: &mut IndexedKmers<IntT>,
@@ -433,24 +311,23 @@ where
 
 /// Public API for assemblers.
 pub trait Assemble {
-    #[cfg(not(target_family = "wasm"))]
-    /// Assembles given data and writes results into the output file.
+    /// Build the graph of `kmers`, correct it, and collapse it into contigs. `graph_sink` sees the
+    /// corrected graph before the collapse: natively it writes DOT and GFA files, and in the browser it
+    /// keeps them as text for the page.
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         kmers: &mut IndexedKmers<IntT>,
         timevec: &mut Option<&mut Vec<Instant>>,
-        path: &mut Option<PathBuf>,
+        graph_sink: Option<&mut dyn FnMut(&DbgGraph)>,
         correction: CorrectionOpts,
     ) -> Contigs;
+}
 
-    #[cfg(target_family = "wasm")]
-    /// Assembles given data and prepares all info for being later transferred to Javascript.
-    fn assemble_wasm(
-        k: usize,
-        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-        maxminsize: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        correction: CorrectionOpts,
-    ) -> (Contigs, String, String, String);
+/// Seconds between the last two stamps of `timevec`.
+fn last_step_secs(timevec: &[Instant]) -> u64 {
+    timevec[timevec.len() - 1]
+        .duration_since(timevec[timevec.len() - 2])
+        .as_secs()
 }
 
 ///////////////////////////////////////////////////////////
@@ -458,12 +335,11 @@ pub trait Assemble {
 pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
-    #[cfg(not(target_family = "wasm"))]
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         kmers: &mut IndexedKmers<IntT>,
         timevec: &mut Option<&mut Vec<Instant>>,
-        path: &mut Option<PathBuf>,
+        graph_sink: Option<&mut dyn FnMut(&DbgGraph)>,
         correction: CorrectionOpts,
     ) -> Contigs {
         // Unpacked once, so the body below reads exactly as it did when these were parameters.
@@ -480,6 +356,7 @@ impl Assemble for BasicAsm {
             ec_require_both_flanks,
         } = correction;
 
+        crate::post_state("assembly:create_graph");
         log::info!("Constructing graph. Searching for neighbours...");
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
@@ -490,16 +367,8 @@ impl Assemble for BasicAsm {
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
             log::info!(
-                "{}",
-                format!(
-                    "Neighbours searched for in {} s. Creating graph...",
-                    timevec
-                        .last()
-                        .unwrap()
-                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                        .as_secs()
-                )
-                .as_str()
+                "Neighbours searched for in {} s. Creating graph...",
+                last_step_secs(timevec)
             );
         }
 
@@ -510,20 +379,10 @@ impl Assemble for BasicAsm {
 
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
-            log::info!(
-                "{}",
-                format!(
-                    "Graph created in {} s.",
-                    timevec
-                        .last()
-                        .unwrap()
-                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                        .as_secs()
-                )
-                .as_str()
-            )
+            log::info!("Graph created in {} s.", last_step_secs(timevec));
         }
 
+        crate::post_state("assembly:correct_graph");
         log::info!("Starting graph correction");
 
         log::info!("Removing self-loops");
@@ -572,60 +431,23 @@ impl Assemble for BasicAsm {
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
             log::info!(
-                "{}",
-                format!(
-                    "Graph correction finished in {} s.",
-                    timevec
-                        .last()
-                        .unwrap()
-                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                        .as_secs()
-                )
-                .as_str()
+                "Graph correction finished in {} s.",
+                last_step_secs(timevec)
             );
         }
 
-        if path.is_some() {
-            log::info!("Saving graph (post-shrink, pre-collapse, w/o one-node contigs) as DOT, GFAv1.1, and GFAv2 files...");
-            let pathmutref = path.as_mut().unwrap();
-            pathmutref.set_extension("dot");
-            let mut wbufdot = set_ostream(&Some(
-                pathmutref.clone().into_os_string().into_string().unwrap(),
-            ));
-            ptgraph.write_to_dot(&mut wbufdot);
-
-            pathmutref.set_extension("gfa");
-            let mut wbufgfa = set_ostream(&Some(
-                pathmutref.clone().into_os_string().into_string().unwrap(),
-            ));
-            ptgraph.write_to_gfa(&mut wbufgfa);
-
-            pathmutref.set_extension("gfa2");
-            let mut wbufgfa2 = set_ostream(&Some(
-                pathmutref.clone().into_os_string().into_string().unwrap(),
-            ));
-            ptgraph.write_to_gfa2(&mut wbufgfa2);
-            log::info!("Done.");
+        if let Some(sink) = graph_sink {
+            sink(&ptgraph);
         }
 
+        crate::post_state("assembly:collapse_graph");
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
         }
         let serialized_contigs = ptgraph.collapse();
         if let Some(timevec) = timevec.as_mut() {
             timevec.push(Instant::now());
-            log::info!(
-                "{}",
-                format!(
-                    "Graph collapse finished in {} s.",
-                    timevec
-                        .last()
-                        .unwrap()
-                        .duration_since(*timevec.get(timevec.len().wrapping_sub(2)).unwrap())
-                        .as_secs()
-                )
-                .as_str()
-            );
+            log::info!("Graph collapse finished in {} s.", last_step_secs(timevec));
             log::info!("I created {} contigs", serialized_contigs.len());
         }
 
@@ -635,94 +457,6 @@ impl Assemble for BasicAsm {
         contigs.shrink();
 
         contigs
-    }
-
-    #[cfg(target_family = "wasm")]
-    fn assemble_wasm(
-        k: usize,
-        indict: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-        maxmindict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        correction: CorrectionOpts,
-    ) -> (Contigs, String, String, String) {
-        // Unpacked once, so the body below reads exactly as it did when these were parameters.
-        let CorrectionOpts {
-            do_bubble_collapse,
-            do_dead_end_removal,
-            pop_ratio,
-            tip_nts,
-            tip_rctc_nts,
-            tip_rctc_cutoff,
-            coverage,
-            // EC removal is native-only, so the browser never reads these.
-            do_ec_removal: _,
-            ec_ratio: _,
-            ec_require_both_flanks: _,
-        } = correction;
-
-        log::info!("Starting assembler!");
-
-        post_state("assembly:starting");
-        post_state("assembly:create_graph");
-        let (nkmers, nalone, directed_edge_refs) = populate_neighbours(k, indict, maxmindict);
-        let alone_pct = if nkmers == 0 {
-            0.0
-        } else {
-            (nalone as f64) / (nkmers as f64) * 100.0
-        };
-
-        log::trace!("Prop. of alone kmers: {:.1} %", alone_pct);
-        log::trace!("Number of edges {}", (directed_edge_refs as f64) / 2_f64);
-
-        let mut ptgraph = DbgGraph::from_kmer_map(k, indict);
-
-        post_state("assembly:correct_graph");
-        log::info!("Starting graph correction");
-
-        log::info!("Removing self-loops");
-        ptgraph.remove_self_loops();
-
-        loop {
-            let shrink_changed_graph = ptgraph.shrink();
-            let pruned = if do_dead_end_removal {
-                ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff)
-            } else {
-                false
-            };
-            if !shrink_changed_graph && !pruned {
-                break;
-            }
-        }
-
-        loop {
-            let mut changed = false;
-            if do_bubble_collapse {
-                changed |= ptgraph.correct_bubbles(pop_ratio, &coverage);
-            }
-            changed |= ptgraph.shrink();
-            if do_dead_end_removal {
-                changed |= ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff);
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        log::info!("Shrinkage and pruning finished");
-
-        let outdot = ptgraph.get_dot_string();
-        let outgfa = ptgraph.get_gfa_string();
-        let outgfa2 = ptgraph.get_gfa2_string();
-
-        post_state("assembly:collapse_graph");
-
-        let serialized_contigs = ptgraph.collapse();
-        log::info!("I created {} contigs", serialized_contigs.len());
-        let mut contigs = Contigs::new(serialized_contigs);
-
-        // TEMPORAL RESTRICTION, WIP
-        contigs.shrink();
-
-        (contigs, outdot, outgfa, outgfa2)
     }
 }
 
@@ -740,32 +474,43 @@ mod tests {
     use nohash_hasher::NoHashHasher;
     use std::{borrow::Cow, collections::HashMap, hash::BuildHasherDefault};
 
-    fn empty_thedict() -> HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>> {
-        HashMap::with_hasher(BuildHasherDefault::default())
-    }
-
-    fn empty_maxmindict() -> HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> {
-        HashMap::with_hasher(BuildHasherDefault::default())
-    }
-
-    fn indexed_from_dicts(
-        packed: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        dict: &HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    ) -> IndexedKmers<u64> {
-        let mut indexed = IndexedKmers::with_capacity(dict.len());
-        for (&hash, info) in dict {
-            indexed.push(
-                hash,
-                info.hnc,
-                info.b,
-                info.counts,
-                *packed.get(&hash).unwrap(),
-            );
+    /// The spelling tests look k-mers up in a plain map.
+    impl<IntT: Copy> KmerLookup<IntT> for HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>> {
+        fn get_kmer(&self, hash: u64) -> Option<IntT> {
+            self.get(&hash).copied()
         }
-        indexed
     }
 
-    /// The graph native assembly builds for a sequence, with the packed k-mers that spell it.
+    /// The packed k-mers of `seq`, and the `IndexedKmers` preprocessing would build from them.
+    #[allow(clippy::type_complexity)]
+    fn build_indexed(
+        seq: &[u8],
+        k: usize,
+    ) -> (
+        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        IndexedKmers<u64>,
+    ) {
+        let mut packed = HashMap::with_hasher(BuildHasherDefault::default());
+        let mut counted: HashMap<u64, (u64, u8, u32), BuildHasherDefault<NoHashHasher<u64>>> =
+            HashMap::with_hasher(BuildHasherDefault::default());
+        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
+        let mut cur = Some(it.get_curr_kmerhash_and_bases_and_kmer());
+        while let Some((hc, hnc, b, km)) = cur {
+            packed.insert(hc, km);
+            counted
+                .entry(hc)
+                .and_modify(|e| e.2 += 1)
+                .or_insert((hnc, b, 1));
+            cur = it.get_next_kmer_and_give_us_things();
+        }
+        let mut indexed = IndexedKmers::with_capacity(counted.len());
+        for (&hash, &(hnc, b, counts)) in &counted {
+            indexed.push(hash, hnc, b, counts, packed[&hash]);
+        }
+        (packed, indexed)
+    }
+
+    /// The graph the assembler builds for a sequence, with the packed k-mers that spell it.
     #[allow(clippy::type_complexity)]
     fn indexed_graph(
         seq: &[u8],
@@ -774,58 +519,12 @@ mod tests {
         HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
         DbgGraph,
     ) {
-        let (packed, dict, _) = build_dicts(seq, k);
-        let mut indexed = indexed_from_dicts(&packed, &dict);
+        let (packed, mut indexed) = build_indexed(seq, k);
         populate_indexed_neighbours(k, &mut indexed);
         indexed.finish_neighbour_search();
         let (hashes, counts, neighbours, predecessor_counts) = indexed.take_graph_inputs();
         let graph = DbgGraph::from_indexed_kmers(k, hashes, counts, neighbours, predecessor_counts);
         (packed, graph)
-    }
-
-    #[test]
-    fn indexed_neighbours_match_legacy_neighbours() {
-        let k = 15;
-        let seq = seq_with_repeat(k);
-        let (packed, mut dict, maxmin) = build_dicts(&seq, k);
-        let mut indexed = indexed_from_dicts(&packed, &dict);
-
-        let legacy_stats = populate_neighbours(k, &mut dict, &maxmin);
-        let indexed_stats = populate_indexed_neighbours(k, &mut indexed);
-        assert_eq!(indexed_stats, legacy_stats);
-
-        for (index, &hash) in indexed.canonical_hashes.iter().enumerate() {
-            let split = usize::from(indexed.predecessor_counts[index]);
-            let mut indexed_pre: Vec<_> = indexed.neighbours[index][..split]
-                .iter()
-                .map(|edge| (indexed.canonical_hashes[edge.target], edge.edge_type))
-                .collect();
-            let mut indexed_post: Vec<_> = indexed.neighbours[index][split..]
-                .iter()
-                .map(|edge| (indexed.canonical_hashes[edge.target], edge.edge_type))
-                .collect();
-            let legacy = dict.get(&hash).unwrap();
-            let mut legacy_pre = legacy.pre.clone();
-            let mut legacy_post = legacy.post.clone();
-            indexed_pre.sort_unstable();
-            indexed_post.sort_unstable();
-            legacy_pre.sort_unstable();
-            legacy_post.sort_unstable();
-            assert_eq!(indexed_pre, legacy_pre, "predecessors differ for {hash}");
-            assert_eq!(indexed_post, legacy_post, "successors differ for {hash}");
-        }
-
-        let legacy_graph = DbgGraph::from_kmer_map(k, &dict);
-        let indexed_graph = DbgGraph::from_indexed_kmers(
-            k,
-            indexed.canonical_hashes,
-            indexed.counts,
-            indexed.neighbours,
-            indexed.predecessor_counts,
-        );
-        assert_eq!(indexed_graph.node_count(), legacy_graph.node_count());
-        assert_eq!(indexed_graph.edge_count(), legacy_graph.edge_count());
-        assert!(indexed_graph.validate().is_ok());
     }
 
     // ── the edge invariant ───────────────────────────────────────────────────
@@ -857,40 +556,6 @@ mod tests {
         s.extend_from_slice(&repeat);
         s.extend(next(200));
         s
-    }
-
-    /// Build (packed-k-mer dict, thedict, maxmindict) for a sequence, as preprocessing would.
-    #[allow(clippy::type_complexity)]
-    fn build_dicts(
-        seq: &[u8],
-        k: usize,
-    ) -> (
-        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-        HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-        HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    ) {
-        let mut packed: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> =
-            HashMap::with_hasher(BuildHasherDefault::default());
-        let mut dict = empty_thedict();
-        let mut maxmin = empty_maxmindict();
-
-        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
-        let mut cur = Some(it.get_curr_kmerhash_and_bases_and_kmer());
-        while let Some((hc, hnc, b, km)) = cur {
-            packed.insert(hc, km);
-            maxmin.insert(hnc, hc);
-            dict.entry(hc)
-                .and_modify(|hi: &mut HashInfoSimple| hi.counts += 1)
-                .or_insert(HashInfoSimple {
-                    hnc,
-                    b,
-                    pre: vec![],
-                    post: vec![],
-                    counts: 1,
-                });
-            cur = it.get_next_kmer_and_give_us_things();
-        }
-        (packed, dict, maxmin)
     }
 
     /// A node's k-mers in the order a walk on `carry` traverses them. Same rule as

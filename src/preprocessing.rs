@@ -1,17 +1,12 @@
 //! K-mer counting, the spectrum's cutoff and quality floor, and the native spectrum plots.
 
-#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
-#[cfg(not(target_family = "wasm"))]
 use std::{error::Error, fmt};
 
-#[cfg(not(target_family = "wasm"))]
 use crate::clock::Instant;
 
 use libm::lgamma;
 use nohash_hasher::NoHashHasher;
-#[cfg(target_family = "wasm")]
-use std::cmp::Ordering;
 use std::{collections::HashMap, hash::BuildHasherDefault};
 
 use rayon::prelude::*;
@@ -23,32 +18,22 @@ use plotters::prelude::*;
 #[cfg(not(target_family = "wasm"))]
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 
-use super::HashInfoSimple;
 use super::QualOpts;
 
 use crate::bit_encoding::UInt;
-#[cfg(not(target_family = "wasm"))]
 use crate::bloom_filter::BloomBits;
-#[cfg(target_family = "wasm")]
-use crate::bloom_filter::KmerFilter;
-#[cfg(not(target_family = "wasm"))]
 use crate::cli::ContigCountRule;
-#[cfg(not(target_family = "wasm"))]
 use crate::indexed_kmers::IndexedKmers;
 use crate::kmer::Kmer;
-#[cfg(not(target_family = "wasm"))]
 use crate::qual_profile::{window_groups, MAX_GROUPS, NONE};
-#[cfg(not(target_family = "wasm"))]
-use crate::spectrum_fitter::{fit_native_spectrum, FitAttempt, GenomeModel, NativeSpectrumFit};
-#[cfg(target_family = "wasm")]
-use crate::spectrum_fitter::{fit_spectrum, SpectrumFit};
+use crate::reads::{MaybeSend, OwnedRecord};
+use crate::spectrum_fitter::{fit_spectrum, FitAttempt, GenomeModel, SpectrumFit};
 
 /// Tuple for name and list of input files
 pub type InputFastx = (String, Vec<String>);
 
 /// Everything the preprocessing of one k value produces. Named fields rather than a tuple, since the
 /// backends and the public entry point order these differently.
-#[cfg(not(target_family = "wasm"))]
 pub struct PreprocessedK<IntT> {
     /// The k this was built with. Hashes from different k live in disjoint spaces, so carrying it
     /// alongside the maps is what stops us mixing them up.
@@ -70,12 +55,10 @@ pub struct PreprocessedK<IntT> {
     pub min_count_unresolved: bool,
 }
 
-/// A native preprocessing or selection failure that prevents a useful assembly step.
-#[cfg(not(target_family = "wasm"))]
+/// A preprocessing or selection failure that prevents a useful assembly step.
 #[derive(Debug)]
 pub struct PreprocessingError(String);
 
-#[cfg(not(target_family = "wasm"))]
 impl PreprocessingError {
     pub(crate) fn peak_too_low(k: usize, peak: PeakSource) -> Self {
         Self(format!(
@@ -90,24 +73,13 @@ impl PreprocessingError {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl fmt::Display for PreprocessingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl Error for PreprocessingError {}
-
-#[cfg(target_family = "wasm")]
-use crate::fastx_wasm::open_fastq;
-#[cfg(target_family = "wasm")]
-use crate::post_state;
-#[cfg(target_family = "wasm")]
-use seq_io::fastq::Record;
-#[cfg(target_family = "wasm")]
-use wasm_bindgen_file_reader::WebSysFile;
 
 // For the fitting, we'll use actually MAXSIZEHISTO - 1
 const MAXSIZEHISTO: usize = 8000;
@@ -134,18 +106,15 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
 }
 
 /// Sampled hashes held before the threshold halves
-#[cfg(not(target_family = "wasm"))]
 const SKETCH_BUDGET: usize = 500_000;
 
 /// The canonical k-mer hash never returns a value below this, so the sample is taken from the interval
 /// above it: halving from zero would put the threshold in a range the hash cannot reach, and the whole
 /// table would be retained away. Measured over 8M k-mers at k = 21, 31, 41 and 71.
-#[cfg(not(target_family = "wasm"))]
 const HASH_FLOOR: u64 = 1 << 52;
 
 /// Per-floor k-mer spectra from a fixed-size sample of hash space. Subsampling hash space does not move
 /// lambda, as a k-mer's hash does not depend on how often it occurs.
-#[cfg(not(target_family = "wasm"))]
 pub struct SpectrumSketch {
     threshold: u64,
     counts: HashMap<u64, [u32; MAX_GROUPS], BuildHasherDefault<NoHashHasher<u64>>>,
@@ -155,7 +124,6 @@ pub struct SpectrumSketch {
     shrinks: u32,
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl SpectrumSketch {
     /// Allocated once at full size: `shrink` frees entries but not the table, so the high-water mark is
     /// reached anyway, and pre-allocating avoids holding the old and new tables during a resize.
@@ -259,13 +227,11 @@ const MIN_CAND_KMER_FRAC: f64 = 0.20;
 /// A selected peak's mirrored valley-to-shoulder interval must carry at least this share of all non-singleton bins.
 const MIN_PEAK_AREA_FRACTION: f64 = 0.05;
 /// Bloom filter occupancy (%) from which a warning is shown.
-#[cfg(not(target_family = "wasm"))]
 const BLOOM_WARN_OCCUPANCY_PCT: f64 = 25.0;
 /// Used when the lobes cannot be separated. Not 1: at a genomic peak of 3-4 every singleton error survives and
 /// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
 const UNRESOLVED_MINCOUNT: u16 = 2;
 
-#[cfg(not(target_family = "wasm"))]
 fn min_count_decision_unresolved(
     automatic: bool,
     min_count: u16,
@@ -368,28 +334,24 @@ struct SpectrumEstimate {
 }
 
 /// Values needed to explain the spectrum decision in the native PNG. Kept independent of plotting
-/// types so the fitting path can carry it without pulling native-only code into WASM.
-#[cfg(not(target_family = "wasm"))]
+/// types so the fitting path can carry it without pulling native-only code into WASM, where nothing
+/// reads it.
 #[derive(Clone, Copy, Default)]
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 struct SpectrumPlotDiagnostics {
     valley_seed: Option<usize>,
     valley: Option<usize>,
     empirical_peak: Option<usize>,
     raw_valley: Option<usize>,
     genomic_peak_seed: Option<usize>,
-    fit: Option<NativeSpectrumFit>,
+    fit: Option<SpectrumFit>,
     fit_attempted: bool,
     genomic_guard: Option<u16>,
     error_floor: Option<u16>,
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl SpectrumPlotDiagnostics {
-    fn new(
-        estimate: &SpectrumEstimate,
-        fit: Option<NativeSpectrumFit>,
-        fit_attempted: bool,
-    ) -> Self {
+    fn new(estimate: &SpectrumEstimate, fit: Option<SpectrumFit>, fit_attempted: bool) -> Self {
         Self {
             valley_seed: (estimate.valley_seed > 0).then_some(estimate.valley_seed),
             valley: (estimate.valley > 0).then_some(estimate.valley),
@@ -405,17 +367,6 @@ impl SpectrumPlotDiagnostics {
                 .flatten(),
             error_floor: fit.map(|fit| fit.error_floor_cutoff()),
         }
-    }
-}
-
-#[cfg(target_family = "wasm")]
-#[derive(Clone, Copy, Default)]
-struct SpectrumPlotDiagnostics;
-
-#[cfg(target_family = "wasm")]
-impl SpectrumPlotDiagnostics {
-    fn new(_estimate: &SpectrumEstimate, _fit: Option<SpectrumFit>, _fit_attempted: bool) -> Self {
-        Self
     }
 }
 
@@ -1008,7 +959,6 @@ fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
         histovec[histovec.len() - 1] > 0,
         estimate.verdict
     );
-    #[cfg(not(target_family = "wasm"))]
     {
         let height = |count: Option<usize>| {
             count
@@ -1056,54 +1006,18 @@ fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
 /// Fit the spectrum and report it. Seeded from the valley estimator's own peak and dispersion: the
 /// estimator locates the lobe, the fit refines it and separates the error lobe from it explicitly.
 /// `None` when no start converges, which leaves the estimator's answer standing.
-/// The browser counts exactly, so its spectra are never scaled.
-#[cfg(target_family = "wasm")]
+/// `sample_scale`: library k-mers per observed one, 1/fraction for a sketch and 1 for an exact table.
 fn fit_and_log(
     histovec: &[u32],
     estimate: &SpectrumEstimate,
-    _sample_scale: f64,
+    sample_scale: f64,
 ) -> Option<SpectrumFit> {
     if !estimate.verdict.is_ok() {
         log::info!("Spectrum fit skipped because the empirical peak pair is unresolved.");
         return None;
     }
-    match fit_spectrum(histovec, estimate.genomic_peak, estimate.dispersion) {
-        Ok(fit) => {
-            log::info!(
-                "Spectrum fit: mean={:.1} dispersion={:.2} error_mean={:.2} w=({:.3}/{:.3}/{:.3}) \
-                     genome_kmers={:.3e} crossover={} hole_cutoff={}",
-                fit.mean,
-                fit.dispersion,
-                fit.error_mean,
-                fit.w_error,
-                fit.w_single,
-                fit.w_repeat,
-                fit.genome_kmers,
-                fit.crossover(),
-                fit.hole_cutoff(MAX_GENOME_HOLES)
-            );
-            Some(fit)
-        }
-        Err(e) => {
-            log::info!("Spectrum fit did not converge ({e}); keeping the valley estimate.");
-            None
-        }
-    }
-}
-
-/// `sample_scale`: library k-mers per observed one, 1/fraction for a sketch and 1 for an exact table.
-#[cfg(not(target_family = "wasm"))]
-fn fit_and_log(
-    histovec: &[u32],
-    estimate: &SpectrumEstimate,
-    sample_scale: f64,
-) -> Option<NativeSpectrumFit> {
-    if !estimate.verdict.is_ok() {
-        log::info!("Native spectrum fit skipped because the empirical peak pair is unresolved.");
-        return None;
-    }
     let started = Instant::now();
-    let result = match fit_native_spectrum(
+    let result = match fit_spectrum(
         histovec,
         estimate.valley,
         estimate.genomic_peak,
@@ -1112,14 +1026,12 @@ fn fit_and_log(
     ) {
         Ok(result) => result,
         Err(error) => {
-            log::info!(
-                "Native spectrum fits could not start ({error}); keeping the valley estimate."
-            );
+            log::info!("Spectrum fits could not start ({error}); keeping the valley estimate.");
             return None;
         }
     };
     for attempt in &result.attempts {
-        log_native_fit_attempt(attempt);
+        log_fit_attempt(attempt);
     }
     let elapsed = started.elapsed();
     if let Some(fit) = result.selected {
@@ -1155,7 +1067,7 @@ fn fit_and_log(
         Some(fit)
     } else {
         log::info!(
-            "All native spectrum fits were rejected; keeping the valley estimate. elapsed_ms={}",
+            "All spectrum fits were rejected; keeping the valley estimate. elapsed_ms={}",
             elapsed.as_millis()
         );
         None
@@ -1163,8 +1075,7 @@ fn fit_and_log(
 }
 
 /// The fitted shelf, or `none` for a model without one.
-#[cfg(not(target_family = "wasm"))]
-fn shelf_summary(fit: &NativeSpectrumFit) -> String {
+fn shelf_summary(fit: &SpectrumFit) -> String {
     fit.shelf.map_or_else(
         || "none".to_string(),
         |s| {
@@ -1176,8 +1087,7 @@ fn shelf_summary(fit: &NativeSpectrumFit) -> String {
     )
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn log_native_fit_attempt(attempt: &FitAttempt) {
+fn log_fit_attempt(attempt: &FitAttempt) {
     let selection_eligible = attempt.genome_model != GenomeModel::Normal;
     if let Some(fit) = attempt.candidate {
         let log_window_masses = fit.component_log_window_masses();
@@ -1238,27 +1148,6 @@ fn log_native_fit_attempt(attempt: &FitAttempt) {
 /// bridge, so it severs a contig: what predicts contiguity is their number, not their share. One
 /// percent of a 4.6 Mb genome is 46 000 severed paths, which is why a loss-fraction bound never binds.
 const MAX_GENOME_HOLES: f64 = 1.0;
-#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-const AUTO_FIT_INITIAL_MIN_COUNT: u16 = crate::cli::MIN_BLOOM_COUNT;
-
-/// Natively the sharded filter has no threshold of its own; the browser's `KmerFilter` still does.
-#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-#[inline]
-fn initial_bloom_min_count(qual: &QualOpts, do_fit: bool) -> u16 {
-    if do_fit {
-        AUTO_FIT_INITIAL_MIN_COUNT
-    } else {
-        qual.min_count
-    }
-}
-
-/// Choose the minimum k-mer count from the spectrum, as an **inclusive** minimum: both filter sites
-/// keep k-mers with `count >= min_count`. Natively this has no callers; the browser reaches it from
-/// its chunked and Bloom entry points.
-#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-fn choose_min_count(histovec: &[u32]) -> u16 {
-    choose_min_count_and_peak(histovec, 1.0).0
-}
 
 /// As [`choose_min_count`], and also the single-copy coverage the same estimate found.
 ///
@@ -1284,49 +1173,27 @@ fn choose_min_count_and_peak(
     )
 }
 
-/// Lower the cutoff to whatever strands at most [`MAX_GENOME_HOLES`] single-copy k-mers.
-///
-/// A **ceiling** on the valley, never a raise: the valley already removes the errors, and the only
-/// failure measured was cutting too deep. Floored at 2, and a no-op when the fit did not converge, so
-/// the worst case is exactly the behaviour without a fit.
-#[cfg(target_family = "wasm")]
-fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&SpectrumFit>) {
-    if !estimate.verdict.is_ok() {
-        return;
-    }
-    let Some(fit) = fit else { return };
-
-    let guarded = fit.hole_cutoff(MAX_GENOME_HOLES);
-    if guarded < estimate.min_count {
-        log::info!(
-            "Cutting at {} would strand more than {} single-copy k-mers; using {} instead.",
-            estimate.min_count,
-            MAX_GENOME_HOLES,
-            guarded
-        );
-        estimate.min_count = guarded.max(2);
-    }
-}
-
 /// The cutoff [`apply_hole_guard`] settles on: the valley capped by the hole guard, then raised to
 /// the 100% error floor.
-#[cfg(not(target_family = "wasm"))]
-fn guarded_min_count(estimate: &SpectrumEstimate, fit: &NativeSpectrumFit) -> u16 {
+fn guarded_min_count(estimate: &SpectrumEstimate, fit: &SpectrumFit) -> u16 {
     hole_guarded_min_count(estimate, fit).max(fit.error_floor_cutoff())
 }
 
 /// The valley lowered to what strands at most [`MAX_GENOME_HOLES`] single-copy k-mers, never below 2,
 /// and only for a resolved spectrum.
-#[cfg(not(target_family = "wasm"))]
-fn hole_guarded_min_count(estimate: &SpectrumEstimate, fit: &NativeSpectrumFit) -> u16 {
+fn hole_guarded_min_count(estimate: &SpectrumEstimate, fit: &SpectrumFit) -> u16 {
     match fit.hole_cutoff(MAX_GENOME_HOLES) {
         Some(cutoff) if estimate.verdict.is_ok() && cutoff < estimate.min_count => cutoff.max(2),
         _ => estimate.min_count,
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&NativeSpectrumFit>) {
+/// Lower the cutoff to whatever strands at most [`MAX_GENOME_HOLES`] single-copy k-mers.
+///
+/// A **ceiling** on the valley, never a raise: the valley already removes the errors, and the only
+/// failure measured was cutting too deep. Floored at 2, and a no-op when the fit did not converge, so
+/// the worst case is exactly the behaviour without a fit.
+fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&SpectrumFit>) {
     let Some(fit) = fit else { return };
     let hole_guarded = hole_guarded_min_count(estimate, fit);
     if hole_guarded < estimate.min_count {
@@ -1362,39 +1229,33 @@ fn warn_unresolved(estimate: &SpectrumEstimate) {
 /// A fit whose error component explains more than this share of observed counts above the applied
 /// cutoff is considered too error-heavy when comparing multiple usable quality floors. Provisional;
 /// cluster results should be used to recalibrate it.
-#[cfg(not(target_family = "wasm"))]
 const MAX_FIT_ERROR_TAIL_FRACTION: f64 = 0.05;
 /// A very shallow empirical peak is a reason to inspect the lower floors, not a reason to refuse a fit.
-#[cfg(not(target_family = "wasm"))]
 const LOW_COVERAGE_FLOOR_REVIEW: usize = 10;
 /// Peak gain a lower floor needs over a starved one (peak below [`LOW_COVERAGE_FLOOR_REVIEW`]) to be
 /// stepped down to. Well-covered floors never step down: that cost Neisseria 6-8% auN locally.
-#[cfg(not(target_family = "wasm"))]
 const STEP_DOWN_GAIN: f64 = 1.10;
 
-#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 struct FloorCandidate {
     floor: u8,
     estimate: SpectrumEstimate,
-    fit: Option<NativeSpectrumFit>,
+    fit: Option<SpectrumFit>,
     fit_attempted: bool,
     error_tail_fraction: Option<f64>,
 }
 
-#[cfg(not(target_family = "wasm"))]
 struct FloorDiagnostic {
     floor: u8,
     spectrum: Vec<u32>,
     estimate: SpectrumEstimate,
-    fit: Option<NativeSpectrumFit>,
+    fit: Option<SpectrumFit>,
     fit_attempted: bool,
 }
 
 /// Share of observed counts the fitted error component explains, from the applied cutoff `start`
 /// through six times the fitted primary mode: the error share among the k-mers the cutoff keeps.
-#[cfg(not(target_family = "wasm"))]
-fn fit_error_tail_fraction(histovec: &[u32], fit: &NativeSpectrumFit, start: u16) -> Option<f64> {
+fn fit_error_tail_fraction(histovec: &[u32], fit: &SpectrumFit, start: u16) -> Option<f64> {
     let start = usize::from(start).max(1);
     let end = fit
         .primary_mode()
@@ -1417,10 +1278,9 @@ fn fit_error_tail_fraction(histovec: &[u32], fit: &NativeSpectrumFit, start: u16
     fraction.is_finite().then_some(fraction)
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn evaluate_floor<F>(floor: u8, histovec: &[u32], sample_scale: f64, fit: &mut F) -> FloorCandidate
 where
-    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
+    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<SpectrumFit>,
 {
     let estimate = estimate_by_valley(histovec);
     let fit_attempted = estimate.verdict.is_ok();
@@ -1446,7 +1306,6 @@ where
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn select_usable_fit(candidates: &[FloorCandidate]) -> Option<usize> {
     let usable: Vec<usize> = candidates
         .iter()
@@ -1482,7 +1341,6 @@ fn select_usable_fit(candidates: &[FloorCandidate]) -> Option<usize> {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn choose_min_count_and_floor_with_debug<F>(
     histovec: &[u32],
     strict_scale: f64,
@@ -1499,7 +1357,7 @@ fn choose_min_count_and_floor_with_debug<F>(
     Vec<FloorDiagnostic>,
 )
 where
-    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
+    F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<SpectrumFit>,
 {
     let strict_index = floors.len() - 1;
     let strict_floor = floors[strict_index];
@@ -1688,7 +1546,6 @@ where
 
 /// Nothing separated at any floor: drop the filter, which is the most depth available, and warn, because
 /// the assembly will be fragmented whatever is chosen.
-#[cfg(not(target_family = "wasm"))]
 fn unresolved(
     floors: &[u8],
     floor_has_kmers: &[bool],
@@ -1714,7 +1571,6 @@ fn unresolved(
 
 /// The sketch's own spectrum at the floor in force, rescaled, against the table built beside it. Free on
 /// every run and the strongest check available that the sampling is unbiased.
-#[cfg(not(target_family = "wasm"))]
 fn check_sketch_against_table(histovec: &[u32], sketch: &SpectrumSketch, keep: usize) {
     let sampled = &sketch.spectra(keep + 1)[keep];
     let (table, sample): (u64, u64) = (
@@ -1736,7 +1592,6 @@ fn check_sketch_against_table(histovec: &[u32], sketch: &SpectrumSketch, keep: u
 
 /// The sketch's strict-floor spectrum, scaled back to the whole library. The hole guard budgets in
 /// absolute k-mers, so bin heights matter to it; the counts on the x-axis are scale-invariant.
-#[cfg(not(target_family = "wasm"))]
 fn rescaled_strict_spectrum(sketch: &SpectrumSketch, keep: u8) -> Vec<u32> {
     sketch
         .rescaled_spectra(keep as usize + 1)
@@ -1744,55 +1599,8 @@ fn rescaled_strict_spectrum(sketch: &SpectrumSketch, keep: u8) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-fn build_histogram_from_countmap(
-    countmap: &HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
-    histovec: &mut [u32],
-) {
-    for tup in countmap.values() {
-        add_to_histogram(histovec, tup.0);
-    }
-}
-
-#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-fn drain_countmap_into_themap<IntT>(
-    countmap: &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
-    themap: &mut HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    outdict: &mut HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    minmaxdict: &mut HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    minc: u16,
-    mut histovec_opt: Option<&mut [u32]>,
-) where
-    IntT: for<'a> UInt<'a>,
-{
-    countmap.retain(|h, tup| {
-        if tup.0 >= minc as u32 {
-            themap.entry(*h).or_insert_with(|| HashInfoSimple {
-                hnc: tup.1,
-                b: tup.2,
-                pre: Vec::new(),
-                post: Vec::new(),
-                counts: tup.0,
-            });
-        } else {
-            outdict.remove(h);
-            minmaxdict.remove(&tup.1);
-        }
-        if let Some(ref mut hv) = histovec_opt {
-            add_to_histogram(hv, tup.0);
-        }
-        false
-    });
-}
-
-/// One FASTQ record, owned: needletail's `Cow` borrows a reader buffer invalidated on the next
-/// `next()`, so a batch processed in parallel must own its bytes.
-#[cfg(not(target_family = "wasm"))]
-type OwnedRecord = (Vec<u8>, Option<Vec<u8>>);
-
 /// How many records go to the workers at a time: ~1M k-mers at 150 bp and k=31, small enough to stay
 /// cache-friendly and large enough to amortise the rayon fork/join.
-#[cfg(not(target_family = "wasm"))]
 const BATCH_RECORDS: usize = 8192;
 
 /// Parse `files` into owned batches of records, handing each to `on_batch`, and return how long the
@@ -1855,9 +1663,39 @@ where
     t0.elapsed()
 }
 
+/// The browser's version: no threads, so parse a batch, count it, and tell the page how far it got.
+#[cfg(target_family = "wasm")]
+fn extract_kmers_from_files_batched<F, I>(
+    input_iters: &mut [I],
+    batch_records: usize,
+    mut on_batch: F,
+) -> std::time::Duration
+where
+    F: FnMut(&[OwnedRecord]),
+    I: Iterator<Item = OwnedRecord>,
+{
+    let t0 = Instant::now();
+    let mut batch = Vec::with_capacity(batch_records);
+    let mut done = 0usize;
+    for records in input_iters.iter_mut() {
+        for record in records {
+            batch.push(record);
+            if batch.len() == batch_records {
+                on_batch(&batch);
+                done += batch.len();
+                batch.clear();
+                crate::post_state(&format!("preprocess:bulk:loop:{done}"));
+            }
+        }
+    }
+    if !batch.is_empty() {
+        on_batch(&batch);
+    }
+    t0.elapsed()
+}
+
 /// Writes the full spectrum beside its plots as `count<TAB>distinct`, so a run's cutoff decision can
 /// be replayed offline. The plots show the fitting window and cannot be read back.
-#[cfg(not(target_family = "wasm"))]
 fn write_kmer_spectrum_tsv(histovec: &[u32], out_path: &std::path::Path) {
     use std::io::Write;
     let path = out_path.with_extension("spectrum.tsv");
@@ -1875,13 +1713,11 @@ fn write_kmer_spectrum_tsv(histovec: &[u32], out_path: &std::path::Path) {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
 fn quality_floor_path(path: &std::path::Path, floor: u8) -> PathBuf {
     suffixed_path(path, &format!("_q{floor}"), "png")
 }
 
 /// `path` with `suffix` appended to its file stem and `extension` set; dots already in the stem stay.
-#[cfg(not(target_family = "wasm"))]
 fn suffixed_path(path: &std::path::Path, suffix: &str, extension: &str) -> PathBuf {
     let mut name = path.file_stem().unwrap_or_default().to_os_string();
     name.push(format!("{suffix}.{extension}"));
@@ -2365,6 +2201,18 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
         .expect("Unable to write result to file. Does the output folder exist?");
 }
 
+/// The browser plots the spectrum on the page; `out_path` is always `None` there.
+#[cfg(target_family = "wasm")]
+fn plot_kmer_histogram(
+    _decision_spectrum: &[u32],
+    _raw_bloom_spectrum: Option<&[u32]>,
+    _diagnostics: &SpectrumPlotDiagnostics,
+    _used_min_count: u16,
+    _out_path: &std::path::Path,
+    _all_variants: bool,
+) {
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn plot_kmer_histogram(
     decision_spectrum: &[u32],
@@ -2456,404 +2304,7 @@ fn plot_kmer_histogram(
     }
 }
 
-// =====================================================================================================
-
-#[cfg(target_family = "wasm")]
-fn chunked_processing_wasm<IntT>(
-    file1: &mut WebSysFile,
-    file2: Option<&mut WebSysFile>,
-    k: usize,
-    qual: &QualOpts,
-    outvec: &mut Vec<(u64, u64, u8)>,
-    csize: usize,
-    do_fit: bool,
-) -> (
-    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    Vec<u32>,
-    u16,
-)
-where
-    IntT: for<'a> UInt<'a>,
-{
-    post_state("preprocess:chunked:start");
-    log::info!("Getting kmers from first file. Creating reader...");
-
-    let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut themap = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut countmap: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> =
-        HashMap::with_hasher(BuildHasherDefault::default());
-
-    let mut reader = open_fastq(file1);
-    let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
-
-    log::info!("Entering while loop...");
-
-    // todo: use the same counter and is_multiple_of
-    let mut i_record = 0;
-    let mut count: usize = 0;
-    post_state("preprocess:chunked:loop:start");
-
-    while let Some(record) = reader.next() {
-        let seqrec = record.expect("Invalid FASTQ record");
-        let rl = seqrec.seq().len();
-        let kmer_opt = Kmer::<IntT>::new(
-            std::borrow::Cow::Borrowed(seqrec.seq()),
-            rl,
-            Some(seqrec.qual()),
-            k,
-            qual.min_qual,
-            true,
-        );
-        if let Some(mut kmer_it) = kmer_opt {
-            let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer();
-            outvec.push((hc, hnc, b));
-            outdict.entry(hc).or_insert(km);
-            minmaxdict.entry(hnc).or_insert(hc);
-            while let Some(tmptuple) = kmer_it.get_next_kmer_and_give_us_things() {
-                let (hc, hnc, b, km) = tmptuple;
-                outvec.push((hc, hnc, b));
-                outdict.entry(hc).or_insert(km);
-                minmaxdict.entry(hnc).or_insert(hc);
-            }
-        }
-
-        i_record += 1;
-        count += 1;
-        if i_record >= csize {
-            // Processssssss! And reset.
-            if !outvec.is_empty() {
-                log::debug!("Processing chunk. Sorting k-mers...");
-                outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                log::debug!("k-mers sorted. Counting k-mers...");
-                // Then, do a counting of everything and save the results in a dictionary and return it
-
-                update_countmap(outvec, &mut countmap);
-            }
-
-            // Reset
-            outvec.clear();
-            post_state(&format!("preprocess:chunked:loop:{:?}", count));
-            i_record = 0;
-        }
-    }
-    log::info!("Finished getting kmers from first file. Starting with the second...");
-
-    post_state(&format!("preprocess:chunked:loop:{:?}:50", count));
-    let percentageblock = (count as f64 / 10_f64) as usize;
-
-    if let Some(file2) = file2 {
-        let mut reader = open_fastq(file2);
-
-        // Filling the seq of the second file!
-        while let Some(record) = reader.next() {
-            let seqrec = record.expect("Invalid FASTQ record");
-            let rl = seqrec.seq().len();
-            let kmer_opt = Kmer::<IntT>::new(
-                std::borrow::Cow::Borrowed(seqrec.seq()),
-                rl,
-                Some(seqrec.qual()),
-                k,
-                qual.min_qual,
-                true,
-            );
-            if let Some(mut kmer_it) = kmer_opt {
-                let (hc, hnc, b, km) = kmer_it.get_curr_kmerhash_and_bases_and_kmer();
-                outvec.push((hc, hnc, b));
-                outdict.entry(hc).or_insert(km);
-                minmaxdict.entry(hnc).or_insert(hc);
-                while let Some(tmptuple) = kmer_it.get_next_kmer_and_give_us_things() {
-                    let (hc, hnc, b, km) = tmptuple;
-                    outvec.push((hc, hnc, b));
-                    outdict.entry(hc).or_insert(km);
-                    minmaxdict.entry(hnc).or_insert(hc);
-                }
-            }
-
-            i_record += 1;
-            count += 1;
-            if i_record >= csize {
-                // Processssssss! And reset.
-                if !outvec.is_empty() {
-                    log::info!("Processing chunk. Sorting k-mers...");
-                    outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                    log::info!("k-mers sorted. Counting k-mers...");
-                    // Then, do a counting of everything and save the results in a dictionary and return it
-
-                    update_countmap(outvec, &mut countmap);
-                }
-
-                // Reset
-                outvec.clear();
-                i_record = 0;
-            }
-
-            // This might be done slightly more efficiently??
-            if percentageblock > 0 && count.is_multiple_of(percentageblock) {
-                post_state(&format!(
-                    "preprocess:chunked:loop:{:?}:{:?}",
-                    count,
-                    count / percentageblock * 5
-                ));
-            }
-        }
-    }
-
-    log::info!("Finished getting kmers from the input file(s)");
-
-    // The residual chunk. This MUST stay outside the `if let Some(file2)` block above, or single-file
-    // input silently loses the k-mers of its trailing partial chunk.
-    if !outvec.is_empty() {
-        log::info!("Processing last chunk. Sorting k-mers...");
-        outvec.par_sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        log::info!("k-mers sorted. Counting k-mers...");
-        update_countmap(outvec, &mut countmap);
-        outvec.clear();
-    }
-
-    post_state("preprocess:chunked:loop:end");
-    log::info!("Filtering...");
-
-    // Now, get themap, histovec, and filter outdict and minmaxdict
-    countmap.shrink_to_fit();
-    let mut minc: u16 = qual.min_count;
-
-    // This can be optimised. also better written: I had to repeat the code for the retains, to try to improve slightly the running time in
-    // case no autofitting is requested. In any case, it could be improved in the future.
-    if do_fit {
-        post_state("preprocess:chunked:fitting");
-        build_histogram_from_countmap(&countmap, &mut histovec);
-
-        // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
-        // large (and so that we can detect it).
-        log::info!("Counting finished. Choosing the minimum count...");
-        minc = choose_min_count(&histovec);
-        log::info!("Minimum count chosen: {}. Starting filtering...", minc);
-
-        post_state("preprocess:chunked:filtering");
-        drain_countmap_into_themap(
-            &mut countmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            minc,
-            None,
-        );
-    } else {
-        post_state("preprocess:chunked:filtering");
-        drain_countmap_into_themap(
-            &mut countmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            minc,
-            Some(&mut histovec),
-        );
-    }
-
-    outdict.shrink_to_fit();
-    minmaxdict.shrink_to_fit();
-    histovec.shrink_to_fit();
-    drop(countmap);
-
-    (outdict, minmaxdict, themap, histovec, minc)
-}
-
-#[cfg(target_family = "wasm")]
-fn bloom_filter_preprocessing_wasm<IntT>(
-    file1: &mut WebSysFile,
-    file2: Option<&mut WebSysFile>,
-    k: usize,
-    qual: &QualOpts,
-    do_fit: bool,
-) -> (
-    HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    Vec<u32>,
-    u16,
-)
-where
-    IntT: for<'a> UInt<'a>,
-{
-    post_state("preprocess:bloom:start");
-    log::info!("Getting kmers from first file with Bloom filter. Creating reader and initialising filter...");
-
-    let mut outdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut minmaxdict = HashMap::with_hasher(BuildHasherDefault::default());
-    let mut themap = HashMap::with_hasher(BuildHasherDefault::default());
-
-    let mut histovec: Vec<u32> = vec![0; MAXSIZEHISTO];
-
-    let mut kmer_filter = KmerFilter::new(initial_bloom_min_count(qual, do_fit));
-    kmer_filter.init();
-
-    log::info!("Entering while loop for the first file...");
-    post_state("preprocess:bloom:loop:start");
-
-    let mut count: usize = 0;
-
-    let mut reader = open_fastq(file1);
-    while let Some(record) = reader.next() {
-        let seqrec = record.expect("Invalid FASTQ record");
-        let rl = seqrec.seq().len();
-        let kmer_opt = Kmer::<IntT>::new(
-            std::borrow::Cow::Borrowed(seqrec.seq()),
-            rl,
-            Some(seqrec.qual()),
-            k,
-            qual.min_qual,
-            true,
-        );
-        if let Some(mut kmer_it) = kmer_opt {
-            let (hc, hnc, b) = kmer_it.get_curr_hash_and_bases();
-            if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
-                minmaxdict.entry(hnc).or_insert(hc);
-            }
-            while let Some((hc, hnc, b)) = kmer_it.get_next_hash_and_bases() {
-                if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                    outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
-                    minmaxdict.entry(hnc).or_insert(hc);
-                }
-            }
-        }
-        count += 1;
-        if count.is_multiple_of(150000) {
-            post_state(&format!("preprocess:bloom:loop:{:?}", count));
-        }
-    }
-    log::info!("Finished getting kmers from first file. Starting with the second...");
-    post_state(&format!("preprocess:bloom:loop:{:?}:50", count));
-    let percentageblock = (count as f64 / 10_f64) as usize;
-
-    if let Some(file2) = file2 {
-        let mut reader = open_fastq(file2);
-
-        // Filling the seq of the second file!
-        while let Some(record) = reader.next() {
-            let seqrec = record.expect("Invalid FASTQ record");
-            let rl = seqrec.seq().len();
-            let kmer_opt = Kmer::<IntT>::new(
-                std::borrow::Cow::Borrowed(seqrec.seq()),
-                rl,
-                Some(seqrec.qual()),
-                k,
-                qual.min_qual,
-                true,
-            );
-            if let Some(mut kmer_it) = kmer_opt {
-                let (hc, hnc, b) = kmer_it.get_curr_hash_and_bases();
-                if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                    outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
-                    minmaxdict.entry(hnc).or_insert(hc);
-                }
-                while let Some((hc, hnc, b)) = kmer_it.get_next_hash_and_bases() {
-                    if Ordering::is_eq(kmer_filter.filter(hc, hnc, b)) {
-                        outdict.entry(hc).or_insert_with(|| kmer_it.get_kmer());
-                        minmaxdict.entry(hnc).or_insert(hc);
-                    }
-                }
-            }
-            count += 1;
-
-            // This might be done slightly more efficiently??
-            if percentageblock > 0 && count.is_multiple_of(percentageblock) {
-                post_state(&format!(
-                    "preprocess:bloom:loop:{:?}:{:?}",
-                    count,
-                    count / percentageblock * 5
-                ));
-            }
-        }
-    }
-
-    post_state("preprocess:bloom:loop:end");
-    log::info!("Finished getting kmers from the second file");
-    log::info!("Second part of filtering...");
-
-    // // Now, get themap, histovec, and filter outdict and minmaxdict
-    let mut countmap = kmer_filter.get_counts_map();
-    countmap.shrink_to_fit();
-
-    // This can be optimised. also better written: I had to repeat the code for the retains, to try to improve slightly the running time in
-    // case no autofitting is requested. In any case, it could be improved in the future.
-    let mut minc = qual.min_count;
-    if do_fit {
-        post_state("preprocess:bloom:fitting");
-        build_histogram_from_countmap(&countmap, &mut histovec);
-
-        // Remove the last bin, as it might affect the fit, but we want it in the vector to plot it in case the coverage is really
-        // large (and so that we can detect it).
-        log::info!("Counting finished. Choosing the minimum count...");
-        minc = choose_min_count(&histovec);
-        log::info!("Minimum count chosen: {}. Starting filtering...", minc);
-
-        post_state("preprocess:bloom:filtering");
-        drain_countmap_into_themap(
-            &mut countmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            minc,
-            None,
-        );
-    } else {
-        post_state("preprocess:bloom:filtering");
-        // I think this part can be improved: now that the min_count error has been corrected, some conditionals could be removed here?
-        drain_countmap_into_themap(
-            &mut countmap,
-            &mut themap,
-            &mut outdict,
-            &mut minmaxdict,
-            minc,
-            Some(&mut histovec),
-        );
-    }
-
-    outdict.shrink_to_fit();
-    minmaxdict.shrink_to_fit();
-
-    (outdict, minmaxdict, themap, histovec, minc)
-}
-
-/// Natively this has no callers: the map counter never materialises a list of
-/// occurrences to run-length count. The browser still reaches it through `chunked_processing_wasm`.
-#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
-fn update_countmap(
-    invec: &[(u64, u64, u8)],
-    countmap: &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
-) {
-    let mut i = 0;
-    let mut c: u32 = 0;
-    let mut tmphash = invec[i].0;
-    // let mut tmpcounter = 0;
-
-    while i < invec.len() {
-        if tmphash != invec[i].0 {
-            let tmpref = countmap
-                .entry(tmphash)
-                .or_insert((0, invec[i - 1].1, invec[i - 1].2));
-            tmpref.0 = tmpref.0.saturating_add(c);
-
-            tmphash = invec[i].0;
-            c = 1;
-        } else {
-            c = c.saturating_add(1);
-        }
-        i += 1;
-    }
-
-    let tmpref = countmap
-        .entry(tmphash)
-        .or_insert((0, invec[i - 1].1, invec[i - 1].2));
-    tmpref.0 = tmpref.0.saturating_add(c);
-}
-
 /// The constants of one counting pass: fixed for every record, so they travel together.
-#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 struct KmerWalk<'a> {
     k: usize,
@@ -2866,7 +2317,6 @@ struct KmerWalk<'a> {
 /// Walk one record's k-mers, handing each to `emit` as `(hc, hnc, b, group, packed)`. `groups` is the
 /// caller's scratch, reused per record. `floors = Some(ladder)` tags each k-mer with the strictest
 /// floor it clears; `None` filters at the iterator and tags everything `keep`.
-#[cfg(not(target_family = "wasm"))]
 #[inline]
 fn for_each_kmer<IntT, F>(
     seq: &[u8],
@@ -2916,7 +2366,6 @@ fn for_each_kmer<IntT, F>(
 ///
 /// `hnc`, `b` and `km` describe the *k-mer*, not the *occurrence*, so they are recorded once, on first
 /// sight, rather than once per occurrence as the old sorting vector did.
-#[cfg(not(target_family = "wasm"))]
 struct KmerInfo<IntT> {
     count: u32,
     hnc: u64,
@@ -2924,13 +2373,11 @@ struct KmerInfo<IntT> {
     km: IntT,
 }
 
-#[cfg(not(target_family = "wasm"))]
 type CountMap<IntT> = HashMap<u64, KmerInfo<IntT>, BuildHasherDefault<NoHashHasher<u64>>>;
 
 /// Where the counting phase spends its time, accumulated over every batch. It is bandwidth-bound
 /// rather than synchronisation-bound, so wall time alone misattributes it, and a few thousand clock
 /// reads per run cost nothing against that.
-#[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
 struct CountTimings {
     hash_ns: u128,
@@ -2940,7 +2387,6 @@ struct CountTimings {
     batches: usize,
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl CountTimings {
     /// `total` is the whole batched walk, so parse is whatever the timed stages did not account for.
     fn log(&self, total: std::time::Duration) {
@@ -2962,15 +2408,12 @@ impl CountTimings {
 }
 
 /// Never fewer shards than this: below it each map stops being a small fraction of the working set. Heuristically set.
-#[cfg(not(target_family = "wasm"))]
 const MIN_COUNTMAP_SHARDS: usize = 64;
 /// Nor more than this, or the per-batch split pays for buckets that hold almost nothing.
-#[cfg(not(target_family = "wasm"))]
 const MAX_COUNTMAP_SHARDS: usize = 256;
 /// Shards per thread. One, not more: oversubscribing to give rayon work to steal was measured and is a
 /// bad trade, since every extra shard is another half-empty table. At k=81 on 12 threads, 64 shards
 /// cost 17% peak RSS to save 4% wall against 16.
-#[cfg(not(target_family = "wasm"))]
 const SHARDS_PER_THREAD: usize = 1;
 
 /// How many shards to split the count-map into.
@@ -2982,7 +2425,6 @@ const SHARDS_PER_THREAD: usize = 1;
 /// Always a power of two, because [`shard_of`] shifts and masks: a non-power-of-two silently collapses
 /// onto the one below it -- 6 shards would use 2, 12 would use 4 -- with no error, and a balance report
 /// that still reads as healthy because the shards in use stay balanced among themselves.
-#[cfg(not(target_family = "wasm"))]
 fn countmap_shards() -> usize {
     (rayon::current_num_threads() * SHARDS_PER_THREAD)
         .next_power_of_two()
@@ -2994,7 +2436,6 @@ fn countmap_shards() -> usize {
 /// Neither end of `hc` works raw. Not the high bits: ntHash is uniform but `hc = min(fwd, rc)` is not,
 /// and measured at k=31 the top 4 bits run 12.2% down to 0.37%, a 33x spread that left shard 15 empty.
 /// Not the low bits: `NoHashHasher` passes the hash through and hashbrown indexes buckets with them.
-#[cfg(not(target_family = "wasm"))]
 #[inline(always)]
 fn shard_of(hc: u64, shards: usize) -> usize {
     const MIX: u64 = 0x9E37_79B9_7F4A_7C15; // odd, golden-ratio derived
@@ -3006,11 +2447,9 @@ fn shard_of(hc: u64, shards: usize) -> usize {
 }
 
 /// Kept k-mers waiting to be absorbed into one shard: hash, non-canonical hash, packed bases, k-mer.
-#[cfg(not(target_family = "wasm"))]
 type Bucket<IntT> = Vec<(u64, u64, u8, IntT)>;
 
 /// One rayon task's private scratch, allocated once and reused across every batch.
-#[cfg(not(target_family = "wasm"))]
 struct TaskState<IntT> {
     /// Kept k-mers, already split by shard. Absorb drains these, so the capacity carries over.
     buckets: Vec<Bucket<IntT>>,
@@ -3022,7 +2461,6 @@ struct TaskState<IntT> {
     floor_has_kmers: [bool; MAX_GROUPS],
 }
 
-#[cfg(not(target_family = "wasm"))]
 impl<IntT> TaskState<IntT> {
     fn new(n_shards: usize) -> Self {
         Self {
@@ -3037,7 +2475,6 @@ impl<IntT> TaskState<IntT> {
 /// Hash one batch straight into the tasks' per-shard buckets, then absorb those into the count-map.
 /// Nothing is materialised in between: a k-mer is written once into a bucket and once into the map,
 /// where the flat-vector version wrote it four times. Shards partition the keys, so absorb needs no lock.
-#[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
 fn count_batch<IntT>(
     batch: &[OwnedRecord],
@@ -3055,7 +2492,7 @@ fn count_batch<IntT>(
 {
     let n_shards = shards.len();
     // The filter eats each k-mer's first sighting, so a surviving entry opens at 2 rather than 1 --
-    // exactly what the serial `KmerFilter::filter` did.
+    // exactly what a serial Bloom filter in front of a hash map did.
     let base = if blooms.iter().any(Option::is_some) {
         2
     } else {
@@ -3179,7 +2616,6 @@ fn count_batch<IntT>(
 /// Replaces "push every occurrence, sort, run-length count". Bringing equal k-mers together is all that
 /// vector ever did, and a hash map does it in one probe per occurrence — against a push, a sort of every
 /// sighting, and two dictionary probes. It also drops the occurrence buffer entirely.
-#[cfg(not(target_family = "wasm"))]
 fn bulk_preprocessing_standalone_cpu<IntT, I>(
     input_iters: &mut [I],
     k: usize,
@@ -3194,7 +2630,7 @@ fn bulk_preprocessing_standalone_cpu<IntT, I>(
 )
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + Send,
+    I: Iterator<Item = OwnedRecord> + MaybeSend,
 {
     // The ladder is ascending, so the last group is the strict floor and `keep` is its index.
     let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
@@ -3231,6 +2667,7 @@ where
         .collect();
 
     let mut t = CountTimings::default();
+    crate::post_state("preprocess:bulk:loop:start");
     let total = extract_kmers_from_files_batched(input_iters, BATCH_RECORDS, |batch| {
         count_batch(
             batch,
@@ -3246,6 +2683,7 @@ where
         );
         t.batches += 1;
     });
+    crate::post_state("preprocess:bulk:loop:end");
     t.log(total);
 
     if do_bloom {
@@ -3283,7 +2721,6 @@ where
 }
 
 /// Consume the count-map into aligned storage, keeping k-mers seen `minc` times.
-#[cfg(not(target_family = "wasm"))]
 fn countmaps_into_indexed_kmers<IntT>(shards: Vec<CountMap<IntT>>, minc: u16) -> IndexedKmers<IntT>
 where
     IntT: for<'a> UInt<'a>,
@@ -3311,11 +2748,9 @@ where
 }
 
 /// Contig bases hashed per round when carrying contigs in; bounds the transient k-mer buffer.
-#[cfg(not(target_family = "wasm"))]
 const CARRY_CHUNK_BASES: usize = 1 << 20;
 
 /// A multi-k step's previous contigs, and how their k-mers are counted when carried in.
-#[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 pub struct CarriedContigs<'a> {
     /// The previous k's contigs, spelled.
@@ -3326,7 +2761,6 @@ pub struct CarriedContigs<'a> {
 
 /// Put every k-mer of `carried` into the count-map so the `minc` filter keeps it, and return how many
 /// the reads never produced. Each chunk is hashed in parallel, then absorbed one writer per shard.
-#[cfg(not(target_family = "wasm"))]
 fn carry_contig_kmers<IntT>(
     shards: &mut [CountMap<IntT>],
     carried: CarriedContigs,
@@ -3407,7 +2841,6 @@ where
 
 /// A recount refits the whole spectrum at the floor the sketch chose. The refit wins unless the
 /// sketch's lobes separated there and the refit's did not, so a recount never loses a resolved cutoff.
-#[cfg(not(target_family = "wasm"))]
 fn keep_refit_or_prior(
     refit: (u16, PeakSource),
     prior: Option<(u16, PeakSource)>,
@@ -3434,7 +2867,6 @@ fn keep_refit_or_prior(
 }
 
 /// Choose, filter and plot from a finished sharded count-map.
-#[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn finish_map_counter<IntT>(
     mut shards: Vec<CountMap<IntT>>,
@@ -3525,6 +2957,7 @@ where
     let mut debug_floor_diagnostics = Vec::new();
     if do_fit {
         log::info!("Counting finished. Choosing the minimum count...");
+        crate::post_state("preprocess:bulk:fitting");
         match (&sketch, floors) {
             (Some(sketch), Some(floors)) => {
                 // The table is a bin short under Bloom counting, so the comparison would be noise.
@@ -3610,6 +3043,7 @@ where
             carried.rule
         );
     }
+    crate::post_state("preprocess:bulk:filtering");
     let kmers = countmaps_into_indexed_kmers::<IntT>(shards, minc);
 
     if let Some(p) = out_path {
@@ -3636,7 +3070,6 @@ where
 /// Read the records, count their k-mers, choose the cutoff and filter by it. `carried`: a multi-k
 /// step's previous contigs, put in once the cutoff is chosen. `debug_quality_floors` also evaluates
 /// and plots every floor; `prior`: a recount's selection from the sketch, see [`keep_refit_or_prior`].
-#[cfg(not(target_family = "wasm"))]
 #[allow(clippy::too_many_arguments)]
 pub fn preprocessing_standalone<IntT, I>(
     input_iters: &mut [I],
@@ -3645,7 +3078,6 @@ pub fn preprocessing_standalone<IntT, I>(
     floors: Option<&[u8]>,
     timevec: &mut Option<&mut Vec<Instant>>,
     out_path: &mut Option<PathBuf>,
-    csize: usize,
     do_bloom: bool,
     do_fit: bool,
     carried: Option<CarriedContigs>,
@@ -3654,16 +3086,10 @@ pub fn preprocessing_standalone<IntT, I>(
 ) -> Result<PreprocessedK<IntT>, PreprocessingError>
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + Send,
+    I: Iterator<Item = OwnedRecord> + MaybeSend,
 {
+    crate::post_state("preprocess:bulk:start");
     log::info!("Starting preprocessing_standalone with k = {k}");
-
-    if csize != 0 {
-        log::warn!(
-            "--chunk-size is ignored: k-mers are counted into a hash map, which buffers no \
-             occurrences, so memory is bounded by the number of distinct k-mers instead."
-        );
-    }
     log::info!("Counting k-mers into a hash map, without sorting");
     let (shards, sketch, floor_has_kmers) = bulk_preprocessing_standalone_cpu::<IntT, _>(
         input_iters,
@@ -3714,52 +3140,6 @@ where
     })
 }
 
-#[cfg(target_family = "wasm")]
-/// Main preprocessing function for wasm
-pub fn preprocessing_wasm<IntT>(
-    file1: &mut WebSysFile,
-    file2: Option<&mut WebSysFile>,
-    k: usize,
-    qual: &QualOpts,
-    csize: usize,
-    do_bloom: bool,
-    do_fit: bool,
-) -> (
-    HashMap<u64, HashInfoSimple, BuildHasherDefault<NoHashHasher<u64>>>,
-    Option<HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>>>,
-    HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
-    Vec<u32>,
-    u16,
-)
-where
-    IntT: for<'a> UInt<'a>,
-{
-    if do_bloom {
-        // Build indexes
-        log::info!("Processing using a Bloom filter");
-
-        let (thedict, maxmindict, themap, histovec, used_min_count) =
-            bloom_filter_preprocessing_wasm::<IntT>(file1, file2, k, qual, do_fit);
-        (themap, Some(thedict), maxmindict, histovec, used_min_count)
-    } else {
-        // "No chunking" is one unbounded chunk. The guard matters: `i_record >= 0` holds on every
-        // record, so passing 0 through would sort and count after every single read.
-        let csize = if csize == 0 { usize::MAX } else { csize };
-        if csize == usize::MAX {
-            log::info!("Counting k-mers by sorting, without chunking");
-        } else {
-            log::info!("Counting k-mers by sorting, in chunks of {csize} records");
-        }
-
-        let mut tmpvec: Vec<(u64, u64, u8)> = Vec::new();
-        let (thedict, maxmindict, themap, mut histovec, used_min_count) =
-            chunked_processing_wasm::<IntT>(file1, file2, k, qual, &mut tmpvec, csize, do_fit);
-        drop(tmpvec);
-        histovec.shrink_to_fit();
-        (themap, Some(thedict), maxmindict, histovec, used_min_count)
-    }
-}
-
 //
 //
 //
@@ -3808,7 +3188,7 @@ mod tests {
             min_count: 12,
             ..SpectrumEstimate::default()
         };
-        let fit = NativeSpectrumFit::for_test(
+        let fit = SpectrumFit::for_test(
             ErrorModel::SingletonPareto,
             GenomeModel::NegativeBinomial,
             [0.7, 0.29, 0.01],
@@ -3847,7 +3227,7 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn active_error_floor_remains_a_hard_minimum() {
-        let fit = NativeSpectrumFit::for_test(
+        let fit = SpectrumFit::for_test(
             ErrorModel::SingletonPareto,
             GenomeModel::NegativeBinomial,
             [0.9, 0.09, 0.01],
@@ -5216,9 +4596,9 @@ mod tests {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    fn native_test_fit(mean: usize, error_weight: f64) -> NativeSpectrumFit {
+    fn test_fit(mean: usize, error_weight: f64) -> SpectrumFit {
         let remainder = 1.0 - error_weight;
-        NativeSpectrumFit::for_test(
+        SpectrumFit::for_test(
             ErrorModel::SingletonPareto,
             GenomeModel::NegativeBinomial,
             [error_weight, remainder * 0.99, remainder * 0.01],
@@ -5265,7 +4645,7 @@ mod tests {
                 &[0, 11, 25],
                 |_, estimate, _| {
                     calls.set(calls.get() + 1);
-                    Some(native_test_fit(estimate.genomic_peak, 0.0))
+                    Some(test_fit(estimate.genomic_peak, 0.0))
                 },
                 &[true; MAX_GROUPS],
             );
@@ -5293,7 +4673,7 @@ mod tests {
             |_, estimate, _| {
                 let call = calls.get();
                 calls.set(call + 1);
-                (call == 1).then(|| native_test_fit(estimate.genomic_peak, 0.0))
+                (call == 1).then(|| test_fit(estimate.genomic_peak, 0.0))
             },
             &[true; MAX_GROUPS],
         );
@@ -5325,7 +4705,7 @@ mod tests {
             &[0, 11, 25],
             |_, estimate, _| {
                 calls.set(calls.get() + 1);
-                Some(native_test_fit(estimate.genomic_peak, 0.0))
+                Some(test_fit(estimate.genomic_peak, 0.0))
             },
             &[true; MAX_GROUPS],
         );
@@ -5360,7 +4740,7 @@ mod tests {
             |_, estimate, _| {
                 let call = calls.get();
                 calls.set(call + 1);
-                (call == 0).then(|| native_test_fit(estimate.genomic_peak, 0.0))
+                (call == 0).then(|| test_fit(estimate.genomic_peak, 0.0))
             },
             &[true; MAX_GROUPS],
         );
@@ -5394,7 +4774,7 @@ mod tests {
             &[0, 11, 25],
             |_, estimate, _| {
                 regular_calls.set(regular_calls.get() + 1);
-                Some(native_test_fit(estimate.genomic_peak, 0.0))
+                Some(test_fit(estimate.genomic_peak, 0.0))
             },
             &[true; MAX_GROUPS],
             false,
@@ -5407,7 +4787,7 @@ mod tests {
             &[0, 11, 25],
             |_, estimate, _| {
                 debug_calls.set(debug_calls.get() + 1);
-                Some(native_test_fit(estimate.genomic_peak, 0.0))
+                Some(test_fit(estimate.genomic_peak, 0.0))
             },
             &[true; MAX_GROUPS],
             true,
@@ -5436,7 +4816,7 @@ mod tests {
         let candidate = |floor, mean, fraction| FloorCandidate {
             floor,
             estimate,
-            fit: Some(native_test_fit(mean, 0.1)),
+            fit: Some(test_fit(mean, 0.1)),
             fit_attempted: true,
             error_tail_fraction: fraction,
         };
@@ -5717,8 +5097,7 @@ mod tests {
                 None,
             )
             .expect("the fixture leaves k-mers after filtering");
-            let contigs =
-                BasicAsm::assemble::<u128>(k, &mut kmers, &mut None, &mut None, correction);
+            let contigs = BasicAsm::assemble::<u128>(k, &mut kmers, &mut None, None, correction);
             crate::save_functions::spell_contigs::<u128>(&contigs, &kmers, k)
         };
 
@@ -5763,7 +5142,7 @@ mod tests {
         floor_has_kmers: &[bool],
     ) -> (u16, u8, PeakSource, Option<SpectrumPlotDiagnostics>)
     where
-        F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<NativeSpectrumFit>,
+        F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<SpectrumFit>,
     {
         // Its callers hand it an exact strict-floor spectrum.
         let (min_count, floor, peak, diagnostics, _) = choose_min_count_and_floor_with_debug(

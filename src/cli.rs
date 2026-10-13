@@ -82,17 +82,35 @@ pub enum ContigCountRule {
     Gatb,
 }
 
+/// An odd k within 3..=MAX_K.
+pub fn check_k(k: usize) -> Result<usize, String> {
+    if !(3..=MAX_K).contains(&k) || k.is_multiple_of(2) {
+        Err("K-mer must be an odd number between 3 and 255 (inclusive)".to_string())
+    } else {
+        Ok(k)
+    }
+}
+
+/// Each k of a ladder is seeded with the previous k's contigs, so the ladder must climb.
+pub fn check_ladder(ks: &[usize]) -> Result<(), String> {
+    for &k in ks {
+        check_k(k)?;
+    }
+    if ks.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(format!(
+            "-k values must be strictly ascending (got {ks:?})."
+        ));
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 #[cfg(not(target_family = "wasm"))]
 fn valid_kmer(s: &str) -> Result<usize, String> {
     let k: usize = s
         .parse()
         .map_err(|_| format!("`{s}` isn't a valid k-mer"))?;
-    if !(3..=MAX_K).contains(&k) || k.is_multiple_of(2) {
-        Err("K-mer must be an odd number between 3 and 255 (inclusive)".to_string())
-    } else {
-        Ok(k)
-    }
+    check_k(k)
 }
 
 #[doc(hidden)]
@@ -235,10 +253,9 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_bloom: bool,
 
-        /// Set a value for the chunks of the reads during preprocessing. A value of zero ignores chunking.
-        /// Native builds now count into a hash map, which buffers no occurrences, so this is a no-op
-        /// there and is kept only so existing command lines still parse.
-        #[arg(long, default_value_t = 100000)]
+        /// Ignored, with a warning when set: k-mers are counted into a hash map, which buffers no
+        /// occurrences, so there is nothing to chunk. Kept only so existing command lines still parse.
+        #[arg(long, default_value_t = 0)]
         chunk_size: usize,
 
         /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is

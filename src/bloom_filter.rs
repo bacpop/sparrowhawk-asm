@@ -1,14 +1,10 @@
 //! A Bloom filter for counting k-mers from reads
 //!
 //! This is to support a minimum count from FASTQ files, for basic error
-//! correction, while keeping memory use low and predictable. Use the
-//! [`KmerFilter`] struct.
+//! correction, while keeping memory use low and predictable. The counter keeps
+//! one [`BloomBits`] per count-map shard.
 
 use std::borrow::BorrowMut;
-use std::cmp::Ordering;
-
-use nohash_hasher::NoHashHasher;
-use std::{collections::HashMap, hash::BuildHasherDefault};
 
 /// Default bloom filter width (expected number of k-mers)
 ///
@@ -81,7 +77,6 @@ impl BloomBits {
     }
 
     /// Number of set bits and allocated bits in the Bloom buffer.
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn occupancy(&self) -> (u64, u64) {
         let set_bits = self
             .buffer
@@ -110,78 +105,6 @@ impl BloomBits {
 impl Default for BloomBits {
     fn default() -> Self {
         Self::with_words(Self::default_words())
-    }
-}
-
-/// A filter which counts input k-mers, returning whether they passed a count threshold. A blocked
-/// bloom filter removes singletons first; past it a HashMap holds counts >= 2, so the filter has no
-/// false negatives and negligible false positives.
-#[derive(Debug, Clone, Default)]
-pub struct KmerFilter {
-    /// The bloom filter's bits
-    bits: BloomBits,
-    /// Table of counts
-    counts: HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>>,
-    /// Minimum count to pass filter
-    min_count: u16,
-}
-
-impl KmerFilter {
-    /// Check if in the bloom filter, add if not. Returns whether passed filter
-    fn bloom_add_and_check(&mut self, key: u64) -> bool {
-        self.bits.add_and_check(key)
-    }
-
-    /// Creates a new filter with given threshold
-    ///
-    /// Note:
-    pub fn new(min_count: u16) -> Self {
-        Self {
-            bits: BloomBits::with_words(BloomBits::default_words()),
-            counts: HashMap::with_hasher(BuildHasherDefault::default()),
-            min_count,
-        }
-    }
-
-    /// Initialises table so it is ready for use.
-    ///
-    /// Allocates memory for bloom filter (which can be avoided with FASTA input)
-    pub fn init(&mut self) {
-        self.bits.init();
-    }
-
-    /// Add an observation of a k-mer and middle base to the filter, and return if it passed
-    /// minimum count filtering criterion.
-    pub fn filter(&mut self, kmer_hash: u64, kmer_nc_hash: u64, bases: u8) -> Ordering {
-        // This is possible because of the k-mer size restriction, the top two
-        // bit are always zero
-        match self.min_count {
-            // No filtering
-            0 | 1 => Ordering::Equal,
-            // Bloom filter then hash table. This also handles min_count = 2.
-            _ => {
-                if self.bloom_add_and_check(kmer_hash) {
-                    let mut count: u32 = 2;
-                    self.counts
-                        .entry(kmer_hash)
-                        .and_modify(|tuple| {
-                            count = tuple.0.saturating_add(1);
-                            tuple.0 = count;
-                        })
-                        .or_insert((count, kmer_nc_hash, bases));
-                    (self.min_count as u32).cmp(&count)
-                } else {
-                    Ordering::Less
-                }
-            }
-        }
-    }
-
-    /// Get method to retrieve the count map
-    pub fn get_counts_map(
-        &mut self,
-    ) -> &mut HashMap<u64, (u32, u64, u8), BuildHasherDefault<NoHashHasher<u64>>> {
-        &mut self.counts
     }
 }
 

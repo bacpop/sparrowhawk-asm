@@ -1,4 +1,4 @@
-//! Native aligned storage used between k-mer counting and graph construction.
+//! Aligned storage used between k-mer counting and graph construction.
 
 use nohash_hasher::NoHashHasher;
 use sparrowhawk_graph::IndexedEdge;

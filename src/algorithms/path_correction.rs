@@ -1,4 +1,4 @@
-//! Native graph-only correction of short low-coverage alternative paths.
+//! Graph-only correction of short low-coverage alternative paths.
 //!
 //! Erroneous-connection removal and bulge removal are both wired into the correction loop, and both
 //! judge a path with `corrector::CoverageRef` rather than a bare ratio.
@@ -371,17 +371,13 @@ fn delete_internal(graph: &mut DbgGraph, candidate: &Candidate) {
     }
 }
 
-/// The diamond popper's rule (`corrector::choose_branch_by_counts`) applied to a bulge: drop the
-/// candidate when it is far weaker than its alternative, or when it reads as error while the
+/// The bubble rule: drop the candidate when it is far weaker than its alternative, or when it reads as error while the
 /// alternative reads as genomic.
 fn should_delete(candidate: f64, alternative: f64, pop_ratio: f32, coverage: &CoverageRef) -> bool {
-    // Strict `<`, so two equally covered branches can never delete each other however the ratio is
-    // set. That is exactly what Minia's `covMult > 1` gives up: above 1.0 the test passes in both
-    // directions for near-equal branches, and sort order decides which one dies.
+    // Strict `<`, so two equally covered branches can never delete each other however the ratio is set.
     //
-    // Compared in `f32`, like `choose_branch_by_counts`, and not by widening `pop_ratio` to `f64`:
-    // `f64::from(0.1f32)` is 0.10000000149011612, which lifts the threshold just enough to delete a
-    // branch sitting exactly on the boundary.
+    // Compared in `f32`, as the ratio is given, and not by widening `pop_ratio` to `f64`:
+    // `f64::from(0.1f32)` is 0.10000000149011612, which can overpass the threshold and add random branch removals
     let by_ratio = (candidate as f32) < pop_ratio * alternative as f32;
     let by_coverage = coverage.is_error_like(candidate.round() as u32)
         && coverage.is_genomic(alternative.round() as u32);

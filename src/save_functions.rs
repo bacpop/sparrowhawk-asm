@@ -3,34 +3,11 @@
 use core::panic;
 use std::io::Write;
 
-#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
-#[cfg(not(target_family = "wasm"))]
-use super::io_utils::*;
-
 use crate::bit_encoding::UInt;
-#[cfg(target_family = "wasm")]
-use crate::cli::DEFAULT_MIN_CONTIG_LENGTH_NTS;
 use crate::graph_works::{spell_path, Contigs, KmerLookup};
-
-/// Spells each contig and keeps those of at least `DEFAULT_MIN_CONTIG_LENGTH_NTS` bases.
-#[cfg(target_family = "wasm")]
-pub fn write_sequences_and_coverages<IntT>(
-    invec: &mut Contigs,
-    inmap: &impl KmerLookup<IntT>,
-    k: usize,
-) where
-    IntT: for<'a> UInt<'a>,
-{
-    let sequences = spell_contigs(invec, inmap, k);
-    let kept = at_least(&sequences, DEFAULT_MIN_CONTIG_LENGTH_NTS);
-    log::info!(
-        "Omitted {} contigs shorter than {DEFAULT_MIN_CONTIG_LENGTH_NTS} nt from FASTA output",
-        sequences.len() - kept.len()
-    );
-    invec.contig_sequences = Some(kept);
-}
+use crate::io_utils::set_ostream;
 
 /// Spells every contig. A multi-k step carries all of them to the next k, so none is length-filtered.
 pub(crate) fn spell_contigs<IntT>(
@@ -84,8 +61,7 @@ pub(crate) fn fasta_string(seqs: &[Vec<u8>]) -> String {
     String::from_utf8(out).expect("contigs are ASCII")
 }
 
-/// Writes spelled contigs of at least `min_contig_length` bases as FASTA, as the single-k path does.
-#[cfg(not(target_family = "wasm"))]
+/// Writes spelled contigs of at least `min_contig_length` bases as FASTA to `outfile`.
 pub(crate) fn save_sequences_as_fasta(
     seqs: &[Vec<u8>],
     min_contig_length: usize,
@@ -98,23 +74,6 @@ pub(crate) fn save_sequences_as_fasta(
     );
     let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
     write_fasta(&kept, &mut wbuf).expect("cannot write the contigs");
-}
-
-/// Stores all the contigs in fasta format, but exports it as JSON for javascript
-#[cfg(target_family = "wasm")]
-pub fn save_as_fasta_wasm<IntT>(
-    ingraph: &mut Contigs,
-    inmap: &impl KmerLookup<IntT>,
-    k: usize,
-) -> String
-where
-    IntT: for<'a> UInt<'a>,
-{
-    // First, we write the sequences and the coverages
-    log::info!("Preparing to export contigs...");
-
-    write_sequences_and_coverages(ingraph, inmap, k);
-    fasta_string(ingraph.contig_sequences.as_ref().unwrap())
 }
 
 //
