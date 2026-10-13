@@ -313,18 +313,23 @@ impl Correctable for DbgGraph {
 pub(crate) fn prune_unpaired_edges(g: &mut DbgGraph, n: NodeId) -> usize {
     type Connection = (NodeId, NodeId, EdgeType);
 
-    let mut incident: BTreeMap<Connection, BTreeSet<EdgeId>> = BTreeMap::new();
-
-    for carry in [CarryType::Min, CarryType::Max] {
-        for (edge_id, target, edge_type) in g.outgoing_edges_by_carry(n, carry) {
-            incident
-                .entry((n, target, edge_type))
-                .or_default()
-                .insert(edge_id);
-        }
+    let mut outgoing = g.outgoing_edges_by_carry(n, CarryType::Min);
+    outgoing.extend(g.outgoing_edges_by_carry(n, CarryType::Max));
+    let incoming = g.incoming_edges(n);
+    if edges_are_paired(&outgoing, &incoming) {
+        return 0;
     }
 
-    for (source, edge_type) in g.incoming_edges(n) {
+    let mut incident: BTreeMap<Connection, BTreeSet<EdgeId>> = BTreeMap::new();
+
+    for (edge_id, target, edge_type) in outgoing {
+        incident
+            .entry((n, target, edge_type))
+            .or_default()
+            .insert(edge_id);
+    }
+
+    for (source, edge_type) in incoming {
         let connection = (source, n, edge_type);
         if incident.contains_key(&connection) {
             continue;
@@ -356,6 +361,30 @@ pub(crate) fn prune_unpaired_edges(g: &mut DbgGraph, n: NodeId) -> usize {
     }
 
     to_remove.len()
+}
+
+/// Whether every edge at a node has exactly one reciprocal (opposite direction, `rev` type), so
+/// [`prune_unpaired_edges`] would remove nothing. Shrinking prunes every absorbed node and this
+/// is nearly always the case, so it is checked first, without that function's maps.
+fn edges_are_paired(
+    outgoing: &[(EdgeId, NodeId, EdgeType)],
+    incoming: &[(NodeId, EdgeType)],
+) -> bool {
+    outgoing.len() == incoming.len()
+        && outgoing.iter().all(|&(_, target, edge_type)| {
+            incoming
+                .iter()
+                .filter(|&&(source, t)| source == target && t == edge_type.rev())
+                .count()
+                == 1
+        })
+        && incoming.iter().all(|&(source, edge_type)| {
+            outgoing
+                .iter()
+                .filter(|&&(_, target, t)| target == source && t == edge_type.rev())
+                .count()
+                == 1
+        })
 }
 
 /// Collapse every bubble whose two branches differ significantly enough in coverage; leave the rest alone.
