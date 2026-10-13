@@ -96,8 +96,6 @@ pub trait UInt<'a>:
     + std::ops::ShlAssign<i32>
     + std::ops::BitOrAssign
     + std::borrow::BorrowMut<Self>
-    + serde::Serialize
-    + serde::Deserialize<'a>
 {
     /// Reverse complement of an encoded and packed split k-mer (64-bits).
     fn rev_comp(self, k_size: usize) -> Self;

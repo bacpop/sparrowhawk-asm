@@ -12,8 +12,6 @@ use std::{
     time::SystemTime,
 };
 
-extern crate num_cpus;
-
 /// Construction, assembly, shrinkage, pruning, and collapse of DNA de Bruijn graphs
 pub mod graph_works;
 

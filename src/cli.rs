@@ -1,6 +1,10 @@
 //! Command line interface, built using [`crate::clap` with `Derive`](https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html)
+//!
+//! The browser shares only the defaults and checks; the parser and its types are native-only.
+#[cfg(not(target_family = "wasm"))]
 use std::fmt;
 
+#[cfg(not(target_family = "wasm"))]
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
 /// Default k-mer size
@@ -69,7 +73,8 @@ pub fn default_kmer_ladder(max_k: usize) -> Vec<usize> {
 }
 
 /// How a multi-k run counts the k-mers carried over from the previous k's contigs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_family = "wasm"), derive(ValueEnum))]
 pub enum ContigCountRule {
     /// Raise each to the fitted minimum count; counts the reads already clear stay untouched.
     Floor,
@@ -78,6 +83,7 @@ pub enum ContigCountRule {
 }
 
 #[doc(hidden)]
+#[cfg(not(target_family = "wasm"))]
 fn valid_kmer(s: &str) -> Result<usize, String> {
     let k: usize = s
         .parse()
@@ -90,6 +96,7 @@ fn valid_kmer(s: &str) -> Result<usize, String> {
 }
 
 #[doc(hidden)]
+#[cfg(not(target_family = "wasm"))]
 fn valid_cpus(s: &str) -> Result<usize, String> {
     let threads: usize = s
         .parse()
@@ -118,14 +125,16 @@ pub(crate) fn validate_bloom_min_count(
 }
 
 /// Prints a warning if more threads than available have been requested
+#[cfg(not(target_family = "wasm"))]
 pub fn check_threads(threads: usize) {
-    let max_threads = num_cpus::get();
+    let max_threads = std::thread::available_parallelism().map_or(1, usize::from);
     if threads > max_threads {
         log::warn!("{threads} threads is greater than available cores {max_threads}");
     }
 }
 
 /// Possible output file types
+#[cfg(not(target_family = "wasm"))]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum FileType {
     /// Variant call format
@@ -135,6 +144,7 @@ pub enum FileType {
 }
 
 /// Possible variant filters
+#[cfg(not(target_family = "wasm"))]
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum FilterType {
     /// Output all variants
@@ -148,6 +158,7 @@ pub enum FilterType {
 }
 
 /// As text, for use in logging messages
+#[cfg(not(target_family = "wasm"))]
 impl fmt::Display for FilterType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -160,6 +171,7 @@ impl fmt::Display for FilterType {
 }
 
 /// Options that apply to all subcommands
+#[cfg(not(target_family = "wasm"))]
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -174,6 +186,7 @@ pub struct Args {
 }
 
 /// Subcommands and their specific options
+#[cfg(not(target_family = "wasm"))]
 #[derive(Subcommand)]
 pub enum Commands {
     #[command(group(
@@ -316,6 +329,7 @@ pub enum Commands {
 }
 
 /// Function to parse command line args into [`Args`] struct
+#[cfg(not(target_family = "wasm"))]
 pub fn cli_args() -> Args {
     Args::parse()
 }
