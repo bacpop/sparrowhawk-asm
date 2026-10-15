@@ -4,7 +4,6 @@ use flate2::read::MultiGzDecoder;
 use seq_io::fasta::Reader as FastaReader;
 use seq_io::fastq::{Reader as FastqReader, Record as _};
 use std::io::{BufRead, BufReader, Read};
-use wasm_bindgen_file_reader::WebSysFile;
 
 use crate::reads::OwnedRecord;
 
@@ -24,7 +23,7 @@ pub enum FastxRecords {
 impl FastxRecords {
     /// Open `file`, telling gzip by its magic bytes and FASTA from FASTQ by the first character. An
     /// empty file reads as a FASTQ file with no records.
-    pub fn open(file: WebSysFile) -> Self {
+    pub fn open<R: Read + 'static>(file: R) -> Self {
         let mut raw = BufReader::new(file);
         let gzipped = raw
             .fill_buf()

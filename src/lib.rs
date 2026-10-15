@@ -100,6 +100,8 @@ impl fmt::Display for QualOpts {
 /// leaves the output fields empty and `no_histo` set.
 struct BuildOpts<'a> {
     quality: QualOpts,
+    /// Count at `quality.min_qual` alone, rather than at the reads' ladder of floors topped by it.
+    fixed_min_qual: bool,
     do_bloom: bool,
     /// Fit `min_count` from the k-mer spectrum rather than using `quality.min_count`.
     do_fit: bool,
@@ -173,6 +175,7 @@ impl BuildOpts<'static> {
         use algorithms::corrector::{DEFAULT_EC_COVERAGE_RATIO, DEFAULT_POP_RATIO};
         Self {
             quality,
+            fixed_min_qual: false,
             do_bloom,
             do_fit,
             do_bubble_collapse: true,
@@ -266,6 +269,23 @@ fn count_single<S: ReadSource>(
     }
 }
 
+/// The base-quality floors a k is counted at, ascending: the given floor alone when it is fixed, which
+/// can never be loosened, or else the ladder the reads' qualities allow, topped by it.
+fn quality_floors<S: ReadSource>(opts: &BuildOpts, reads: &S) -> Vec<u8> {
+    let floors = if opts.fixed_min_qual {
+        vec![opts.quality.min_qual]
+    } else {
+        // The alphabet only, from the head of the reads: a few thousand show all 4-5 bins, and no
+        // spectrum is built from them, so the depth of the peek does not matter.
+        qual_profile::floors_from(
+            &qual_profile::peek_alphabet(reads.records(), qual_profile::PEEK_READS),
+            opts.quality.min_qual,
+        )
+    };
+    log::info!("Candidate base-quality floors: {floors:?}");
+    floors
+}
+
 fn count_single_at<IntT, S>(
     opts: &BuildOpts,
     reads: &S,
@@ -276,13 +296,7 @@ where
     IntT: for<'a> UInt<'a>,
     S: ReadSource,
 {
-    // The alphabet only, from the head of the reads: a few thousand show all 4-5 bins, and no spectrum
-    // is built from them, so the depth of the peek does not matter.
-    let ladder = qual_profile::floors_from(
-        &qual_profile::peek_alphabet(reads.records(), qual_profile::PEEK_READS),
-        opts.quality.min_qual,
-    );
-    log::info!("Candidate base-quality floors: {ladder:?}");
+    let ladder = quality_floors(opts, reads);
     // The ladder's strict floor, not the default: with `[0]`, no quality filtering.
     let quality = QualOpts {
         min_count: opts.quality.min_count,
@@ -310,6 +324,7 @@ where
          k-mers.",
         quality.min_qual
     );
+    post_state(&format!("preprocess:recount:{chosen}"));
     let loosened = QualOpts {
         min_count: quality.min_count,
         min_qual: chosen,
@@ -411,11 +426,10 @@ impl LadderState {
         requested: Option<&[usize]>,
         in_memory: bool,
     ) -> Self {
-        let floors = qual_profile::floors_from(
-            &qual_profile::peek_alphabet(reads.records(), qual_profile::PEEK_READS),
-            opts.quality.min_qual,
-        );
-        log::info!("Candidate base-quality floors: {floors:?}");
+        let floors = quality_floors(opts, reads);
+        if let Some(ks) = requested {
+            post_ladder(ks);
+        }
         let replay = if in_memory {
             Replay::Store(Box::new(read_store::ReadStore::new(&floors)))
         } else {
@@ -491,8 +505,13 @@ fn count_step<S: ReadSource>(
     timevec: &mut Vec<Instant>,
 ) -> Result<CountedK, preprocessing::PreprocessingError> {
     let k = state.ks[step];
-    log::info!("Multi-k step {}: k={k}", step + 1);
-    post_state(&format!("multik:{}:{k}", step + 1));
+    // The default ladder is only settled from the read lengths once its first k has been counted.
+    if state.default_ladder && step == 0 {
+        log::info!("Multi-k step 1: k={k} (the rest of the ladder is set after it)");
+    } else {
+        log::info!("Multi-k step {} of {}: k={k}", step + 1, state.ks.len());
+    }
+    post_state(&format!("multik:step:{}:{k}", step + 1));
     match k {
         3..=32 => ladder_count::<u64, S>(opts, reads, step, state, timevec).map(CountedK::W64),
         33..=64 => ladder_count::<u128, S>(opts, reads, step, state, timevec).map(CountedK::W128),
@@ -555,6 +574,7 @@ where
             stats.average_read_len().unwrap_or(0.0),
             stats.max_read_len(),
         );
+        post_ladder(&state.ks);
         pass1
     } else {
         count_again::<IntT, S>(
@@ -667,6 +687,7 @@ where
         first.genomic_peak,
     );
     log::warn!("Recounting k={k} at a base-quality floor of {floor}.");
+    post_state(&format!("preprocess:recount:{floor}"));
     drop(first);
     let quality = QualOpts {
         min_count,
@@ -846,6 +867,12 @@ fn settle_ladder(
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn post_state(_state: &str) {}
 
+/// Tells the page every k of a multi-k ladder, so it can say how far along the ladder a run is.
+fn post_ladder(ks: &[usize]) {
+    let ks: Vec<String> = ks.iter().map(usize::to_string).collect();
+    post_state(&format!("multik:ladder:{}", ks.join(",")));
+}
+
 /// Writes the corrected graph, before its collapse, as `<base>.dot`, `.gfa` and `.gfa2`.
 #[cfg(not(target_family = "wasm"))]
 fn write_graph_files(graph: &DbgGraph, base: &Path) {
@@ -918,6 +945,12 @@ pub fn main() {
                 );
                 std::process::exit(2);
             }
+            if *debug_quality_floors && min_qual.is_some() {
+                eprintln!(
+                    "error: --debug-quality-floors requires automatic base-quality floors; remove --min-qual"
+                );
+                std::process::exit(2);
+            }
 
             // Create the output directory if it does not exist, so every write below can assume it is
             // there.
@@ -951,7 +984,16 @@ pub fn main() {
                 min_count: min_count.unwrap_or(DEFAULT_MINCOUNT),
                 min_qual: min_qual.unwrap_or(DEFAULT_MINQUAL),
             };
-            log::info!("Minimum base quality used: {}", quality.min_qual);
+            // An explicit --min-qual is used as is, as an explicit --min-count is.
+            let fixed_min_qual = min_qual.is_some();
+            if fixed_min_qual {
+                log::info!("Base-quality floor fixed at {}", quality.min_qual);
+            } else {
+                log::info!(
+                    "Base-quality floors chosen automatically, at most {}",
+                    quality.min_qual
+                );
+            }
 
             // Build, merge
             // let rc = !*single_strand;
@@ -1040,6 +1082,7 @@ pub fn main() {
             }
             let opts = BuildOpts {
                 quality,
+                fixed_min_qual,
                 do_bloom,
                 do_fit,
                 do_bubble_collapse: !no_bubble_collapse,
@@ -1155,10 +1198,12 @@ pub struct AssemblyHelper {
     /// Multi-k when set: the requested k values, or empty for the default ladder.
     multik: Option<Vec<usize>>,
     quality: QualOpts,
+    /// Whether `quality.min_qual` was given, and is used as is rather than as the ladder's top.
+    fixed_min_qual: bool,
     do_bloom: bool,
     do_fit: bool,
-    no_bubble_collapse: bool,
-    no_dead_end_removal: bool,
+    /// The CLI's `--min-contig-length`: shorter contigs are left out of the FASTA.
+    min_contig_length: usize,
     /// The CLI's `--bubble-pop-ratio`, set through `set_bubble_pop_ratio`.
     bubble_pop_ratio: f32,
     /// The CLI's `--tip-length-kmult`, set through `set_tip_length_kmult`.
@@ -1168,10 +1213,11 @@ pub struct AssemblyHelper {
     /// The first k's count, from `preprocess` until `assemble`.
     counted: Option<CountedK>,
     ladder: Option<LadderState>,
-    /// What `get_preprocessing_info` reports.
+    /// What `get_preprocessing_info` reports, `spectrum_k` being the k counted.
     histo: Vec<u32>,
     nkmers: usize,
     used_min_count: u16,
+    spectrum_k: usize,
     ncontigs: usize,
     outfasta: String,
     outdot: String,
@@ -1182,17 +1228,17 @@ pub struct AssemblyHelper {
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 impl AssemblyHelper {
-    /// Set up an assembly. `verbose` logs progress to the console, as `-v` does natively.
-    #[allow(clippy::too_many_arguments)]
+    /// Set up an assembly. `verbose` logs progress to the console, as `-v` does natively. `min_qual`
+    /// is used as is when given, and otherwise chosen automatically, as `--min-qual` natively. Bubble
+    /// collapse and dead-end removal always run, as they do by default natively.
     pub fn new(
         k: u32,
         verbose: bool,
         min_count: u16,
-        min_qual: u8,
+        min_qual: Option<u8>,
         do_bloom: bool,
         do_fit: bool,
-        no_bubble_collapse: bool,
-        no_dead_end_removal: bool,
+        min_contig_length: u32,
     ) -> Result<AssemblyHelper, JsError> {
         if cfg!(debug_assertions) {
             init_panic_hook();
@@ -1211,12 +1257,12 @@ impl AssemblyHelper {
             multik: None,
             quality: QualOpts {
                 min_count,
-                min_qual,
+                min_qual: min_qual.unwrap_or(DEFAULT_MINQUAL),
             },
+            fixed_min_qual: min_qual.is_some(),
             do_bloom,
             do_fit,
-            no_bubble_collapse,
-            no_dead_end_removal,
+            min_contig_length: min_contig_length as usize,
             bubble_pop_ratio: algorithms::corrector::DEFAULT_POP_RATIO,
             tip_length_kmult: cli::DEFAULT_TIP_LEN_KMULT,
             reads: None,
@@ -1225,6 +1271,7 @@ impl AssemblyHelper {
             histo: Vec::new(),
             nkmers: 0,
             used_min_count: 0,
+            spectrum_k: k,
             ncontigs: 0,
             outfasta: String::new(),
             outdot: String::new(),
@@ -1278,10 +1325,15 @@ impl AssemblyHelper {
         let opts = self.build_opts();
         let mut timevec = vec![Instant::now()];
         let counted = match &self.multik {
-            None => count_single(&opts, &reads, self.k, &mut timevec)?,
+            None => {
+                self.spectrum_k = self.k;
+                count_single(&opts, &reads, self.k, &mut timevec)?
+            }
             Some(ks) => {
                 let requested = (!ks.is_empty()).then_some(ks.as_slice());
                 let mut ladder = LadderState::new(&opts, &reads, requested, false);
+                // Before the first count settles the rest of the ladder.
+                self.spectrum_k = ladder.ks[0];
                 let first = count_step(&opts, &reads, 0, &mut ladder, &mut timevec)?;
                 self.ladder = Some(ladder);
                 first
@@ -1368,6 +1420,9 @@ impl AssemblyHelper {
                 .collect(),
         );
         results["used_min_count"] = json::JsonValue::Number(self.used_min_count.into());
+        // In a multi-k run, the spectrum is the first k's; the later ones are counted in `assemble`.
+        results["k"] = json::JsonValue::Number(self.spectrum_k.into());
+        results["multik"] = json::JsonValue::Boolean(self.multik.is_some());
 
         log::debug!("{}", results.dump());
 
@@ -1380,8 +1435,8 @@ impl AssemblyHelper {
     /// The CLI's defaults, with the page's own settings over them.
     fn build_opts(&self) -> BuildOpts<'static> {
         BuildOpts {
-            do_bubble_collapse: !self.no_bubble_collapse,
-            do_dead_end_removal: !self.no_dead_end_removal,
+            fixed_min_qual: self.fixed_min_qual,
+            min_contig_length: self.min_contig_length,
             pop_ratio: self.bubble_pop_ratio,
             tip_length_kmult: self.tip_length_kmult,
             ..BuildOpts::with_defaults(self.quality, self.do_bloom, self.do_fit)
@@ -1412,8 +1467,8 @@ impl CountedK {
 #[cfg(test)]
 mod multik_tests {
     use super::{
-        active_quality_floors, aun, count_step, lowered_floor_index, read_store, run_ladder,
-        settle_ladder, BuildOpts, LadderState, QualOpts, Replay,
+        active_quality_floors, aun, count_step, lowered_floor_index, quality_floors, read_store,
+        run_ladder, settle_ladder, BuildOpts, LadderState, QualOpts, Replay,
     };
     use crate::cli::{DEFAULT_MINCOUNT, DEFAULT_MINQUAL};
     use crate::clock::Instant;
@@ -1519,5 +1574,31 @@ mod multik_tests {
             run_ladder(&opts, &reads, &mut ladder, first, &mut timevec, None).unwrap()
         };
         assert_eq!(run(false), run(true));
+    }
+
+    /// A given floor is the only one counted at, so it can never be loosened; without one, the
+    /// fixture's qualities give a ladder topped by the default.
+    #[test]
+    fn a_fixed_floor_is_the_only_floor() {
+        let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+        let files = vec![(
+            "window".to_owned(),
+            vec![data
+                .join("ecoli_window_1.fastq.gz")
+                .to_string_lossy()
+                .into_owned()],
+        )];
+        let reads = crate::reads::InputFiles(&files);
+        let mut opts = BuildOpts::with_defaults(
+            QualOpts {
+                min_count: DEFAULT_MINCOUNT,
+                min_qual: 25,
+            },
+            true,
+            true,
+        );
+        assert!(quality_floors(&opts, &reads).len() > 1);
+        opts.fixed_min_qual = true;
+        assert_eq!(quality_floors(&opts, &reads), vec![25]);
     }
 }

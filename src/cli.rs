@@ -240,7 +240,8 @@ pub enum Commands {
         #[arg(long)]
         min_count: Option<u16>,
 
-        /// Minimum k-mer base quality, inclusive (with reads). Defaults to 20 at every k.
+        /// Minimum k-mer base quality, inclusive (with reads). If omitted, it is chosen automatically
+        /// at each k from the reads' quality ladder, topped at 20; if given, it is used as is at every k.
         #[arg(long)]
         min_qual: Option<u8>,
 

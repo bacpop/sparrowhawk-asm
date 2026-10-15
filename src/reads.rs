@@ -68,16 +68,51 @@ impl ReadSource for BrowserFiles {
     where
         Self: 'a;
 
+    /// Also restarts the progress count, against the files' combined size.
     fn records(&self) -> Self::Records<'_> {
+        let total: f64 = self.0.iter().map(|file| file.size()).sum();
+        PASS_PROGRESS.with(|progress| progress.set((0.0, total)));
         self.0
             .iter()
             .map(|file| {
-                crate::fastx_wasm::FastxRecords::open(wasm_bindgen_file_reader::WebSysFile::new(
-                    file.clone(),
+                crate::fastx_wasm::FastxRecords::open(Counted(
+                    wasm_bindgen_file_reader::WebSysFile::new(file.clone()),
                 ))
             })
             .collect::<Vec<_>>()
             .into_iter()
             .flatten()
+    }
+}
+
+// This is quite magic, but it is interesting: this is a way of having a shared variable that lies in the current thread, given that we have the two-buffer system. Those generate IIUC scopes that do not speak to each other in any way. This thread_local! macro creates essentially a, thanks to the "static", global variable for all the thread. Because it's static for globalness, we need std:cell:Cell for having mutability in its interior, as static mut is unsafe and forbidden in recent Rust versions. All a bit quite magic, but I did something similar when I didn't know in Python how to pass info to shared threads, now that I remember
+
+#[cfg(target_family = "wasm")]
+thread_local! {
+    /// Bytes the current pass over the page's files has read, and their combined size. Compressed
+    /// bytes for gzipped files, which is still how far through them the pass is.
+    static PASS_PROGRESS: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((0.0, 0.0)) };
+}
+
+/// How far through the page's files the current pass is, in percent, for the page's progress line.
+#[cfg(target_family = "wasm")]
+pub fn pass_percent() -> Option<u32> {
+    let (read, total) = PASS_PROGRESS.with(std::cell::Cell::get);
+    (total > 0.0).then(|| (100.0 * read / total).min(100.0) as u32)
+}
+
+/// A file whose reads add to the pass's progress.
+#[cfg(target_family = "wasm")]
+struct Counted<R>(R);
+
+#[cfg(target_family = "wasm")]
+impl<R: std::io::Read> std::io::Read for Counted<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        PASS_PROGRESS.with(|progress| {
+            let (read, total) = progress.get();
+            progress.set((read + n as f64, total));
+        });
+        Ok(n)
     }
 }

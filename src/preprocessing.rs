@@ -1684,7 +1684,10 @@ where
                 on_batch(&batch);
                 done += batch.len();
                 batch.clear();
-                crate::post_state(&format!("preprocess:bulk:loop:{done}"));
+                crate::post_state(&match crate::reads::pass_percent() {
+                    Some(percent) => format!("preprocess:bulk:loop:{done}:{percent}"),
+                    None => format!("preprocess:bulk:loop:{done}"),
+                });
             }
         }
     }
