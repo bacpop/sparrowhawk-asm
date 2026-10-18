@@ -13,13 +13,13 @@ pub const DEFAULT_KMER: usize = 31;
 pub const DEFAULT_MINCOUNT: u16 = 5;
 /// Default minimum base quality (PHRED score) for FASTQ files
 pub const DEFAULT_MINQUAL: u8 = 20;
-/// Default flat tip-removal threshold, in bases
+/// Default flat deadend-removal threshold, in bases
 pub const DEFAULT_TIP_LEN_NTS: usize = 100;
-/// Default tip-removal k multiplier, matching Minia's `-tip-len-topo-kmult`
+/// Default deadend-removal k multiplier, taken from Minia/SPAdes
 pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
-/// Minia's `_tipLen_RCTC_kMult` (`Simplifications.cpp:94`): the longer band judged on coverage
+/// Default value for the multiplier of coverage needed to clean dead-ends when the coverage is very different
 pub const DEFAULT_TIP_RCTC_KMULT: f32 = 10.0;
-/// Minia's `_tipRCTCcutoff` (`Simplifications.cpp:95`), SPAdes-derived
+/// Default value for the coverage rule threshold, SPAdes/Minia-derived
 pub const DEFAULT_TIP_RCTC_CUTOFF: f64 = 2.0;
 /// Default minimum contig sequence length written to FASTA, in nucleotides
 pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
@@ -43,7 +43,7 @@ pub const READ_LEN_MARGIN: usize = 10;
 
 /// The automatic ladder, bounded by `max_k` (the longest read less [`READ_LEN_MARGIN`]) and by [`MAX_K`].
 ///
-/// The rung past the ceiling becomes the largest odd k under it if that adds [`MIN_CLAMPED_STEP`];
+/// The step past the ceiling becomes the largest odd k under it if that adds [`MIN_CLAMPED_STEP`];
 /// one past [`MAX_K`] always does. The initial 21 is retained as the bootstrap k.
 pub fn default_kmer_ladder(max_k: usize) -> Vec<usize> {
     let ceiling = max_k.min(MAX_K);
@@ -254,8 +254,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_bloom: bool,
 
-        /// Ignored, with a warning when set: k-mers are counted into a hash map, which buffers no
-        /// occurrences, so there is nothing to chunk. Kept only so existing command lines still parse.
+        /// DEPRECATED: now ignored, with warning.
         #[arg(long, default_value_t = 0)]
         chunk_size: usize,
 
@@ -282,28 +281,26 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         ec_require_both_flanks: bool,
 
-        /// Tip removal: dead-end paths shorter than this many bases are pruned. The threshold actually
+        /// Dead-end removal by length: paths shorter than this many bases are pruned. The threshold actually
         /// used is `max(--tip-length, --tip-length-kmult * k)`.
         #[arg(long, default_value_t = DEFAULT_TIP_LEN_NTS)]
         tip_length: usize,
 
-        /// Tip removal: scale that threshold with k, as Minia does. Zero keeps the flat `--tip-length`,
-        /// which is the historical behaviour.
+        /// Dead-end removal by length, length scale: scale its threshold with k. Zero disables scaling with k.
         #[arg(long, default_value_t = DEFAULT_TIP_LEN_KMULT)]
         tip_length_kmult: f32,
 
-        /// Tip removal: also prune dead ends up to `--tip-length-rctc-kmult * k` bases when the
-        /// junction they hang off is much better covered. Minia's second tier
-        /// (`Simplifications.cpp:559`). Zero disables it, leaving only the length rule.
+        /// Dead-end removal by coverage, length threshold: prune dead ends up to `--tip-length-rctc-kmult * k` bases when the
+        /// junction they hang off is much better covered. Zero disables it.
         #[arg(long, default_value_t = DEFAULT_TIP_RCTC_KMULT)]
         tip_length_rctc_kmult: f32,
 
-        /// Tip removal: a longer tip goes when its junction's other neighbours average this many
-        /// times its coverage (Minia's `-tip-rctc-cutoff`, `Simplifications.cpp:95`).
+        /// Dead-end removal by coverage, coverage threshold: a dead-end that might be a bit longth is removed when its junction's other neighbours average this many
+        /// times its coverage
         #[arg(long, default_value_t = DEFAULT_TIP_RCTC_CUTOFF)]
         tip_rctc_cutoff: f64,
 
-        /// Tip removal: keep only the length rule, dropping the coverage tier entirely.
+        /// Disable dead-end removal by coverage: only remove dead-ends by length.
         #[arg(long, default_value_t = false)]
         no_tip_rctc: bool,
 
@@ -340,7 +337,7 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_bubble_collapse: bool,
 
-        /// Do not remove dead endsin the graph
+        /// Do not remove dead ends in the graph
         #[arg(long, default_value_t = false)]
         no_dead_end_removal: bool,
     },

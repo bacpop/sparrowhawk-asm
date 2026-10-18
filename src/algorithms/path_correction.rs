@@ -1,29 +1,32 @@
 //! Graph-only correction of short low-coverage alternative paths.
 //!
-//! Erroneous-connection removal and bulge removal are both wired into the correction loop, and both
-//! judge a path with `corrector::CoverageRef` rather than a bare ratio.
+//! Erroneous-connection removal and bubble/bulge removal are both wired into the correction loop, and both
+//! judge a path with `corrector::CoverageRef` rather than a bare ratio. The old bubble collapser we had is
+//! part of the bulge removal, as they are special cases of them.
 
 use crate::algorithms::corrector::{CoverageRef, PathCoverage};
 use sparrowhawk_graph::{CarryType, DbgGraph, EdgeType, NodeId};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
+/// Multipliers and what to add for bulge removal
 const BULGE_LEN_K_MULT: usize = 3;
 const BULGE_LEN_K_ADD: usize = 100;
-/// Partial paths the alternative search expands before giving up. A pop budget, not a length —
-/// Minia's `backtrackingLimit` counts bases traversed (`Simplifications.cpp:1042`).
+
+/// Partial paths the alternative search expands before giving up, and thresholds/limits.
 const BULGE_ALT_PATH_POPS: usize = 131;
 const BULGE_RELATIVE_LEN_DELTA: f64 = 0.10;
 const BULGE_MIN_LEN_DELTA: usize = 3;
 
-/// Longest candidate the bulge rule considers, in k-mers. Minia's `maxBulgeLength`
-/// (`Simplifications.cpp:1298`) is a base count, and n k-mers span `k + n - 1` bases.
+/// Longest candidate the bulge rule considers, in k-mers.
 fn bulge_max_kmers(k: usize) -> usize {
     let max_bases = (BULGE_LEN_K_MULT * k).max(k + BULGE_LEN_K_ADD);
     max_bases.saturating_sub(k.saturating_sub(1)).max(1)
 }
 const EC_LEN_K_MULT: usize = 9;
 
+// Structs to apply bulge correction in a more structured way
+/// OrientedNode is a normal petgraph node BUT with an exact direction (i.e. strand)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OrientedNode {
     node: NodeId,
@@ -103,6 +106,7 @@ fn sorted_forward(graph: &DbgGraph, state: OrientedNode) -> Vec<(OrientedNode, E
             )
         })
         .collect();
+
     next.sort_by(|(a, ae), (b, be)| {
         oriented_hashes(graph, *a)
             .cmp(&oriented_hashes(graph, *b))
@@ -466,12 +470,7 @@ fn bounded_coverage(graph: &DbgGraph, first: OrientedNode, forward: bool) -> Opt
 }
 
 /// Mean coverage of the competing branches: length-weighted *within* each branch, then averaged
-/// unweighted *across* them.
-///
-/// That asymmetry is deliberate and matches Minia (`Simplifications.cpp:238` divides by the neighbour
-/// count, over values that are each `coverage / seqLength` from `GraphUnitigs.cpp:1521`). The branches
-/// are alternative routes, not pieces of one sequence, so what matters is whether *a* route is well
-/// covered — pooling them by k-mer would let one long weak route mask a short strong one.
+/// unweighted *across* them. Taken from Minia.
 fn mean_competitors(coverages: &[PathCoverage]) -> Option<f64> {
     (!coverages.is_empty()).then(|| {
         coverages

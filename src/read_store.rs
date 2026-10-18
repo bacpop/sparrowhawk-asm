@@ -11,16 +11,14 @@ const BLOCK_READS: usize = 8192;
 const INVALID: u8 = 3;
 const _: () = assert!(MAX_GROUPS <= INVALID as usize);
 
-/// One block of reads, eight bases per `u32` word (first base in the low nibble), as WGSL buffers hold
-/// them. Each nibble is a 2-bit base code with the 2-bit quality class above it.
+/// One block of reads, eight bases per `u32` word (first base in the low nibble), as WGSL buffers (thinking on them for potential GPGPU adaptation) hold them. Each entry is a 2-bit base code with the 2-bit quality class above it.
 struct Block {
     words: Vec<u32>,
     /// Exclusive end of each read, in bases from the start of the block.
     ends: Vec<u32>,
 }
 
-/// The reads, each base's quality reduced to the strictest ladder floor it clears. That is all counting
-/// ever reads from a quality, so replaying the store counts exactly what streaming the files did.
+/// The reads, each base's quality reduced to the strictest ladder floor it clears. That is all counting ever reads from a quality, so replaying the store counts exactly what streaming the files did.
 pub struct ReadStore {
     /// Ascending ladder. A valid base's class is the index of the strictest floor it clears, the same
     /// index `window_groups` gives a window.

@@ -1,4 +1,4 @@
-//! Aligned storage used between k-mer counting and graph construction.
+//! Aligned storage used between k-mer counting (AFTER filtering) and graph construction.
 
 use nohash_hasher::NoHashHasher;
 use sparrowhawk_graph::IndexedEdge;
@@ -6,8 +6,11 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
+/// Simple type: just a hashmap that we'll use for the correspondence between hashes and the vector index associated to it.
 type IndexMap = HashMap<u64, OrientedKmerIndex, BuildHasherDefault<NoHashHasher<u64>>>;
 
+
+/// OrientedKmerIndex is just an usize, i.e. for our cases just an u32 or u64. It is "oriented" because it includes the information in its first bit of whether the hash is canonical or not.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OrientedKmerIndex(usize);
@@ -15,8 +18,8 @@ pub(crate) struct OrientedKmerIndex(usize);
 impl OrientedKmerIndex {
     fn new(index: usize, is_reverse: bool) -> Self {
         let encoded = index
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(usize::from(is_reverse)))
+            .checked_mul(2) // *2 is equivalent to move to the left one bit
+            .and_then(|value| value.checked_add(usize::from(is_reverse))) // we sum one or zero for the first bit, that codifies whether it is or not canonical
             .expect("too many indexed k-mers to encode their orientation");
         Self(encoded)
     }
@@ -38,7 +41,7 @@ impl OrientedKmerIndex {
     }
 }
 
-/// K-mer attributes stored once in vectors sharing a stable index.
+/// K-mer attributes stored once in vectors sharing a stable index. Essentially, aligned vectors that allow us later to parallelise in CPU operations without atomics. This also replaces our old minmaxdict, a hashmap that I added for having the correspondance between canonical and non-canonical hashes.
 #[derive(Clone)]
 pub struct IndexedKmers<IntT> {
     pub(crate) canonical_hashes: Vec<u64>,
@@ -52,9 +55,9 @@ pub struct IndexedKmers<IntT> {
 }
 
 impl<IntT> IndexedKmers<IntT> {
-    pub(crate) fn with_capacity(kmers: usize) -> Self {
+    pub(crate) fn with_capacity(kmers: usize) -> Self { // ONE ALLOCATION!
         let lookup_capacity = kmers
-            .checked_mul(2)
+            .checked_mul(2) // We store direct and reverse!
             .expect("too many indexed k-mers to allocate their hash lookup");
         Self {
             canonical_hashes: Vec::with_capacity(kmers),

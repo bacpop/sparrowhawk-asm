@@ -4,16 +4,19 @@ version = "0.1.3"
 edition = "2021"
 repository = "https://github.com/bacpop/sparrowhawk-asm"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
 
 [features]
 default = ["xz2", "zstd"]
 xz2 = ["needletail/xz2"]
 zstd = ["needletail/zstd"]
 
+# Dependencies =======================================================
+# - Common
 [dependencies]
 num-traits = { version = "0.2.19" }
 log = { version = "0.4.27" }
@@ -28,6 +31,7 @@ libm = { version = "0.2" }
 argmin = { version = "0.10.0", default-features = false }
 argmin-math = { version = "0.4" }
 
+# - Per target
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 clap = { version = "4.5.35", features = ["derive"] }
 needletail = { version = "0.7.3", default-features = false, features = ["flate2"] }
@@ -45,10 +49,6 @@ getrandom = { version = "0.2", features = ["js"] }
 web-sys = { version = "0.3.77", features = ["Blob", "File"] }
 json = { version = "0.12.4" }
 
+# - Testing
 [dev-dependencies]
-# testing
 pretty_assertions = "1.4.1"
-
-
-[profile.release]
-lto = true

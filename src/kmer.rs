@@ -1,5 +1,5 @@
 //! Some docs here, but I think the file name is already self-explicative enough
-//!
+//! Blutantly copied from ska.rust
 
 use std::borrow::Cow;
 
@@ -30,13 +30,10 @@ pub struct Kmer<'a, IntT> {
     hash_gen: NtHashIterator,
     /// rc or Not
     rc: bool,
-    // /// the index of the record
-    // rec_ind: &'a u32,
 }
 
 impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
-    /// Quality score is at least minimum. Inclusive, so `--min-qual 20` keeps Q20; saturating because a
-    /// byte below b'!' = 33, where the ASCII encoding starts, would otherwise underflow.
+    /// Quality score is at least minimum. Inclusive, so `--min-qual 20` keeps Q20; saturating because a byte below b'!' = 33, where the ASCII encoding starts, would otherwise underflow.
     #[inline(always)]
     fn valid_qual(idx: usize, qual: Option<&'a [u8]>, min_qual: u8) -> bool {
         match qual {
@@ -56,7 +53,6 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         idx: &mut usize,
         min_qual: u8,
         rc: bool,
-        // rec_ind: &'a u32,
     ) -> Option<(IntT, NtHashIterator)> {
         // log::info!("Building kmer");
         // A k-mer starting at `idx` spans [idx, idx + k - 1], so it exists iff idx + k <= seq_len.
@@ -261,16 +257,6 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         self.hash_gen.curr_hash()
     }
 
-    // /// Get the next k-mer in the sequence
-    // ///
-    // pub fn get_next_kmer(&mut self) -> Option<(u64, u8, u64)> {
-    //     let next = self.roll_fwd();
-    //     match next {
-    //         true => Some(self.get_curr_kmerhash_and_bases()),
-    //         false => None,
-    //     }
-    // }
-
     /// Get the next k-mer in the sequence and provide other information
     pub fn get_next_kmer_and_give_us_things(&mut self) -> Option<(u64, u64, u8, IntT)> {
         let next = self.roll_fwd();
@@ -279,30 +265,8 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
             false => None,
         }
     }
-
-    // pub fn create_absolute_index_for_illumina(&self) -> u64 {
-    // //     println!("{} {} {}", *seq_ind, *rec_ind, *rec_ind as u64 + *seq_ind as u64);
-    //     if self.rc {
-    //         return *self.rec_ind as u64 + ((self.seq_len - self.index - 1 + self.k - 1) as u64);
-    //     } else {
-    //         return *self.rec_ind as u64 + self.index as u64;
-    //     }
-    // }
 }
 
-// fn create_absolute_index(rc: &bool,
-//     seq_ind: &usize,
-//     rec_ind: u32) -> u64 {
-//
-//     let mut outind : u64 = (rec_ind as u64) << 1;
-//     if *rc {
-//         outind |= 1u64;
-//     }
-//
-//     outind <<= 32;
-//
-//     outind | ((*seq_ind as u64) & 33u64)
-// }
 
 //
 //

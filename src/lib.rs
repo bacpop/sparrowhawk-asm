@@ -1,11 +1,11 @@
-//! Efficient genome assembler for small genomes in Rust
+//! Efficient genome assembler for bacterial species in Rust, browser-ready
 #![warn(missing_docs)]
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::clock::Instant;
 
-/// A monotonic clock that also works in the browser
+/// A clock that also works in the browser
 pub mod clock;
 
 /// The logger, natively to stdout and the log file, in the browser to the console
@@ -102,6 +102,7 @@ struct BuildOpts<'a> {
     quality: QualOpts,
     /// Count at `quality.min_qual` alone, rather than at the reads' ladder of floors topped by it.
     fixed_min_qual: bool,
+    /// Enabled by default
     do_bloom: bool,
     /// Fit `min_count` from the k-mer spectrum rather than using `quality.min_count`.
     do_fit: bool,
@@ -135,7 +136,7 @@ struct BuildOpts<'a> {
 }
 
 impl BuildOpts<'_> {
-    /// Correction settings for one k: tip thresholds scale with k, coverage comes from its spectrum.
+    /// Correction settings for one k: tip thresholds scale with k, coverage comes from its spectrum. Small helper that gets the info from buildopts
     fn correction(
         &self,
         k: usize,
@@ -995,9 +996,7 @@ pub fn main() {
                 );
             }
 
-            // Build, merge
-            // let rc = !*single_strand;
-
+            // Set up multithreadding pool
             log::info!("Checking requested threads and creating pool if needed");
             rayon::ThreadPoolBuilder::new()
                 .num_threads(*threads)
@@ -1024,7 +1023,8 @@ pub fn main() {
 
             let output: PathBuf =
                 Path::new(output_dir).join(format!("{output_prefix}_contigs.fasta"));
-
+            
+            // Checks for invalid values of parameter
             if !(*bubble_pop_ratio > 0.0 && *bubble_pop_ratio < 1.0) {
                 eprintln!(
                     "error: --bubble-pop-ratio must be strictly between 0 and 1 (got \
@@ -1080,6 +1080,8 @@ pub fn main() {
                     std::process::exit(2);
                 }
             }
+
+            // Finished checks, let's put all the options in a convenient struct...
             let opts = BuildOpts {
                 quality,
                 fixed_min_qual,
@@ -1104,7 +1106,8 @@ pub fn main() {
                 output_dir,
                 output_prefix,
             };
-
+            
+            // And do final preparations
             let reads = reads::InputFiles(&input_files);
             let mut write_graph = out_path_graph
                 .as_deref()
@@ -1112,9 +1115,13 @@ pub fn main() {
             let graph_sink = write_graph
                 .as_mut()
                 .map(|write| write as &mut dyn FnMut(&DbgGraph));
+
+            // ...and RUN!!
             let built = match k.as_deref() {
+                // single-k
                 Some(&[single]) => count_single(&opts, &reads, single, &mut timevec)
                     .map(|counted| assemble_single(&opts, counted, &mut timevec, graph_sink)),
+                // multi-k
                 requested => {
                     let mut ladder = LadderState::new(&opts, &reads, requested, true);
                     count_step(&opts, &reads, 0, &mut ladder, &mut timevec).and_then(|first| {
@@ -1122,6 +1129,8 @@ pub fn main() {
                     })
                 }
             };
+            
+            // In any case, save output contigs
             match built {
                 Ok(contigs) => save_functions::save_sequences_as_fasta(
                     &contigs,
@@ -1149,7 +1158,10 @@ pub fn main() {
     log::info!("Finishing program!");
 }
 
+//
+//
 // ===================================== WebAssembly stuff follows
+//
 #[cfg(target_family = "wasm")]
 /// Binary dummy function. In the future, we need to completely remove it whenever compilating with the feature "wasm"
 pub fn main() {
@@ -1229,8 +1241,7 @@ pub struct AssemblyHelper {
 #[wasm_bindgen]
 impl AssemblyHelper {
     /// Set up an assembly. `verbose` logs progress to the console, as `-v` does natively. `min_qual`
-    /// is used as is when given, and otherwise chosen automatically, as `--min-qual` natively. Bubble
-    /// collapse and dead-end removal always run, as they do by default natively.
+    /// is used as is when given, and otherwise chosen automatically, as `--min-qual` natively.
     pub fn new(
         k: u32,
         verbose: bool,
@@ -1314,7 +1325,7 @@ impl AssemblyHelper {
         }
     }
 
-    /// Count the first k from the read files (one, or a pair).
+    /// Parse, filter, and count the first k-value's kmers from the read files (one, or a pair).
     pub fn preprocess(
         &mut self,
         file1: web_sys::File,
@@ -1354,7 +1365,7 @@ impl AssemblyHelper {
         Ok(())
     }
 
-    /// Assemble what `preprocess` counted, and every later k of a multi-k run.
+    /// Assemble what `preprocess` obtained, and every later k of a multi-k run.
     pub fn assemble(&mut self) -> Result<(), JsError> {
         let counted = self
             .counted
@@ -1396,6 +1407,7 @@ impl AssemblyHelper {
     }
 
     /// Getter to obtain the results as JSON of the assembly
+    /// TODO: do as we do in ska.rust, so that the output is directly written to disk? Also, compression? Though, is it preferable to keep the contigs compressed/uncompressed, or the graph from which they come? In this case probably I'll need to keep the strings better, but it should be better still to offer them compressed (and we'll save some space as well).
     pub fn get_assembly(&self) -> String {
         let mut results = json::JsonValue::new_array();
 

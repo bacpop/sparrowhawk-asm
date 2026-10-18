@@ -1,4 +1,4 @@
-//! Shrink the given graph
+//! Shrink the given graph. Crucial for performance!!
 use crate::algorithms::corrector::prune_unpaired_edges;
 use sparrowhawk_graph::{CarryType, DbgGraph, EdgeId, EdgeType, NodeId};
 

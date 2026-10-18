@@ -3,7 +3,7 @@
 //! It works particularly well as a rolling hash, e.g. for k-mers in an input
 //! sequence.
 //!
-//! This implementation based on ntHash 2
+//! This implementation is based on ntHash 2, but using more partitions than the two present in the paper for the hashes, to reduce collisions
 
 use super::bit_encoding::{encode_base, rc_base};
 

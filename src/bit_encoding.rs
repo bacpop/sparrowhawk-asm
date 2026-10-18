@@ -13,8 +13,6 @@
 //! EOR w/ 10          10     10     10     10
 //! gives rc           10     11     00     01
 //! ```
-//! (Same as used in GATB library)
-//!
 //! Ns/n are checked cheaply in a similar way
 //!
 //! There are also lookup tables to support ambiguity using IUPAC codes.
@@ -80,7 +78,7 @@ pub fn base_to_prob(base: u8) -> [f64; 4] {
     }
 }
 
-/// Trait to support both `u64` and `u128` representation of split k-mers
+/// Trait to support both `u64`, `u128`, and larger integer format representation of split k-mers
 pub trait UInt<'a>:
     PrimInt
     + Unsigned
@@ -252,16 +250,8 @@ impl<'a> UInt<'a> for u128 {
 }
 
 // ADDING NEW UINTS TO INCREASE K-MER LENGTH UP TO 256/255.
-// pub type u192 = BUint<3>;
 
-/// New created type of 256 bits
 pub type U256 = BUint<4>;
-
-// pub type u320 = BUint<5>;
-// pub type u384 = BUint<6>;
-// pub type u448 = BUint<7>;
-
-/// New created type of 512 bits
 pub type U512 = BUint<8>;
 
 impl<'a> UInt<'a> for U256 {

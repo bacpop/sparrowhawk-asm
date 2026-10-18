@@ -15,12 +15,12 @@ const BITS_PER_ENTRY: usize = 12;
 
 /// The blocked Bloom filter's bit array on its own, so the parallel counter can shard it: one array
 /// per count-map shard keeps every buffer single-writer, needing no atomics. Based on
-/// <https://github.com/lemire/Code-used-on-Daniel-Lemire-s-blog/blob/master/2021/10/02/wordbasedbloom.cpp>
+/// <https://github.com/lemire/Code-used-on-Daniel-Lemire-s-blog/blob/master/2021/10/02/wordbasedbloom.cpp>, then taken from ska.rust in origin
 #[derive(Debug, Clone)]
 pub struct BloomBits {
     /// Size of the bloom filter, in 64-bit words
     buf_size: u64,
-    /// Buffer for the bloom filter
+    /// Buffer for the bloom filter, i.e. the actual filter.
     buffer: Vec<u64>,
 }
 
@@ -55,7 +55,8 @@ impl BloomBits {
     }
 
     /// Words the unsharded filter uses. A sharded caller divides this, so bits per key are preserved.
-    /// `BITS_PER_ENTRY` is already in bits; the former `/ 8.0` sized the filter 8x too small.
+    /// `BITS_PER_ENTRY` is already in bits; the former `/ 8.0` sized the filter 8x too small, I think
+    /// the bug is already in the Lemire blog, but perhaps I'm wrong?
     pub fn default_words() -> u64 {
         f64::round(BLOOM_WIDTH as f64 * (BITS_PER_ENTRY as f64) / (u64::BITS as f64)) as u64
     }

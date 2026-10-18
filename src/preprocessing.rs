@@ -1,4 +1,4 @@
-//! K-mer counting, the spectrum's cutoff and quality floor, and the native spectrum plots.
+//! Assembly preprocessing: this includes, k-mer parsing, k-mer filtering, and k-mer counting. We also plot here k-mer spectrums and fits to them.
 
 use std::path::PathBuf;
 use std::{error::Error, fmt};
@@ -35,14 +35,13 @@ pub type InputFastx = (String, Vec<String>);
 /// Everything the preprocessing of one k value produces. Named fields rather than a tuple, since the
 /// backends and the public entry point order these differently.
 pub struct PreprocessedK<IntT> {
-    /// The k this was built with. Hashes from different k live in disjoint spaces, so carrying it
-    /// alongside the maps is what stops us mixing them up.
+    /// The k this was built with.
     pub k: usize,
     /// K-mer fields stored once in aligned vectors, plus their hash-to-index lookup.
     pub kmers: IndexedKmers<IntT>,
     /// `MAXSIZEHISTO`-bin k-mer spectrum; index `c-1` holds the number of distinct k-mers seen `c` times
     pub histovec: Vec<u32>,
-    /// the min-count actually applied (fitted, or taken from the CLI)
+    /// the min-count actually applied (fitted, a fallback, or taken from the CLI)
     pub used_min_count: u16,
     /// the base-quality floor the spectrum asked for. Below `QualOpts::min_qual` when the lobes only
     /// separated at a looser floor, which is the caller's signal to recount.
@@ -51,7 +50,7 @@ pub struct PreprocessedK<IntT> {
     /// reads it to tell an error branch from a real one.
     pub genomic_peak: PeakSource,
     /// Whether automatic spectrum selection fell back to the unresolved sentinel without a trusted
-    /// peak. Explicit `--min-count 2`, and a trusted decision that happens to choose 2, do not count.
+    /// peak.
     pub min_count_unresolved: bool,
 }
 
@@ -539,9 +538,7 @@ fn find_raw_valley(histovec: &[u32], raw_peak: usize) -> Option<usize> {
     (2..=hi).min_by_key(|&count| (histovec[count - 1], count))
 }
 
-/// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the valley.
-/// This is the binding one at depth, where the genome lobe measures 8-12x overdispersed and a Poisson
-/// tail would permit a cutoff about 35 % too high.
+/// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the valley. This binds/protects at large coverage.
 fn measured_guard(histovec: &[u32], valley: usize, genomic_peak: usize) -> u16 {
     let total: u128 = (valley..histovec.len())
         .map(|c| histovec[c - 1] as u128)
@@ -565,9 +562,7 @@ fn measured_guard(histovec: &[u32], valley: usize, genomic_peak: usize) -> u16 {
     (m as u16).max(2)
 }
 
-/// Largest cutoff deleting at most [`MAX_GENOME_LOSS`] of a Poisson(`genomic_peak`) genome. This is the binding
-/// one at low coverage, where the lobe really is near-Poisson and the measured bound is loosened by the
-/// error k-mers that still sit above the valley.
+/// Largest cutoff deleting at most [`MAX_GENOME_LOSS`] of a Poisson(`genomic_peak`) genome. This binds/protects at low coverage.
 fn poisson_guard(genomic_peak: usize) -> u16 {
     let lam = genomic_peak as f64;
     let mut cdf = (-lam).exp();
@@ -583,9 +578,7 @@ fn poisson_guard(genomic_peak: usize) -> u16 {
     (m as u16).max(2)
 }
 
-/// Variance-to-mean ratio of the single-copy lobe; 1.0 is Poisson. Logged because it is what says
-/// whether a negative binomial in the mixture fit would be worth the work.
-///
+/// Variance-to-mean ratio of the single-copy lobe; 1.0 is Poisson. 
 /// Stops at twice the genomic peak: beyond that lie the repeat copies and the saturating bin, and including
 /// them measures the spread of the whole spectrum rather than of the lobe the fit tries to model.
 fn dispersion_above(histovec: &[u32], valley: usize, genomic_peak: usize) -> f64 {
@@ -1143,10 +1136,10 @@ fn log_fit_attempt(attempt: &FitAttempt) {
 }
 
 // =====================================================================================================
+// =====================================================================================================
+// =====================================================================================================
 
-/// Expected single-copy k-mers the cutoff may strand below itself. Each is a hole the graph cannot
-/// bridge, so it severs a contig: what predicts contiguity is their number, not their share. One
-/// percent of a 4.6 Mb genome is 46 000 severed paths, which is why a loss-fraction bound never binds.
+/// Expected single-copy k-mers the cutoff may strand below itself.
 const MAX_GENOME_HOLES: f64 = 1.0;
 
 /// As [`choose_min_count`], and also the single-copy coverage the same estimate found.
@@ -1341,6 +1334,8 @@ fn select_usable_fit(candidates: &[FloorCandidate]) -> Option<usize> {
     }
 }
 
+
+/// MAIN METHOD FOR SETTING MIN_COUNT AND FOLOOR
 fn choose_min_count_and_floor_with_debug<F>(
     histovec: &[u32],
     strict_scale: f64,
@@ -2420,14 +2415,6 @@ const MAX_COUNTMAP_SHARDS: usize = 256;
 const SHARDS_PER_THREAD: usize = 1;
 
 /// How many shards to split the count-map into.
-///
-/// Shards partition the key space, so counting runs on all cores with no locking, and each map is a
-/// fraction of the working set, which probes better than one big one. The floor of 16 is what every
-/// run up to 16 threads gets, so this only scales where fewer shards than threads would idle workers.
-///
-/// Always a power of two, because [`shard_of`] shifts and masks: a non-power-of-two silently collapses
-/// onto the one below it -- 6 shards would use 2, 12 would use 4 -- with no error, and a balance report
-/// that still reads as healthy because the shards in use stay balanced among themselves.
 fn countmap_shards() -> usize {
     (rayon::current_num_threads() * SHARDS_PER_THREAD)
         .next_power_of_two()
@@ -2435,10 +2422,6 @@ fn countmap_shards() -> usize {
 }
 
 /// Pick a shard for a canonical hash, mixing first. `shards` must be a power of two.
-///
-/// Neither end of `hc` works raw. Not the high bits: ntHash is uniform but `hc = min(fwd, rc)` is not,
-/// and measured at k=31 the top 4 bits run 12.2% down to 0.37%, a 33x spread that left shard 15 empty.
-/// Not the low bits: `NoHashHasher` passes the hash through and hashbrown indexes buckets with them.
 #[inline(always)]
 fn shard_of(hc: u64, shards: usize) -> usize {
     const MIX: u64 = 0x9E37_79B9_7F4A_7C15; // odd, golden-ratio derived
@@ -2614,11 +2597,8 @@ fn count_batch<IntT>(
     t.absorb_ns += t3.elapsed().as_nanos();
 }
 
+/// Main function for preprocessing
 /// Count every k-mer straight into a [`CountMap`], with the per-floor sketch.
-///
-/// Replaces "push every occurrence, sort, run-length count". Bringing equal k-mers together is all that
-/// vector ever did, and a hash map does it in one probe per occurrence — against a push, a sort of every
-/// sighting, and two dictionary probes. It also drops the occurrence buffer entirely.
 fn bulk_preprocessing_standalone_cpu<IntT, I>(
     input_iters: &mut [I],
     k: usize,
@@ -2841,6 +2821,7 @@ where
     }
     shards.iter().map(HashMap::len).sum::<usize>() - before
 }
+
 
 /// A recount refits the whole spectrum at the floor the sketch chose. The refit wins unless the
 /// sketch's lobes separated there and the refit's did not, so a recount never loses a resolved cutoff.
@@ -3069,6 +3050,7 @@ where
     }
     Ok((kmers, histovec, minc, chosen_min_qual, genomic_peak))
 }
+
 
 /// Read the records, count their k-mers, choose the cutoff and filter by it. `carried`: a multi-k
 /// step's previous contigs, put in once the cutoff is chosen. `debug_quality_floors` also evaluates

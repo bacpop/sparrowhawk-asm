@@ -21,7 +21,7 @@ impl Collapsable for DbgGraph {
         );
 
         // Every contig is kept, however short, and each junction is one of its own: a multi-k step
-        // carries them all to the next k, as GATB-Minia does. Output length filters come later.
+        // carries them all to the next k. Output length filters come later.
         let mut contigs = erase_junction_nodes(&mut self);
         log::info!(
             "Kept {} branching junction nodes as their own contigs",
@@ -48,7 +48,7 @@ impl Collapsable for DbgGraph {
                             contigs.push(vec![self.node_weight(n).unwrap().clone()]);
                             self.remove_node(n);
                         } else {
-                            stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                            stacker::maybe_grow(32 * 1024, 1024 * 1024, || { // remember the stack overflow!!!! (RIP btw)
                                 let contigs_ = contigs_from_vertex(&mut self, n);
                                 contigs.extend(contigs_.into_iter().filter(|c| !c.is_empty()));
                             });
@@ -101,6 +101,7 @@ impl Collapsable for DbgGraph {
 }
 
 /// Remove branching junction nodes before collapse walks begin, returning each as its own contig.
+/// This is important for performance, speeds up a lot things
 #[inline]
 fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> SerializedContigs {
     let junctions: Vec<NodeId> = ptgraph
@@ -116,7 +117,8 @@ fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> SerializedContigs {
         .collect()
 }
 
-// Main collapse function/method
+/// Main collapse function/method
+/// Now, almost not used... The previous function takes care of simplifying most of this.
 #[inline]
 fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
     let mut contigs: SerializedContigs = vec![];

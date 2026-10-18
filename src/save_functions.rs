@@ -1,4 +1,4 @@
-//! Spelling contigs and writing them as FASTA.
+//! Spelling contigs back to nucleotides, and writing them as FASTA.
 
 use core::panic;
 use std::io::Write;

@@ -366,8 +366,7 @@ fn remove_paths(ptgraph: &mut DbgGraph, to_remove: Drain<NodeId>) {
     }
 }
 
-/// Minia's relative-coverage tip condition (`Simplifications.cpp:319`, `satisfyRCTC`): a tip too long
-/// to drop on length alone still goes when the junction it hangs off is much better covered.
+/// Check if the main branch from which a dedad-end comes from has a much different coverage than the dead end-.
 fn neighbourhood_outcovers_tip(
     ptgraph: &DbgGraph,
     junction: NodeId,

@@ -3,20 +3,11 @@
 //! The functions are used by a few different subcommands to set correct
 //! args to build structs, given the command line input
 
-// use std::error::Error;
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
-// use regex::Regex;
-
-// use super::QualOpts;
 use crate::preprocessing::InputFastx;
-// use crate::bit_encoding::UInt;
-
-// use crate::cli::{
-//     DEFAULT_KMER, DEFAULT_MINCOUNT, DEFAULT_MINQUAL, DEFAULT_STRAND,
-// };
 
 /// Set a buffered stream to write to.
 ///

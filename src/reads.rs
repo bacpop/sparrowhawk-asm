@@ -1,18 +1,18 @@
-//! Where reads come from: files on disk or the page's `File`s. Either can be read from the start again,
+//! Where reads come from: files on disk or the browser's `File`s, which are handles, not the file data themselves. Either can be read from the start again,
 //! since a recount at a looser floor, or the next k of a ladder, starts over.
 
 /// One read: its bases and, from FASTQ, its quality bytes.
-pub type OwnedRecord = (Vec<u8>, Option<Vec<u8>>);
+pub type OwnedRecord = (Vec<u8>, Option<Vec<u8>>); // nts, option<qualities>
 
 /// `Send` natively, where a producer thread parses ahead of the counter; nothing in the browser, which
 /// has no threads, and whose `File`s could not cross one anyway.
+/// NOTE: the "Send" trait is the trait we need to transfer things between threads.
 #[cfg(not(target_family = "wasm"))]
 pub trait MaybeSend: Send {}
 #[cfg(not(target_family = "wasm"))]
 impl<T: Send> MaybeSend for T {}
 
-/// This is the definition for wasm: here we cannot have Send, because javascript file handles cannot be shared across threads
-/// (I mean the "web_sys::File" object)
+/// This is the definition for wasm: here we cannot have Send, because javascript file handles cannot be shared across threads (I mean the "web_sys::File" handle, that is not the file's data itself)
 #[cfg(target_family = "wasm")]
 pub trait MaybeSend {}
 #[cfg(target_family = "wasm")]
@@ -29,8 +29,7 @@ pub trait ReadSource {
     fn records(&self) -> Self::Records<'_>;
 }
 
-/// Files on disk, opened afresh for every pass. A single k reads them again for its recount; a
-/// multi-k run reads them once, packing them into a `ReadStore` that its later k values replay.
+/// For NATIVE: Files on disk, opened afresh for every pass. A single k reads them again for its recount; a multi-k run reads them once, packing them into a `ReadStore` that its later k values replay. This uses needletail at the end of the day, because we're running on native.
 #[cfg(not(target_family = "wasm"))]
 pub struct InputFiles<'a>(pub &'a [crate::preprocessing::InputFastx]);
 
@@ -56,8 +55,7 @@ impl ReadSource for InputFiles<'_> {
     }
 }
 
-/// The page's `File`s, opened afresh for every pass. The browser keeps them readable while the page
-/// holds them, so nothing is copied into memory.
+/// WASM: the browser's `File`s, opened afresh for every pass. The browser keeps them readable while the page holds them, so nothing is copied into memory. Here we use the fastx_wasm.rs structs and functions.
 #[cfg(target_family = "wasm")]
 pub struct BrowserFiles(pub Vec<web_sys::File>);
 
@@ -85,7 +83,7 @@ impl ReadSource for BrowserFiles {
     }
 }
 
-// This is quite magic, but it is interesting: this is a way of having a shared variable that lies in the current thread, given that we have the two-buffer system. Those generate IIUC scopes that do not speak to each other in any way. This thread_local! macro creates essentially a, thanks to the "static", global variable for all the thread. Because it's static for globalness, we need std:cell:Cell for having mutability in its interior, as static mut is unsafe and forbidden in recent Rust versions. All a bit quite magic, but I did something similar when I didn't know in Python how to pass info to shared threads, now that I remember
+// This is quite magic, but it is interesting: this is a way of having a shared variable that lies in the current thread, given that we have the two-buffer system. Those generate, IIUC, scopes that do not speak to each other in any way. This thread_local! macro creates essentially a, thanks to the "static", global variable for all the thread. Because it's static for globalness, we need std:cell:Cell for having mutability in its interior, as static mut is unsafe and forbidden in recent Rust versions. All a bit quite magic, but I did something similar when I didn't know in Python how to pass info to shared threads, now that I remember. We use this for showing progress on the web.
 
 #[cfg(target_family = "wasm")]
 thread_local! {
@@ -101,7 +99,7 @@ pub fn pass_percent() -> Option<u32> {
     (total > 0.0).then(|| (100.0 * read / total).min(100.0) as u32)
 }
 
-/// A file whose reads add to the pass's progress.
+/// WASM: A file whose reads add to the pass's progress.
 #[cfg(target_family = "wasm")]
 struct Counted<R>(R);
 

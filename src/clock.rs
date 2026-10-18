@@ -5,8 +5,9 @@
 pub use std::time::Instant;
 
 #[cfg(target_family = "wasm")]
-pub use browser::Instant;
+pub use browser::Instant; // Defined here!
 
+// Definition if Instant for the browser
 #[cfg(target_family = "wasm")]
 mod browser {
     use std::time::Duration;

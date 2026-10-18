@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use crate::clock::Instant;
 
+// The shared logger
 struct Logger {
     start: Instant,
     /// The run's log file, appended to as fern did.
@@ -15,6 +16,7 @@ struct Logger {
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
+// The shared log::Log implementation for both compilation targets
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         metadata.level() <= log::max_level()
@@ -38,6 +40,7 @@ impl log::Log for Logger {
     fn flush(&self) {}
 }
 
+// Logger for native
 #[cfg(not(target_family = "wasm"))]
 impl Logger {
     fn emit(&self, _level: log::Level, line: &str) {
@@ -49,6 +52,7 @@ impl Logger {
     }
 }
 
+// Logger for wasm
 #[cfg(target_family = "wasm")]
 impl Logger {
     fn emit(&self, level: log::Level, line: &str) {
@@ -59,6 +63,7 @@ impl Logger {
         }
     }
 }
+
 
 /// Log natively at `level`, to stdout and appended to `log_file`. A log file that cannot be opened
 /// costs only that copy, with a warning on stderr.

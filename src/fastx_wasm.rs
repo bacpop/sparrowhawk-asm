@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read};
 
 use crate::reads::OwnedRecord;
 
+// What a .gz file starts with
 const GZ_MAGIC: [u8; 2] = [0x1F, 0x8B];
 
 /// The file's bytes, decompressed when they start with the gzip magic.

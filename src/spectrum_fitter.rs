@@ -1,7 +1,6 @@
 //! Fits a coverage model to the k-mer spectrum, to choose a count cutoff.
 //!
-//! Three-component coverage mixture. Both targets compare two singleton-aware error tails against
-//! negative-binomial and Normal genomic lobes.
+//! Three-component coverage mixture.
 //!
 //! ====================================================== Got from ska-rust!! =====
 //!
@@ -18,6 +17,7 @@ use std::{fmt, sync::Arc};
 
 /// Ratio we allow the second lobe (repeats lobe) to float in
 const REPEAT_RATIO: (f64, f64) = (1.5, 2.0);
+
 /// Where the ratio starts: just under a double, so the simplex has room on both sides.
 const REPEAT_RATIO_START: f64 = 1.9;
 
@@ -26,14 +26,16 @@ const MU_LO: f64 = 0.75;
 const MU_SPAN: f64 = 0.58;
 
 /// Dispersions to restart the fit from, alongside the valley estimator's own guess.
-///
-/// A single start is not enough: `dispersion = 1 + exp(theta)` flattens as `theta` falls, so the
-/// simplex can crawl out to the Poisson boundary and stop there while still reporting convergence.
+/// A single start is NOT enough.
 const DISPERSION_SEEDS: [f64; 3] = [2.0, 8.0, 15.0];
 
-/// Counts above this multiple of the peak are not fitted: they are repeats beyond the two-copy lobe.
+/// Counts above this multiple of the peak are not fitted: conservative threshold.
 const FIT_WINDOW_PEAK_MULT: usize = 6;
 
+// These are consts that allow the mode to move a bit more from the empirical peaks,
+// for cases of high coverage. In those situations, the distribution can be very dispersed
+// and it makes total sense to allow for more "space" for the mode to be different from the
+// empirical peak, as a good fit can be recovered even under those circumstances.
 const PRIMARY_MODE_RATIO_LOW: f64 = 1.25;
 const PRIMARY_MODE_RATIO_HIGH: f64 = 1.40;
 const PRIMARY_MODE_RATIO_START_PEAK: usize = 100;
@@ -51,6 +53,7 @@ pub(crate) fn fit_window_end(histogram_len: usize, peak: usize) -> usize {
     (FIT_WINDOW_PEAK_MULT * peak).min(histogram_len.saturating_sub(1))
 }
 
+/// Just the integral of the histogram
 fn full_spectrum_distinct_total(histovec: &[u32]) -> f64 {
     histovec.iter().map(|&n| f64::from(n)).sum()
 }
@@ -74,6 +77,7 @@ fn empirical_shelf_share(histovec: &[u32], valley: usize, peak: usize) -> f64 {
     (2.0 * mass(valley, peak / 2) / lobe).clamp(0.01, 0.4)
 }
 
+/// Maximum number of fit iterations (per fit)
 const MAX_ITERS: u64 = 1_000;
 /// Offset applied to one coordinate at a time to build the initial simplex.
 const SIMPLEX_STEP: f64 = 0.5;
@@ -105,9 +109,15 @@ const WINDOW_LOG_MASS_TOLERANCE: f64 = 1e-12;
 /// Require the NB mode encoded by mean and dispersion to retain half-count precision.
 const NB_MODE_ROUNDTRIP_TOLERANCE: f64 = 0.5;
 
+
+// Shelf stuff (inside the main genome model)
 /// Struct to hold a beta-binomial distribution to model cases where some k-mers lot part of their reads or weren't
 /// as sequenced as most of the total kmers. This could be the case of e.g. very GC-enriched genome areas, so it has
 /// a biological reason to exist. Also we could have systematic errors :/
+/// The idea is that this could explain a strong left shoulder of the main genomic peak, and/or a strong valley that would not
+/// be explained by the error or genomic peaks themselves. Additionally, it could explain even an extra minipeak at the left
+/// of the clearly main one. It is really versatile, but I had to set some heuristics to constraint it so that it doesn't get
+/// an absurd shape, or size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Shelf {
     pub(crate) share: f64,
@@ -136,6 +146,7 @@ impl Shelf {
     }
 }
 
+// Helper functions
 /// Log of the three softmax weights, computed in log space so no exponential can overflow.
 fn ln_softmax3(a: f64, b: f64, c: f64) -> (f64, f64, f64) {
     let norm = lse3(a, b, c);
@@ -169,6 +180,7 @@ fn ln_dnbinom(x: f64, mean: f64, dispersion: f64) -> f64 {
         + x * (1.0 - 1.0 / dispersion).ln()
 }
 
+// Error model stuff
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorModel {
     FreeSingletonWeibull,
@@ -193,6 +205,7 @@ impl ErrorModel {
     }
 }
 
+// Genome model stuff
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GenomeModel {
     /// Two NB lobes, one main, one secondary to fit potential repeats.
@@ -285,6 +298,7 @@ fn ln_sub_exp(high: f64, low: f64) -> f64 {
     high + (-(low - high).exp_m1()).ln()
 }
 
+// Enum for failure types
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FitRejection {
     OptimisationFailed,
@@ -318,6 +332,7 @@ impl fmt::Display for FitRejection {
     }
 }
 
+// Main struct
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SpectrumFit {
     pub(crate) error_model: ErrorModel,
@@ -437,7 +452,10 @@ impl SpectrumFit {
             self.observed_total * self.w_single * (ln - self.component_log_normalisers[1]).exp()
         })
     }
-
+    
+    /// Very important heuristic: this help us reduce the valley avoiding losing kmers from the genome parts whenever
+    /// we see in the fit that the genomic part extends significantly to the left of the empirical valley. This recovers,
+    /// in most situations, a good portion of contiguity.
     pub(crate) fn hole_cutoff(&self, budget: f64) -> Option<u16> {
         if self.genome_kmers <= 0.0
             || !self.mean.is_finite()
@@ -456,7 +474,7 @@ impl SpectrumFit {
                 self.genome_model,
                 self.shelf,
             )
-            .exp()
+            .exp() // we un-log it
         };
         let mut cdf = match self.genome_model {
             GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial => single(0.0),
@@ -475,7 +493,8 @@ impl SpectrumFit {
         }
         None
     }
-
+    
+    /// Where error and genomic parts cross. This would be, ideally, equivalent to the empiric valley.
     pub(crate) fn crossover(&self) -> Option<u16> {
         if !self.mean.is_finite() || self.mean < 2.0 || self.fit_window_end < 2 {
             return None;
@@ -489,7 +508,7 @@ impl SpectrumFit {
         }
         None
     }
-
+    
     pub(crate) fn error_floor_cutoff(&self) -> u16 {
         let reference = self.component_heights(self.primary_mode())[1];
         let mut last_bad = 0usize;
@@ -677,7 +696,7 @@ impl MixtureFit {
     }
 }
 
-/// This implements the CostFunction trait for our mixture of distributions!
+/// This implements the CostFunction trait for our mixture of distributions! This comes from the argmin crate
 impl CostFunction for MixtureFit {
     type Param = Vec<f64>;
     type Output = f64;
@@ -699,6 +718,7 @@ impl CostFunction for MixtureFit {
         {
             return Ok(f64::INFINITY);
         }
+        // Also for the NB mode
         if matches!(
             self.genome_model,
             GenomeModel::NegativeBinomial | GenomeModel::ShelfNegativeBinomial
@@ -712,6 +732,7 @@ impl CostFunction for MixtureFit {
         let table = params
             .shelf
             .map(|s| shelf_log_table(params.mean, s, self.fit_window_end));
+
         let normalisers = self.log_normalisers(params, table.as_deref());
         if normalisers
             .iter()
@@ -757,6 +778,7 @@ impl CostFunction for MixtureFit {
     }
 }
 
+/// Main function for doing the fits, after the empirical values have been extracted
 /// `histovec` is at library scale; `sample_scale` is how many library k-mers each observed one stands
 /// for. The likelihood and BIC count the sample itself, so a sketch is not mistaken for millions of
 /// independent k-mers; totals and heights are reported back at library scale.
@@ -770,22 +792,26 @@ pub(crate) fn fit_spectrum(
     if peak < 2 || valley < 2 || histovec.len() < 2 {
         return Err(Error::msg("no usable genome peak or valley to fit around"));
     }
+    
     let sample_scale = if sample_scale.is_finite() && sample_scale >= 1.0 {
         sample_scale
     } else {
         1.0
     };
+    
     // A rescaled sketch bin is floor(sampled * scale), so dividing and rounding recovers the sample.
     let sample: Vec<u32> = histovec
         .iter()
         .map(|&n| (f64::from(n) / sample_scale).round() as u32)
         .collect();
+    
     // `histovec` is already at library scale and spans the full count range. Keep this separate from
     // `observed_total`, which is restricted to the fit window and sample scale.
     let full_distinct_total = full_spectrum_distinct_total(histovec);
     if !full_distinct_total.is_finite() || full_distinct_total <= 0.0 {
         return Err(Error::msg("no distinct k-mers in the full spectrum"));
     }
+    
     let top = fit_window_end(sample.len(), peak);
     let observed: Arc<[(f64, f64)]> = sample[..top]
         .iter()
@@ -805,6 +831,7 @@ pub(crate) fn fit_spectrum(
     };
 
     let shelf_share = empirical_shelf_share(&sample, valley, peak);
+    
     // These are the different distributions we're gonna try
     const CONFIGURATIONS: [(ErrorModel, GenomeModel); 4] = [
         (ErrorModel::SingletonPareto, GenomeModel::NegativeBinomial),
@@ -837,7 +864,7 @@ pub(crate) fn fit_spectrum(
         })
         .collect();
 
-    // All different starts/tries are parallelised with Rayon
+    // All different starts/tries that we'll need
     let jobs: Vec<(usize, Vec<f64>)> = problems
         .iter()
         .enumerate()
@@ -906,6 +933,7 @@ fn attempt_from(
         };
         converged.push((cost, params, outcome.iterations));
     }
+    
     // The first valid entry in cost order is the best valid fit. If all are rejected, the first
     // rejected entry is also the best one to retain for diagnostics. Stable sorting preserves start
     // order for equal costs, as before.
@@ -1053,6 +1081,8 @@ fn run_one(problem: MixtureFit, start: Vec<f64>, max_iters: u64) -> Result<RunOu
     })
 }
 
+
+/// Checker method for review parameters/details of a fit result
 fn validate_fit(fit: &SpectrumFit, valley: usize, empirical_peak: usize) -> Option<FitRejection> {
     if !fit.log_likelihood.is_finite() || !fit.deviance.is_finite() || !fit.bic.is_finite() {
         return Some(FitRejection::NonFiniteLikelihood);

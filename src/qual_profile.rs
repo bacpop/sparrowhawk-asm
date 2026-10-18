@@ -1,11 +1,11 @@
 //! The candidate base-quality floors for a library, and which of them each k-mer window clears.
 
-/// Reads peeked for the quality alphabet. Only distinct values are wanted, never a spectrum, so an
-/// RTA3 library shows all 4-5 of its bins long before this.
+/// Reads peeked for the quality alphabet. Only distinct values are wanted, never a spectrum, so a
+/// library shows all 4-5 of its bins long before this.
 pub const PEEK_READS: usize = 5_000;
 /// The ladder never holds more than the A/B/C of the workflow.
 pub const MAX_GROUPS: usize = 3;
-/// A "loose" floor at or below this is not a filter: on every RTA3 alphabet the bin below B is 2.
+/// A "loose" floor at or below this is not a filter, after checking many reads it seems lower than ten implies no quality whatsoever.
 pub const MIN_LOOSE_FLOOR: u8 = 10;
 /// A loose rung must sit at least this far below the strict one, or it admits the same bases under a
 /// different name. Binned alphabets clear this easily; near-continuous ones do not.
@@ -14,7 +14,7 @@ pub const MIN_RUNG_GAP: u8 = 5;
 pub const NONE: u8 = u8::MAX;
 
 /// Distinct PHRED values on called bases (A, C, G, T) in the first `max_reads` of `records`, ascending.
-/// Ns carry Illumina's Q2 but break every window at every floor, so they say nothing about the ladder.
+/// Ns carry Q2 but break every window at every floor, so they say nothing about the ladder.
 /// Empty for FASTA, which has no qualities.
 pub fn peek_alphabet<I: Iterator<Item = crate::reads::OwnedRecord>>(
     records: I,
