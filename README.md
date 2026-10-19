@@ -84,11 +84,7 @@ If using the `--release` flag, this should place your compiled binary inside `ta
 # Usage
 Here we will only consider the binary compiled for x86_64, refer to [sparrowhawk](https://github.com/bacpop/sparrowhawk) for an example of usage of the `wasm32-unknown-unknown` compilation target.
 
-Run `./sparrowhawk-asm --help` to see its options:
-
-```
-./sparrowhawk-asm --help
-```
+Run `./sparrowhawk-asm --help` to see its options.
 
 An example execution could be the following:
 
@@ -115,4 +111,7 @@ Pass `--no-bloom` to use exact counts instead. Bloom counting requires an explic
 explicit values 0 or 1 require `--no-bloom`. The old `--do-bloom` flag has been removed: omit it to use the new
 default, or add `--no-bloom` to preserve the former non-Bloom default.
 
-In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. Two native diagnostic plots of the k-mer frequency spectrum are saved beside them: `prefix_kmerspectrum.png`, linear and capped at three times the empirical peak's height (unbounded without a peak), and `prefix_kmerspectrum_log.png`, with a logarithmic Y axis. Each is also written as SVG. These optional files can be avoided with the corresponding arguments.
+A multi-k run keeps its reads in memory after the first k, whole, at four bits a base (a base code and a quality
+class), and counts every later k from there.
+
+In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. Two native diagnostic plots of the k-mer frequency spectrum are saved beside them: `prefix_kmerspectrum.png`, linear and capped at three times the empirical peak's height (unbounded without a peak), and `prefix_kmerspectrum_log.png`, with a logarithmic Y axis. Each is also written as SVG. Runs using automatic count selection overlay the fitted error, single-copy, and repeat components, the total mixture, the empirical valley and peak, the fitted single-copy mean and mode, and the error/genome crossover. With Bloom counting, the plots show both the rescaled sketch used for fitting and the raw Bloom count map. These optional files can be avoided with the corresponding arguments.

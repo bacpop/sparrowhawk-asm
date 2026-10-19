@@ -15,6 +15,8 @@ pub struct PackedSeqs {
     two_bit: bool,
     same_length: bool,
     common_len: usize,
+    /// Set by `finish`: the writing phase is over, and uniform-length offsets may be gone.
+    finished: bool,
     blocks: Vec<Block>,
 }
 
@@ -24,8 +26,10 @@ struct Block {
     // Possible future compression: consecutive equal-length sequences in one u32, with low 10 bits
     // for length and upper 22 for count: (count << 10) | length. Start another entry on a length
     // change or at count 0x3F_FFFF. Lengths above 1023 would need an extension before adopting this.
-    /// Exclusive sequence ends in bases. Released at finalisation when all lengths are equal.
+    /// Exclusive sequence ends, in bases from the start of the block. Released at finalisation when
+    /// all lengths are equal: each block then starts its sequences at multiples of the common length.
     ends: Vec<u32>,
+    /// Sequences in the block, kept apart from `ends`, which finalisation may release.
     seq_count: usize,
 }
 
@@ -113,6 +117,7 @@ impl PackedSeqs {
             two_bit,
             same_length: false,
             common_len: 0,
+            finished: false,
             blocks: Vec::new(),
         }
     }
@@ -145,6 +150,7 @@ impl PackedSeqs {
     }
     /// Append one whole sequence, detecting length variation while its bases are packed.
     fn push(&mut self, len: usize, values: impl IntoIterator<Item = u8>) {
+        assert!(!self.finished, "a finished store was written to");
         if self.blocks.is_empty() {
             self.common_len = len;
             self.same_length = true;
@@ -168,11 +174,6 @@ impl PackedSeqs {
             });
         }
         let block = self.blocks.last_mut().expect("an open block exists");
-        debug_assert_eq!(
-            block.ends.len(),
-            block.seq_count,
-            "append after finalisation"
-        );
         let start = block.ends.last().copied().unwrap_or(0) as usize;
         let (bits, per_word) = if self.two_bit { (2, 16) } else { (4, 8) };
         let mut pos = start;
@@ -198,6 +199,7 @@ impl PackedSeqs {
     /// End the writing phase: release uniform-length offsets and trim the remaining buffers.
     /// Returns retained payload and offset capacity in bytes, without rescanning sequence lengths.
     pub(crate) fn finish(&mut self) -> usize {
+        self.finished = true;
         if self.same_length {
             for block in &mut self.blocks {
                 block.ends = Vec::new();
@@ -325,12 +327,16 @@ impl ReadStore {
             self.seqs.push(
                 seq.len(),
                 seq.iter().enumerate().map(|(i, &base)| {
-                    assert!(
-                        valid_base(base),
-                        "two-bit read {read}, base {}: non-ACGT symbol {:?}",
-                        i + 1,
-                        char::from(base)
-                    );
+                    if !valid_base(base) {
+                        // This runs in the reader thread, whose panic reaches only stderr: log it too.
+                        let message = format!(
+                            "two-bit read {read}, base {}: non-ACGT symbol {:?}",
+                            i + 1,
+                            char::from(base)
+                        );
+                        log::error!("{message}");
+                        panic!("{message}");
+                    }
                     encode_base(base)
                 }),
             );
@@ -541,12 +547,25 @@ mod tests {
         assert!(!store.seqs.same_length);
         store.push(b"ACG", None);
         assert!(!store.seqs.same_length);
+        let before: Vec<_> = store.seqs.iter().map(|s| s.ascii()).collect();
         store.finish();
         assert!(store.seqs.blocks.iter().all(|b| !b.ends.is_empty()));
         assert_eq!(
             store.seqs.iter().map(|s| s.len()).sum::<usize>(),
             BLOCK_READS * 3 + 5
         );
+        assert_eq!(
+            store.seqs.iter().map(|s| s.ascii()).collect::<Vec<_>>(),
+            before
+        );
+    }
+    #[test]
+    #[should_panic(expected = "a finished store was written to")]
+    fn a_finished_store_refuses_writes() {
+        let mut seqs = PackedSeqs::new(true);
+        seqs.push_contig(&[0, 1, 2]);
+        seqs.finish();
+        seqs.push_contig(&[0, 1, 2]);
     }
     #[test]
     fn empty_single_and_long_sequences_survive_finalisation() {

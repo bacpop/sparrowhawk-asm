@@ -1430,7 +1430,7 @@ mod multik_tests {
                 .to_vec(),
         )];
         let reads = crate::reads::InputFiles(&files);
-        let opts = BuildOpts::with_defaults(
+        let mut opts = BuildOpts::with_defaults(
             QualOpts {
                 min_count: DEFAULT_MINCOUNT,
                 min_qual: DEFAULT_MINQUAL,
@@ -1438,16 +1438,30 @@ mod multik_tests {
             true,
             true,
         );
-        let run = |in_memory| {
+        let run = |opts: &BuildOpts, in_memory| {
             let mut timevec = vec![Instant::now()];
-            let mut ladder = LadderState::new(&opts, &reads, None, in_memory);
-            let first = preprocess_step(&opts, &reads, 0, &mut ladder, &mut timevec).unwrap();
-            run_ladder(&opts, &reads, &mut ladder, first, &mut timevec, None).unwrap()
+            let mut ladder = LadderState::new(opts, &reads, None, in_memory);
+            let first = preprocess_step(opts, &reads, 0, &mut ladder, &mut timevec).unwrap();
+            run_ladder(opts, &reads, &mut ladder, first, &mut timevec, None).unwrap()
         };
-        assert_eq!(
-            run(false).iter().map(|s| s.ascii()).collect::<Vec<_>>(),
-            run(true).iter().map(|s| s.ascii()).collect::<Vec<_>>()
-        );
+        // The automatic ladder, and a fixed floor, whose 4-bit store holds a single class.
+        for fixed in [None, Some(20)] {
+            if let Some(floor) = fixed {
+                opts.quality.min_qual = floor;
+                opts.fixed_min_qual = true;
+            }
+            assert_eq!(
+                run(&opts, false)
+                    .iter()
+                    .map(|s| s.ascii())
+                    .collect::<Vec<_>>(),
+                run(&opts, true)
+                    .iter()
+                    .map(|s| s.ascii())
+                    .collect::<Vec<_>>(),
+                "fixed floor {fixed:?}"
+            );
+        }
     }
 
     /// A given floor is the only one counted at, so it can never be loosened; without one, the

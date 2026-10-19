@@ -2370,7 +2370,6 @@ impl<IntT> TaskState<IntT> {
 /// Hash one batch straight into the tasks' per-shard buckets, then absorb those into the count-map.
 /// Nothing is materialised in between: a k-mer is written once into a bucket and once into the map,
 /// where the flat-vector version wrote it four times. Shards partition the keys, so absorb needs no lock.
-#[allow(clippy::too_many_arguments)]
 fn count_batch<IntT, R: CountedRead>(
     batch: &[R],
     w: KmerWalk,
@@ -3031,7 +3030,7 @@ where
 mod tests {
     use super::*;
     /// Text adapter for the existing counter fixtures, including multiple input iterators.
-    fn count_kmers<IntT, I>(
+    fn count_text<IntT, I>(
         records: &mut [I],
         k: usize,
         qual: &QualOpts,
@@ -3047,7 +3046,7 @@ mod tests {
         IntT: for<'a> UInt<'a>,
         I: Iterator<Item = OwnedRecord> + MaybeSend,
     {
-        super::count_kmers(
+        count_kmers(
             PassInput::Text(records.iter_mut().flatten()),
             k,
             qual,
@@ -3204,7 +3203,7 @@ mod tests {
         let floors = [0u8, 11, 25];
         let mut iters = [Vec::<OwnedRecord>::new().into_iter()];
         let (shards, sketch, floor_has_kmers) =
-            count_kmers::<u64, _>(&mut iters, 31, &qual, Some(&floors), false, true);
+            count_text::<u64, _>(&mut iters, 31, &qual, Some(&floors), false, true);
         let error = choose_cutoff_and_filter::<u64>(
             shards,
             31,
@@ -3235,7 +3234,7 @@ mod tests {
         let reads = deep_library(2, 20);
         let mut iters = [reads.into_iter()];
         let (shards, sketch, floor_has_kmers) =
-            count_kmers::<u64, _>(&mut iters, 31, &qual, Some(&floors), false, true);
+            count_text::<u64, _>(&mut iters, 31, &qual, Some(&floors), false, true);
         assert!(!floor_has_kmers[2]);
         assert!(floor_has_kmers[1]);
         let error = choose_cutoff_and_filter::<u64>(
@@ -3405,7 +3404,7 @@ mod tests {
             min_qual: 20,
         };
         let counts = |floors: Option<&[u8]>| -> HashMap<u64, u32> {
-            count_kmers::<u64, _>(
+            count_text::<u64, _>(
                 &mut [reads.clone().into_iter()],
                 11,
                 &qual,
@@ -3438,7 +3437,7 @@ mod tests {
 
         let mut iters = [reads.clone().into_iter()];
         let (shards, _, _) =
-            count_kmers::<u64, _>(&mut iters, k, &qual, Some(&ladder[..]), false, true);
+            count_text::<u64, _>(&mut iters, k, &qual, Some(&ladder[..]), false, true);
 
         let n_shards = shards.len();
         let mut got: HashMap<u64, (u32, u64, u8)> = HashMap::default();
@@ -3496,7 +3495,7 @@ mod tests {
         ladder: &[u8],
     ) -> HashMap<u64, u32> {
         let mut iters = [reads.into_iter()];
-        let (shards, _, _) = count_kmers::<u64, _>(&mut iters, k, qual, Some(ladder), true, true);
+        let (shards, _, _) = count_text::<u64, _>(&mut iters, k, qual, Some(ladder), true, true);
         let mut got: HashMap<u64, u32> = HashMap::default();
         for shard in &shards {
             for (hc, info) in shard {
@@ -4412,7 +4411,7 @@ mod tests {
     ) -> (IndexedKmers<u64>, Vec<u32>, u16, u8, PeakSource) {
         let mut iters = [reads.into_iter()];
         let (shards, sketch, floor_has_kmers) =
-            count_kmers::<u64, _>(&mut iters, k, qual, Some(ladder), do_bloom, true);
+            count_text::<u64, _>(&mut iters, k, qual, Some(ladder), do_bloom, true);
         choose_cutoff_and_filter::<u64>(
             shards,
             k,
@@ -4870,8 +4869,20 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn counting_the_read_store_matches_counting_the_reads() {
-        let reads = counter_test_reads();
-        let counts = |shards: Vec<CountMap<u64>>| -> HashMap<u64, (u32, u64, u8, u64)> {
+        // The reads three times over, so that every width can take a k from its own range.
+        let reads: Vec<OwnedRecord> = counter_test_reads()
+            .into_iter()
+            .map(|(seq, qual)| (seq.repeat(3), qual.map(|q| q.repeat(3))))
+            .collect();
+        store_counts_match_text::<u64>(&reads, 11);
+        store_counts_match_text::<u128>(&reads, 41);
+        store_counts_match_text::<crate::bit_encoding::U256>(&reads, 71);
+        store_counts_match_text::<crate::bit_encoding::U512>(&reads, 131);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn store_counts_match_text<IntT: for<'a> UInt<'a>>(reads: &[OwnedRecord], k: usize) {
+        let counts = |shards: Vec<CountMap<IntT>>| -> HashMap<u64, (u32, u64, u8, IntT)> {
             shards
                 .into_iter()
                 .flatten()
@@ -4885,7 +4896,7 @@ mod tests {
             (vec![0], true),
         ] {
             let mut store = ReadStore::new(&ladder, two_bit);
-            for (seq, qual) in &reads {
+            for (seq, qual) in reads {
                 store.push(seq, qual.as_deref());
             }
             store.finish();
@@ -4898,18 +4909,18 @@ mod tests {
                             min_count: 2,
                             min_qual: floor,
                         };
-                        let text = super::count_kmers::<u64, _>(
-                            PassInput::Text(reads.clone().into_iter()),
-                            11,
+                        let text = count_kmers::<IntT, _>(
+                            PassInput::Text(reads.iter().cloned()),
+                            k,
                             &qual,
                             floors,
                             0,
                             do_bloom,
                             true,
                         );
-                        let packed = super::count_kmers::<u64, std::iter::Empty<OwnedRecord>>(
+                        let packed = count_kmers::<IntT, std::iter::Empty<OwnedRecord>>(
                             PassInput::Stored(&store),
-                            11,
+                            k,
                             &qual,
                             floors,
                             if classify { 0 } else { top as u8 },
@@ -4919,7 +4930,7 @@ mod tests {
                         assert_eq!(
                             counts(text.0),
                             counts(packed.0),
-                            "ladder={ladder:?} top={top} two_bit={two_bit} bloom={do_bloom}"
+                            "k={k} ladder={ladder:?} top={top} two_bit={two_bit} bloom={do_bloom}"
                         );
                         assert_eq!(text.2, packed.2);
                         assert_eq!(
@@ -4958,7 +4969,7 @@ mod tests {
                 .map(|(h, i)| (*h, i.count))
                 .collect()
         };
-        let (mut shards, _, _) = count_kmers::<u64, _>(
+        let (mut shards, _, _) = count_text::<u64, _>(
             &mut [reads.clone().into_iter()],
             k,
             &qual,
@@ -5031,7 +5042,7 @@ mod tests {
             ec_require_both_flanks: false,
         };
         let assemble = |k: usize, carried: Option<&PackedSeqs>| -> PackedSeqs {
-            let (shards, sketch, present) = count_kmers::<u128, _>(
+            let (shards, sketch, present) = count_text::<u128, _>(
                 &mut [reads.clone().into_iter()],
                 k,
                 &qual,

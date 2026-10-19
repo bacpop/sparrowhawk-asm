@@ -12,8 +12,8 @@ use crate::graph_works::{spell_path, Contigs};
 use crate::io_utils::set_ostream;
 use crate::read_store::PackedSeqs;
 
-/// Spells every contig, looking each packed k-mer up with `lookup`. A multi-k step carries all of them
-/// to the next k, so none is length-filtered.
+/// Transcribes every contig into 2-bit storage, looking each packed k-mer up with `lookup`. A multi-k
+/// step carries all of them to the next k, so none is length-filtered.
 pub(crate) fn spell_contigs<IntT>(
     contigs: &Contigs,
     lookup: impl Fn(u64) -> Option<IntT>,
