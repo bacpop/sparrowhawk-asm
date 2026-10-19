@@ -8,7 +8,7 @@
 use super::bit_encoding::rc_base;
 
 /// Values to look up and multiply for direct k-mers
-pub const HASH_LOOKUP: [u64; 4] = [
+pub(crate) const HASH_LOOKUP: [u64; 4] = [
     0x3c8b_fbb3_95c6_0474, // A
     0x3193_c185_62a0_2b4c, // C
     0x2955_49f5_4be2_4456, // T
@@ -16,7 +16,7 @@ pub const HASH_LOOKUP: [u64; 4] = [
 ];
 
 /// Values to look up and multiply for reverse-complement k-mers
-pub const RC_HASH_LOOKUP: [u64; 4] = [
+pub(crate) const RC_HASH_LOOKUP: [u64; 4] = [
     0x2955_49f5_4be2_4456,
     0x2032_3ed0_8257_2324,
     0x3c8b_fbb3_95c6_0474,
@@ -25,7 +25,8 @@ pub const RC_HASH_LOOKUP: [u64; 4] = [
 
 /// Retained from the older two-part rotation for reference; the active hash uses six partitions.
 /// This is A33R, C33R, T33R, G33R so can be indexed by nucleotide * 33
-pub const MS_TAB_33R: [u64; 132] = [
+#[allow(dead_code)] // Retained reference table.
+pub(crate) const MS_TAB_33R: [u64; 132] = [
     0x195c60474,
     0x12b8c08e9,
     0x571811d3,
@@ -162,7 +163,8 @@ pub const MS_TAB_33R: [u64; 132] = [
 
 /// Retained from the older two-part rotation for reference; the active hash uses six partitions.
 /// This is A31R, C31R, T31R, G31R so can be indexed by nucleotide * 31
-pub const MS_TAB_31L: [u64; 124] = [
+#[allow(dead_code)] // Retained reference table.
+pub(crate) const MS_TAB_31L: [u64; 124] = [
     0x3c8bfbb200000000,
     0x7917f76400000000,
     0xf22feec800000000,
@@ -290,7 +292,7 @@ pub const MS_TAB_31L: [u64; 124] = [
 ];
 
 /// This is the look-up table for the first split, 5LL
-pub const MS_TAB_5LL: [u64; 20] = [
+pub(crate) const MS_TAB_5LL: [u64; 20] = [
     0x3800000000000000,
     0x7000000000000000,
     0xe000000000000000,
@@ -314,7 +316,7 @@ pub const MS_TAB_5LL: [u64; 20] = [
 ];
 
 /// This is the LUT for the second split, 7L
-pub const MS_TAB_7L: [u64; 28] = [
+pub(crate) const MS_TAB_7L: [u64; 28] = [
     0x0480000000000000,
     0x0110000000000000,
     0x0220000000000000,
@@ -346,7 +348,7 @@ pub const MS_TAB_7L: [u64; 28] = [
 ];
 
 /// This is the LUT for the third split, 9LC
-pub const MS_TAB_9LC: [u64; 36] = [
+pub(crate) const MS_TAB_9LC: [u64; 36] = [
     0x000bf80000000000,
     0x0007f80000000000,
     0x000ff00000000000,
@@ -386,7 +388,7 @@ pub const MS_TAB_9LC: [u64; 36] = [
 ];
 
 /// This is the LUT for the fourth split, 11CR
-pub const MS_TAB_11CR: [u64; 44] = [
+pub(crate) const MS_TAB_11CR: [u64; 44] = [
     0x03b300000000,
     0x076600000000,
     0x06cd00000000,
@@ -434,7 +436,7 @@ pub const MS_TAB_11CR: [u64; 44] = [
 ];
 
 /// This is the LUT for the fifth split, 13R
-pub const MS_TAB_13R: [u64; 52] = [
+pub(crate) const MS_TAB_13R: [u64; 52] = [
     0x000095c00000,
     0x00002b880000,
     0x000057100000,
@@ -490,7 +492,7 @@ pub const MS_TAB_13R: [u64; 52] = [
 ];
 
 /// This is the LUT for the sixth split, 19RR
-pub const MS_TAB_19RR: [u64; 76] = [
+pub(crate) const MS_TAB_19RR: [u64; 76] = [
     0x00060474, 0x000408e9, 0x000011d3, 0x000023a6, 0x0000474c, 0x00008e98, 0x00011d30, 0x00023a60,
     0x000474c0, 0x0000e981, 0x0001d302, 0x0003a604, 0x00074c08, 0x00069811, 0x00053023, 0x00026047,
     0x0004c08e, 0x0001811d, 0x0003023a, 0x00002b4c, 0x00005698, 0x0000ad30, 0x00015a60, 0x0002b4c0,
@@ -513,7 +515,7 @@ pub struct NtHashIterator {
 
 /// Function that cycles to the RIGHT the bits in the 0, 19, 32, 43, 52, and 59 positions
 #[inline(always)]
-pub fn swapbits_0_19_32_43_52_59(v: u64) -> u64 {
+pub(crate) fn swapbits_0_19_32_43_52_59(v: u64) -> u64 {
     let x = (v ^ (v >> 19)) & 1; // The 19th bit XOR the 0th  bit
     let y = ((v >> 32) ^ (v >> 19)) & 1; // The 32nd bit XOR the 19th bit
     let z = ((v >> 43) ^ (v >> 32)) & 1; // The 32nd bit XOR the 43rd bit
@@ -526,7 +528,7 @@ pub fn swapbits_0_19_32_43_52_59(v: u64) -> u64 {
 
 /// Function that cycles to the LEFT the bits in the 18, 31, 42, 51, 58, and 63 positions
 #[inline(always)]
-pub fn swapbits_18_31_42_51_58_63(v: u64) -> u64 {
+pub(crate) fn swapbits_18_31_42_51_58_63(v: u64) -> u64 {
     let x = ((v >> 63) ^ (v >> 58)) & 1; // 63rd XOR 58th bit
     let y = ((v >> 58) ^ (v >> 51)) & 1; // 58th XOR 51st bit
     let z = ((v >> 51) ^ (v >> 42)) & 1; // 51st XOR 42nd bit

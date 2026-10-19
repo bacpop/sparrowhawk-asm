@@ -18,14 +18,15 @@ pub const NONE: u8 = u8::MAX;
 /// Distinct PHRED values on called bases (A, C, G, T) in the first `max_reads` of `records`, ascending.
 /// Ns carry Q2 but break every window at every floor, so they say nothing about the ladder.
 /// Empty for FASTA, which has no qualities.
-pub fn peek_alphabet<I: Iterator<Item = crate::utils::reads::OwnedRecord>>(
+pub fn peek_alphabet<I: Iterator<Item = std::io::Result<crate::utils::reads::OwnedRecord>>>(
     records: I,
     max_reads: usize,
-) -> Vec<u8> {
+) -> std::io::Result<Vec<u8>> {
     let mut seen = [false; 64];
-    for (seq, qual) in records.take(max_reads) {
+    for record in records.take(max_reads) {
+        let (seq, qual) = crate::utils::reads::validate_record(record?)?;
         let Some(qual) = qual else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         for (&base, &q) in seq.iter().zip(&qual) {
             if !valid_base(base) {
@@ -37,10 +38,10 @@ pub fn peek_alphabet<I: Iterator<Item = crate::utils::reads::OwnedRecord>>(
             }
         }
     }
-    (0..seen.len())
+    Ok((0..seen.len())
         .filter(|p| seen[*p])
         .map(|p| p as u8)
-        .collect()
+        .collect())
 }
 
 /// The A/B/C ladder, ascending in looseness, so a group index is directly "how loose". The loose rung
@@ -228,7 +229,10 @@ mod tests {
             (b"ACGTNNACGT".to_vec(), Some(b"-.-.##-.-.".to_vec())),
             (b"NACG".to_vec(), Some(b"#---".to_vec())),
         ];
-        assert_eq!(peek_alphabet(records.into_iter(), 10), vec![12, 13]);
+        assert_eq!(
+            peek_alphabet(records.into_iter().map(Ok), 10).unwrap(),
+            vec![12, 13]
+        );
     }
 
     /// An N breaks every run, so no window spanning it clears any floor, not even 0.

@@ -99,8 +99,28 @@ impl<IntT> IndexedKmers<IntT> {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    /// Number of k-mers still available for graph construction; zero after assembly drains them.
+    pub fn len(&self) -> usize {
         self.canonical_hashes.len()
+    }
+
+    /// Whether graph-construction data is empty or has already been consumed.
+    pub fn is_empty(&self) -> bool {
+        self.canonical_hashes.is_empty()
+    }
+    /// Canonical hash, count, and packed word before assembly; empty afterwards.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, u32, &IntT)> + '_ {
+        self.canonical_hashes
+            .iter()
+            .copied()
+            .zip(self.counts.iter().copied())
+            .zip(self.packed_kmers.iter())
+            .map(|((hash, count), packed)| (hash, count, packed))
+    }
+    /// Count for a canonical hash; `None` after graph assembly consumes the counts.
+    pub fn count(&self, hash: u64) -> Option<u32> {
+        let entry = self.hash_to_index.get(&hash)?;
+        self.counts.get(entry.index()).copied()
     }
 
     pub(crate) fn initialise_neighbour_slots(&mut self) {
@@ -129,7 +149,9 @@ impl<IntT> IndexedKmers<IntT> {
         )
     }
 
-    pub(crate) fn get_packed(&self, hash: u64) -> Option<&IntT> {
+    /// Packed word for a canonical hash, retained after assembly for sequence spelling.
+    /// Canonicalisation follows the hash, not the numerical order of packed base words.
+    pub fn get_packed(&self, hash: u64) -> Option<&IntT> {
         let entry = self.hash_to_index.get(&hash)?;
         self.packed_kmers.get(entry.index())
     }

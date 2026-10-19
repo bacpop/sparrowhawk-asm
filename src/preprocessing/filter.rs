@@ -732,7 +732,7 @@ where
         write_kmer_spectrum_tsv(&histovec, p.as_path());
     }
     // After the plot and TSV, so a k that leaves nothing still says why.
-    if kmers.len() == 0 {
+    if kmers.is_empty() {
         return Err(PreprocessingError(format!(
             "no k-mers survived filtering at k={k}, base-quality floor {chosen_min_qual}, and minimum count {minc}"
         )));
@@ -1391,12 +1391,13 @@ mod tests {
                 None,
             )
             .expect("the fixture leaves k-mers after filtering");
-            let contigs = BasicAsm::assemble::<u128>(k, &mut kmers, &mut None, None, correction);
+            let contigs = BasicAsm::assemble::<u128>(k, &mut kmers, correction, None).unwrap();
             crate::graph_works::spelling::spell_contigs::<u128>(
                 &contigs,
                 |hash| kmers.get_packed(hash).copied(),
                 k,
             )
+            .unwrap()
         };
 
         let small = assemble(21, None);

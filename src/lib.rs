@@ -1,7 +1,38 @@
 //! Efficient genome assembler for bacterial species in Rust, browser-ready.
+//!
+//! Use [`assemble`] with [`AssemblyOptions`] for the complete single-k/multi-k pipeline,
+//! or call [`preprocessing::preprocessing`], [`graph_works::BasicAsm`] through
+//! [`graph_works::Assemble`], and [`graph_works::spelling::spell_contigs`] separately.
+//! Results remain packed; FASTA writing decodes bounded buffers and returns I/O errors.
+//! Library entry points do not initialise logging or a global Rayon pool.
+//!
+//! ```no_run
+//! use sparrowhawk_asm::{assemble, AssemblyOptions, InputFiles};
+//! use std::io::{self, Write};
+//!
+//! # #[cfg(not(target_family = "wasm"))]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let reads = InputFiles::new(["reads_1.fastq.gz", "reads_2.fastq.gz"])?;
+//! let result = assemble(&reads, &AssemblyOptions::default())?;
+//! let mut output = io::BufWriter::new(io::stdout().lock());
+//! result.write_fasta(&mut output)?;
+//! output.flush()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Sources must be repeatable; see [`IteratorSource`] for custom parsers. Qualities are
+//! PHRED+33 bytes, while quality thresholds are numerical PHRED scores. Component
+//! preprocessing keeps a fixed quality floor; the complete API chooses floors and recounts.
+//! Accepted k values and biological early stops are available on [`Assembly`]. Input,
+//! spelling, and graph callback failures propagate through [`AssemblyError`].
+//!
+//! See `examples/api_usage.rs` for automatic assembly and
+//! `examples/api_usage_step_by_step.rs` for the manual component workflow.
 #![warn(missing_docs)]
 
-pub mod cli;
+mod api;
+mod cli;
 pub mod graph_works;
 mod pipeline;
 pub mod preprocessing;
@@ -12,15 +43,23 @@ use crate::cli::*;
 use crate::pipeline::Preprocessed;
 use crate::pipeline::{preprocess_step, run_ladder, BuildOpts, LadderState};
 #[cfg(not(target_family = "wasm"))]
-use crate::utils::io_utils::{get_input_list, set_ostream};
+use crate::utils::io_utils::get_input_list;
 use crate::utils::{clock::Instant, io_utils, logging, reads};
-use sparrowhawk_graph::DbgGraph;
 use std::fmt;
 #[cfg(not(target_family = "wasm"))]
 use std::path::{Path, PathBuf};
 
 // Re-export core graph types so callers do not need to depend on sparrowhawk-graph directly.
-pub use sparrowhawk_graph::{EdgeType, EdgeWeight, Idx};
+pub use api::{assemble, assemble_with_graph, Assembly, AssemblyOptions};
+pub use sparrowhawk_graph::{
+    CarryType, DbgGraph, EdgeId, EdgeType, EdgeWeight, Idx, NodeId, NodeStruct, SerializedContigs,
+};
+pub use utils::error::AssemblyError;
+#[cfg(target_family = "wasm")]
+pub use utils::reads::BrowserFiles;
+#[cfg(not(target_family = "wasm"))]
+pub use utils::reads::InputFiles;
+pub use utils::reads::{IteratorSource, MaybeSend, OwnedRecord, ReadSource};
 
 #[cfg(target_family = "wasm")]
 use std::io::Write;
@@ -34,7 +73,7 @@ const BROWSER_HISTOGRAM_BINS: usize = 500;
 const _: () = assert!(BROWSER_HISTOGRAM_BINS <= preprocessing::MAXSIZEHISTO);
 
 /// Quality filtering options for FASTQ files
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct QualOpts {
     /// Minimum k-mer count across reads to be added
     pub min_count: u16,
@@ -60,26 +99,27 @@ pub(crate) fn post_state(_state: &str) {}
 
 /// Writes the corrected graph, before its collapse, as `<base>.dot`, `.gfa` and `.gfa2`.
 #[cfg(not(target_family = "wasm"))]
-fn write_graph_files(graph: &DbgGraph, base: &Path) {
-    log::info!(
-        "Saving graph (post-shrink, pre-collapse, w/o one-node contigs) as DOT, GFAv1.1, and GFAv2 \
-         files..."
-    );
-    // Appended, not `with_extension`, which would replace whatever follows a dot in the prefix.
-    let open = |extension: &str| {
+fn write_graph_files(graph: &DbgGraph, base: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    // Append extensions: replacing one would discard dots in the caller's prefix.
+    for (extension, render) in [
+        ("dot", DbgGraph::get_dot_string as fn(&DbgGraph) -> String),
+        ("gfa", DbgGraph::get_gfa_string),
+        ("gfa2", DbgGraph::get_gfa2_string),
+    ] {
         let mut path = base.as_os_str().to_owned();
         path.push(format!(".{extension}"));
-        set_ostream(&Some(path.into_string().unwrap()))
-    };
-    graph.write_to_dot(&mut open("dot"));
-    graph.write_to_gfa(&mut open("gfa"));
-    graph.write_to_gfa2(&mut open("gfa2"));
-    log::info!("Done.");
+        let mut out = std::io::BufWriter::new(std::fs::File::create(PathBuf::from(path))?);
+        let text = render(graph);
+        out.write_all(text.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 #[doc(hidden)]
 #[cfg(not(target_family = "wasm"))]
-pub fn main() {
+pub fn run_cli() {
     let args = cli_args();
 
     // log::info!("Starting program!");
@@ -98,25 +138,12 @@ pub fn main() {
         min_qual,
         two_bit_reads,
         threads,
-        no_bloom,
-        bubble_pop_ratio,
-        bubble_peak_ratio,
-        no_ec_removal,
-        ec_coverage_ratio,
-        ec_require_both_flanks,
-        dead_end_length,
-        dead_end_length_kmult,
-        dead_end_coverage_kmult,
-        dead_end_coverage_ratio,
-        no_dead_end_coverage,
-        min_contig_length,
         keep_intermediate_contigs,
         no_histo,
         debug_quality_floors,
         no_graphs,
-        no_bubble_collapse,
-        no_dead_end_removal,
         verbose,
+        ..
     } = &args;
     let mut timevec = Vec::new();
     timevec.push(Instant::now());
@@ -187,44 +214,36 @@ pub fn main() {
     let output: PathBuf = Path::new(output_dir).join(format!("{output_prefix}_contigs.fasta"));
 
     // Finished checks, let's put all the options in a convenient struct...
-    let opts = BuildOpts {
-        quality,
-        fixed_min_qual,
-        two_bit_reads: *two_bit_reads,
-        do_bloom: !no_bloom,
-        do_fit,
-        do_bubble_collapse: !no_bubble_collapse,
-        do_dead_end_removal: !no_dead_end_removal,
-        pop_ratio: *bubble_pop_ratio,
-        peak_ratio: *bubble_peak_ratio,
-        do_ec_removal: !no_ec_removal,
-        ec_ratio: *ec_coverage_ratio,
-        ec_require_both_flanks: *ec_require_both_flanks,
-        dead_end_length: *dead_end_length,
-        dead_end_length_kmult: *dead_end_length_kmult,
-        dead_end_coverage_kmult: (!no_dead_end_coverage).then_some(*dead_end_coverage_kmult),
-        dead_end_coverage_ratio: *dead_end_coverage_ratio,
-        min_contig_length: *min_contig_length,
-        keep_intermediate_contigs: *keep_intermediate_contigs,
-        no_histo: *no_histo,
-        debug_quality_floors: *debug_quality_floors,
-        output_dir,
-        output_prefix,
-    };
+    let mut opts = BuildOpts::from(&AssemblyOptions::from(&args));
+    opts.keep_intermediate_contigs = *keep_intermediate_contigs;
+    opts.no_histo = *no_histo;
+    opts.debug_quality_floors = *debug_quality_floors;
+    opts.output_dir = output_dir;
+    opts.output_prefix = output_prefix;
 
     // And do final preparations
-    let reads = reads::InputFiles(&input_files);
+    let reads = reads::InputFiles::new(
+        input_files
+            .iter()
+            .flat_map(|(_, files)| files.iter().cloned()),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(1)
+    });
     let mut write_graph = out_path_graph
         .as_deref()
         .map(|path| move |graph: &DbgGraph| write_graph_files(graph, path));
     let graph_sink = write_graph
         .as_mut()
-        .map(|write| write as &mut dyn FnMut(&DbgGraph));
+        .map(|write| write as &mut dyn FnMut(&DbgGraph) -> std::io::Result<()>);
 
     // A single k runs as a ladder of one step; only multi-k packs the reads for later steps.
-    let mut ladder = LadderState::new(&opts, &reads, k.as_deref(), true);
-    let built = preprocess_step(&opts, &reads, 0, &mut ladder, &mut timevec)
-        .and_then(|first| run_ladder(&opts, &reads, &mut ladder, first, &mut timevec, graph_sink));
+    let built = LadderState::new(&opts, &reads, k.as_deref(), true).and_then(|mut ladder| {
+        preprocess_step(&opts, &reads, 0, &mut ladder, &mut timevec).and_then(|first| {
+            run_ladder(&opts, &reads, &mut ladder, first, &mut timevec, graph_sink)
+        })
+    });
 
     // In any case, save output contigs
     match built {
@@ -253,12 +272,6 @@ pub fn main() {
 // ===================================== WebAssembly stuff follows
 //
 #[cfg(target_family = "wasm")]
-/// Binary dummy function. In the future, we need to completely remove it whenever compilating with the feature "wasm"
-pub fn main() {
-    panic!("You've compiled Sparrowhawk for WebAssembly support, you cannot use it as a normal binary anymore!");
-}
-
-#[cfg(target_family = "wasm")]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = log)]
@@ -275,7 +288,7 @@ extern "C" {
 
 #[cfg(target_family = "wasm")]
 /// Posts a state update message to the main thread via postMessage
-pub fn post_state(state: &str) {
+pub(crate) fn post_state(state: &str) {
     let obj = js_sys::Object::new();
     let _ = js_sys::Reflect::set(
         &obj,
@@ -406,11 +419,11 @@ impl AssemblyHelper {
 
     /// Multiplier scaling the dead-end removal threshold with k. Zero keeps the flat floor.
     pub fn set_dead_end_length_kmult(&mut self, kmult: f32) {
-        if kmult >= 0.0 {
+        if kmult.is_finite() && kmult >= 0.0 {
             self.dead_end_length_kmult = kmult;
         } else {
             log::warn!(
-                "Ignoring --dead-end-length-kmult {kmult}: it must be >= 0. Keeping {}.",
+                "Ignoring --dead-end-length-kmult {kmult}: it must be finite and >= 0. Keeping {}.",
                 self.dead_end_length_kmult
             );
         }
@@ -423,17 +436,22 @@ impl AssemblyHelper {
         file2: Option<web_sys::File>,
     ) -> Result<(), JsError> {
         post_state("preprocess:start");
-        let reads = reads::BrowserFiles(std::iter::once(file1).chain(file2).collect());
-        let opts = self.build_opts();
+        let reads = reads::BrowserFiles::new(std::iter::once(file1).chain(file2).collect())
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let opts = self
+            .build_opts()
+            .map_err(|error| JsError::new(&error.to_string()))?;
         let mut timevec = vec![Instant::now()];
         // A single k is a ladder of one step; an empty multi-k list requests the default ladder.
         let requested = match &self.multik {
             None => Some(vec![self.k]),
             Some(ks) => (!ks.is_empty()).then(|| ks.clone()),
         };
-        let mut ladder = LadderState::new(&opts, &reads, requested.as_deref(), false);
+        let mut ladder = LadderState::new(&opts, &reads, requested.as_deref(), false)
+            .map_err(|error| JsError::new(&error.to_string()))?;
         self.spectrum_k = ladder.ks[0];
-        let preprocessed = preprocess_step(&opts, &reads, 0, &mut ladder, &mut timevec)?;
+        let preprocessed = preprocess_step(&opts, &reads, 0, &mut ladder, &mut timevec)
+            .map_err(|error| JsError::new(&error.to_string()))?;
         self.ladder = Some(ladder);
         let (histovec, nkmers, used_min_count) = preprocessed.summary();
         // Limit the display payload; spectrum fitting has already used the full histogram.
@@ -456,7 +474,9 @@ impl AssemblyHelper {
             .preprocessed
             .take()
             .ok_or_else(|| JsError::new("preprocess must run before assemble"))?;
-        let opts = self.build_opts();
+        let opts = self
+            .build_opts()
+            .map_err(|error| JsError::new(&error.to_string()))?;
         let mut timevec = vec![Instant::now()];
         let mut graph_text = None;
         let mut keep_graph = |graph: &DbgGraph| {
@@ -465,6 +485,7 @@ impl AssemblyHelper {
                 graph.get_gfa_string(),
                 graph.get_gfa2_string(),
             ));
+            Ok(())
         };
         let ladder = self
             .ladder
@@ -481,7 +502,8 @@ impl AssemblyHelper {
             preprocessed,
             &mut timevec,
             Some(&mut keep_graph),
-        )?;
+        )
+        .map_err(|error| JsError::new(&error.to_string()))?;
         post_state("assembly:saving");
         let mut written = 0;
         self.fasta_gz = io_utils::gzipped(|out| {
@@ -554,13 +576,18 @@ impl AssemblyHelper {
 #[cfg(target_family = "wasm")]
 impl AssemblyHelper {
     /// The CLI's defaults, with the page's own settings over them.
-    fn build_opts(&self) -> BuildOpts<'static> {
-        BuildOpts {
-            fixed_min_qual: self.fixed_min_qual,
+    fn build_opts(&self) -> Result<BuildOpts<'static>, AssemblyError> {
+        let options = AssemblyOptions {
+            k_values: self.multik.clone().unwrap_or_else(|| vec![self.k]),
+            min_count: (!self.do_fit).then_some(self.quality.min_count),
+            min_qual: self.fixed_min_qual.then_some(self.quality.min_qual),
+            use_bloom: self.do_bloom,
             min_contig_length: self.min_contig_length,
             pop_ratio: self.bubble_pop_ratio,
             dead_end_length_kmult: self.dead_end_length_kmult,
-            ..BuildOpts::with_defaults(self.quality, self.do_bloom, self.do_fit)
-        }
+            ..AssemblyOptions::default()
+        };
+        options.validate()?;
+        Ok(BuildOpts::from(&options))
     }
 }

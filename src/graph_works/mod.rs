@@ -3,8 +3,8 @@
 pub mod collapser;
 pub mod corrector;
 pub mod indexed_kmers;
-pub mod neighbours;
-pub mod path_correction;
+pub(crate) mod neighbours;
+pub(crate) mod path_correction;
 pub mod shrinker;
 pub mod spelling;
 
@@ -51,16 +51,16 @@ impl Contigs {
 
 /// Public API for assemblers.
 pub trait Assemble {
-    /// Build the graph of `kmers`, correct it, and collapse it into contigs. `graph_sink` sees the
-    /// corrected graph before the collapse: natively it writes DOT and GFA files, and in the browser it
-    /// keeps them as text for the page.
+    /// Build, correct, and collapse the indexed k-mers, consuming their graph data.
+    /// Canonical packed lookup remains available for spelling. A callback borrows the corrected
+    /// graph before collapse; its errors abort assembly. Use the same k as preprocessing.
+    #[allow(clippy::type_complexity)] // Keep the optional callback explicit in the public API.
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         kmers: &mut IndexedKmers<IntT>,
-        timevec: &mut Option<&mut Vec<Instant>>,
-        graph_sink: Option<&mut dyn FnMut(&DbgGraph)>,
         correction: CorrectionOpts,
-    ) -> Contigs;
+        graph_sink: Option<&mut dyn FnMut(&DbgGraph) -> std::io::Result<()>>,
+    ) -> Result<Contigs, crate::AssemblyError>;
 }
 
 /// Seconds between the last two stamps of `timevec`.
@@ -75,13 +75,32 @@ fn last_step_secs(timevec: &[Instant]) -> u64 {
 pub struct BasicAsm {}
 
 impl Assemble for BasicAsm {
+    #[allow(clippy::type_complexity)] // Keep the optional callback explicit in the public API.
     fn assemble<IntT: for<'a> UInt<'a>>(
         k: usize,
         kmers: &mut IndexedKmers<IntT>,
-        timevec: &mut Option<&mut Vec<Instant>>,
-        graph_sink: Option<&mut dyn FnMut(&DbgGraph)>,
         correction: CorrectionOpts,
-    ) -> Contigs {
+        graph_sink: Option<&mut dyn FnMut(&DbgGraph) -> std::io::Result<()>>,
+    ) -> Result<Contigs, crate::AssemblyError> {
+        Self::assemble_timed(k, kmers, &mut None, graph_sink, correction)
+    }
+}
+
+impl BasicAsm {
+    pub(crate) fn assemble_timed<IntT: for<'a> UInt<'a>>(
+        k: usize,
+        kmers: &mut IndexedKmers<IntT>,
+        timevec: &mut Option<&mut Vec<Instant>>,
+        graph_sink: Option<crate::api::GraphSink<'_>>,
+        correction: CorrectionOpts,
+    ) -> Result<Contigs, crate::AssemblyError> {
+        crate::api::validate_packed_k::<IntT>(k)?;
+        crate::api::validate_correction(&correction)?;
+        if kmers.is_empty() {
+            return Err(crate::AssemblyError::InvalidOptions(
+                "no indexed k-mers remain for graph construction".into(),
+            ));
+        }
         // Unpacked once, so the body below reads exactly as it did when these were parameters.
         let CorrectionOpts {
             do_bubble_collapse,
@@ -185,7 +204,7 @@ impl Assemble for BasicAsm {
         }
 
         if let Some(sink) = graph_sink {
-            sink(&ptgraph);
+            sink(&ptgraph).map_err(crate::AssemblyError::GraphOutput)?;
         }
 
         crate::post_state("assembly:collapse_graph");
@@ -204,7 +223,7 @@ impl Assemble for BasicAsm {
         // Sequence spelling consumes one node containing the complete walk per contig.
         contigs.shrink();
 
-        contigs
+        Ok(contigs)
     }
 }
 
@@ -378,7 +397,8 @@ mod tests {
             walk, before_shrink,
             "shrinking preserves the collapsed walk"
         );
-        let spelled = spelling::spell_contigs(&contigs, |hash| packed.get(&hash).copied(), k);
+        let spelled =
+            spelling::spell_contigs(&contigs, |hash| packed.get(&hash).copied(), k).unwrap();
         assert_eq!(spelled.len(), 1);
         let bases = spelled.iter().next().unwrap().ascii();
         (walk, bases)

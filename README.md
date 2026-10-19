@@ -35,15 +35,14 @@ sparrowhawk aims to be a fast short-read assembler for bacterial genomics that c
 
 Current **main features**:
 - Currently only support for Illumina paired short reads.
-- Single k-value, that must be odd and between 3 (not recommended to go below 19/21, due to memory requirements) and 256.
+- Single-k and iterative multi-k assembly, with odd k values in `3..=255`; very small k values require more memory.
 - Designed thinking on bacterial genomes (i.e. "small").
 - Uses a node-based de Bruijn graph built upon [petgraph](https://docs.rs/petgraph/latest/petgraph).
 - Partially parallelised with [rayon](https://docs.rs/rayon/latest/rayon).
-- Compilation to WebAssembly targets (currently only `wasm32-unknown-unknown`) is possible to run the assembler in web projects. For more info, see [sparrowhawk](https://github.com/bacpop/sparrowhawk).
+- Compilation to WebAssembly targets (`wasm32-unknown-unknown` and the browser integration's WASM64 build) is possible to run the assembler in web projects. For more info, see [sparrowhawk](https://github.com/bacpop/sparrowhawk).
 
 :construction: In-progress future main (not all) features: :construction:
 - Partial GPU acceleration.
-- Multi-k support.
 - Improved error correction and graph collapse logics.
 
 
@@ -116,14 +115,39 @@ class), and counts every later k from there.
 
 In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. Two native diagnostic plots of the k-mer frequency spectrum are saved beside them: `prefix_kmerspectrum.png`, linear and capped at three times the empirical peak's height (unbounded without a peak), and `prefix_kmerspectrum_log.png`, with a logarithmic Y axis. Each is also written as SVG. Runs using automatic count selection overlay the fitted error, single-copy, and repeat components, the total mixture, the empirical valley and peak, the fitted single-copy mean and mode, and the error/genome crossover. With Bloom counting, the plots show both the rescaled sketch used for fitting and the raw Bloom count map. These optional files can be avoided with the corresponding arguments.
 
+## Rust library API
+
+Use `assemble()` with `AssemblyOptions` for the complete assembly pipeline, or run
+preprocessing, graph assembly, spelling, and FASTA writing separately.
+
+To use this checkout as a dependency, adjust the path below:
+
+```toml
+[dependencies]
+sparrowhawk-asm = { path = "../sparrowhawk-asm" }
+```
+
+See the commented examples:
+
+- [Complete workflow](examples/api_usage.rs): automatic assembly with the default settings.
+- [Step-by-step workflow](examples/api_usage_step_by_step.rs): call each stage independently and inspect preprocessing results.
+
+Run either example with your input files:
+
+```sh
+cargo run --release --example api_usage -- reads_1.fastq.gz reads_2.fastq.gz > contigs.fasta
+cargo run --release --example api_usage_step_by_step -- reads_1.fastq.gz reads_2.fastq.gz > contigs.fasta
+```
+
 ## Source layout
 
 ```text
 src/
 ├── main.rs                 # Native executable entry point.
 ├── cli.rs                  # CLI options, defaults, and argument validation.
-├── lib.rs                  # Library configuration, native entry, and browser interface.
-├── pipeline.rs             # Shared single-k and multi-k assembly workflow, for native executions.
+├── lib.rs                  # Public exports, native entry, and browser interface.
+├── api.rs                  # Complete assembly API, options, validation, and packed results.
+├── pipeline.rs             # Shared single-k and multi-k assembly workflow, for both execution targets.
 ├── preprocessing/          # Read packing, k-mer counting, and spectrum filtering.
 │   ├── mod.rs              # Preprocessing orchestration and empirical spectrum analysis.
 │   ├── sketch.rs           # Hash sampling and per-quality-floor k-mer spectra.
@@ -147,6 +171,7 @@ src/
 │   └── shrinker.rs         # Merge compatible graph paths into unitigs.
 └── utils/                  # Input/output, encoding, hashing, logging, and timing utilities.
     ├── mod.rs              # Utility module declarations.
+    ├── error.rs            # Assembly API errors, re-exported at the crate root.
     ├── logging.rs          # Native and browser logging.
     ├── fastx_wasm.rs       # Browser FASTA/FASTQ parsing and gzip input.
     ├── io_utils.rs         # Native input handling and FASTA/gzip output helpers.
@@ -155,4 +180,10 @@ src/
     ├── bit_encoding.rs     # Base encoding and packed integer operations.
     ├── nthash.rs           # Rolling DNA hashes and lookup tables.
     └── qual_profile.rs     # Quality-floor discovery and k-mer window classification.
+```
+
+```text
+examples/
+├── api_usage.rs                 # Complete automatic assembly and buffered FASTA output.
+└── api_usage_step_by_step.rs    # Separate preprocessing, graph assembly, spelling, and output.
 ```

@@ -45,52 +45,67 @@ fn extract_kmers_from_files_batched<F, I>(
     input_iters: &mut [I],
     batch_records: usize,
     mut on_batch: F,
-) -> std::time::Duration
+) -> std::io::Result<std::time::Duration>
 where
     F: FnMut(&[OwnedRecord]),
-    I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)> + Send,
+    I: Iterator<Item = std::io::Result<OwnedRecord>> + Send,
 {
-    let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<Vec<OwnedRecord>>(1);
+    let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<OwnedRecord>>>(1);
     let (empty_tx, empty_rx) = std::sync::mpsc::sync_channel::<Vec<OwnedRecord>>(2);
     for _ in 0..2 {
         let _ = empty_tx.send(Vec::with_capacity(batch_records));
     }
     let nfiles = input_iters.len();
     let t0 = Instant::now();
-    std::thread::scope(|scope| {
+    std::thread::scope(move |scope| -> std::io::Result<()> {
         scope.spawn(move || {
-            let mut batch = empty_rx.recv().unwrap_or_default();
+            let Ok(mut batch) = empty_rx.recv() else {
+                return;
+            };
             for (idx, records) in input_iters.iter_mut().enumerate() {
                 log::info!("Getting kmers from file number {idx}.");
                 for record in records {
-                    let seq: Vec<u8> = record.0;
-                    let qual: Option<Vec<u8>> = record.1;
-                    batch.push((seq, qual));
-                    if batch.len() == batch_records {
-                        // A closed channel means the consumer is gone; there is nothing left to feed.
-                        if full_tx.send(batch).is_err() {
+                    let record = match record.and_then(crate::utils::reads::validate_record) {
+                        Ok(record) => record,
+                        Err(error) => {
+                            let _ = full_tx.send(Err(error));
                             return;
                         }
-                        batch = empty_rx
-                            .recv()
-                            .unwrap_or_else(|_| Vec::with_capacity(batch_records));
+                    };
+                    batch.push(record);
+                    if batch.len() == batch_records {
+                        if full_tx.send(Ok(batch)).is_err() {
+                            return;
+                        }
+                        let Ok(empty) = empty_rx.recv() else {
+                            return;
+                        };
+                        batch = empty;
                     }
                 }
                 log::info!("Finished getting kmers from file number {idx}.");
             }
             if !batch.is_empty() {
-                let _ = full_tx.send(batch);
+                let _ = full_tx.send(Ok(batch));
             }
         });
-        // The producer holds the only `full_tx`, so this loop ends when the producer does.
-        for mut batch in full_rx {
-            on_batch(&batch);
-            batch.clear();
-            let _ = empty_tx.send(batch);
-        }
-    });
+        let result = (|| {
+            for message in &full_rx {
+                let mut batch = message?;
+                on_batch(&batch);
+                batch.clear();
+                // The producer may have exited after queuing an input error. A disconnected
+                // return channel must not discard that error from the full-buffer channel.
+                let _ = empty_tx.send(batch);
+            }
+            Ok(())
+        })();
+        drop(full_rx);
+        drop(empty_tx);
+        result
+    })?;
     log::info!("Finished getting kmers from {nfiles} file(s)");
-    t0.elapsed()
+    Ok(t0.elapsed())
 }
 
 /// The browser's version: no threads, so parse a batch, count it, and tell the page how far it got.
@@ -99,17 +114,17 @@ fn extract_kmers_from_files_batched<F, I>(
     input_iters: &mut [I],
     batch_records: usize,
     mut on_batch: F,
-) -> std::time::Duration
+) -> std::io::Result<std::time::Duration>
 where
     F: FnMut(&[OwnedRecord]),
-    I: Iterator<Item = OwnedRecord>,
+    I: Iterator<Item = std::io::Result<OwnedRecord>>,
 {
     let t0 = Instant::now();
     let mut batch = Vec::with_capacity(batch_records);
     let mut done = 0usize;
     for records in input_iters.iter_mut() {
         for record in records {
-            batch.push(record);
+            batch.push(crate::utils::reads::validate_record(record?)?);
             if batch.len() == batch_records {
                 on_batch(&batch);
                 done += batch.len();
@@ -124,7 +139,7 @@ where
     if !batch.is_empty() {
         on_batch(&batch);
     }
-    t0.elapsed()
+    Ok(t0.elapsed())
 }
 
 /// The constants of one counting pass: fixed for every record, so they travel together.
@@ -450,6 +465,12 @@ fn count_batch<IntT, R: CountedRead>(
     t.absorb_ns += t3.elapsed().as_nanos();
 }
 
+type CountResult<IntT> = (
+    Vec<CountMap<IntT>>,
+    Option<SpectrumSketch>,
+    [bool; MAX_GROUPS],
+);
+
 /// One pass over the reads: every kept k-mer counted into the sharded count map, and every
 /// k-mer sampled into the per-floor sketch.
 pub(super) fn count_kmers<IntT, I>(
@@ -460,14 +481,10 @@ pub(super) fn count_kmers<IntT, I>(
     min_class: u8,
     do_bloom: bool,
     do_fit: bool,
-) -> (
-    Vec<CountMap<IntT>>,
-    Option<SpectrumSketch>,
-    [bool; MAX_GROUPS],
-)
+) -> std::io::Result<CountResult<IntT>>
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = OwnedRecord> + MaybeSend,
+    I: Iterator<Item = std::io::Result<OwnedRecord>> + MaybeSend,
 {
     // The ladder is ascending, so the last group is the strict floor and `keep` is its index.
     let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
@@ -527,7 +544,7 @@ where
                     &mut t,
                 );
                 t.batches += 1;
-            })
+            })?
         }
         PassInput::Stored(store) => {
             let start = Instant::now();
@@ -583,7 +600,7 @@ where
         }
     }
 
-    (shards, sketch, floor_has_kmers)
+    Ok((shards, sketch, floor_has_kmers))
 }
 
 /// Consume the count-map into aligned storage, keeping k-mers seen `minc` times.
@@ -683,6 +700,13 @@ where
         });
     }
     shards.iter().map(HashMap::len).sum::<usize>() - before
+}
+
+impl<'a> PassInput<'a, std::iter::Empty<std::io::Result<OwnedRecord>>> {
+    /// Replay a packed store without needing to name an unused text iterator type.
+    pub fn stored(store: &'a ReadStore) -> Self {
+        Self::Stored(store)
+    }
 }
 
 #[cfg(test)]
@@ -932,9 +956,9 @@ mod tests {
             (vec![0], false),
             (vec![0], true),
         ] {
-            let mut store = ReadStore::new(&ladder, two_bit);
+            let mut store = ReadStore::new(&ladder, two_bit).unwrap();
             for (seq, qual) in reads {
-                store.push(seq, qual.as_deref());
+                store.push(seq, qual.as_deref()).unwrap();
             }
             store.finish();
             for &do_bloom in blooms {
@@ -947,23 +971,26 @@ mod tests {
                             min_qual: floor,
                         };
                         let text = count_kmers::<IntT, _>(
-                            PassInput::Text(reads.iter().cloned()),
+                            PassInput::Text(reads.iter().cloned().map(Ok)),
                             k,
                             &qual,
                             floors,
                             0,
                             do_bloom,
                             true,
-                        );
-                        let packed = count_kmers::<IntT, std::iter::Empty<OwnedRecord>>(
-                            PassInput::Stored(&store),
-                            k,
-                            &qual,
-                            floors,
-                            if classify { 0 } else { top as u8 },
-                            do_bloom,
-                            true,
-                        );
+                        )
+                        .unwrap();
+                        let packed =
+                            count_kmers::<IntT, std::iter::Empty<std::io::Result<OwnedRecord>>>(
+                                PassInput::Stored(&store),
+                                k,
+                                &qual,
+                                floors,
+                                if classify { 0 } else { top as u8 },
+                                do_bloom,
+                                true,
+                            )
+                            .unwrap();
                         assert_eq!(
                             counts(text.0),
                             counts(packed.0),

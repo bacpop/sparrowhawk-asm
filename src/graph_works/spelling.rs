@@ -8,6 +8,18 @@ use std::fmt;
 /// Why a walk could not be spelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpellError {
+    /// k is not odd/in range, or does not fit the packed integer.
+    InvalidK {
+        /// Requested k.
+        k: usize,
+        /// Available packed bits.
+        width: u32,
+    },
+    /// A contig must contain exactly one node after shrinking.
+    UncollapsedContig {
+        /// Index in the contig collection.
+        index: usize,
+    },
     /// The walk was empty.
     Empty,
     /// A hash in the walk is absent from the dictionary.
@@ -27,6 +39,10 @@ pub enum SpellError {
 impl fmt::Display for SpellError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            Self::InvalidK { k, width } => write!(f, "invalid k={k} for a {width}-bit packed word"),
+            Self::UncollapsedContig { index } => {
+                write!(f, "contig {index} was not shrunk to one node")
+            }
             Self::Empty => write!(f, "the walk is empty"),
             Self::UnknownKmer { index, hash } => {
                 write!(f, "k-mer {index} (hash {hash}) is not in the dictionary")
@@ -39,6 +55,8 @@ impl fmt::Display for SpellError {
     }
 }
 
+impl std::error::Error for SpellError {}
+
 /// Spell the two-bit base codes of a walk of canonical k-mer hashes, looking each packed k-mer up with `lookup`.
 pub fn spell_path<IntT>(
     hashes: &[u64],
@@ -48,6 +66,10 @@ pub fn spell_path<IntT>(
 where
     IntT: for<'a> UInt<'a>,
 {
+    crate::api::validate_packed_k::<IntT>(k).map_err(|_| SpellError::InvalidK {
+        k,
+        width: IntT::zero_init().n_bits(),
+    })?;
     if hashes.is_empty() {
         return Err(SpellError::Empty);
     }
@@ -114,23 +136,28 @@ where
 
 /// Transcribes every contig into 2-bit storage, looking each packed k-mer up with `lookup`. A multi-k
 /// step carries all of them to the next k, so none is length-filtered.
-pub(crate) fn spell_contigs<IntT>(
+pub fn spell_contigs<IntT>(
     contigs: &Contigs,
     lookup: impl Fn(u64) -> Option<IntT>,
     k: usize,
-) -> PackedSeqs
+) -> Result<PackedSeqs, SpellError>
 where
     IntT: for<'a> UInt<'a>,
 {
+    crate::api::validate_packed_k::<IntT>(k).map_err(|_| SpellError::InvalidK {
+        k,
+        width: IntT::zero_init().n_bits(),
+    })?;
     let mut spelled = PackedSeqs::new(true);
     for (i, contig) in contigs.serialized_contigs.iter().enumerate() {
-        assert_eq!(contig.len(), 1, "contig {i} was not shrunk to one node");
-        let codes = spell_path(&contig[0].abs_ind, &lookup, k)
-            .unwrap_or_else(|e| panic!("contig {i} is not a valid walk: {e}"));
+        if contig.len() != 1 {
+            return Err(SpellError::UncollapsedContig { index: i });
+        }
+        let codes = spell_path(&contig[0].abs_ind, &lookup, k)?;
         spelled.push_contig(&codes);
     }
     spelled.finish();
-    spelled
+    Ok(spelled)
 }
 
 #[cfg(test)]
@@ -140,6 +167,37 @@ mod tests {
     use nohash_hasher::NoHashHasher;
     use sparrowhawk_graph::NodeStruct;
     use std::{borrow::Cow, collections::HashMap, hash::BuildHasherDefault};
+
+    #[test]
+    fn invalid_k_and_uncollapsed_contigs_return_errors() {
+        for k in [0, 2, 33, 255, usize::MAX] {
+            assert!(matches!(
+                spell_path::<u64>(&[1], |_| Some(0), k),
+                Err(SpellError::InvalidK { .. })
+            ));
+            assert!(matches!(
+                spell_contigs::<u64>(&Contigs::default(), |_| Some(0), k),
+                Err(SpellError::InvalidK { .. })
+            ));
+        }
+        for nodes in [
+            Vec::new(),
+            vec![
+                NodeStruct {
+                    counts: 1,
+                    abs_ind: vec![1],
+                    innerdir: None
+                };
+                2
+            ],
+        ] {
+            let contigs = Contigs::new(vec![nodes]);
+            assert!(matches!(
+                spell_contigs::<u64>(&contigs, |_| Some(0), 31),
+                Err(SpellError::UncollapsedContig { index: 0 })
+            ));
+        }
+    }
 
     // ── spelling ─────────────────────────────────────────────────────────
     /// A deterministic ACGT sequence; an LCG keeps it reproducible without pulling in an rng crate.
@@ -351,7 +409,8 @@ mod tests {
         let (dict, path) = dict_and_walk::<u64>(&seq, k);
         assert_eq!(path.len(), n);
 
-        let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
+        let sequences =
+            spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k).unwrap();
         let got = sequences.iter().next().unwrap().ascii();
         assert_eq!(got.len(), seq.len(), "contig length");
         assert_eq!(&got[..k], &seq[..k], "the first terminal k-mer");
@@ -368,7 +427,8 @@ mod tests {
         let (dict, path) = dict_and_walk::<u64>(&seq, k);
         assert!(path.len() < k, "fixture must have fewer than k k-mers");
 
-        let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
+        let sequences =
+            spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k).unwrap();
         assert_eq!(sequences.len(), 1, "the short path must still be written");
         assert_eq!(sequences.iter().next().unwrap().ascii(), seq);
     }

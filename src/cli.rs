@@ -22,8 +22,10 @@ pub const DEFAULT_DEAD_END_COVERAGE_RATIO: f64 = 2.0;
 /// Default minimum contig sequence length written to FASTA, in nucleotides
 pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 /// Default output directory
+#[cfg(not(target_family = "wasm"))]
 pub const DEFAULT_OUTPUT_DIR: &str = "./";
 /// Default output prefix
+#[cfg(not(target_family = "wasm"))]
 pub const DEFAULT_OUTPUT_PREFIX: &str = "sphk";
 /// Smallest minimum count supported by Bloom filtering and automatic Bloom fitting.
 pub(crate) const MIN_BLOOM_COUNT: u16 = 2;
@@ -282,78 +284,19 @@ pub struct Args {
 impl Args {
     /// Reject option values a run cannot use, before anything is created or logged.
     pub fn validate(&self) -> Result<(), String> {
-        if self.two_bit_reads {
-            if self.k.as_ref().is_some_and(|ks| ks.len() == 1) {
-                return Err("--two-bit-reads requires multi-k mode; omit -k or provide at least two k values".into());
-            }
-            if self.min_qual.is_some_and(|q| q > 0) {
-                return Err("--two-bit-reads requires Q0; remove --min-qual or set it to 0".into());
-            }
-            if self.debug_quality_floors {
-                return Err(
-                    "--two-bit-reads fixes Q0 and is incompatible with --debug-quality-floors"
-                        .into(),
-                );
-            }
-        }
-        validate_bloom_min_count(!self.no_bloom, self.min_count)?;
-        if self.debug_quality_floors && self.min_count.is_some() {
+        crate::AssemblyOptions::from(self)
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if self.two_bit_reads && self.debug_quality_floors {
             return Err(
-                "--debug-quality-floors requires automatic min-count selection; remove --min-count"
-                    .into(),
+                "--two-bit-reads fixes Q0 and is incompatible with --debug-quality-floors".into(),
             );
         }
-        if self.debug_quality_floors && self.min_qual.is_some() {
+        if self.debug_quality_floors && (self.min_count.is_some() || self.min_qual.is_some()) {
             return Err(
-                "--debug-quality-floors requires automatic base-quality floors; remove --min-qual"
+                "--debug-quality-floors requires automatic count and quality-floor selection"
                     .into(),
             );
-        }
-        if !(self.bubble_pop_ratio > 0.0 && self.bubble_pop_ratio < 1.0) {
-            return Err(format!(
-                "--bubble-pop-ratio must be strictly between 0 and 1 (got {}). It is the fraction of \
-                 the stronger branch's coverage below which the weaker branch counts as an error; 1.0 \
-                 or more pops every bubble, 0.0 or less pops none.",
-                self.bubble_pop_ratio
-            ));
-        }
-        if let Some(ratio) = self.bubble_peak_ratio.filter(|r| !(*r > 0.0 && *r < 1.0)) {
-            return Err(format!(
-                "--bubble-peak-ratio must be strictly between 0 and 1 (got {ratio}). It is the \
-                 fraction of single-copy coverage below which a branch counts as an error."
-            ));
-        }
-        if !(self.ec_coverage_ratio.is_finite() && self.ec_coverage_ratio > 1.0) {
-            return Err(format!(
-                "--ec-coverage-ratio must be finite and greater than 1 (got {}). It is how many times \
-                 a connector's flanks must out-cover it before the connector is treated as erroneous.",
-                self.ec_coverage_ratio
-            ));
-        }
-        if self.dead_end_length_kmult < 0.0 {
-            return Err(format!(
-                "--dead-end-length-kmult must be >= 0 (got {}). Zero keeps the flat \
-                 --dead-end-length.",
-                self.dead_end_length_kmult
-            ));
-        }
-        if self.dead_end_coverage_kmult < 0.0 {
-            return Err(format!(
-                "--dead-end-coverage-kmult must be >= 0 (got {}). Zero drops dead-end removal by \
-                 coverage, leaving only the length rule.",
-                self.dead_end_coverage_kmult
-            ));
-        }
-        if !self.dead_end_coverage_ratio.is_finite() || self.dead_end_coverage_ratio <= 0.0 {
-            return Err(format!(
-                "--dead-end-coverage-ratio must be finite and > 0 (got {}). It is how many times \
-                 better covered a junction must be than the dead end hanging off it.",
-                self.dead_end_coverage_ratio
-            ));
-        }
-        // Each k is seeded with the contigs of the k before it, so the ladder must climb.
-        if let Some(ks) = &self.k {
-            check_ladder(ks)?;
         }
         Ok(())
     }

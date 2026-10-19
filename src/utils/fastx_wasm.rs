@@ -24,43 +24,42 @@ pub enum FastxRecords {
 impl FastxRecords {
     /// Open `file`, telling gzip by its magic bytes and FASTA from FASTQ by the first character. An
     /// empty file reads as a FASTQ file with no records.
-    pub fn open<R: Read + 'static>(file: R) -> Self {
+    pub fn open<R: Read + 'static>(file: R) -> std::io::Result<Self> {
         let mut raw = BufReader::new(file);
-        let gzipped = raw
-            .fill_buf()
-            .expect("cannot read the input file")
-            .starts_with(&GZ_MAGIC);
+        let gzipped = raw.fill_buf()?.starts_with(&GZ_MAGIC);
         let decoded: Decoded = if gzipped {
             Box::new(MultiGzDecoder::new(raw))
         } else {
             Box::new(raw)
         };
         let mut decoded = BufReader::new(decoded);
-        let first = decoded
-            .fill_buf()
-            .expect("cannot read the input file")
-            .first()
-            .copied();
+        let first = decoded.fill_buf()?.first().copied();
         let decoded: Decoded = Box::new(decoded);
         match first {
-            Some(b'>') => Self::Fasta(FastaReader::new(decoded)),
-            _ => Self::Fastq(FastqReader::new(decoded)),
+            Some(b'>') => Ok(Self::Fasta(FastaReader::new(decoded))),
+            _ => Ok(Self::Fastq(FastqReader::new(decoded))),
         }
     }
 }
 
 impl Iterator for FastxRecords {
-    type Item = OwnedRecord;
+    type Item = std::io::Result<OwnedRecord>;
 
-    fn next(&mut self) -> Option<OwnedRecord> {
+    fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Fastq(reader) => reader.next().map(|record| {
-                let record = record.expect("Invalid FASTQ record");
-                (record.seq().to_vec(), Some(record.qual().to_vec()))
+                record
+                    .map(|record| (record.seq().to_vec(), Some(record.qual().to_vec())))
+                    .map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                    })
             }),
             Self::Fasta(reader) => reader.next().map(|record| {
-                let record = record.expect("Invalid FASTA record");
-                (record.full_seq().into_owned(), None)
+                record
+                    .map(|record| (record.full_seq().into_owned(), None))
+                    .map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                    })
             }),
         }
     }

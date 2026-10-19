@@ -1,15 +1,15 @@
 //! Read preprocessing orchestration and empirical coverage estimation.
 
-pub mod bloom_filter;
-pub mod filter;
+pub(crate) mod bloom_filter;
+pub(crate) mod filter;
 pub mod kmer;
-pub mod math_helpers;
-pub mod models;
-pub mod parsercounter;
-pub mod plotter;
+pub(crate) mod math_helpers;
+pub(crate) mod models;
+pub(crate) mod parsercounter;
+pub(crate) mod plotter;
 pub mod read_store;
-pub mod sketch;
-pub mod spectrum_fitter;
+pub(crate) mod sketch;
+pub(crate) mod spectrum_fitter;
 
 use crate::graph_works::indexed_kmers::IndexedKmers;
 use crate::utils::bit_encoding::UInt;
@@ -21,12 +21,70 @@ use std::{error::Error, fmt, path::PathBuf};
 
 use self::filter::choose_cutoff_and_filter;
 use self::models::SpectrumFit;
-use self::parsercounter::{count_kmers, PassInput};
+use self::parsercounter::count_kmers;
+pub use self::parsercounter::PassInput;
 use self::read_store::PackedSeqs;
 
 /// Bins of the k-mer spectrum: bin `c - 1` holds the k-mers seen `c` times, and the last bin every
 /// count from `MAXSIZEHISTO` up. For the fitting, we'll use actually MAXSIZEHISTO - 1.
 pub(crate) const MAXSIZEHISTO: usize = 8000;
+
+/// Settings for one preprocessing pass at exactly the requested quality floor.
+#[derive(Clone, Copy, Debug)]
+pub struct PreprocessingOptions {
+    /// Numerical PHRED floor and fixed count (when fitting is disabled).
+    pub quality: QualOpts,
+    /// Use Bloom counting, with possible false-positive counts.
+    pub use_bloom: bool,
+    /// Fit the minimum count instead of using `quality.min_count`.
+    pub fit_min_count: bool,
+}
+
+impl Default for PreprocessingOptions {
+    fn default() -> Self {
+        Self {
+            quality: QualOpts {
+                min_count: crate::cli::DEFAULT_MINCOUNT,
+                min_qual: crate::cli::DEFAULT_MINQUAL,
+            },
+            use_bloom: true,
+            fit_min_count: true,
+        }
+    }
+}
+
+/// Count and filter one k at one quality floor, without recounting or writing diagnostics.
+/// Quality bytes are PHRED+33. For automatic quality selection or multiple k values use
+/// [`crate::assemble`]. The chosen integer must hold at least `2 * k` bits.
+pub fn preprocessing<IntT, I>(
+    input: PassInput<'_, I>,
+    k: usize,
+    options: &PreprocessingOptions,
+) -> Result<PreprocessedK<IntT>, crate::AssemblyError>
+where
+    IntT: for<'a> UInt<'a>,
+    I: Iterator<Item = std::io::Result<OwnedRecord>> + MaybeSend,
+{
+    crate::api::validate_packed_k::<IntT>(k)?;
+    crate::cli::validate_bloom_min_count(
+        options.use_bloom,
+        (!options.fit_min_count).then_some(options.quality.min_count),
+    )
+    .map_err(|message| crate::AssemblyError::InvalidOptions(message.into()))?;
+    preprocessing_pass(
+        input,
+        k,
+        &options.quality,
+        None,
+        &mut None,
+        &mut None,
+        options.use_bloom,
+        options.fit_min_count,
+        None,
+        false,
+        None,
+    )
+}
 
 /// Bins either side of a count in the smoothed spectrum.
 const SMOOTH: usize = 2;
@@ -63,12 +121,13 @@ pub struct PreprocessedK<IntT> {
     pub k: usize,
     /// K-mer fields stored once in aligned vectors, plus their hash-to-index lookup.
     pub kmers: IndexedKmers<IntT>,
-    /// `MAXSIZEHISTO`-bin k-mer spectrum; index `c-1` holds the number of distinct k-mers seen `c` times
+    /// 8,000-bin spectrum: index `c - 1` counts distinct k-mers seen `c` times.
+    /// The last bin includes counts of 8,000 and above.
     pub histovec: Vec<u32>,
     /// the min-count actually applied (fitted, a fallback, or taken from the CLI)
     pub used_min_count: u16,
-    /// the base-quality floor the spectrum asked for. Below `QualOpts::min_qual` when the lobes only
-    /// separated at a looser floor, which is the caller's signal to recount.
+    /// Selected PHRED floor. The public single-pass component keeps the requested floor;
+    /// automatic floor selection and recounting belong to the complete API.
     pub chosen_min_qual: u8,
     /// Single-copy coverage of the spectrum *this* map was filtered against, as a count. Correction
     /// reads it to tell an error branch from a real one.
@@ -791,7 +850,7 @@ impl SpectrumEstimate {
 /// and plots every floor; `prior`: a recount's selection from the sketch, see
 /// `filter::keep_refit_or_prior` for the refit policy.
 #[allow(clippy::too_many_arguments)]
-pub fn preprocessing<IntT, I>(
+pub(crate) fn preprocessing_pass<IntT, I>(
     input: PassInput<'_, I>,
     k: usize,
     qual: &QualOpts,
@@ -803,20 +862,26 @@ pub fn preprocessing<IntT, I>(
     carried: Option<&PackedSeqs>,
     debug_quality_floors: bool,
     prior: Option<(u16, PeakSource)>,
-) -> Result<PreprocessedK<IntT>, PreprocessingError>
+) -> Result<PreprocessedK<IntT>, crate::AssemblyError>
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = OwnedRecord> + MaybeSend,
+    I: Iterator<Item = std::io::Result<OwnedRecord>> + MaybeSend,
 {
     crate::post_state("preprocess:bulk:start");
     log::info!("Starting preprocessing with k = {k}");
     log::info!("Counting k-mers into a hash map, without sorting");
     let min_class = match (&input, floors) {
-        (PassInput::Stored(store), None) => store.class_of_floor(qual.min_qual),
+        (PassInput::Stored(store), None) => {
+            store.class_of_floor(qual.min_qual).ok_or_else(|| {
+                crate::AssemblyError::InvalidOptions(
+                    "floor must belong to the stored ladder".into(),
+                )
+            })?
+        }
         _ => 0,
     };
     let (shards, sketch, floor_has_kmers) =
-        count_kmers::<IntT, _>(input, k, qual, floors, min_class, do_bloom, do_fit);
+        count_kmers::<IntT, _>(input, k, qual, floors, min_class, do_bloom, do_fit)?;
     let (kmers, histovec, used_min_count, chosen_min_qual, genomic_peak) =
         choose_cutoff_and_filter::<IntT>(
             shards,
@@ -1547,7 +1612,7 @@ pub(super) mod test_support {
         I: Iterator<Item = OwnedRecord> + MaybeSend,
     {
         count_kmers(
-            PassInput::Text(records.iter_mut().flatten()),
+            PassInput::Text(records.iter_mut().flatten().map(Ok)),
             k,
             qual,
             floors,
@@ -1555,6 +1620,7 @@ pub(super) mod test_support {
             do_bloom,
             do_fit,
         )
+        .unwrap()
     }
 
     pub(super) fn packed_contigs(seqs: &[Vec<u8>]) -> PackedSeqs {

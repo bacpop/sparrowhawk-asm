@@ -1,7 +1,7 @@
 //! Shared single-k and multi-k preprocessing, recounting, assembly, and ladder state.
 
 use crate::cli::*;
-use crate::graph_works::{self, Assemble};
+use crate::graph_works;
 use crate::preprocessing::{
     self,
     parsercounter::PassInput,
@@ -13,8 +13,7 @@ use crate::utils::{
     io_utils, qual_profile,
     reads::{self, ReadSource},
 };
-use crate::{post_state, QualOpts};
-use sparrowhawk_graph::DbgGraph;
+use crate::{post_state, AssemblyError, QualOpts};
 use std::path::{Path, PathBuf};
 
 /// A k after the first with a single-copy peak below this, fitted or fallback, is not assembled: the
@@ -62,7 +61,7 @@ pub(crate) struct BuildOpts<'a> {
 
 impl BuildOpts<'_> {
     /// Correction settings for one k: dead-end thresholds scale with k, coverage comes from its spectrum. Small helper that gets the info from buildopts
-    fn correction(
+    pub(crate) fn correction(
         &self,
         k: usize,
         peak: preprocessing::PeakSource,
@@ -94,34 +93,15 @@ impl BuildOpts<'_> {
     }
 }
 
-#[cfg(any(test, target_family = "wasm"))]
+#[cfg(test)]
 impl BuildOpts<'static> {
-    /// The CLI's defaults, writing no files: the browser's settings, and the tests' starting point.
+    /// Shared defaults, retaining the supplied quality/fitting settings for internal callers.
     pub(crate) fn with_defaults(quality: QualOpts, do_bloom: bool, do_fit: bool) -> Self {
-        use graph_works::corrector::{DEFAULT_EC_COVERAGE_RATIO, DEFAULT_POP_RATIO};
         Self {
             quality,
-            fixed_min_qual: false,
-            two_bit_reads: false,
             do_bloom,
             do_fit,
-            do_bubble_collapse: true,
-            do_dead_end_removal: true,
-            pop_ratio: DEFAULT_POP_RATIO,
-            peak_ratio: None,
-            dead_end_length: DEFAULT_DEAD_END_LEN_NTS,
-            dead_end_length_kmult: DEFAULT_DEAD_END_LEN_KMULT,
-            dead_end_coverage_kmult: Some(DEFAULT_DEAD_END_COVERAGE_KMULT),
-            dead_end_coverage_ratio: DEFAULT_DEAD_END_COVERAGE_RATIO,
-            do_ec_removal: true,
-            ec_ratio: DEFAULT_EC_COVERAGE_RATIO,
-            ec_require_both_flanks: false,
-            min_contig_length: DEFAULT_MIN_CONTIG_LENGTH_NTS,
-            keep_intermediate_contigs: false,
-            no_histo: true,
-            debug_quality_floors: false,
-            output_dir: "",
-            output_prefix: "",
+            ..Self::from(&crate::AssemblyOptions::default())
         }
     }
 }
@@ -138,7 +118,7 @@ pub(crate) enum Preprocessed {
 
 /// The base-quality floors a k is counted at, ascending: the given floor alone when it is fixed, which
 /// can never be loosened, or else the ladder the reads' qualities allow, topped by it.
-fn quality_floors<S: ReadSource>(opts: &BuildOpts, reads: &S) -> Vec<u8> {
+fn quality_floors<S: ReadSource>(opts: &BuildOpts, reads: &S) -> Result<Vec<u8>, AssemblyError> {
     let floors = if opts.two_bit_reads {
         vec![0]
     } else if opts.fixed_min_qual {
@@ -147,12 +127,12 @@ fn quality_floors<S: ReadSource>(opts: &BuildOpts, reads: &S) -> Vec<u8> {
         // The alphabet only, from the head of the reads: a few thousand show all 4-5 bins, and no
         // spectrum is built from them, so the depth of the peek does not matter.
         qual_profile::floors_from(
-            &qual_profile::peek_alphabet(reads.records(), qual_profile::PEEK_READS),
+            &qual_profile::peek_alphabet(reads.records()?, qual_profile::PEEK_READS)?,
             opts.quality.min_qual,
         )
     };
     log::info!("Candidate base-quality floors: {floors:?}");
-    floors
+    Ok(floors)
 }
 
 /// One pass of the preprocessing (parse, filter, count, choose the cutoff, filter by it) of one k.
@@ -169,12 +149,12 @@ fn preprocess_pass<IntT, I>(
     prior: Option<(u16, preprocessing::PeakSource)>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
-) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
+) -> Result<preprocessing::PreprocessedK<IntT>, AssemblyError>
 where
     IntT: for<'a> UInt<'a>,
-    I: Iterator<Item = reads::OwnedRecord> + reads::MaybeSend,
+    I: Iterator<Item = std::io::Result<reads::OwnedRecord>> + reads::MaybeSend,
 {
-    preprocessing::preprocessing::<IntT, _>(
+    preprocessing::preprocessing_pass::<IntT, _>(
         input,
         k,
         quality,
@@ -196,7 +176,7 @@ pub(crate) fn preprocess_step<S: ReadSource>(
     step: usize,
     state: &mut LadderState,
     timevec: &mut Vec<Instant>,
-) -> Result<Preprocessed, preprocessing::PreprocessingError> {
+) -> Result<Preprocessed, AssemblyError> {
     let k = state.ks[step];
     if state.multik {
         // The default ladder is settled from the read lengths once its first k has been counted.
@@ -238,7 +218,7 @@ fn preprocess_step_at<IntT, S>(
     step: usize,
     state: &mut LadderState,
     timevec: &mut Vec<Instant>,
-) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
+) -> Result<preprocessing::PreprocessedK<IntT>, AssemblyError>
 where
     IntT: for<'a> UInt<'a>,
     S: ReadSource,
@@ -261,7 +241,7 @@ where
                 k,
                 &quality,
                 floors,
-                PassInput::Text(read_store::Tee::new(reads.records(), &mut **store)),
+                PassInput::Text(read_store::Tee::new(reads.records()?, &mut **store)),
                 None,
                 None,
                 timevec,
@@ -272,7 +252,7 @@ where
                 k,
                 &quality,
                 floors,
-                PassInput::Text(read_store::Tee::new(reads.records(), stats)),
+                PassInput::Text(read_store::Tee::new(reads.records()?, stats)),
                 None,
                 None,
                 timevec,
@@ -322,10 +302,9 @@ where
             .value()
             .is_none_or(|peak| peak < MIN_LADDER_PEAK)
     {
-        return Err(preprocessing::PreprocessingError::peak_too_low(
-            k,
-            assembly.genomic_peak,
-        ));
+        return Err(
+            preprocessing::PreprocessingError::peak_too_low(k, assembly.genomic_peak).into(),
+        );
     }
     Ok(assembly)
 }
@@ -342,7 +321,7 @@ fn preprocess_again<IntT, S>(
     prior: Option<(u16, preprocessing::PeakSource)>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
-) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
+) -> Result<preprocessing::PreprocessedK<IntT>, AssemblyError>
 where
     IntT: for<'a> UInt<'a>,
     S: ReadSource,
@@ -350,7 +329,7 @@ where
     let carried = (!state.contigs.is_empty()).then_some(&state.contigs);
     let input = match &state.replay {
         Replay::Store(store) => PassInput::Stored(store),
-        Replay::Reread(_) => PassInput::Text(reads.records()),
+        Replay::Reread(_) => PassInput::Text(reads.records()?),
     };
     preprocess_pass::<IntT, _>(
         opts,
@@ -379,7 +358,7 @@ fn settle_floor<IntT, S>(
     strict_floor: u8,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
-) -> Result<preprocessing::PreprocessedK<IntT>, preprocessing::PreprocessingError>
+) -> Result<preprocessing::PreprocessedK<IntT>, AssemblyError>
 where
     IntT: for<'a> UInt<'a>,
     S: ReadSource,
@@ -428,8 +407,8 @@ fn assemble_step(
     state: &mut LadderState,
     counted: Preprocessed,
     timevec: &mut Vec<Instant>,
-    graph_sink: &mut Option<&mut dyn FnMut(&DbgGraph)>,
-) -> Result<(), preprocessing::PreprocessingError> {
+    graph_sink: &mut Option<crate::api::GraphSink<'_>>,
+) -> Result<(), AssemblyError> {
     match counted {
         Preprocessed::W64(c) => assemble_step_at(opts, step, state, c, timevec, graph_sink),
         Preprocessed::W128(c) => assemble_step_at(opts, step, state, c, timevec, graph_sink),
@@ -446,8 +425,8 @@ fn assemble_step_at<IntT: for<'a> UInt<'a>>(
     state: &mut LadderState,
     mut assembly: preprocessing::PreprocessedK<IntT>,
     timevec: &mut Vec<Instant>,
-    graph_sink: &mut Option<&mut dyn FnMut(&DbgGraph)>,
-) -> Result<(), preprocessing::PreprocessingError> {
+    graph_sink: &mut Option<crate::api::GraphSink<'_>>,
+) -> Result<(), AssemblyError> {
     let k = state.ks[step];
     // An unresolved cutoff must beat the previous contigs, so they are kept until it has; otherwise
     // they are carried into the count-map by now and dead weight.
@@ -463,18 +442,18 @@ fn assemble_step_at<IntT: for<'a> UInt<'a>>(
         None
     };
     let correction = opts.correction(k, assembly.genomic_peak, assembly.used_min_count);
-    let contigs = graph_works::BasicAsm::assemble::<IntT>(
+    let contigs = graph_works::BasicAsm::assemble_timed::<IntT>(
         k,
         &mut assembly.kmers,
         &mut Some(timevec),
         sink,
         correction,
-    );
+    )?;
     state.contigs = crate::graph_works::spelling::spell_contigs::<IntT>(
         &contigs,
         |hash| assembly.kmers.get_packed(hash).copied(),
         k,
-    );
+    )?;
     log::info!(
         "k={k}: {} contigs, {} bases",
         state.contigs.len(),
@@ -492,7 +471,7 @@ fn assemble_step_at<IntT: for<'a> UInt<'a>>(
         );
         if new <= old {
             state.contigs = previous;
-            return Err(preprocessing::PreprocessingError::no_aun_gain(k, new, old));
+            return Err(preprocessing::PreprocessingError::no_aun_gain(k, new, old).into());
         }
         log::info!(
             "k={k}: kept despite an unresolved cutoff, as auN rose from {old:.1} to {new:.1}."
@@ -526,6 +505,8 @@ pub(crate) struct LadderState {
     multik: bool,
     /// The k values to run; a default ladder is settled once the first k has seen every read.
     pub(crate) ks: Vec<usize>,
+    pub(crate) completed_steps: usize,
+    pub(crate) stopped_at: Option<(usize, String)>,
     default_ladder: bool,
     /// The reads' quality ladder, ascending.
     floors: Vec<u8>,
@@ -549,8 +530,8 @@ impl LadderState {
         reads: &S,
         requested: Option<&[usize]>,
         in_memory: bool,
-    ) -> Self {
-        let floors = quality_floors(opts, reads);
+    ) -> Result<Self, AssemblyError> {
+        let floors = quality_floors(opts, reads)?;
         let multik = requested.is_none_or(|ks| ks.len() > 1);
         if let Some(ks) = requested.filter(|_| multik) {
             post_ladder(ks);
@@ -559,11 +540,13 @@ impl LadderState {
             Replay::Store(Box::new(read_store::ReadStore::new(
                 &floors,
                 opts.two_bit_reads,
-            )))
+            )?))
         } else {
             Replay::Reread(read_store::ReadStats::default())
         };
-        Self {
+        Ok(Self {
+            completed_steps: 0,
+            stopped_at: None,
             multik,
             ks: requested.map_or_else(|| vec![DEFAULT_KMER_LADDER[0]], <[usize]>::to_vec),
             default_ladder: requested.is_none(),
@@ -577,7 +560,7 @@ impl LadderState {
             contigs: PackedSeqs::new(true),
             floors,
             replay,
-        }
+        })
     }
 
     /// Record the floor this k chose. An unresolved k is skipped: its loosest-floor fallback is not a
@@ -617,34 +600,33 @@ fn aun(contigs: &PackedSeqs, min_len: usize) -> f64 {
 }
 
 /// Assemble the ladder from its first k, already counted, to its last; each later k is counted with
-/// the previous contigs carried in. A k that fails ends the ladder on the previous contigs.
+/// the previous contigs carried in. A biological rejection keeps the previous contigs;
+/// input, spelling, and graph-output errors abort the run.
 pub(crate) fn run_ladder<S: ReadSource>(
     opts: &BuildOpts,
     reads: &S,
     state: &mut LadderState,
     first: Preprocessed,
     timevec: &mut Vec<Instant>,
-    mut graph_sink: Option<&mut dyn FnMut(&DbgGraph)>,
-) -> Result<PackedSeqs, preprocessing::PreprocessingError> {
+    mut graph_sink: Option<crate::api::GraphSink<'_>>,
+) -> Result<PackedSeqs, AssemblyError> {
     let mut counted = Ok(first);
     let mut step = 0;
     loop {
         let outcome =
             counted.and_then(|c| assemble_step(opts, step, state, c, timevec, &mut graph_sink));
         if let Err(error) = outcome {
-            // A k with no usable k-mers, too low a peak, or an unresolved cutoff that did not raise
-            // auN ends the ladder. In every case the previous contigs are in `state`.
-            if step == 0 {
-                return Err(error);
+            match error {
+                AssemblyError::Preprocessing(error) if step > 0 => {
+                    let reason = error.to_string();
+                    log::warn!("Stopping the multi-k ladder at k={}: {reason}. Keeping the k={} contigs; a stopped ladder writes no graph.", state.ks[step], state.ks[step - 1]);
+                    state.stopped_at = Some((state.ks[step], reason));
+                    break;
+                }
+                error => return Err(error),
             }
-            log::warn!(
-                "Stopping the multi-k ladder at k={}: {error}. Keeping the k={} contigs; a stopped \
-                 ladder writes no graph.",
-                state.ks[step],
-                state.ks[step - 1]
-            );
-            break;
         }
+        state.completed_steps = step + 1;
         step += 1;
         if step == state.ks.len() {
             break;
@@ -730,13 +712,13 @@ impl Preprocessed {
 mod multik_tests {
     use super::{
         assemble_step, aun, lowered_floor_index, preprocess_step, quality_floors, read_store,
-        run_ladder, settle_ladder, BuildOpts, DbgGraph, LadderState, Preprocessed, QualOpts,
-        Replay,
+        run_ladder, settle_ladder, BuildOpts, LadderState, Preprocessed, QualOpts, Replay,
     };
     use crate::cli::{DEFAULT_MINCOUNT, DEFAULT_MINQUAL};
     use crate::preprocessing::read_store::PackedSeqs;
     use crate::utils::clock::Instant;
     use crate::utils::reads::{OwnedRecord, ReadSource};
+    use crate::DbgGraph;
     use std::cell::Cell;
 
     /// Reads held in memory, counting how many times the input is opened.
@@ -746,10 +728,16 @@ mod multik_tests {
     }
 
     impl ReadSource for Reads {
-        type Records<'a> = std::vec::IntoIter<OwnedRecord>;
-        fn records(&self) -> Self::Records<'_> {
+        type Records<'a> = std::vec::IntoIter<std::io::Result<OwnedRecord>>;
+        fn records(&self) -> std::io::Result<Self::Records<'_>> {
             self.opens.set(self.opens.get() + 1);
-            self.records.clone().into_iter()
+            Ok(self
+                .records
+                .clone()
+                .into_iter()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter())
         }
     }
 
@@ -844,6 +832,8 @@ mod multik_tests {
 
     fn state_with(floors: &[u8]) -> LadderState {
         LadderState {
+            completed_steps: 0,
+            stopped_at: None,
             multik: true,
             ks: vec![21],
             default_ladder: true,
@@ -924,13 +914,16 @@ mod multik_tests {
     #[test]
     fn rereading_the_input_assembles_what_the_store_does() {
         let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-        let files = vec![(
+        let files = [(
             "window".to_owned(),
             ["ecoli_window_1.fastq.gz", "ecoli_window_2.fastq.gz"]
                 .map(|f| data.join(f).to_string_lossy().into_owned())
                 .to_vec(),
         )];
-        let reads = crate::utils::reads::InputFiles(&files);
+        let reads = crate::utils::reads::InputFiles::new(
+            files.iter().flat_map(|(_, paths)| paths.iter().cloned()),
+        )
+        .unwrap();
         let mut opts = BuildOpts::with_defaults(
             QualOpts {
                 min_count: DEFAULT_MINCOUNT,
@@ -941,7 +934,7 @@ mod multik_tests {
         );
         let run = |opts: &BuildOpts, ks: Option<&[usize]>, in_memory| {
             let mut timevec = vec![Instant::now()];
-            let mut ladder = LadderState::new(opts, &reads, ks, in_memory);
+            let mut ladder = LadderState::new(opts, &reads, ks, in_memory).unwrap();
             let first = preprocess_step(opts, &reads, 0, &mut ladder, &mut timevec).unwrap();
             ascii(&run_ladder(opts, &reads, &mut ladder, first, &mut timevec, None).unwrap())
         };
@@ -964,14 +957,17 @@ mod multik_tests {
     #[test]
     fn a_fixed_floor_is_the_only_floor() {
         let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
-        let files = vec![(
+        let files = [(
             "window".to_owned(),
             vec![data
                 .join("ecoli_window_1.fastq.gz")
                 .to_string_lossy()
                 .into_owned()],
         )];
-        let reads = crate::utils::reads::InputFiles(&files);
+        let reads = crate::utils::reads::InputFiles::new(
+            files.iter().flat_map(|(_, paths)| paths.iter().cloned()),
+        )
+        .unwrap();
         let mut opts = BuildOpts::with_defaults(
             QualOpts {
                 min_count: DEFAULT_MINCOUNT,
@@ -980,15 +976,15 @@ mod multik_tests {
             true,
             true,
         );
-        let floors = quality_floors(&opts, &reads);
+        let floors = quality_floors(&opts, &reads).unwrap();
         assert!(floors.len() > 1, "{floors:?}");
         assert_eq!(floors.last(), Some(&25), "{floors:?}");
         opts.fixed_min_qual = true;
-        assert_eq!(quality_floors(&opts, &reads), vec![25]);
-        let ladder = LadderState::new(&opts, &reads, Some(&[21, 31]), true);
+        assert_eq!(quality_floors(&opts, &reads).unwrap(), vec![25]);
+        let ladder = LadderState::new(&opts, &reads, Some(&[21, 31]), true).unwrap();
         assert_eq!(ladder.floors, vec![25]);
         assert!(matches!(ladder.replay, Replay::Store(_)));
-        let single = LadderState::new(&opts, &reads, Some(&[31]), true);
+        let single = LadderState::new(&opts, &reads, Some(&[31]), true).unwrap();
         assert!(!single.multik);
         assert!(matches!(single.replay, Replay::Reread(_)));
     }
@@ -1003,9 +999,9 @@ mod multik_tests {
             let mut opts = q0_opts();
             opts.two_bit_reads = two_bit;
             opts.fixed_min_qual = !two_bit;
-            assert_eq!(quality_floors(&opts, &reads), [0]);
+            assert_eq!(quality_floors(&opts, &reads).unwrap(), [0]);
             assert_eq!(reads.opens.get(), 0, "Q0 must not peek at input qualities");
-            let mut state = LadderState::new(&opts, &reads, Some(&[21, 31]), true);
+            let mut state = LadderState::new(&opts, &reads, Some(&[21, 31]), true).unwrap();
             assert_eq!(state.floors, [0]);
             let mut times = vec![Instant::now()];
             let first = preprocess_step(&opts, &reads, 0, &mut state, &mut times).unwrap();
@@ -1014,7 +1010,10 @@ mod multik_tests {
                 _ => panic!("k=21 must use u64"),
             }
             let mut graphs = 0;
-            let mut count_graph = |_: &DbgGraph| graphs += 1;
+            let mut count_graph = |_: &DbgGraph| {
+                graphs += 1;
+                Ok(())
+            };
             let result = run_ladder(
                 &opts,
                 &reads,
@@ -1048,7 +1047,7 @@ mod multik_tests {
         let (genome, reads) = simulated_reads();
         let opts = q0_opts();
         let mut times = vec![Instant::now()];
-        let mut state = LadderState::new(&opts, &reads, Some(&[21, 145]), true);
+        let mut state = LadderState::new(&opts, &reads, Some(&[21, 145]), true).unwrap();
         let first = preprocess_step(&opts, &reads, 0, &mut state, &mut times).unwrap();
         assemble_step(&opts, 0, &mut state, first, &mut times, &mut None).unwrap();
         let k21 = ascii(&state.contigs);
@@ -1058,10 +1057,13 @@ mod multik_tests {
         };
         assert!(error.to_string().contains("too low"), "{error}");
 
-        let mut state = LadderState::new(&opts, &reads, Some(&[21, 145]), true);
+        let mut state = LadderState::new(&opts, &reads, Some(&[21, 145]), true).unwrap();
         let first = preprocess_step(&opts, &reads, 0, &mut state, &mut times).unwrap();
         let mut graphs = 0;
-        let mut count_graph = |_: &DbgGraph| graphs += 1;
+        let mut count_graph = |_: &DbgGraph| {
+            graphs += 1;
+            Ok(())
+        };
         let contigs = run_ladder(
             &opts,
             &reads,
@@ -1072,6 +1074,8 @@ mod multik_tests {
         )
         .unwrap();
         assert_eq!(ascii(&contigs), k21);
+        assert_eq!(state.completed_steps, 1);
+        assert_eq!(state.stopped_at.as_ref().map(|(k, _)| *k), Some(145));
         assert_eq!(graphs, 0, "a stopped ladder sends no graph");
     }
 
@@ -1093,7 +1097,7 @@ mod multik_tests {
         // (previous contig lengths, whether the k=31 contigs are kept)
         for (lengths, kept) in [(&[600, 600][..], true), (&[10_000][..], false)] {
             let mut times = vec![Instant::now()];
-            let mut state = LadderState::new(&opts, &reads, Some(&[21, 31]), false);
+            let mut state = LadderState::new(&opts, &reads, Some(&[21, 31]), false).unwrap();
             let Ok(mut counted) = preprocess_step(&opts, &reads, 1, &mut state, &mut times) else {
                 panic!("k=31 must count");
             };
@@ -1107,7 +1111,10 @@ mod multik_tests {
             state.contigs = previous(lengths);
             let old = ascii(&state.contigs);
             let mut graphs = 0;
-            let mut count_graph = |_: &DbgGraph| graphs += 1;
+            let mut count_graph = |_: &DbgGraph| {
+                graphs += 1;
+                Ok(())
+            };
             let outcome = assemble_step(
                 &opts,
                 1,
@@ -1133,5 +1140,40 @@ mod multik_tests {
                 );
             }
         }
+    }
+    #[test]
+    fn a_later_k_input_error_is_fatal_in_the_reread_path() {
+        let (_, reads) = simulated_reads();
+        let opens = Cell::new(0);
+        let source = crate::IteratorSource::new(|| {
+            opens.set(opens.get() + 1);
+            if opens.get() == 1 {
+                Ok(reads
+                    .records
+                    .clone()
+                    .into_iter()
+                    .map(Ok)
+                    .collect::<Vec<_>>()
+                    .into_iter())
+            } else {
+                Ok(vec![Err(std::io::Error::other("later-k read failure"))].into_iter())
+            }
+        });
+        let options = crate::AssemblyOptions {
+            k_values: vec![21, 31],
+            min_count: Some(2),
+            min_qual: Some(0),
+            use_bloom: false,
+            ..crate::AssemblyOptions::default()
+        };
+        let opts = BuildOpts::from(&options);
+        let mut times = vec![Instant::now()];
+        let mut state = LadderState::new(&opts, &source, Some(&options.k_values), false).unwrap();
+        let first = preprocess_step(&opts, &source, 0, &mut state, &mut times).unwrap();
+        let result = run_ladder(&opts, &source, &mut state, first, &mut times, None);
+        assert!(matches!(result, Err(crate::AssemblyError::Input(_))));
+        assert_eq!(state.completed_steps, 1);
+        assert!(state.stopped_at.is_none());
+        assert_eq!(opens.get(), 2);
     }
 }

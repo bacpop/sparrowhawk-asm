@@ -2,9 +2,12 @@
 //! since a recount at a looser floor, or the next k of a ladder, starts over.
 
 /// Tuple for name and list of input files
-pub type InputFastx = (String, Vec<String>);
+#[cfg(not(target_family = "wasm"))]
+pub(crate) type InputFastx = (String, Vec<String>);
 
-/// One read: its bases and, from FASTQ, its quality bytes.
+/// One owned read: ASCII bases and optional PHRED+33 quality bytes of the same length.
+/// FASTA records have no qualities. Non-ACGT bases break k-mers in normal storage;
+/// two-bit read storage rejects them.
 pub type OwnedRecord = (Vec<u8>, Option<Vec<u8>>); // nts, option<qualities>
 
 /// `Send` natively, where a producer thread parses ahead of the counter; nothing in the browser, which
@@ -21,69 +24,218 @@ pub trait MaybeSend {}
 #[cfg(target_family = "wasm")]
 impl<T> MaybeSend for T {}
 
-/// Reads that can be read from the start as often as a run needs.
+/// A repeatable source. Every pass must yield the same reads in the same order.
+///
+/// A pass owns its records. Natively its iterator must be `Send`, because parsing can run
+/// on a scoped producer thread; the factory and source need not be `Send` or `Sync`.
+/// Do not convert read errors to end-of-input: later passes may follow a quality peek,
+/// a recount, or another k value.
 pub trait ReadSource {
-    /// One pass over every read, in file order.
-    type Records<'a>: Iterator<Item = OwnedRecord> + MaybeSend
+    /// One pass, with opening/parse failures carried explicitly.
+    type Records<'a>: Iterator<Item = std::io::Result<OwnedRecord>> + MaybeSend
     where
         Self: 'a;
-
-    /// Start a pass.
-    fn records(&self) -> Self::Records<'_>;
+    /// Start a fresh pass; errors must not be treated as end-of-input.
+    fn records(&self) -> std::io::Result<Self::Records<'_>>;
 }
 
-/// For NATIVE: Files on disk, opened afresh for every pass. A single k reads them again for its recount; a multi-k run reads them once, packing them into a `ReadStore` that its later k values replay. This uses needletail at the end of the day, because we're running on native.
-#[cfg(not(target_family = "wasm"))]
-pub struct InputFiles<'a>(pub &'a [crate::utils::reads::InputFastx]);
-
-#[cfg(not(target_family = "wasm"))]
-impl ReadSource for InputFiles<'_> {
+/// A repeatable custom parser factory. Wrap infallible iterator items with `.map(Ok)`.
+///
+/// ```
+/// use sparrowhawk_asm::{IteratorSource, OwnedRecord, ReadSource};
+/// let records: Vec<OwnedRecord> = vec![(b"ACGT".to_vec(), None)];
+/// let source = IteratorSource::new(|| Ok(records.clone().into_iter().map(Ok)));
+/// assert_eq!(source.records()?.collect::<std::io::Result<Vec<_>>>()?, records);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub struct IteratorSource<F> {
+    factory: F,
+}
+impl<F> IteratorSource<F> {
+    /// Call `factory` once for each requested pass, including quality peeks.
+    pub fn new(factory: F) -> Self {
+        Self { factory }
+    }
+}
+impl<F, I> ReadSource for IteratorSource<F>
+where
+    F: Fn() -> std::io::Result<I>,
+    I: Iterator<Item = std::io::Result<OwnedRecord>> + MaybeSend,
+{
     type Records<'a>
-        = std::iter::Flatten<std::vec::IntoIter<crate::utils::io_utils::NeedletailIterator>>
+        = I
     where
         Self: 'a;
-
-    fn records(&self) -> Self::Records<'_> {
-        self.0
-            .iter()
-            .flat_map(|(_, files)| files)
-            .map(|file| {
-                let reader = needletail::parse_fastx_file(file)
-                    .unwrap_or_else(|_| panic!("Invalid path/file: {file}"));
-                crate::utils::io_utils::NeedletailIterator::new(reader)
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
+    fn records(&self) -> std::io::Result<I> {
+        (self.factory)()
     }
 }
 
-/// WASM: the browser's `File`s, opened afresh for every pass. The browser keeps them readable while the page holds them, so nothing is copied into memory. Here we use the fastx_wasm.rs structs and functions.
-#[cfg(target_family = "wasm")]
-pub struct BrowserFiles(pub Vec<web_sys::File>);
+/// Adapter for callers already using a needletail parser.
+#[cfg(not(target_family = "wasm"))]
+pub use super::io_utils::NeedletailIterator;
 
+/// Native paths owned by the source. Files open lazily, one at a time, on each pass.
+#[cfg(not(target_family = "wasm"))]
+pub struct InputFiles {
+    paths: Vec<std::path::PathBuf>,
+}
+#[cfg(not(target_family = "wasm"))]
+impl InputFiles {
+    /// Create a source without opening files. An empty path list is invalid.
+    pub fn new<P: Into<std::path::PathBuf>>(
+        paths: impl IntoIterator<Item = P>,
+    ) -> std::io::Result<Self> {
+        let paths: Vec<_> = paths.into_iter().map(Into::into).collect();
+        if paths.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no input files",
+            ));
+        }
+        Ok(Self { paths })
+    }
+}
+
+/// Opaque iterator over native files; ends after the first opening or parsing failure.
+#[cfg(not(target_family = "wasm"))]
+pub struct FileRecords<'a> {
+    paths: std::slice::Iter<'a, std::path::PathBuf>,
+    current: Option<(NeedletailIterator, &'a std::path::Path)>,
+    failed: bool,
+}
+#[cfg(not(target_family = "wasm"))]
+impl ReadSource for InputFiles {
+    type Records<'a> = FileRecords<'a>;
+    fn records(&self) -> std::io::Result<FileRecords<'_>> {
+        Ok(FileRecords {
+            paths: self.paths.iter(),
+            current: None,
+            failed: false,
+        })
+    }
+}
+#[cfg(not(target_family = "wasm"))]
+impl Iterator for FileRecords<'_> {
+    type Item = std::io::Result<OwnedRecord>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            if let Some((records, path)) = &mut self.current {
+                if let Some(record) = records.next() {
+                    return Some(record.map_err(|error| {
+                        self.failed = true;
+                        std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                    }));
+                }
+                self.current = None;
+            }
+            let path = self.paths.next()?;
+            let reader = std::fs::File::open(path).and_then(|file| {
+                needletail::parse_fastx_reader(file)
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            });
+            match reader {
+                Ok(reader) => self.current = Some((NeedletailIterator::new(reader), path)),
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(std::io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", path.display()),
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Browser file handles, reopened lazily for recounts and later k values.
+#[cfg(target_family = "wasm")]
+pub struct BrowserFiles {
+    files: Vec<web_sys::File>,
+}
+#[cfg(target_family = "wasm")]
+impl BrowserFiles {
+    /// Reject an empty file list; file contents are read only when a pass requests records.
+    pub fn new(files: Vec<web_sys::File>) -> std::io::Result<Self> {
+        if files.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no input files",
+            ));
+        }
+        Ok(Self { files })
+    }
+}
+/// Opaque browser parser iterator, retaining file context on failures.
+#[cfg(target_family = "wasm")]
+pub struct BrowserRecords<'a> {
+    files: std::slice::Iter<'a, web_sys::File>,
+    current: Option<(super::fastx_wasm::FastxRecords, String)>,
+    failed: bool,
+}
 #[cfg(target_family = "wasm")]
 impl ReadSource for BrowserFiles {
-    type Records<'a>
-        = std::iter::Flatten<std::vec::IntoIter<crate::utils::fastx_wasm::FastxRecords>>
-    where
-        Self: 'a;
-
-    /// Also restarts the progress count, against the files' combined size.
-    fn records(&self) -> Self::Records<'_> {
-        let total: f64 = self.0.iter().map(|file| file.size()).sum();
-        PASS_PROGRESS.with(|progress| progress.set((0.0, total)));
-        self.0
-            .iter()
-            .map(|file| {
-                crate::utils::fastx_wasm::FastxRecords::open(Counted(
-                    wasm_bindgen_file_reader::WebSysFile::new(file.clone()),
-                ))
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
+    type Records<'a> = BrowserRecords<'a>;
+    fn records(&self) -> std::io::Result<BrowserRecords<'_>> {
+        let total = self.files.iter().map(|file| file.size()).sum();
+        PASS_PROGRESS.with(|p| p.set((0.0, total)));
+        Ok(BrowserRecords {
+            files: self.files.iter(),
+            current: None,
+            failed: false,
+        })
     }
+}
+#[cfg(target_family = "wasm")]
+impl Iterator for BrowserRecords<'_> {
+    type Item = std::io::Result<OwnedRecord>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        loop {
+            if let Some((records, name)) = &mut self.current {
+                if let Some(record) = records.next() {
+                    return Some(record.map_err(|error| {
+                        self.failed = true;
+                        std::io::Error::new(error.kind(), format!("{name}: {error}"))
+                    }));
+                }
+                self.current = None;
+            }
+            let file = self.files.next()?;
+            match super::fastx_wasm::FastxRecords::open(Counted(
+                wasm_bindgen_file_reader::WebSysFile::new(file.clone()),
+            )) {
+                Ok(records) => self.current = Some((records, file.name())),
+                Err(error) => {
+                    self.failed = true;
+                    return Some(Err(std::io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", file.name()),
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Reject malformed qualities before any counting or storage mutation.
+pub(crate) fn validate_record(record: OwnedRecord) -> std::io::Result<OwnedRecord> {
+    validate_quality(&record.0, record.1.as_deref())?;
+    Ok(record)
+}
+pub(crate) fn validate_quality(seq: &[u8], qual: Option<&[u8]>) -> std::io::Result<()> {
+    if qual.is_some_and(|q| q.len() != seq.len()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sequence and quality lengths differ",
+        ));
+    }
+    Ok(())
 }
 
 // This is quite magic, but it is interesting: this is a way of having a shared variable that lies in the current thread, given that we have the two-buffer system. Those generate, IIUC, scopes that do not speak to each other in any way. This thread_local! macro creates essentially a, thanks to the "static", global variable for all the thread. Because it's static for globalness, we need std::cell::Cell for having mutability in its interior, as static mut is unsafe and forbidden in recent Rust versions. All a bit quite magic, but I did something similar when I didn't know in Python how to pass info to shared threads, now that I remember. We use this for showing progress on the web.
@@ -97,7 +249,7 @@ thread_local! {
 
 /// How far through the page's files the current pass is, in percent, for the page's progress line.
 #[cfg(target_family = "wasm")]
-pub fn pass_percent() -> Option<u32> {
+pub(crate) fn pass_percent() -> Option<u32> {
     let (read, total) = PASS_PROGRESS.with(std::cell::Cell::get);
     (total > 0.0).then(|| (100.0 * read / total).min(100.0) as u32)
 }

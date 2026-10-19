@@ -15,7 +15,7 @@ const HASH_FLOOR: u64 = 1 << 52;
 
 /// Per-floor k-mer spectra from a fixed-size sample of hash space. Subsampling hash space does not move
 /// lambda, as a k-mer's hash does not depend on how often it occurs.
-pub struct SpectrumSketch {
+pub(super) struct SpectrumSketch {
     /// Exclusive hash cutoff, also read by the counter before sketch insertion.
     pub(super) threshold: u64,
     counts: HashMap<u64, [u32; MAX_GROUPS], BuildHasherDefault<NoHashHasher<u64>>>,

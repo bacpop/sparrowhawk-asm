@@ -6,7 +6,7 @@ use crate::utils::qual_profile::MAX_GROUPS;
 /// Original reads per block and counting batch. Bounded buffers avoid reallocating the whole store.
 pub(crate) const BLOCK_READS: usize = 8192;
 /// Class reserved for a base that no k-mer may contain.
-pub const UNUSABLE: u8 = 3;
+pub(crate) const UNUSABLE: u8 = 3;
 const _: () = assert!(MAX_GROUPS <= UNUSABLE as usize);
 
 /// Packed sequences, with the first base in the lowest bits: four bits per read base by default
@@ -55,13 +55,15 @@ impl PackedSeq<'_> {
     pub fn is_two_bit(&self) -> bool {
         self.two_bit
     }
-    /// Two-bit base code at `i`.
+    /// Two-bit base code at `i` (A=0, C=1, T=2, G=3).
+    /// Requires two-bit storage and `i < self.len()`; for four-bit reads use `nibble(i) & 3`.
     #[inline(always)]
     pub fn code(&self, i: usize) -> u8 {
         let at = self.start + i;
         ((self.words[at / 16] >> (2 * (at % 16))) & 3) as u8
     }
-    /// Four-bit entry at `i`: the quality class over the base code.
+    /// Four-bit entry at `i`: quality class in bits 2–3, base code in bits 0–1.
+    /// Class 3 means unusable. Requires four-bit storage and `i < self.len()`.
     #[inline(always)]
     pub fn nibble(&self, i: usize) -> u8 {
         let at = self.start + i;
@@ -112,7 +114,7 @@ impl Block {
 
 impl PackedSeqs {
     /// Empty collection in the requested encoding.
-    pub fn new(two_bit: bool) -> Self {
+    pub(crate) fn new(two_bit: bool) -> Self {
         Self {
             two_bit,
             same_length: false,
@@ -120,6 +122,15 @@ impl PackedSeqs {
             finished: false,
             blocks: Vec::new(),
         }
+    }
+    /// Write records clearing the inclusive length filter, decoding at most 80 bases at a time.
+    /// Returns the number of FASTA records written; flush buffered writers explicitly afterwards.
+    pub fn write_fasta<W: std::io::Write>(
+        &self,
+        min_contig_length: usize,
+        writer: &mut W,
+    ) -> std::io::Result<usize> {
+        crate::utils::io_utils::write_fasta(self, min_contig_length, writer)
     }
     /// Whether the collection stores two-bit codes.
     pub fn is_two_bit(&self) -> bool {
@@ -138,13 +149,13 @@ impl PackedSeqs {
         self.batches().flatten()
     }
     /// Borrowed sequence iterators, one per original counting batch.
-    pub fn batches(&self) -> impl Iterator<Item = impl Iterator<Item = PackedSeq<'_>>> {
+    pub(crate) fn batches(&self) -> impl Iterator<Item = impl Iterator<Item = PackedSeq<'_>>> {
         self.blocks
             .iter()
             .map(|b| b.seqs(self.two_bit, self.same_length, self.common_len))
     }
     /// Append one contig's base codes before finalisation.
-    pub fn push_contig(&mut self, codes: &[u8]) {
+    pub(crate) fn push_contig(&mut self, codes: &[u8]) {
         assert!(self.two_bit, "contigs need two-bit storage");
         self.push(codes.len(), codes.iter().copied());
     }
@@ -252,31 +263,40 @@ impl ReadStats {
 }
 
 /// What a first pass leaves behind of every read: the whole read, or only its length.
-pub trait RecordSink {
+pub(crate) trait RecordSink {
     /// Take note of one read.
-    fn take(&mut self, seq: &[u8], qual: Option<&[u8]>);
+    fn take(&mut self, seq: &[u8], qual: Option<&[u8]>) -> std::io::Result<()>;
 }
 
 impl RecordSink for ReadStore {
-    fn take(&mut self, seq: &[u8], qual: Option<&[u8]>) {
-        self.push(seq, qual);
+    fn take(&mut self, seq: &[u8], qual: Option<&[u8]>) -> std::io::Result<()> {
+        self.push(seq, qual)
     }
 }
 
 impl RecordSink for ReadStats {
-    fn take(&mut self, seq: &[u8], _qual: Option<&[u8]>) {
+    fn take(&mut self, seq: &[u8], _qual: Option<&[u8]>) -> std::io::Result<()> {
         self.record(seq);
+        Ok(())
     }
 }
 
 impl ReadStore {
     /// Empty store for a quality ladder or fixed floor. Two-bit storage requires Q0 alone.
-    pub fn new(floors: &[u8], two_bit: bool) -> Self {
-        assert!(
-            !floors.is_empty() && floors.len() <= MAX_GROUPS,
-            "not a quality ladder: {floors:?}"
-        );
-        assert!(!two_bit || floors == [0], "two-bit reads require Q0 alone");
+    pub fn new(floors: &[u8], two_bit: bool) -> std::io::Result<Self> {
+        if floors.is_empty() || floors.len() > MAX_GROUPS || floors.windows(2).any(|p| p[0] >= p[1])
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not an ascending quality ladder: {floors:?}"),
+            ));
+        }
+        if two_bit && floors != [0] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "two-bit reads require Q0 alone",
+            ));
+        }
         let mut class_of = [UNUSABLE; 256];
         for (byte, class) in class_of.iter_mut().enumerate() {
             let phred = (byte as u8).saturating_sub(33);
@@ -284,12 +304,12 @@ impl ReadStore {
                 *class = floor as u8;
             }
         }
-        Self {
+        Ok(Self {
             floors: floors.to_vec(),
             class_of,
             seqs: PackedSeqs::new(two_bit),
             stats: ReadStats::default(),
-        }
+        })
     }
     /// Floors represented by the stored classes.
     pub fn floors(&self) -> &[u8] {
@@ -312,34 +332,40 @@ impl ReadStore {
         &self.seqs
     }
     /// Stored class for a floor of this ladder.
-    pub fn class_of_floor(&self, floor: u8) -> u8 {
+    pub fn class_of_floor(&self, floor: u8) -> Option<u8> {
         self.floors
             .iter()
             .position(|&f| f == floor)
-            .expect("floor must belong to the stored ladder") as u8
+            .map(|class| class as u8)
     }
     /// Pack a whole read. Two-bit mode rejects non-ACGT symbols rather than splitting reads.
-    pub fn push(&mut self, seq: &[u8], qual: Option<&[u8]>) {
+    pub fn push(&mut self, seq: &[u8], qual: Option<&[u8]>) -> std::io::Result<()> {
+        if self.seqs.finished {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a finished store was written to",
+            ));
+        }
+        crate::utils::reads::validate_quality(seq, qual)?;
+        // Validate before packing: a failed read must leave payload and statistics unchanged.
+        if self.seqs.is_two_bit() {
+            if let Some((i, &base)) = seq.iter().enumerate().find(|(_, base)| !valid_base(**base)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "two-bit read {}, base {}: non-ACGT symbol {:?}",
+                        self.stats.reads + 1,
+                        i + 1,
+                        char::from(base)
+                    ),
+                ));
+            }
+        }
         let strict = (self.floors.len() - 1) as u8;
         let class_of = &self.class_of;
         if self.seqs.is_two_bit() {
-            let read = self.stats.reads + 1;
-            self.seqs.push(
-                seq.len(),
-                seq.iter().enumerate().map(|(i, &base)| {
-                    if !valid_base(base) {
-                        // This runs in the reader thread, whose panic reaches only stderr: log it too.
-                        let message = format!(
-                            "two-bit read {read}, base {}: non-ACGT symbol {:?}",
-                            i + 1,
-                            char::from(base)
-                        );
-                        log::error!("{message}");
-                        panic!("{message}");
-                    }
-                    encode_base(base)
-                }),
-            );
+            self.seqs
+                .push(seq.len(), seq.iter().copied().map(encode_base));
         } else {
             self.seqs.push(
                 seq.len(),
@@ -361,6 +387,7 @@ impl ReadStore {
             );
         }
         self.stats.record(seq);
+        Ok(())
     }
     /// Finish storage, releasing offsets if lengths stayed uniform, and report retained capacity.
     pub fn finish(&mut self) {
@@ -377,25 +404,42 @@ impl ReadStore {
 }
 
 /// Passes records through unchanged, leaving each in `sink` on the way.
-pub struct Tee<'s, I, S> {
+pub(crate) struct Tee<'s, I, S> {
     inner: I,
     sink: &'s mut S,
+    failed: bool,
 }
 
 impl<'s, I, S> Tee<'s, I, S> {
     /// Wrap `inner`, leaving its records in `sink`.
     pub fn new(inner: I, sink: &'s mut S) -> Self {
-        Self { inner, sink }
+        Self {
+            inner,
+            sink,
+            failed: false,
+        }
     }
 }
 
-impl<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>, S: RecordSink> Iterator for Tee<'_, I, S> {
+impl<I: Iterator<Item = std::io::Result<crate::OwnedRecord>>, S: RecordSink> Iterator
+    for Tee<'_, I, S>
+{
     type Item = I::Item;
-
     fn next(&mut self) -> Option<Self::Item> {
-        let record = self.inner.next()?;
-        self.sink.take(&record.0, record.1.as_deref());
-        Some(record)
+        if self.failed {
+            return None;
+        }
+        let result = self
+            .inner
+            .next()?
+            .and_then(crate::utils::reads::validate_record)
+            .and_then(|record| {
+                self.sink
+                    .take(&record.0, record.1.as_deref())
+                    .map(|()| record)
+            });
+        self.failed = result.is_err();
+        Some(result)
     }
 }
 
@@ -443,9 +487,9 @@ mod tests {
     }
     fn check(floors: &[u8]) {
         let reads = fixture();
-        let mut store = ReadStore::new(floors, false);
+        let mut store = ReadStore::new(floors, false).unwrap();
         for (seq, qual) in &reads {
-            store.push(seq, qual.as_deref());
+            store.push(seq, qual.as_deref()).unwrap();
         }
         store.finish();
         assert_eq!(store.seqs.len(), reads.len());
@@ -463,7 +507,7 @@ mod tests {
                         )),
                         walk(Kmer::<u64, _>::from_four_bit(packed, k, class as u8, true))
                     );
-                    assert_eq!(store.class_of_floor(floor), class as u8);
+                    assert_eq!(store.class_of_floor(floor), Some(class as u8));
                 }
                 if let Some(qual) = qual {
                     for top in 0..floors.len() {
@@ -499,9 +543,9 @@ mod tests {
             })
             .collect();
         for two_bit in [false, true] {
-            let mut store = ReadStore::new(&[0], two_bit);
+            let mut store = ReadStore::new(&[0], two_bit).unwrap();
             for read in &reads {
-                store.push(read, None);
+                store.push(read, None).unwrap();
             }
             assert!(!store.seqs.same_length);
             store.finish();
@@ -516,11 +560,11 @@ mod tests {
     #[test]
     fn uniform_lengths_are_detected_during_insertion_and_offsets_are_freed() {
         for two_bit in [false, true] {
-            let mut store = ReadStore::new(&[0], two_bit);
+            let mut store = ReadStore::new(&[0], two_bit).unwrap();
             assert!(!store.seqs.same_length);
             assert!(store.seqs.is_empty());
             for _ in 0..BLOCK_READS + 3 {
-                store.push(b"aCGta", None);
+                store.push(b"aCGta", None).unwrap();
                 assert!(store.seqs.same_length);
             }
             let before: Vec<_> = store.seqs.iter().map(|s| s.ascii()).collect();
@@ -538,14 +582,14 @@ mod tests {
     }
     #[test]
     fn a_late_length_difference_is_permanent() {
-        let mut store = ReadStore::new(&[0], false);
+        let mut store = ReadStore::new(&[0], false).unwrap();
         for _ in 0..BLOCK_READS {
-            store.push(b"ACG", None);
+            store.push(b"ACG", None).unwrap();
         }
         assert!(store.seqs.same_length);
-        store.push(b"AC", None);
+        store.push(b"AC", None).unwrap();
         assert!(!store.seqs.same_length);
-        store.push(b"ACG", None);
+        store.push(b"ACG", None).unwrap();
         assert!(!store.seqs.same_length);
         let before: Vec<_> = store.seqs.iter().map(|s| s.ascii()).collect();
         store.finish();
@@ -601,11 +645,11 @@ mod tests {
             for seq in [forward, reverse] {
                 let mut qual = vec![70; seq.len()];
                 qual[500] = 33;
-                let mut four = ReadStore::new(&[0, 20], false);
-                four.push(&seq, Some(&qual));
+                let mut four = ReadStore::new(&[0, 20], false).unwrap();
+                four.push(&seq, Some(&qual)).unwrap();
                 four.finish();
-                let mut two = ReadStore::new(&[0], true);
-                two.push(&seq, Some(&qual));
+                let mut two = ReadStore::new(&[0], true).unwrap();
+                two.push(&seq, Some(&qual)).unwrap();
                 two.finish();
                 for (class, floor) in [(0, 0), (1, 20)] {
                     assert_eq!(
@@ -660,25 +704,22 @@ mod tests {
     #[test]
     fn two_bit_reads_reject_ns_and_other_iupac() {
         for symbol in *b"Nr" {
-            let read = [b'A', b'C', symbol, b'T', b'A'];
-            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                ReadStore::new(&[0], true).push(&read, None);
-            }))
-            .expect_err("a non-ACGT symbol must be refused");
-            let message = panic
-                .downcast_ref::<String>()
-                .expect("the panic carries a formatted message");
-            assert!(
-                message.contains("two-bit read 1, base 3: non-ACGT"),
-                "{}: {message}",
-                char::from(symbol)
-            );
+            let mut store = ReadStore::new(&[0], true).unwrap();
+            let error = store
+                .push(&[b'A', b'C', symbol, b'T', b'A'], None)
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(error
+                .to_string()
+                .contains("two-bit read 1, base 3: non-ACGT"));
+            assert!(store.seqs().is_empty());
+            assert_eq!(store.stats().reads, 0);
         }
     }
     #[test]
     fn packed_reads_keep_exact_k_suffixes_after_unusable_bases() {
-        let mut store = ReadStore::new(&[0], false);
-        store.push(b"ANACG", None);
+        let mut store = ReadStore::new(&[0], false).unwrap();
+        store.push(b"ANACG", None).unwrap();
         store.finish();
         assert_eq!(
             walk(Kmer::<u64, _>::from_four_bit(

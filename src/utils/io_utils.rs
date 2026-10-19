@@ -5,9 +5,12 @@ use crate::utils::bit_encoding::decode_base;
 #[cfg(target_family = "wasm")]
 use flate2::{write::GzEncoder, Compression};
 use std::fs::File;
-use std::io::{stdout, BufRead, BufReader, BufWriter, Write};
+use std::io::{stdout, BufWriter, Write};
+#[cfg(not(target_family = "wasm"))]
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_family = "wasm"))]
 use crate::utils::reads::InputFastx;
 
 /// Set a buffered stream to write to.
@@ -28,6 +31,7 @@ pub fn set_ostream(oprefix: &Option<String>) -> BufWriter<Box<dyn Write>> {
 ///
 /// If `file_list` is provided, its entries will be parsed but currently they will be all assembled together.
 /// If `seq_files` are provided use, all input files will be merged.
+#[cfg(not(target_family = "wasm"))]
 pub fn get_input_list(
     file_list: &Option<String>,
     seq_files: &Option<Vec<String>>,
@@ -57,6 +61,7 @@ pub fn get_input_list(
     validate_input_files(input_files)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_file_list_line(line: &str, line_number: usize) -> InputFastx {
     let fields: Vec<&str> = line.split_whitespace().collect();
 
@@ -74,6 +79,7 @@ fn parse_file_list_line(line: &str, line_number: usize) -> InputFastx {
     )
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn validate_input_files(input_files: Vec<InputFastx>) -> Vec<InputFastx> {
     assert!(
         !input_files.is_empty(),
@@ -94,25 +100,41 @@ fn validate_input_files(input_files: Vec<InputFastx>) -> Vec<InputFastx> {
 #[cfg(not(target_family = "wasm"))]
 pub struct NeedletailIterator {
     reader: Box<dyn needletail::FastxReader>,
+    record_number: usize,
+    failed: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl NeedletailIterator {
     /// Construct from needletail readers
     pub fn new(reader: Box<dyn needletail::FastxReader>) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            record_number: 0,
+            failed: false,
+        }
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
 impl Iterator for NeedletailIterator {
-    type Item = (Vec<u8>, Option<Vec<u8>>);
-
-    fn next(&mut self) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        let record = self.reader.next()?.expect("Invalid FASTA/Q record");
-        let seq = record.seq();
-        let qual = record.qual().map(|qual| qual.to_vec());
-        Some((seq.to_vec(), qual))
+    type Item = std::io::Result<crate::OwnedRecord>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let result = self.reader.next()?;
+        self.record_number += 1;
+        Some(match result {
+            Ok(record) => Ok((record.seq().to_vec(), record.qual().map(<[u8]>::to_vec))),
+            Err(error) => {
+                self.failed = true;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("record {}: {error}", self.record_number),
+                ))
+            }
+        })
     }
 }
 
