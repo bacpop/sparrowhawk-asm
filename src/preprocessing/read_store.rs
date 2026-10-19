@@ -1,7 +1,7 @@
 //! Whole reads packed once, and borrowed in place by later counting passes.
 
-use crate::bit_encoding::{decode_base, encode_base, valid_base};
-use crate::qual_profile::MAX_GROUPS;
+use crate::utils::bit_encoding::{decode_base, encode_base, valid_base};
+use crate::utils::qual_profile::MAX_GROUPS;
 
 /// Original reads per block and counting batch. Bounded buffers avoid reallocating the whole store.
 pub(crate) const BLOCK_READS: usize = 8192;
@@ -410,9 +410,9 @@ impl<I: Iterator<Item = (Vec<u8>, Option<Vec<u8>>)>, S: RecordSink> Iterator for
 mod tests {
     use super::*;
     use crate::{
-        bit_encoding::{UInt, U256, U512},
-        kmer::{Bases, Kmer},
-        qual_profile::{window_classes, window_groups},
+        preprocessing::kmer::{Bases, Kmer},
+        utils::bit_encoding::{UInt, U256, U512},
+        utils::qual_profile::{window_classes, window_groups},
     };
     use std::borrow::Cow;
 

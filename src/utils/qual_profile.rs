@@ -1,6 +1,6 @@
 //! The candidate base-quality floors for a library, and which of them each k-mer window clears.
 
-use crate::bit_encoding::valid_base;
+use crate::utils::bit_encoding::valid_base;
 
 /// Reads peeked for the quality alphabet. Only distinct values are wanted, never a spectrum, so a
 /// library shows all 4-5 of its bins long before this.
@@ -18,7 +18,7 @@ pub const NONE: u8 = u8::MAX;
 /// Distinct PHRED values on called bases (A, C, G, T) in the first `max_reads` of `records`, ascending.
 /// Ns carry Q2 but break every window at every floor, so they say nothing about the ladder.
 /// Empty for FASTA, which has no qualities.
-pub fn peek_alphabet<I: Iterator<Item = crate::reads::OwnedRecord>>(
+pub fn peek_alphabet<I: Iterator<Item = crate::utils::reads::OwnedRecord>>(
     records: I,
     max_reads: usize,
 ) -> Vec<u8> {
@@ -98,7 +98,12 @@ pub fn window_groups(seq: &[u8], qual: &[u8], k: usize, floors: &[u8], out: &mut
 }
 
 /// Stored four-bit equivalent of `window_groups`, using the active ladder's highest class.
-pub fn window_classes(seq: crate::read_store::PackedSeq<'_>, k: usize, top: u8, out: &mut Vec<u8>) {
+pub fn window_classes(
+    seq: crate::preprocessing::read_store::PackedSeq<'_>,
+    k: usize,
+    top: u8,
+    out: &mut Vec<u8>,
+) {
     out.clear();
     out.resize(seq.len(), NONE);
     let mut run = [0usize; MAX_GROUPS];
@@ -106,11 +111,12 @@ pub fn window_classes(seq: crate::read_store::PackedSeq<'_>, k: usize, top: u8, 
         let class = seq.nibble(i) >> 2;
         let mut best = NONE;
         for (g, count) in run.iter_mut().enumerate().take(usize::from(top) + 1) {
-            *count = if class != crate::read_store::UNUSABLE && usize::from(class) >= g {
-                *count + 1
-            } else {
-                0
-            };
+            *count =
+                if class != crate::preprocessing::read_store::UNUSABLE && usize::from(class) >= g {
+                    *count + 1
+                } else {
+                    0
+                };
             if *count >= k {
                 best = g as u8;
             }
@@ -129,7 +135,7 @@ pub fn window_classes(seq: crate::read_store::PackedSeq<'_>, k: usize, top: u8, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kmer::Kmer;
+    use crate::preprocessing::kmer::Kmer;
     use std::borrow::Cow;
 
     /// K-mers the real iterator emits from this read at this floor.

@@ -1,13 +1,14 @@
-//! Common helper functions for parsing file input, loading, and setting output
-//!
-//! The functions are used by a few different subcommands to set correct
-//! args to build structs, given the command line input
+//! Native input-file parsing and buffered output, shared FASTA writing, and browser gzip output.
 
+use crate::preprocessing::read_store::PackedSeqs;
+use crate::utils::bit_encoding::decode_base;
+#[cfg(target_family = "wasm")]
+use flate2::{write::GzEncoder, Compression};
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::preprocessing::InputFastx;
+use crate::utils::reads::InputFastx;
 
 /// Set a buffered stream to write to.
 ///
@@ -115,16 +116,62 @@ impl Iterator for NeedletailIterator {
     }
 }
 
-//
-//
-//
-//
-// ===================================================================
-// ============================================================= TESTS
-// ==================================================================
+/// Bases per FASTA line.
+const FASTA_LINE_WIDTH: usize = 80;
+
+/// Write sequences clearing the inclusive length filter, with consecutive names and 80-base lines.
+/// Returns the number written; decoding needs only one fixed-size line buffer.
+pub(crate) fn write_fasta<W: Write>(
+    seqs: &PackedSeqs,
+    min_contig_length: usize,
+    out: &mut W,
+) -> std::io::Result<usize> {
+    let mut written = 0;
+    let mut line = [0u8; FASTA_LINE_WIDTH];
+    for seq in seqs.iter().filter(|s| s.len() >= min_contig_length) {
+        writeln!(out, ">{written}")?;
+        for start in (0..seq.len()).step_by(FASTA_LINE_WIDTH) {
+            let len = (seq.len() - start).min(FASTA_LINE_WIDTH);
+            for (i, base) in line[..len].iter_mut().enumerate() {
+                *base = decode_base(seq.code(start + i));
+            }
+            out.write_all(&line[..len])?;
+            out.write_all(b"\n")?;
+        }
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// What `write` produces, gzipped as one member: how the page keeps and offers its downloads.
+#[cfg(target_family = "wasm")]
+pub(crate) fn gzipped(
+    write: impl FnOnce(&mut GzEncoder<Vec<u8>>) -> std::io::Result<()>,
+) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    write(&mut encoder)
+        .and_then(|()| encoder.finish())
+        .expect("writing to memory cannot fail")
+}
+
+/// Writes spelled contigs of at least `min_contig_length` bases as FASTA to `outfile`.
+pub(crate) fn save_sequences_as_fasta(
+    seqs: &PackedSeqs,
+    min_contig_length: usize,
+    outfile: PathBuf,
+) {
+    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
+    let written =
+        write_fasta(seqs, min_contig_length, &mut wbuf).expect("cannot write the contigs");
+    log::info!(
+        "Omitted {} contigs shorter than {min_contig_length} nt from FASTA output",
+        seqs.len() - written
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_file_list_line, validate_input_files};
+    use super::*;
 
     #[test]
     #[should_panic(expected = "Input file list contains no entries")]
@@ -152,6 +199,46 @@ mod tests {
                 "sample".to_owned(),
                 vec!["reads_1.fq".to_owned(), "reads_2.fq".to_owned()]
             )
+        );
+    }
+
+    fn packed(seqs: &[Vec<u8>]) -> PackedSeqs {
+        let mut result = PackedSeqs::new(true);
+        for seq in seqs {
+            result.push_contig(
+                &seq.iter()
+                    .map(|&b| crate::utils::bit_encoding::encode_base(b))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        result.finish();
+        result
+    }
+
+    #[test]
+    fn minimum_contig_length_is_inclusive_and_configurable() {
+        // The threshold applies to the sequence written, not to a trimmed body, so it means what it says.
+        let sequences = [vec![b'A'; 500], vec![b'C'; 499]];
+        let packed = packed(&sequences);
+        assert_eq!(write_fasta(&packed, 500, &mut Vec::new()).unwrap(), 1);
+        assert_eq!(write_fasta(&packed, 499, &mut Vec::new()).unwrap(), 2);
+        assert_eq!(write_fasta(&packed, 501, &mut Vec::new()).unwrap(), 0);
+    }
+
+    /// Headers are the contigs' indices, and sequences wrap every `FASTA_LINE_WIDTH` bases.
+    #[test]
+    fn fasta_wraps_sequences_at_the_line_width() {
+        let seqs = vec![
+            vec![b'A'; 2 * FASTA_LINE_WIDTH + 5],
+            vec![b'C'; FASTA_LINE_WIDTH],
+        ];
+        let mut out = Vec::new();
+        write_fasta(&packed(&seqs), 0, &mut out).unwrap();
+        let a = "A".repeat(FASTA_LINE_WIDTH);
+        let c = "C".repeat(FASTA_LINE_WIDTH);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(">0\n{a}\n{a}\nAAAAA\n>1\n{c}\n")
         );
     }
 }

@@ -1,10 +1,10 @@
 //! One logger for both targets, on the `log` crate alone: natively each line goes to stdout and to the
 //! run's log file, in the browser to the console. Every line carries the time since logging started,
-//! from [`crate::clock::Instant`], so the same lines time a run on both.
+//! from [`crate::utils::clock::Instant`], so the same lines time a run on both.
 
 use std::sync::OnceLock;
 
-use crate::clock::Instant;
+use crate::utils::clock::Instant;
 
 // The shared logger
 struct Logger {

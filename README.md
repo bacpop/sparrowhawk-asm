@@ -115,3 +115,44 @@ A multi-k run keeps its reads in memory after the first k, whole, at four bits a
 class), and counts every later k from there.
 
 In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. Two native diagnostic plots of the k-mer frequency spectrum are saved beside them: `prefix_kmerspectrum.png`, linear and capped at three times the empirical peak's height (unbounded without a peak), and `prefix_kmerspectrum_log.png`, with a logarithmic Y axis. Each is also written as SVG. Runs using automatic count selection overlay the fitted error, single-copy, and repeat components, the total mixture, the empirical valley and peak, the fitted single-copy mean and mode, and the error/genome crossover. With Bloom counting, the plots show both the rescaled sketch used for fitting and the raw Bloom count map. These optional files can be avoided with the corresponding arguments.
+
+## Source layout
+
+```text
+src/
+├── main.rs                 # Native executable entry point.
+├── cli.rs                  # CLI options, defaults, and argument validation.
+├── lib.rs                  # Library configuration, native entry, and browser interface.
+├── pipeline.rs             # Shared single-k and multi-k assembly workflow, for native executions.
+├── preprocessing/          # Read packing, k-mer counting, and spectrum filtering.
+│   ├── mod.rs              # Preprocessing orchestration and empirical spectrum analysis.
+│   ├── sketch.rs           # Hash sampling and per-quality-floor k-mer spectra.
+│   ├── spectrum_fitter.rs  # Optimiser execution, fit validation, and model selection.
+│   ├── math_helpers.rs     # Numerical helpers, probability distributions, and recurrence calculations.
+│   ├── models.rs           # Coverage models, their parameters, and mixture evaluation.
+│   ├── bloom_filter.rs     # Bloom filtering to reduce memory used for counting.
+│   ├── kmer.rs             # K-mer iteration over text and packed sequences.
+│   ├── read_store.rs       # Packed read and contig storage for repeated processing.
+│   ├── filter.rs           # Quality-floor selection and k-mer count filtering.
+│   ├── plotter.rs          # Spectrum plots and diagnostic spectrum tables.
+│   └── parsercounter.rs    # Batched parsing, parallel counting, and carried-contig counting.
+├── graph_works/            # Graph construction, correction, collapse, and contig spelling.
+│   ├── mod.rs              # Graph assembly orchestration and contig representation.
+│   ├── indexed_kmers.rs    # Indexed k-mer storage for graph construction and spelling.
+│   ├── neighbours.rs       # Neighbour discovery and graph edge calculation.
+│   ├── spelling.rs         # Conversion of graph walks into packed contig sequences.
+│   ├── collapser.rs        # Collapse corrected graphs into contig walks.
+│   ├── corrector.rs        # Correction settings, coverage checks, and dead-end removal.
+│   ├── path_correction.rs  # Bubble and erroneous-connection correction.
+│   └── shrinker.rs         # Merge compatible graph paths into unitigs.
+└── utils/                  # Input/output, encoding, hashing, logging, and timing utilities.
+    ├── mod.rs              # Utility module declarations.
+    ├── logging.rs          # Native and browser logging.
+    ├── fastx_wasm.rs       # Browser FASTA/FASTQ parsing and gzip input.
+    ├── io_utils.rs         # Native input handling and FASTA/gzip output helpers.
+    ├── clock.rs            # Monotonic timing on native and WebAssembly targets.
+    ├── reads.rs            # Read records, input descriptions, sources, and browser progress.
+    ├── bit_encoding.rs     # Base encoding and packed integer operations.
+    ├── nthash.rs           # Rolling DNA hashes and lookup tables.
+    └── qual_profile.rs     # Quality-floor discovery and k-mer window classification.
+```

@@ -5,7 +5,7 @@ use seq_io::fasta::Reader as FastaReader;
 use seq_io::fastq::{Reader as FastqReader, Record as _};
 use std::io::{BufRead, BufReader, Read};
 
-use crate::reads::OwnedRecord;
+use crate::utils::reads::OwnedRecord;
 
 // What a .gz file starts with
 const GZ_MAGIC: [u8; 2] = [0x1F, 0x8B];

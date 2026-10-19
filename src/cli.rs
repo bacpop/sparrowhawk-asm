@@ -1,11 +1,9 @@
-//! Command line interface, built using [`crate::clap` with `Derive`](https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html)
+//! Command line interface, built using [clap's derive interface](https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html).
 //!
 //! The browser shares only the defaults and checks; the parser is native-only.
 #[cfg(not(target_family = "wasm"))]
 use clap::{ArgGroup, Parser};
 
-/// Default k-mer size
-pub const DEFAULT_KMER: usize = 31;
 /// Default minimum k-mer count for FASTQ files
 pub const DEFAULT_MINCOUNT: u16 = 5;
 /// Default minimum base quality (PHRED score) for FASTQ files
@@ -197,13 +195,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_bloom: bool,
 
-    /// DEPRECATED: now ignored, with warning.
-    #[arg(long, default_value_t = 0)]
-    pub chunk_size: usize,
-
     /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
     /// treated as an error and popped.
-    #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
+    #[arg(long, default_value_t = crate::graph_works::corrector::DEFAULT_POP_RATIO)]
     pub bubble_pop_ratio: f32,
 
     /// Fraction of the fitted single-copy coverage below which a bubble branch is treated as an
@@ -217,7 +211,7 @@ pub struct Args {
 
     /// Erroneous-connection removal: a connector goes when both its flanking branches carry this
     /// many times its coverage.
-    #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_EC_COVERAGE_RATIO)]
+    #[arg(long, default_value_t = crate::graph_works::corrector::DEFAULT_EC_COVERAGE_RATIO)]
     pub ec_coverage_ratio: f64,
 
     /// Erroneous-connection removal: require both flanks over the ratio rather than either.

@@ -1,5 +1,5 @@
 //! Shrink the given graph. Crucial for performance!!
-use crate::algorithms::corrector::prune_unpaired_edges;
+use crate::graph_works::corrector::prune_unpaired_edges;
 use sparrowhawk_graph::{CarryType, DbgGraph, EdgeId, EdgeType, NodeId};
 
 use std::collections::BTreeSet;

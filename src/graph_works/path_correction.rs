@@ -4,7 +4,7 @@
 //! judge a path with `corrector::CoverageRef` rather than a bare ratio. The old bubble collapser we had is
 //! part of the bulge removal, as bubbles are special cases of bulges.
 
-use crate::algorithms::corrector::{CoverageRef, PathCoverage};
+use crate::graph_works::corrector::{CoverageRef, PathCoverage};
 use sparrowhawk_graph::{CarryType, DbgGraph, EdgeType, NodeId};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -580,7 +580,7 @@ pub(crate) fn remove_erroneous_connections(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::algorithms::shrinker::Shrinkable;
+    use crate::graph_works::shrinker::Shrinkable;
     use crate::preprocessing::PeakSource;
     use sparrowhawk_graph::NodeStruct;
 

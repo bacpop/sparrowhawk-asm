@@ -1,31 +1,18 @@
-//! Fits a coverage model to the k-mer spectrum, to choose a count cutoff.
-//!
-//! Three-component coverage mixture.
-//!
-//! ====================================================== Got from ska-rust!! =====
-//!
-//! [`fit_spectrum`] is the main interface.
+//! Fit coverage models to a k-mer spectrum, validate candidates, and select the best fit.
 
-use argmin::core::TerminationReason::MaxItersReached;
+use super::{math_helpers::*, models::*};
 use argmin::{
-    core::{CostFunction, Error, Executor, State, TerminationReason::SolverConverged},
+    core::{
+        Error, Executor, State,
+        TerminationReason::{MaxItersReached, SolverConverged},
+    },
     solver::neldermead::NelderMead,
 };
-use libm::lgamma;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{fmt, sync::Arc};
 
-// Constants
-
-// The fit window and the single-copy mode's band
-
 /// Counts above this multiple of the peak are not fitted: conservative threshold.
 const FIT_WINDOW_PEAK_MULT: usize = 6;
-
-/// The fitted single-copy mode is held within peak × [MU_LO, MU_LO + MU_SPAN], 0.75 to 1.33.
-const MU_LO: f64 = 0.75;
-/// Width of that band, as a multiple of the peak.
-const MU_SPAN: f64 = 0.58;
 
 // These are consts that allow the mode to move a bit more from the empirical peaks,
 // for cases of high coverage. In those situations, the distribution can be very dispersed
@@ -33,34 +20,22 @@ const MU_SPAN: f64 = 0.58;
 // empirical peak, as a good fit can be recovered even under those circumstances.
 /// Largest ratio allowed between the fitted single-copy mode and the empirical peak, at low coverage...
 const PRIMARY_MODE_RATIO_LOW: f64 = 1.25;
+
 /// ...and at high coverage.
 const PRIMARY_MODE_RATIO_HIGH: f64 = 1.40;
+
 /// The allowed ratio starts rising from the low one at this empirical peak...
 const PRIMARY_MODE_RATIO_START_PEAK: usize = 100;
+
 /// ...and reaches the high one at this one.
 const PRIMARY_MODE_RATIO_END_PEAK: usize = 200;
 
-// The two-copy lobe
-
-/// Ratio we allow the second lobe (repeats lobe) to float in
-const REPEAT_RATIO: (f64, f64) = (1.5, 2.0);
 /// Where the ratio starts: just under a double, so the simplex has room on both sides.
 const REPEAT_RATIO_START: f64 = 1.9;
 
-// The shelf
-
-/// The shelf never holds more than this share of single-copy k-mers, so it cannot swallow the lobe.
-const SHELF_MAX_SHARE: f64 = 0.5;
-/// The shelf's k-mers keep at least this fraction of their coverage on average: below it the shelf
-/// sat on the error tail, at counts 0-1, in the 2026_09_28 sweep.
-const SHELF_MIN_RETAINED: f64 = 0.3;
-/// Upper bound on the shelf's a + b: above it the shelf is a spike.
-const SHELF_MAX_CONCENTRATION: f64 = 20.0;
 /// Starting (retained fraction, concentration): a broad bump, and one ramping up to the lobe. Both sit
 /// inside the bounds, so the simplex can move either way.
 const SHELF_SHAPES: [(f64, f64); 2] = [(0.5, 3.0), (0.75, 4.0)];
-
-// The search
 
 /// The error and genome models fitted from every start; the lowest BIC among the valid fits wins.
 const CONFIGURATIONS: [(ErrorModel, GenomeModel); 4] = [
@@ -78,392 +53,26 @@ const CONFIGURATIONS: [(ErrorModel, GenomeModel); 4] = [
         GenomeModel::ShelfNegativeBinomial,
     ),
 ];
+
 /// Dispersions to restart the fit from, alongside the valley estimator's own guess.
 /// A single start is NOT enough.
 const DISPERSION_SEEDS: [f64; 3] = [2.0, 8.0, 15.0];
+
 /// Offset applied to one coordinate at a time to build the initial simplex.
 const SIMPLEX_STEP: f64 = 0.5;
+
 /// Argmin defaults to machine epsilon, which is needlessly strict for likelihoods around 1e7 and
 /// makes an otherwise stationary simplex run to [`MAX_ITERS`].
 const SD_TOLERANCE: f64 = 1e-4;
+
 /// Maximum number of fit iterations (per fit)
 const MAX_ITERS: u64 = 1_000;
+
 /// Three more dimensions need more simplex steps than the NB fit's cap.
 const SHELF_MAX_ITERS: u64 = 2_000;
 
-// Validation
-
 /// Allow modest fit/sketch error, but not component totals larger than the whole spectrum.
 const COMPONENT_MASS_MAX_RATIO: f64 = 1.10;
-/// A log window mass is a probability and therefore cannot exceed one, apart from round-off.
-const WINDOW_LOG_MASS_TOLERANCE: f64 = 1e-12;
-/// Require the NB mode encoded by mean and dispersion to retain half-count precision.
-const NB_MODE_ROUNDTRIP_TOLERANCE: f64 = 0.5;
-
-// Maths helpers
-
-/// Log-sum-exp of two terms, shifted by the larger so the exponentials stay in range.
-#[inline]
-fn lse2(a: f64, b: f64) -> f64 {
-    let maximum = a.max(b);
-    if !maximum.is_finite() {
-        return maximum;
-    }
-    maximum + ((a - maximum).exp() + (b - maximum).exp()).ln()
-}
-
-/// Log-sum-exp of three terms, shifted by the largest so the exponentials stay in range.
-#[inline]
-fn lse3(a: f64, b: f64, c: f64) -> f64 {
-    let m = a.max(b).max(c);
-    if !m.is_finite() {
-        return m;
-    }
-    m + ((a - m).exp() + (b - m).exp() + (c - m).exp()).ln()
-}
-
-/// Log of the three softmax weights, computed in log space so no exponential can overflow.
-#[inline]
-fn ln_softmax3(a: f64, b: f64, c: f64) -> (f64, f64, f64) {
-    let norm = lse3(a, b, c);
-    (a - norm, b - norm, c - norm)
-}
-
-/// ln(e^high − e^low) for `high >= low`, computed as high + ln(−expm1(low − high)), so nothing
-/// underflows. Minus infinity when `high` is minus infinity, and NaN when `low > high`.
-#[inline]
-fn ln_sub_exp(high: f64, low: f64) -> f64 {
-    if high == f64::NEG_INFINITY {
-        return high;
-    }
-    if low > high || low.is_nan() {
-        return f64::NAN;
-    }
-    high + (-(low - high).exp_m1()).ln()
-}
-
-/// The logistic function, evaluated on the side that cannot overflow.
-#[inline]
-fn sigmoid(value: f64) -> f64 {
-    if value >= 0.0 {
-        1.0 / (1.0 + (-value).exp())
-    } else {
-        let scaled = value.exp();
-        scaled / (1.0 + scaled)
-    }
-}
-
-/// ln Σ p(count) over counts 1 to `top`, from ln p(1) and the log ratio of consecutive terms.
-fn log_recurrence_mass<F>(mut log_probability: f64, top: usize, log_ratio: F) -> f64
-where
-    F: Fn(usize) -> f64,
-{
-    let mut total = f64::NEG_INFINITY;
-    for count in 1..=top {
-        total = lse2(total, log_probability);
-        log_probability += log_ratio(count);
-    }
-    total
-}
-
-// Error model
-
-/// The error component's family: both give count 1 a free probability, and differ in the tail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ErrorModel {
-    /// A free count-1 probability, then the Weibull-like tail.
-    FreeSingletonWeibull,
-    /// A free count-1 probability, then a Pareto tail.
-    SingletonPareto,
-}
-
-impl fmt::Display for ErrorModel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::FreeSingletonWeibull => "free_singleton_weibull",
-            Self::SingletonPareto => "singleton_pareto",
-        })
-    }
-}
-
-impl ErrorModel {
-    /// Coordinates of θ before the genome model's own: the two free weights, the mode, the dispersion,
-    /// and this model's error parameters.
-    const fn parameter_count(self) -> usize {
-        match self {
-            Self::FreeSingletonWeibull => 7,
-            Self::SingletonPareto => 6,
-        }
-    }
-}
-
-/// The error component's parameters. Count 1 has probability p₁ (`singleton_probability`); from
-/// count 2 on, the tail has survival S(x) = exp(−λ((x − 1)^β − 1)/β), with λ the `tail_exponent` and
-/// β the `weibull_shape`. It is Weibull-like in x − 1, and tends to the Pareto (x − 1)^−λ as β → 0,
-/// which `SingletonPareto` fixes. `c = scale * beta` keeps the conditional Weibull tail
-/// well-conditioned as beta approaches zero.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ErrorParams {
-    /// p₁, the probability of count 1.
-    pub(crate) singleton_probability: f64,
-    /// λ, the tail's scale: its exponent in the Pareto limit.
-    pub(crate) tail_exponent: f64,
-    /// β, or `None` for the Pareto tail.
-    pub(crate) weibull_shape: Option<f64>,
-}
-
-impl ErrorParams {
-    /// ln S(count): the log probability that an error k-mer of count 2 or more reaches `count`.
-    #[inline]
-    fn log_survival_from_two(self, count: f64) -> f64 {
-        let log_offset = (count - 1.0).ln();
-        let factor = self.weibull_shape.map_or(1.0, |beta| {
-            let value = beta * log_offset;
-            if value == 0.0 {
-                1.0
-            } else {
-                value.exp_m1() / value
-            }
-        });
-        -self.tail_exponent * log_offset * factor
-    }
-
-    /// ln p(count): p₁ at count 1, and (1 − p₁)(S(count) − S(count + 1)) beyond.
-    #[inline]
-    fn log_probability(self, count: f64) -> f64 {
-        if count == 1.0 {
-            return self.singleton_probability.ln();
-        }
-        (1.0 - self.singleton_probability).ln()
-            + ln_sub_exp(
-                self.log_survival_from_two(count),
-                self.log_survival_from_two(count + 1.0),
-            )
-    }
-
-    /// Log of the mass on the fit window, [1, top]: ln(1 − (1 − p₁) S(top + 1)).
-    fn log_window_mass(self, top: usize) -> f64 {
-        let log_beyond =
-            (1.0 - self.singleton_probability).ln() + self.log_survival_from_two(top as f64 + 1.0);
-        (-log_beyond.exp_m1()).ln()
-    }
-}
-
-// Genome model
-
-/// The genome lobes' family.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GenomeModel {
-    /// Two NB lobes, one main, one secondary to fit potential repeats.
-    NegativeBinomial,
-    /// Negative-binomial lobes, plus a beta-binomial shelf under the single-copy one to accommodate strong left genomic lobe tails.
-    ShelfNegativeBinomial,
-}
-
-impl fmt::Display for GenomeModel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NegativeBinomial => "negative_binomial",
-            Self::ShelfNegativeBinomial => "betabinomial_shelf+negative_binomial",
-        })
-    }
-}
-
-impl GenomeModel {
-    /// Parameters beyond the lobes' mean and dispersion: the two-copy lobe's ratio, and for a shelf its
-    /// share, a and b.
-    const fn extra_parameters(self) -> usize {
-        match self {
-            Self::ShelfNegativeBinomial => 4,
-            Self::NegativeBinomial => 1,
-        }
-    }
-}
-
-/// Natural log of the Poisson density.
-#[inline]
-fn ln_dpois(x: f64, lambda: f64) -> f64 {
-    x * lambda.ln() - lgamma(x + 1.0) - lambda
-}
-
-/// Natural log of the negative-binomial density, by mean and dispersion (`variance = dispersion *
-/// mean`), so `r = mean / (dispersion - 1)` and `p = 1 / dispersion`. Tends to the Poisson as the
-/// dispersion approaches 1, which is where the genome lobe of a clean simulated library sits.
-#[inline]
-fn ln_dnbinom(x: f64, mean: f64, dispersion: f64) -> f64 {
-    if dispersion <= 1.0 + 1e-9 {
-        return ln_dpois(x, mean);
-    }
-    let r = mean / (dispersion - 1.0);
-    lgamma(x + r) - lgamma(x + 1.0) - lgamma(r)
-        + r * (-dispersion.ln())
-        + x * (1.0 - 1.0 / dispersion).ln()
-}
-
-/// The negative binomial's mode, as a count: floor(mean − (dispersion − 1)), or 0.
-fn discrete_nb_mode(mean: f64, dispersion: f64) -> usize {
-    let mode = mean - (dispersion - 1.0);
-    if mode.is_finite() && mode > 0.0 {
-        mode.floor().min(usize::MAX as f64) as usize
-    } else {
-        0
-    }
-}
-
-/// Log of the negative binomial's mass on [1, top].
-fn log_nb_mass(mean: f64, dispersion: f64, top: usize) -> f64 {
-    if dispersion <= 1.0 + 1e-9 {
-        return log_recurrence_mass(ln_dpois(1.0, mean), top, |count| {
-            mean.ln() - ((count + 1) as f64).ln()
-        });
-    }
-    let r = mean / (dispersion - 1.0);
-    let log_q = (1.0 - 1.0 / dispersion).ln();
-    log_recurrence_mass(ln_dnbinom(1.0, mean, dispersion), top, |count| {
-        ((count as f64) + r).ln() - ((count + 1) as f64).ln() + log_q
-    })
-}
-
-// The shelf, inside the single-copy lobe
-
-/// Struct to hold a beta-binomial distribution to model cases where some k-mers lost part of their reads or weren't
-/// as sequenced as most of the total kmers. This could be the case of e.g. very GC-enriched genome areas, so it has
-/// a biological reason to exist. Also we could have systematic errors :/
-/// The idea is that this could explain a strong left shoulder of the main genomic peak, and/or a strong valley that would not
-/// be explained by the error or genomic peaks themselves. Additionally, it could explain even an extra minipeak at the left
-/// of the clearly main one. It is really versatile, but I had to set some heuristics to constraint it so that it doesn't get
-/// an absurd shape, or size.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Shelf {
-    /// Share of the single-copy component the shelf holds.
-    pub(crate) share: f64,
-    /// The beta-binomial's a...
-    pub(crate) alpha: f64,
-    /// ...and b.
-    pub(crate) beta: f64,
-}
-
-impl Shelf {
-    /// From the fit's bounded coordinates: `a = m * kappa`, `b = (1 - m) * kappa`.
-    fn from_retained(share: f64, retained: f64, concentration: f64) -> Self {
-        Self {
-            share,
-            alpha: retained * concentration,
-            beta: (1.0 - retained) * concentration,
-        }
-    }
-
-    /// Mean fraction of coverage the shelf's k-mers keep, `a / (a + b)`.
-    pub(crate) fn retained(self) -> f64 {
-        self.alpha / (self.alpha + self.beta)
-    }
-
-    /// How narrow the shelf is, `a + b`: the variance of the retained fraction is `m(1 - m)/(kappa + 1)`.
-    pub(crate) fn concentration(self) -> f64 {
-        self.alpha + self.beta
-    }
-}
-
-/// Bounds on a + b for a retained fraction `m`. The lower one is a = m * (a + b) >= 1: below it the
-/// density diverges at count 0 and its mass at counts 1-2 pulled the hole guard down (S. aureus, k = 71).
-fn shelf_concentration_bounds(retained: f64) -> (f64, f64) {
-    (1.0 / retained, SHELF_MAX_CONCENTRATION)
-}
-
-/// The shelf's trials: the single-copy mean, rounded, as the beta-binomial needs a whole number.
-fn shelf_trials(mean: f64) -> f64 {
-    mean.round().max(1.0)
-}
-
-/// A share inside (0, [`SHELF_MAX_SHARE`]), and finite shapes with a >= 1 within the retained-fraction
-/// and concentration bounds.
-fn shelf_is_valid(shelf: Shelf) -> bool {
-    // Rounding in `a / (a + b)` may land a hair outside a bound the mapping itself respects.
-    let slack = 1e-9;
-    shelf.share > 0.0
-        && shelf.share < SHELF_MAX_SHARE
-        && shelf.alpha.is_finite()
-        && shelf.alpha >= 1.0 - slack
-        && shelf.beta.is_finite()
-        && shelf.beta > 0.0
-        && shelf.retained() >= SHELF_MIN_RETAINED - slack
-        && shelf.concentration() <= SHELF_MAX_CONCENTRATION + slack
-}
-
-/// Natural log of the beta-binomial density over `trials` trials; minus infinity above them.
-fn ln_dbetabinom(x: f64, trials: f64, alpha: f64, beta: f64) -> f64 {
-    if x > trials {
-        return f64::NEG_INFINITY;
-    }
-    lgamma(trials + 1.0) - lgamma(x + 1.0) - lgamma(trials - x + 1.0)
-        + lgamma(x + alpha)
-        + lgamma(trials - x + beta)
-        - lgamma(trials + alpha + beta)
-        - (lgamma(alpha) + lgamma(beta) - lgamma(alpha + beta))
-}
-
-/// The shelf's log density at every count `0..=min(trials, top)`, from the ratio of consecutive terms,
-/// so the fit's hot loop pays four logs per count instead of eight log-gammas. Only counts inside the
-/// fit window are ever read, and mid-search the mean (so the trials) is unbounded.
-fn shelf_log_table(mean: f64, shelf: Shelf, top: usize) -> Vec<f64> {
-    let trials = shelf_trials(mean);
-    let last = trials.min(top as f64) as usize;
-    let (alpha, beta) = (shelf.alpha, shelf.beta);
-    let mut ln =
-        lgamma(trials + beta) + lgamma(alpha + beta) - lgamma(trials + alpha + beta) - lgamma(beta);
-    let mut shelf_table = Vec::with_capacity(last + 1);
-    shelf_table.push(ln);
-    for x in 0..last {
-        let x = x as f64;
-        ln +=
-            (trials - x).ln() + (x + alpha).ln() - (x + 1.0).ln() - (trials - x - 1.0 + beta).ln();
-        shelf_table.push(ln);
-    }
-    shelf_table
-}
-
-/// Log density of the single-copy component: its lobe, plus the shelf when the model has one.
-fn ln_single_copy(count: f64, mean: f64, dispersion: f64, shelf: Option<Shelf>) -> f64 {
-    let lobe = ln_dnbinom(count, mean, dispersion);
-    shelf.map_or(lobe, |s| {
-        lse2(
-            (1.0 - s.share).ln() + lobe,
-            s.share.ln() + ln_dbetabinom(count, shelf_trials(mean), s.alpha, s.beta),
-        )
-    })
-}
-
-/// The single-copy log density from its lobe's, adding the shelf read from its table.
-#[inline]
-fn mix_single_copy(lobe: f64, count: f64, shelf: Option<(Shelf, &[f64])>) -> f64 {
-    shelf.map_or(lobe, |(s, shelf_table)| {
-        let at = shelf_table
-            .get(count as usize)
-            .copied()
-            .unwrap_or(f64::NEG_INFINITY);
-        lse2((1.0 - s.share).ln() + lobe, s.share.ln() + at)
-    })
-}
-
-/// Log of the single-copy component's mass inside `[1, top]`, the shelf read from its table.
-fn single_copy_log_mass(
-    mean: f64,
-    dispersion: f64,
-    shelf: Option<(Shelf, &[f64])>,
-    top: usize,
-) -> f64 {
-    let lobe = log_nb_mass(mean, dispersion, top);
-    shelf.map_or(lobe, |(s, shelf_table)| {
-        let shelf_mass = shelf_table
-            .iter()
-            .take(top + 1)
-            .skip(1)
-            .fold(f64::NEG_INFINITY, |acc, &ln| lse2(acc, ln));
-        lse2((1.0 - s.share).ln() + lobe, s.share.ln() + shelf_mass)
-    })
-}
-
-// Fit result
 
 /// Why a converged fit is not used: the first validation check it fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -499,195 +108,6 @@ impl fmt::Display for FitRejection {
     }
 }
 
-/// A converged fit, as the crate reads it: the model's parameters, and the totals, likelihood and
-/// masses derived from them.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SpectrumFit {
-    /// The error component's family.
-    pub(crate) error_model: ErrorModel,
-    /// The genome lobes' family.
-    pub(crate) genome_model: GenomeModel,
-    /// Mixture weight of the error component, inside the fit window.
-    pub(crate) w_error: f64,
-    /// Mixture weight of the single-copy component, inside the fit window.
-    pub(crate) w_single: f64,
-    /// Mixture weight of the two-copy component, inside the fit window.
-    pub(crate) w_repeat: f64,
-    /// Mean of the single-copy lobe.
-    pub(crate) mean: f64,
-    /// Variance over mean, shared by both lobes.
-    pub(crate) dispersion: f64,
-    /// The continuous mode used to derive the NB mean, retained to detect cancellation.
-    target_mode: f64,
-    /// The error component's parameters.
-    pub(crate) error_params: ErrorParams,
-    /// The shelf under the single-copy lobe, when the genome model has one.
-    pub(crate) shelf: Option<Shelf>,
-    /// The two-copy lobe's mean as a multiple of the single-copy mean.
-    pub(crate) repeat_ratio: f64,
-    /// Distinct k-mers in the single-copy component, extrapolated over every count, at library scale.
-    pub(crate) genome_kmers: f64,
-    /// Distinct k-mers in the error component, likewise.
-    pub(crate) error_kmers: f64,
-    /// Distinct k-mers in the two-copy component, likewise.
-    pub(crate) repeat_kmers: f64,
-    /// Log-likelihood of the fit window, at sample scale.
-    pub(crate) log_likelihood: f64,
-    /// Bayesian information criterion: the lowest valid one is selected.
-    pub(crate) bic: f64,
-    /// The window's deviance, 2 Σ obs·ln(obs/expected), at sample scale.
-    pub(crate) deviance: f64,
-    /// Last count fitted.
-    pub(crate) fit_window_end: usize,
-    /// Simplex iterations of the converged start.
-    pub(crate) best_iterations: u64,
-    /// Each component's log mass inside the fit window, [1, `fit_window_end`]: its density is divided
-    /// by it, so the mixture is a distribution over the counts actually fitted.
-    pub(crate) component_log_window_masses: [f64; 3],
-    /// Each component's log total of distinct k-mers, extrapolated over every count, at library scale.
-    component_log_totals: [f64; 3],
-    /// Distinct k-mers inside the fit window, at library scale.
-    observed_total: f64,
-    /// Distinct k-mers in the whole spectrum, at library scale.
-    full_distinct_total: f64,
-}
-
-impl SpectrumFit {
-    /// The components' extrapolated totals over the spectrum's distinct k-mers; validation tests the
-    /// same in log space.
-    pub(crate) fn component_total_ratio(&self) -> f64 {
-        let log_total = lse3(
-            self.component_log_totals[0],
-            self.component_log_totals[1],
-            self.component_log_totals[2],
-        );
-        (log_total - self.full_distinct_total.ln()).exp()
-    }
-
-    /// How far the mode recovered from the mean, mean − (dispersion − 1), lands from the mode the fit
-    /// searched over. At a huge dispersion the subtraction cancels, and validation rejects the fit.
-    pub(crate) fn mode_roundtrip_error(&self) -> f64 {
-        (self.mean - (self.dispersion - 1.0) - self.target_mode).abs()
-    }
-
-    /// The single-copy lobe's mode.
-    pub(crate) fn primary_mode(&self) -> usize {
-        discrete_nb_mode(self.mean, self.dispersion)
-    }
-
-    /// The two-copy lobe's mode.
-    pub(crate) fn repeat_mode(&self) -> usize {
-        discrete_nb_mode(self.repeat_ratio * self.mean, self.dispersion)
-    }
-
-    /// Count where the error component is highest in the window; validation needs it under the valley.
-    pub(crate) fn error_mode(&self) -> usize {
-        (1..=self.fit_window_end)
-            .max_by(|&a, &b| {
-                self.error_params
-                    .log_probability(a as f64)
-                    .total_cmp(&self.error_params.log_probability(b as f64))
-            })
-            .unwrap_or(1)
-    }
-
-    /// Expected in-window component heights at one observed abundance.
-    pub(crate) fn component_heights(&self, count: usize) -> [f64; 3] {
-        let count = count as f64;
-        let logs = [
-            self.error_params.log_probability(count),
-            ln_single_copy(count, self.mean, self.dispersion, self.shelf),
-            ln_dnbinom(count, self.repeat_ratio * self.mean, self.dispersion),
-        ];
-        [
-            self.observed_total
-                * self.w_error
-                * (logs[0] - self.component_log_window_masses[0]).exp(),
-            self.observed_total
-                * self.w_single
-                * (logs[1] - self.component_log_window_masses[1]).exp(),
-            self.observed_total
-                * self.w_repeat
-                * (logs[2] - self.component_log_window_masses[2]).exp(),
-        ]
-    }
-
-    /// Expected in-window height of the shelf alone, the part of the single-copy component it holds.
-    /// Read only by the native plots.
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn shelf_height(&self, count: usize) -> Option<f64> {
-        self.shelf.map(|s| {
-            let ln = s.share.ln()
-                + ln_dbetabinom(count as f64, shelf_trials(self.mean), s.alpha, s.beta);
-            self.observed_total * self.w_single * (ln - self.component_log_window_masses[1]).exp()
-        })
-    }
-
-    /// Very important heuristic: this helps us reduce the valley avoiding losing kmers from the genome parts whenever
-    /// we see in the fit that the genomic part extends significantly to the left of the empirical valley. This recovers,
-    /// in most situations, a good portion of contiguity.
-    ///
-    /// It is the largest cutoff whose expected removed single-copy k-mers (those below it, the unobserved
-    /// count 0 included) stay within `budget`, and at least 2; `None` when every cutoff up to the mean
-    /// stays within it.
-    pub(crate) fn hole_cutoff(&self, budget: f64) -> Option<u16> {
-        if self.genome_kmers <= 0.0
-            || !self.mean.is_finite()
-            || self.mean < 2.0
-            || self.fit_window_end < 2
-        {
-            return None;
-        }
-        let allowed = budget / self.genome_kmers;
-        let ceiling = (self.mean.round() as usize).min(self.fit_window_end);
-        let single = |count: f64| {
-            ln_single_copy(count, self.mean, self.dispersion, self.shelf).exp() // we un-log it
-        };
-        let mut cdf = single(0.0);
-        let mut cutoff = 1usize;
-        while cutoff < ceiling {
-            let next = cdf + single(cutoff as f64);
-            if next > allowed {
-                return Some((cutoff.min(u16::MAX as usize) as u16).max(2));
-            }
-            cdf = next;
-            cutoff += 1;
-        }
-        None
-    }
-
-    /// Where error and genomic parts cross. This would be, ideally, equivalent to the empiric valley.
-    /// It is the first count where the single-copy component outgrows the error one; only the logs and
-    /// the plots read it.
-    pub(crate) fn crossover(&self) -> Option<u16> {
-        if !self.mean.is_finite() || self.mean < 2.0 || self.fit_window_end < 2 {
-            return None;
-        }
-        let ceiling = (self.mean.round().max(2.0) as usize).min(self.fit_window_end);
-        for count in 1..ceiling {
-            let heights = self.component_heights(count);
-            if heights[1] > heights[0] {
-                return Some((count.min(u16::MAX as usize) as u16).max(2));
-            }
-        }
-        None
-    }
-
-    /// One past the last count, within the fit window, where the error component is at least as high
-    /// as the single-copy lobe at its own mode; at least 2. Below it, errors alone fill a bin to the
-    /// genome peak's height, so the cutoff never goes under it (the logs' "100% error floor").
-    pub(crate) fn error_floor_cutoff(&self) -> u16 {
-        let reference = self.component_heights(self.primary_mode())[1];
-        let mut last_bad = 0usize;
-        for count in 1..=self.fit_window_end {
-            if self.component_heights(count)[0] >= reference {
-                last_bad = count;
-            }
-        }
-        last_bad.saturating_add(1).min(u16::MAX as usize).max(2) as u16
-    }
-}
-
 /// One configuration's outcome: its best valid fit, or its best rejected one for the logs.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FitAttempt {
@@ -713,252 +133,6 @@ pub(crate) struct FitSearchResult {
     /// One attempt per entry of [`CONFIGURATIONS`], in its order.
     pub(crate) attempts: [FitAttempt; 4],
 }
-
-// Optimisation problem
-
-/// One simplex point decoded into the model's parameters.
-#[derive(Clone, Copy)]
-struct Params {
-    /// Log mixture weights.
-    ln_error: f64,
-    ln_single: f64,
-    ln_repeat: f64,
-    /// The single-copy lobe's mode, the coordinate the simplex moves.
-    target_mode: f64,
-    /// The single-copy lobe's mean, from the mode and the dispersion.
-    mean: f64,
-    dispersion: f64,
-    error_params: ErrorParams,
-    shelf: Option<Shelf>,
-    repeat_ratio: f64,
-}
-
-/// The problem argmin minimises: one configuration over the fit window.
-#[derive(Clone)]
-struct MixtureFit {
-    /// (count, distinct k-mers) of every non-empty bin in the window, at sample scale.
-    observed: Arc<[(f64, f64)]>,
-    /// Their total.
-    observed_total: f64,
-    /// Distinct k-mers in the whole spectrum, at library scale.
-    full_distinct_total: f64,
-    /// The empirical single-copy peak the mode is held around.
-    peak: f64,
-    /// Last count fitted.
-    fit_window_end: usize,
-    error_model: ErrorModel,
-    genome_model: GenomeModel,
-    /// Library k-mers each observed one stands for: 1/fraction for a sketch, 1 for an exact table.
-    sample_scale: f64,
-}
-
-impl MixtureFit {
-    /// Decode θ: softmax weights with the error's logit fixed at 0, and sigmoid or exponential maps
-    /// into each parameter's range.
-    fn params(&self, theta: &[f64]) -> Params {
-        let (ln_error, ln_single, ln_repeat) = ln_softmax3(0.0, theta[0], theta[1]);
-        let target_mode = self.peak * (MU_LO + MU_SPAN / (1.0 + (-theta[2]).exp()));
-        let dispersion = 1.0 + theta[3].exp();
-        let error_params = ErrorParams {
-            tail_exponent: theta[4].exp(),
-            singleton_probability: sigmoid(theta[5]),
-            weibull_shape: match self.error_model {
-                ErrorModel::FreeSingletonWeibull => Some(theta[6].exp()),
-                ErrorModel::SingletonPareto => None,
-            },
-        };
-        let base = self.error_model.parameter_count();
-        let (ratio_low, ratio_high) = REPEAT_RATIO;
-        let repeat_ratio = ratio_low + (ratio_high - ratio_low) * sigmoid(theta[base]);
-        let shelf_at = base + 1;
-        let shelf = (self.genome_model == GenomeModel::ShelfNegativeBinomial).then(|| {
-            let retained =
-                SHELF_MIN_RETAINED + (1.0 - SHELF_MIN_RETAINED) * sigmoid(theta[shelf_at + 1]);
-            let (low, high) = shelf_concentration_bounds(retained);
-            Shelf::from_retained(
-                SHELF_MAX_SHARE * sigmoid(theta[shelf_at]),
-                retained,
-                low + (high - low) * sigmoid(theta[shelf_at + 2]),
-            )
-        });
-        Params {
-            ln_error,
-            ln_single,
-            ln_repeat,
-            target_mode,
-            mean: target_mode + dispersion - 1.0,
-            dispersion,
-            error_params,
-            shelf,
-            repeat_ratio,
-        }
-    }
-
-    /// Each component's log mass inside the window, [1, `fit_window_end`].
-    fn log_window_masses(&self, params: Params, shelf_table: Option<&[f64]>) -> [f64; 3] {
-        [
-            params.error_params.log_window_mass(self.fit_window_end),
-            single_copy_log_mass(
-                params.mean,
-                params.dispersion,
-                params.shelf.zip(shelf_table),
-                self.fit_window_end,
-            ),
-            log_nb_mass(
-                params.repeat_ratio * params.mean,
-                params.dispersion,
-                self.fit_window_end,
-            ),
-        ]
-    }
-
-    /// A converged θ as the crate reads it.
-    fn unpack(&self, theta: &[f64], cost: f64, iterations: u64) -> SpectrumFit {
-        let params = self.params(theta);
-        let shelf_table = params
-            .shelf
-            .map(|s| shelf_log_table(params.mean, s, self.fit_window_end));
-        let window_masses = self.log_window_masses(params, shelf_table.as_deref());
-        let w_error = params.ln_error.exp();
-        let w_single = params.ln_single.exp();
-        let w_repeat = params.ln_repeat.exp();
-        // Totals and heights at library scale, for the hole guard's absolute budget and the plots;
-        // BIC's penalty counts the sample that was actually observed.
-        let library_total = self.observed_total * self.sample_scale;
-        let component_log_totals = [
-            params.ln_error + library_total.ln() - window_masses[0],
-            params.ln_single + library_total.ln() - window_masses[1],
-            params.ln_repeat + library_total.ln() - window_masses[2],
-        ];
-        let mut fit = SpectrumFit {
-            error_model: self.error_model,
-            genome_model: self.genome_model,
-            w_error,
-            w_single,
-            w_repeat,
-            mean: params.mean,
-            dispersion: params.dispersion,
-            target_mode: params.target_mode,
-            error_params: params.error_params,
-            shelf: params.shelf,
-            repeat_ratio: params.repeat_ratio,
-            genome_kmers: component_log_totals[1].exp(),
-            error_kmers: component_log_totals[0].exp(),
-            repeat_kmers: component_log_totals[2].exp(),
-            log_likelihood: -cost,
-            bic: 2.0 * cost
-                + (self.error_model.parameter_count() + self.genome_model.extra_parameters())
-                    as f64
-                    * self.observed_total.ln(),
-            deviance: 0.0,
-            fit_window_end: self.fit_window_end,
-            best_iterations: iterations,
-            component_log_window_masses: window_masses,
-            component_log_totals,
-            observed_total: library_total,
-            full_distinct_total: self.full_distinct_total,
-        };
-        fit.deviance = self.conditional_deviance(&fit);
-        fit
-    }
-
-    /// 2 Σ obs·ln(obs/expected) over the window, in the sample's units.
-    fn conditional_deviance(&self, fit: &SpectrumFit) -> f64 {
-        self.observed
-            .iter()
-            .map(|&(count, observed)| {
-                // Heights are at library scale; the deviance compares in the sample's own units.
-                let expected = fit
-                    .component_heights(count as usize)
-                    .into_iter()
-                    .sum::<f64>()
-                    / self.sample_scale;
-                if expected > 0.0 {
-                    2.0 * observed * (observed / expected).ln()
-                } else {
-                    f64::INFINITY
-                }
-            })
-            .sum()
-    }
-}
-
-/// This implements the CostFunction trait for our mixture of distributions! This comes from the argmin crate
-impl CostFunction for MixtureFit {
-    type Param = Vec<f64>;
-    type Output = f64;
-
-    /// The negative log-likelihood of the window, or infinity for parameters the model cannot use.
-    fn cost(&self, theta: &Self::Param) -> Result<Self::Output, Error> {
-        let params = self.params(theta);
-
-        // If the parameters don't make any sense, the cost is infinite
-        if !(params.mean.is_finite()
-            && params.dispersion.is_finite()
-            && params.target_mode.is_finite()
-            && params.error_params.tail_exponent.is_finite()
-            && params.error_params.singleton_probability.is_finite()
-            && params.error_params.weibull_shape.is_none_or(f64::is_finite))
-            || params.mean <= 0.0
-            || params.error_params.tail_exponent <= 0.0
-            || !(0.0..1.0).contains(&params.error_params.singleton_probability)
-            || params.shelf.is_some_and(|s| !shelf_is_valid(s))
-        {
-            return Ok(f64::INFINITY);
-        }
-        // Also for the NB mode
-        if (params.mean - (params.dispersion - 1.0) - params.target_mode).abs()
-            > NB_MODE_ROUNDTRIP_TOLERANCE
-        {
-            return Ok(f64::INFINITY);
-        }
-
-        // Built once per evaluation, then read for the window mass and at every observed count.
-        let shelf_table = params
-            .shelf
-            .map(|s| shelf_log_table(params.mean, s, self.fit_window_end));
-
-        let window_masses = self.log_window_masses(params, shelf_table.as_deref());
-        if window_masses
-            .iter()
-            .any(|value| !value.is_finite() || *value > WINDOW_LOG_MASS_TOLERANCE)
-        {
-            return Ok(f64::INFINITY);
-        }
-
-        let shelf = params.shelf.zip(shelf_table.as_deref());
-
-        let loglikelihood = self
-            .observed
-            .iter()
-            .map(|&(count, weight)| {
-                // Error lobe
-                let error =
-                    params.ln_error + params.error_params.log_probability(count) - window_masses[0];
-
-                // Genomic lobe
-                let lobe = ln_dnbinom(count, params.mean, params.dispersion);
-                // Genomic lobe + shelf
-                let single =
-                    params.ln_single + mix_single_copy(lobe, count, shelf) - window_masses[1];
-
-                // Second genomic lobe (repeat lobe)
-                let repeat = params.ln_repeat
-                    + ln_dnbinom(count, params.repeat_ratio * params.mean, params.dispersion)
-                    - window_masses[2];
-                weight * lse3(error, single, repeat)
-            })
-            .sum::<f64>();
-
-        Ok(if loglikelihood.is_finite() && loglikelihood <= 0.0 {
-            -loglikelihood
-        } else {
-            f64::INFINITY
-        })
-    }
-}
-
-// Search
 
 /// Main function for doing the fits, after the empirical values have been extracted
 /// `histovec` is at library scale; `sample_scale` is how many library k-mers each observed one stands
@@ -1375,32 +549,11 @@ fn select_fit(attempts: &[FitAttempt]) -> Option<SpectrumFit> {
     selected
 }
 
-//
-//
-//
-//
-// ===================================================================
-// ============================================================= TESTS
-// ==================================================================
 #[cfg(test)]
 mod tests {
     use super::*;
+    use argmin::core::CostFunction;
 
-    /// Genome lobes modelled: single-copy and two-copy
-    const REPEAT_LOBE_COPIES: f64 = 2.0;
-
-    #[test]
-    fn fit_matches_poisson_when_dispersion_is_one() {
-        for x in [0.0, 1.0, 5.0, 40.0] {
-            let nb = ln_dnbinom(x, 20.0, 1.0);
-            let po = ln_dpois(x, 20.0);
-            assert!((nb - po).abs() < 1e-9, "x={x}: {nb} vs {po}");
-        }
-        // Just past the switch the two must still be close, or the limit is discontinuous.
-        assert!((ln_dnbinom(5.0, 20.0, 1.001) - ln_dpois(5.0, 20.0)).abs() < 0.05);
-    }
-
-    #[cfg(not(target_family = "wasm"))]
     fn synthetic_histogram(error: ErrorParams) -> Vec<u32> {
         let mut histogram = vec![0u32; 601];
         let mean = 53.0;
@@ -1414,7 +567,6 @@ mod tests {
         histogram
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn capped_starts_count_iterations_but_are_not_candidates() {
         let histogram = synthetic_histogram(ErrorParams {
@@ -1446,45 +598,7 @@ mod tests {
         assert_eq!(attempt.rejection, Some(FitRejection::OptimisationFailed));
     }
 
-    /// A(1, 1) beta-binomial is uniform over its trials, and any beta-binomial sums to one.
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn the_beta_binomial_is_normalised_and_uniform_at_one_one() {
-        for x in 0..=50 {
-            assert!((ln_dbetabinom(f64::from(x), 50.0, 1.0, 1.0).exp() - 1.0 / 51.0).abs() < 1e-12);
-        }
-        let total: f64 = (0..=60)
-            .map(|x| ln_dbetabinom(f64::from(x), 60.0, 2.5, 0.7).exp())
-            .sum();
-        assert!((total - 1.0).abs() < 1e-10);
-        assert_eq!(ln_dbetabinom(61.0, 60.0, 2.5, 0.7), f64::NEG_INFINITY);
-    }
-
-    /// The fit's recurrence table agrees with the direct log-gamma density at every count.
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn the_shelf_table_matches_the_direct_density() {
-        for (alpha, beta) in [(1.0, 1.0), (2.5, 0.7), (0.4, 0.8), (3.0, 1.0)] {
-            let shelf = Shelf {
-                share: 0.1,
-                alpha,
-                beta,
-            };
-            let shelf_table = shelf_log_table(147.4, shelf, 1_000);
-            assert_eq!(shelf_table.len(), 148);
-            for (count, &ln) in shelf_table.iter().enumerate() {
-                let direct = ln_dbetabinom(count as f64, 147.0, alpha, beta);
-                assert!((ln - direct).abs() < 1e-9, "a={alpha} b={beta} x={count}");
-            }
-            // A window shorter than the trials cuts the table without changing its values.
-            let short = shelf_log_table(147.4, shelf, 60);
-            assert_eq!(short.len(), 61);
-            assert_eq!(short[..], shelf_table[..61]);
-        }
-    }
-
     /// The shelf model with a Pareto tail, over the NB-only synthetic spectrum's first 300 counts.
-    #[cfg(not(target_family = "wasm"))]
     fn shelf_problem() -> MixtureFit {
         let histogram = synthetic_histogram(ErrorParams {
             singleton_probability: 0.85,
@@ -1510,7 +624,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
     fn valid_fit_for_validation_tests() -> SpectrumFit {
         SpectrumFit::for_test(
             ErrorModel::SingletonPareto,
@@ -1530,7 +643,6 @@ mod tests {
 
     /// Each validation limit accepts its boundary and rejects just past it: a window log-mass above round-off,
     /// an NB mode off by more than half a count, and component totals above 1.10x the *full* spectrum.
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn validation_limits_are_inclusive_at_their_boundaries() {
         let mut fit = valid_fit_for_validation_tests();
@@ -1579,7 +691,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn a_lower_cost_rejected_start_does_not_hide_a_valid_start() {
         let error = ErrorParams {
@@ -1659,7 +770,6 @@ mod tests {
 
     /// However far the simplex pushes its coordinates, the shelf stays off the error tail, keeps a >= 1
     /// and never becomes a spike, and the two-copy lobe stays within its ratio bounds.
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn simplex_coordinates_map_inside_their_bounds() {
         let problem = shelf_problem();
@@ -1702,7 +812,6 @@ mod tests {
     }
 
     /// A second lobe at 1.7 times the single-copy mean, not 2, is followed by the fit.
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn a_second_lobe_off_the_double_is_followed() {
         let error = ErrorParams {
@@ -1728,7 +837,6 @@ mod tests {
 
     /// A simplex probe at an absurd dispersion (a mean near 1e13) returns promptly, as it did before
     /// the table: no allocation proportional to the mean.
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn a_shelf_cost_at_an_extreme_dispersion_stays_bounded() {
         let problem = shelf_problem();
@@ -1764,30 +872,8 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn single_copy_mass_mixes_the_lobe_and_the_shelf() {
-        let shelf = Shelf {
-            share: 0.12,
-            alpha: 2.0,
-            beta: 0.8,
-        };
-        for shelf in [None, Some(shelf)] {
-            let shelf_table = shelf.map(|s| shelf_log_table(53.0, s, 300));
-            let direct = (1..=300).fold(f64::NEG_INFINITY, |acc, count| {
-                lse2(acc, ln_single_copy(f64::from(count), 53.0, 4.0, shelf))
-            });
-            let mass = single_copy_log_mass(53.0, 4.0, shelf.zip(shelf_table.as_deref()), 300);
-            assert!(
-                (mass - direct).abs() < 1e-9,
-                "{shelf:?}: {mass} != {direct}"
-            );
-        }
-    }
-
     /// A spectrum with a tenth of its single-copy k-mers in a uniform shelf selects the shelf model,
     /// and the hole guard then counts the shelf's low counts as genome.
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn the_shelf_model_recovers_a_synthetic_shelf() {
         let error = ErrorParams {
@@ -1822,7 +908,6 @@ mod tests {
 
     /// A spectrum rescaled from a sample fits exactly as the sample does, with genome k-mers, heights
     /// and so the hole guard at library scale.
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn a_rescaled_sample_fits_as_the_sample_itself() {
         let error = ErrorParams {
@@ -1858,7 +943,6 @@ mod tests {
         assert_eq!(fit.hole_cutoff(scale), raw.hole_cutoff(1.0));
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn free_singleton_weibull_nests_ordinary_weibull_geometric_and_one_inflated() {
         for (scale, shape) in [(1.2_f64, 0.6_f64), (0.7, 1.0)] {
@@ -1892,7 +976,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn pareto_is_the_stable_weibull_boundary() {
         let pareto = ErrorParams {
@@ -1925,7 +1008,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn fit_recovers_the_pareto_tail_with_negative_binomial_genomes() {
         let error = ErrorParams {
@@ -1973,7 +1055,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn fit_recovers_the_weibull_tail_with_negative_binomial_genomes() {
         let error = ErrorParams {
@@ -1993,7 +1074,6 @@ mod tests {
         assert!(selected.error_params.weibull_shape.is_some());
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn bic_ties_prefer_pareto_and_lower_bic_selects_weibull() {
         let error = ErrorParams {
@@ -2050,7 +1130,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn bad_srr_like_mode_is_rejected() {
         let fit = SpectrumFit::for_test(
@@ -2076,7 +1155,6 @@ mod tests {
 
     /// The primary mode must lie within a ratio of the empirical peak, ramping from 1.25 (peak <= 100) to
     /// 1.40 (peak >= 200), on both sides and inclusively.
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn the_primary_mode_band_ramps_with_the_peak_and_is_inclusive() {
         for (peak, limit) in [
@@ -2131,7 +1209,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn degenerate_genome_parameters_and_modes_outside_fit_window_are_rejected() {
         let params = ErrorParams {
@@ -2175,7 +1252,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn cutoff_searches_stop_at_the_fit_window() {
         let fit = SpectrumFit::for_test(
@@ -2196,7 +1272,6 @@ mod tests {
         assert_eq!(fit.hole_cutoff(f64::INFINITY), None);
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn components_are_conditioned_on_the_fit_window() {
         for model in [
@@ -2232,7 +1307,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn active_error_floor_is_one_past_the_last_overlapping_count() {
         for model in [
@@ -2265,65 +1339,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    impl SpectrumFit {
-        #[allow(clippy::too_many_arguments)]
-        pub(crate) fn for_test(
-            error_model: ErrorModel,
-            genome_model: GenomeModel,
-            weights: [f64; 3],
-            mean: f64,
-            dispersion: f64,
-            error_params: ErrorParams,
-            observed_total: f64,
-            fit_window_end: usize,
-        ) -> Self {
-            let window_masses = [
-                error_params.log_window_mass(fit_window_end),
-                single_copy_log_mass(mean, dispersion, None, fit_window_end),
-                log_nb_mass(REPEAT_LOBE_COPIES * mean, dispersion, fit_window_end),
-            ];
-            let target_mode = mean - (dispersion - 1.0);
-            let log_observed_total = observed_total.ln();
-            let component_log_totals = [
-                weights[0].ln() + log_observed_total - window_masses[0],
-                weights[1].ln() + log_observed_total - window_masses[1],
-                weights[2].ln() + log_observed_total - window_masses[2],
-            ];
-            Self {
-                error_model,
-                genome_model,
-                w_error: weights[0],
-                w_single: weights[1],
-                w_repeat: weights[2],
-                mean,
-                dispersion,
-                target_mode,
-                error_params,
-                shelf: None,
-                repeat_ratio: REPEAT_LOBE_COPIES,
-                genome_kmers: component_log_totals[1].exp(),
-                error_kmers: component_log_totals[0].exp(),
-                repeat_kmers: component_log_totals[2].exp(),
-                log_likelihood: -1.0,
-                bic: 2.0
-                    + (error_model.parameter_count() + genome_model.extra_parameters()) as f64
-                        * observed_total.ln(),
-                deviance: 1.0,
-                fit_window_end,
-                best_iterations: 1,
-                component_log_window_masses: window_masses,
-                component_log_totals,
-                observed_total,
-                // Existing hand-built test fits focus on their specific guard. Dedicated mass tests set
-                // this to a realistic whole-spectrum total.
-                full_distinct_total: f64::MAX,
-            }
-        }
-    }
-
     /// One candidate's starts run in turn, as the whole search once did.
-    #[cfg(not(target_family = "wasm"))]
     fn fit_candidate(
         problem: MixtureFit,
         valley: usize,

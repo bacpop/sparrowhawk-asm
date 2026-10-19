@@ -1,10 +1,10 @@
 //! K-mer iteration over ASCII reads, packed four-bit reads, or two-bit sequences.
 
-use super::bit_encoding::*;
-use super::nthash::NtHashIterator;
+use crate::utils::bit_encoding::*;
+use crate::utils::nthash::NtHashIterator;
 use crate::{
     cli::MAX_K,
-    read_store::{PackedSeq, UNUSABLE},
+    preprocessing::read_store::{PackedSeq, UNUSABLE},
 };
 use std::{borrow::Cow, marker::PhantomData};
 

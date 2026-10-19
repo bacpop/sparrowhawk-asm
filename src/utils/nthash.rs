@@ -23,6 +23,7 @@ pub const RC_HASH_LOOKUP: [u64; 4] = [
     0x3193_c185_62a0_2b4c,
 ];
 
+/// Retained from the older two-part rotation for reference; the active hash uses six partitions.
 /// This is A33R, C33R, T33R, G33R so can be indexed by nucleotide * 33
 pub const MS_TAB_33R: [u64; 132] = [
     0x195c60474,
@@ -159,6 +160,7 @@ pub const MS_TAB_33R: [u64; 132] = [
     0x412b9192,
 ];
 
+/// Retained from the older two-part rotation for reference; the active hash uses six partitions.
 /// This is A31R, C31R, T31R, G31R so can be indexed by nucleotide * 31
 pub const MS_TAB_31L: [u64; 124] = [
     0x3c8bfbb200000000,
@@ -509,13 +511,6 @@ pub struct NtHashIterator {
     rh: Option<u64>,
 }
 
-/// Function that exchanges the bits in the 0 and 33 positions
-#[inline(always)]
-pub fn swapbits033(v: u64) -> u64 {
-    let x = (v ^ (v >> 33)) & 1;
-    v ^ (x | (x << 33))
-}
-
 /// Function that cycles to the RIGHT the bits in the 0, 19, 32, 43, 52, and 59 positions
 #[inline(always)]
 pub fn swapbits_0_19_32_43_52_59(v: u64) -> u64 {
@@ -527,13 +522,6 @@ pub fn swapbits_0_19_32_43_52_59(v: u64) -> u64 {
     let w = (v ^ (v >> 59)) & 1; // The 59th bit XOR the 0th  bit
 
     v ^ (x | (y << 19) | (z << 32) | (t << 43) | (u << 52) | (w << 59))
-}
-
-/// Function that exchanges the bits in the 32 and 63 positions
-#[inline(always)]
-pub fn swapbits3263(v: u64) -> u64 {
-    let x = ((v >> 32) ^ (v >> 63)) & 1;
-    v ^ ((x << 32) | (x << 63))
 }
 
 /// Function that cycles to the LEFT the bits in the 18, 31, 42, 51, 58, and 63 positions
@@ -645,40 +633,11 @@ impl NtHashIterator {
 mod tests {
     fn codes(seq: &[u8]) -> Vec<u8> {
         seq.iter()
-            .map(|&b| crate::bit_encoding::encode_base(b))
+            .map(|&b| crate::utils::bit_encoding::encode_base(b))
             .collect()
     }
     use super::*;
-    use crate::bit_encoding::encode_base;
-
-    #[test]
-    fn swapbits033_known_value() {
-        // Bit 0 set, bit 33 unset → should swap → only bit 33 set
-        assert_eq!(swapbits033(1), 1u64 << 33);
-        // Bit 33 set, bit 0 unset → should swap → only bit 0 set
-        assert_eq!(swapbits033(1u64 << 33), 1);
-    }
-
-    #[test]
-    fn swapbits033_roundtrip() {
-        for v in [0u64, 1, 1u64 << 33, 0xDEADBEEF, u64::MAX] {
-            assert_eq!(swapbits033(swapbits033(v)), v);
-        }
-    }
-
-    #[test]
-    fn swapbits3263_known_value() {
-        // Bit 32 set, bit 63 unset → swap → only bit 63 set
-        assert_eq!(swapbits3263(1u64 << 32), 1u64 << 63);
-        assert_eq!(swapbits3263(1u64 << 63), 1u64 << 32);
-    }
-
-    #[test]
-    fn swapbits3263_roundtrip() {
-        for v in [0u64, 1u64 << 32, 1u64 << 63, 0xDEADBEEF_CAFEBABEu64] {
-            assert_eq!(swapbits3263(swapbits3263(v)), v);
-        }
-    }
+    use crate::utils::bit_encoding::encode_base;
 
     #[test]
     fn rolling_equals_fresh() {
