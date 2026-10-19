@@ -725,18 +725,34 @@ mod tests {
     }
 
     /// A fixed floor is a ladder of one rung: counting under it keeps exactly what filtering at that
-    /// floor keeps, and no emitted window is tagged NONE.
+    /// floor keeps, and no emitted window is tagged NONE. Both keep what a plain walk over the text
+    /// keeps: every window whose k bases are all ACGT and at least Q20, counted per canonical k-mer.
     #[test]
     fn a_fixed_floor_counts_only_what_clears_it() {
+        const K: usize = 11;
         let reads = counter_test_reads();
         let qual = QualOpts {
             min_count: 2,
             min_qual: 20,
         };
-        let counts = |floors: Option<&[u8]>| -> HashMap<u64, u32> {
+        let canonical = |forward: Vec<u8>| {
+            let reverse: Vec<u8> = forward
+                .iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    b'T' => b'A',
+                    _ => panic!("only ACGT windows are admitted"),
+                })
+                .collect();
+            forward.min(reverse)
+        };
+        let counts = |floors: Option<&[u8]>| -> HashMap<Vec<u8>, u32> {
             count_text::<u64, _>(
                 &mut [reads.clone().into_iter()],
-                11,
+                K,
                 &qual,
                 floors,
                 false,
@@ -745,10 +761,41 @@ mod tests {
             .0
             .into_iter()
             .flatten()
-            .map(|(hc, info)| (hc, info.count))
+            .map(|(_, info)| {
+                // Packed k-mers are MSB-first, with A=0, C=1, T=2, and G=3. Hash
+                // canonicalisation may choose either strand, so compare ASCII canonical words.
+                let forward = (0..K)
+                    .map(|i| b"ACTG"[((info.km >> (2 * (K - i - 1))) & 3) as usize])
+                    .collect();
+                (canonical(forward), info.count)
+            })
             .collect()
         };
-        assert_eq!(counts(Some(&[20])), counts(None));
+        let fixed = counts(Some(&[20]));
+        assert_eq!(fixed, counts(None));
+
+        let mut want: HashMap<Vec<u8>, u32> = HashMap::default();
+        for (seq, q) in &reads {
+            let q = q.as_ref().expect("the fixture has qualities");
+            for (start, _) in seq.windows(K).enumerate() {
+                let window = start..start + K;
+                let clears = seq[window.clone()]
+                    .iter()
+                    .zip(&q[window.clone()])
+                    .all(|(&b, &p)| b"ACGT".contains(&b) && p - 33 >= 20);
+                if clears {
+                    *want.entry(canonical(seq[window].to_vec())).or_insert(0) += 1;
+                }
+            }
+        }
+        assert!(
+            want.values().any(|&n| n >= 2),
+            "the fixture has no repeated k-mer"
+        );
+        assert_eq!(
+            fixed, want,
+            "the counted k-mers and their counts differ from an independent walk"
+        );
     }
 
     /// The sharded, threaded counter must agree with the obvious serial one, and every k-mer must sit
@@ -830,11 +877,12 @@ mod tests {
         assert_eq!(got, bloom_shards(counter_test_reads(), 11, &qual, &ladder));
     }
 
-    /// `shard_of` must spread evenly at every shard count we can pick, since the busiest shard paces
-    /// the counting. Sharding on the raw high bits measured a 33x spread, making 16 shards act like 8.
+    /// `shard_of` must spread evenly at every shard count we can pick, from [`MIN_COUNTMAP_SHARDS`] to
+    /// [`MAX_COUNTMAP_SHARDS`], since the busiest shard paces the counting. Sharding on the raw high
+    /// bits measured a 33x spread, making 16 shards act like 8.
     #[test]
     fn shard_of_is_balanced_at_every_shard_count() {
-        for shards in [16usize, 32, 64, 128, 256] {
+        for shards in [64usize, 128, 256] {
             let mut sizes = vec![0usize; shards];
             for h in canonical_minimum_hashes(400_000) {
                 sizes[shard_of(h, shards)] += 1;
@@ -851,7 +899,8 @@ mod tests {
     }
 
     /// The store replays the reads exactly: at the ladder, as the first k counts, and at one floor, as
-    /// the recount and every later k count.
+    /// the recount and every later k count. The Bloom path is width-independent and zero-fills a large
+    /// filter per pass, so it is replayed at the `u64` width only.
     #[test]
     fn counting_the_read_store_matches_counting_the_reads() {
         // The reads three times over, so that every width can take a k from its own range.
@@ -859,13 +908,17 @@ mod tests {
             .into_iter()
             .map(|(seq, qual)| (seq.repeat(3), qual.map(|q| q.repeat(3))))
             .collect();
-        store_counts_match_text::<u64>(&reads, 11);
-        store_counts_match_text::<u128>(&reads, 41);
-        store_counts_match_text::<crate::utils::bit_encoding::U256>(&reads, 71);
-        store_counts_match_text::<crate::utils::bit_encoding::U512>(&reads, 131);
+        store_counts_match_text::<u64>(&reads, 11, &[false, true]);
+        store_counts_match_text::<u128>(&reads, 41, &[false]);
+        store_counts_match_text::<crate::utils::bit_encoding::U256>(&reads, 71, &[false]);
+        store_counts_match_text::<crate::utils::bit_encoding::U512>(&reads, 131, &[false]);
     }
 
-    fn store_counts_match_text<IntT: for<'a> UInt<'a>>(reads: &[OwnedRecord], k: usize) {
+    fn store_counts_match_text<IntT: for<'a> UInt<'a>>(
+        reads: &[OwnedRecord],
+        k: usize,
+        blooms: &[bool],
+    ) {
         let counts = |shards: Vec<CountMap<IntT>>| -> HashMap<u64, (u32, u64, u8, IntT)> {
             shards
                 .into_iter()
@@ -884,7 +937,7 @@ mod tests {
                 store.push(seq, qual.as_deref());
             }
             store.finish();
-            for do_bloom in [false, true] {
+            for &do_bloom in blooms {
                 for top in 0..ladder.len() {
                     for classify in [false, true] {
                         let floor = ladder[top];

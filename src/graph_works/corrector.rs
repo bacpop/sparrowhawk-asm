@@ -26,8 +26,7 @@ pub(crate) fn dead_end_length_nts(flat_nts: usize, kmult: f32, k: usize) -> usiz
 
 /// Mean coverage of a path, weighted by how many k-mers each node contributes.
 ///
-/// Lives here rather than in `path_correction` because that module is not compiled for wasm
-/// (`algorithms.rs:5`) while dead-end removal is, and both need the same accumulator.
+/// Shared by dead-end removal here and by `path_correction`'s bulge and connector checks.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PathCoverage {
     pub(crate) weighted_sum: u128,
@@ -63,7 +62,6 @@ pub(crate) fn path_mean_coverage(ptgraph: &DbgGraph, path: &[NodeId]) -> f64 {
 pub const DEFAULT_POP_RATIO: f32 = 0.1;
 
 /// A connector goes when its flanks carry this many times its coverage (Minia's `_ecRCTCcutoff`).
-/// Here rather than in `path_correction`: `cli` compiles for wasm and that module does not.
 pub const DEFAULT_EC_COVERAGE_RATIO: f64 = 4.0;
 
 /// A branch below this fraction of fitted single-copy coverage cannot be a copy of anything.
@@ -802,34 +800,6 @@ mod tests {
     }
 
     #[test]
-    fn a_short_dead_end_at_a_fanout_includes_and_removes_the_endpoint() {
-        let (mut graph, dead_end, fanout, _) =
-            dead_end_at_fanout(EdgeType::MinToMin, 2, 2, 1, 2, [20, 20]);
-        let mut removal_path = Vec::new();
-        let removed_by_coverage = check_dead_path(
-            &graph,
-            dead_end,
-            &mut removal_path,
-            4,
-            100,
-            2.0,
-            graph.first_outgoing_edge_type(dead_end).unwrap(),
-        );
-
-        assert!(
-            !removed_by_coverage,
-            "a short fan-out dead end is removed by length"
-        );
-        assert_eq!(removal_path, vec![dead_end, fanout]);
-        assert_eq!(removal_path.iter().filter(|&&n| n == fanout).count(), 1);
-
-        remove_paths(&mut graph, removal_path.drain(..));
-        assert!(graph.node_weight(dead_end).is_none());
-        assert!(graph.node_weight(fanout).is_none());
-        assert_eq!(graph.validate(), Ok(()));
-    }
-
-    #[test]
     fn a_fanout_dead_end_at_the_short_length_limit_is_not_removed_by_length_alone() {
         let (graph, dead_end, _, _) = dead_end_at_fanout(EdgeType::MinToMin, 3, 2, 1, 2, [40, 40]);
         let mut removal_path = Vec::new();
@@ -868,12 +838,6 @@ mod tests {
         let (removal_path, removed_by_coverage) = walk_dead_end(&graph, dead_end, 2.0);
         assert!(removal_path.is_empty());
         assert!(!removed_by_coverage);
-
-        let (graph, dead_end, _, _) =
-            dead_end_at_fanout(EdgeType::MinToMin, 12, 10, 1, 10, [19, 19]);
-        let (removal_path, removed_by_coverage) = walk_dead_end(&graph, dead_end, 2.0);
-        assert!(removal_path.is_empty());
-        assert!(!removed_by_coverage);
     }
 
     #[test]
@@ -885,6 +849,8 @@ mod tests {
         assert!(!removed_by_coverage);
     }
 
+    /// A short dead end ending at a fan-out is removed by length together with the fan-out endpoint,
+    /// once, whichever way the edge into the fan-out is oriented, and the graph stays paired.
     #[test]
     fn fanout_endpoint_removal_works_for_all_edge_orientations() {
         for edge in [
@@ -915,6 +881,10 @@ mod tests {
                 "edge orientation {edge:?}"
             );
             remove_paths(&mut graph, removal_path.drain(..));
+            assert!(
+                graph.node_weight(dead_end).is_none(),
+                "edge orientation {edge:?}"
+            );
             assert!(
                 graph.node_weight(fanout).is_none(),
                 "edge orientation {edge:?}"
@@ -995,8 +965,7 @@ mod tests {
     #[test]
     fn a_long_dead_end_survives_a_comparably_covered_junction() {
         let (graph, dead_end, _) = dead_end_at_junction(20, 20, 30);
-        let (removed, removed_by_coverage) =
-            walk_dead_end(&graph, dead_end, DEFAULT_DEAD_END_COVERAGE_RATIO);
+        let (removed, removed_by_coverage) = walk_dead_end(&graph, dead_end, 2.0);
         assert!(removed.is_empty(), "1.5x is under the 2x cutoff");
         assert!(!removed_by_coverage);
     }
@@ -1047,29 +1016,62 @@ mod tests {
     }
 
     /// A whole isolated component has no junction to be compared against, so it stays tier one's
-    /// business whatever the band is set to.
+    /// business: over the tier-one limit it is kept even inside the coverage band, and under it it
+    /// goes whole, on length.
     #[test]
-    fn an_isolated_component_is_never_judged_on_coverage() {
-        let mut graph = DbgGraph::new(3);
-        let head = graph.add_node(NodeStruct {
-            counts: 1,
-            abs_ind: vec![0; 20],
-            innerdir: None,
-        });
-        let tail = graph.add_node(NodeStruct {
-            counts: 1,
-            abs_ind: vec![0; 20],
-            innerdir: None,
-        });
-        graph.add_bi_edge(head, tail, EdgeType::MinToMin);
+    fn an_isolated_component_inside_the_coverage_band_is_judged_on_length_alone() {
+        let component = |kmers: usize| {
+            let mut graph = DbgGraph::new(3);
+            let head = graph.add_node(NodeStruct {
+                counts: 1,
+                abs_ind: vec![0; kmers],
+                innerdir: None,
+            });
+            let tail = graph.add_node(NodeStruct {
+                counts: 1,
+                abs_ind: vec![0; kmers],
+                innerdir: None,
+            });
+            graph.add_bi_edge(head, tail, EdgeType::MinToMin);
+            (graph, head, tail)
+        };
 
+        let (graph, head, _) = component(20);
         let (removed, removed_by_coverage) =
             walk_dead_end(&graph, head, DEFAULT_DEAD_END_COVERAGE_RATIO);
         assert!(
             removed.is_empty(),
-            "40 k-mers is over the tier-one limit of 10"
+            "40 k-mers is over the tier-one limit of 10, though under the band's 100"
         );
         assert!(!removed_by_coverage);
+
+        let (graph, head, tail) = component(2);
+        let (removed, removed_by_coverage) =
+            walk_dead_end(&graph, head, DEFAULT_DEAD_END_COVERAGE_RATIO);
+        assert_eq!(removed, vec![head, tail], "4 k-mers is under the limit");
+        assert!(!removed_by_coverage);
+    }
+
+    /// Coverage is weighted by the k-mers each node contributes, and a partial node counts only the
+    /// k-mers asked for.
+    #[test]
+    fn path_coverage_weights_nodes_and_partial_prefixes() {
+        let node = |counts, kmers| NodeStruct {
+            counts,
+            abs_ind: vec![0; kmers],
+            innerdir: None,
+        };
+        let short = node(10, 1);
+        let long = node(100, 9);
+        let mut coverage = PathCoverage::default();
+        coverage.add_node(&short);
+        coverage.add_node(&long);
+        assert_eq!(coverage.mean(), 91.0, "an unweighted mean would give 55");
+
+        let mut prefix = PathCoverage::default();
+        prefix.add_part(&long, 3);
+        assert_eq!(prefix.weighted_sum, 300);
+        assert_eq!(prefix.kmers, 3);
     }
 
     // ── dead_end_length_nts ───────────────────────────────────────────────────────

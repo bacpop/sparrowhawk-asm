@@ -292,6 +292,8 @@ mod tests {
     fn kmer_count_basic() {
         // 8-mer sequence with k=3 → 8-3+1 = 6 k-mers
         assert_eq!(count_kmers(b"ACGTACGT", 3), 6);
+        // seq_len = k+1: exactly two k-mers (initial + one roll)
+        assert_eq!(count_kmers(b"ACGT", 3), 2);
     }
 
     #[test]
@@ -310,12 +312,6 @@ mod tests {
         // "ANACG" k=3: the N restarts the window at idx=2, leaving a suffix of exactly k.
         // That suffix is a valid k-mer ("ACG") and must not be dropped.
         assert_eq!(count_kmers(b"ANACG", 3), 1);
-    }
-
-    #[test]
-    fn kmer_minimum_valid_length() {
-        // seq_len = k+1: exactly two k-mers (initial + one roll)
-        assert_eq!(count_kmers(b"ACGT", 3), 2);
     }
 
     #[test]
@@ -348,6 +344,7 @@ mod tests {
         bad_qual[1] = b'!';
 
         let good_count = count_kmers(seq, 3); // no quality filter → 6
+        assert_eq!(good_count, 6);
 
         let bad_count = match Kmer::<u64>::new(
             Cow::Borrowed(seq.as_slice()),
@@ -367,10 +364,8 @@ mod tests {
             }
         };
 
-        assert!(
-            bad_count < good_count,
-            "bad_count={bad_count} good_count={good_count}"
-        );
+        // Only the windows starting after the failing base survive: positions 2..=4, ..., 5..=7.
+        assert_eq!(bad_count, 4, "good_count={good_count}");
     }
 
     /// The floor is inclusive, so a read sitting exactly on it keeps every k-mer. This is the
@@ -397,7 +392,7 @@ mod tests {
     }
 
     /// `end_index` must name the last base of the current window, since Step 2 uses it to index a
-    /// per-position array of floors.
+    /// per-position array of floors, including after an N restarts the window.
     #[test]
     fn end_index_lines_up_with_the_window() {
         let seq = b"ACGTACGTACGT";
@@ -407,6 +402,17 @@ mod tests {
         assert_eq!(it.end_index() + 1 - k, 0);
         it.get_next_hash_and_bases().unwrap();
         assert_eq!(it.end_index() + 1 - k, 1);
+
+        // The N at position 4 ends the windows starting at 0 and 1; the next one starts at 5.
+        let seq = b"ACGTNACGTAC";
+        let k = 3;
+        let mut it =
+            Kmer::<u64>::new(Cow::Borrowed(seq.as_slice()), seq.len(), None, k, 0, true).unwrap();
+        let mut starts = vec![it.end_index() + 1 - k];
+        while it.get_next_hash_and_bases().is_some() {
+            starts.push(it.end_index() + 1 - k);
+        }
+        assert_eq!(starts, [0, 1, 5, 6, 7, 8]);
     }
 
     /// Test to see if the u8 store the first and last bases as they should

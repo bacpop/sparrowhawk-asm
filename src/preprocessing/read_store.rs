@@ -476,13 +476,13 @@ mod tests {
             }
         }
     }
+    /// Replay admits what the text iterator admits at every rung of a ladder, and at a fixed floor,
+    /// which stores the bases below it as unusable.
     #[test]
     fn replay_admits_the_same_kmers_at_every_floor() {
-        check(&[0, 11, 25]);
-    }
-    #[test]
-    fn a_fixed_floor_replays_what_the_iterator_keeps() {
-        check(&[20]);
+        for floors in [&[0, 11, 25][..], &[20]] {
+            check(floors);
+        }
     }
 
     #[test]
@@ -655,15 +655,25 @@ mod tests {
             check::<U512>(k);
         }
     }
+    /// Two-bit storage cannot mark a base unusable, so an N or any other IUPAC symbol is refused, naming
+    /// the read and the base.
     #[test]
-    #[should_panic(expected = "two-bit read 1, base 3")]
-    fn two_bit_reads_reject_ns() {
-        ReadStore::new(&[0], true).push(b"ACNTA", None);
-    }
-    #[test]
-    #[should_panic(expected = "non-ACGT")]
-    fn two_bit_reads_reject_other_iupac() {
-        ReadStore::new(&[0], true).push(b"ACrTA", None);
+    fn two_bit_reads_reject_ns_and_other_iupac() {
+        for symbol in *b"Nr" {
+            let read = [b'A', b'C', symbol, b'T', b'A'];
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ReadStore::new(&[0], true).push(&read, None);
+            }))
+            .expect_err("a non-ACGT symbol must be refused");
+            let message = panic
+                .downcast_ref::<String>()
+                .expect("the panic carries a formatted message");
+            assert!(
+                message.contains("two-bit read 1, base 3: non-ACGT"),
+                "{}: {message}",
+                char::from(symbol)
+            );
+        }
     }
     #[test]
     fn packed_reads_keep_exact_k_suffixes_after_unusable_bases() {

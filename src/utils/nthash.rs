@@ -631,61 +631,76 @@ impl NtHashIterator {
 // ==================================================================
 #[cfg(test)]
 mod tests {
-    fn codes(seq: &[u8]) -> Vec<u8> {
-        seq.iter()
-            .map(|&b| crate::utils::bit_encoding::encode_base(b))
+    use super::*;
+
+    /// Odd k across the whole supported range, including both ends and every packing width's edge.
+    const KS: [usize; 6] = [3, 21, 31, 63, 127, 255];
+
+    /// Random two-bit base codes from a xorshift64, reproducible without pulling in an rng crate.
+    fn random_codes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8 & 3
+            })
             .collect()
     }
-    use super::*;
-    use crate::utils::bit_encoding::encode_base;
 
-    #[test]
-    fn rolling_equals_fresh() {
-        // Roll from seq[0..k] by one position; should equal fresh iterator on seq[1..k+1]
-        let seq = b"ACGTACGT";
-        let k = 4;
-        let mut it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
-        // roll_fwd takes encoded bases, not ASCII
-        it.roll_fwd(encode_base(seq[0]), encode_base(seq[k]));
-        let rolled = it.canonical_hash();
-        let fresh = NtHashIterator::new(&codes(&seq[1..k + 1]), k, true).canonical_hash();
-        assert_eq!(rolled, fresh);
+    /// The reverse complement of a sequence of two-bit codes.
+    fn rc_codes(codes: &[u8]) -> Vec<u8> {
+        codes.iter().rev().map(|&c| rc_base(c)).collect()
     }
 
+    /// The canonical hash of every k-window of `codes`, rolled.
+    fn rolled_canonical(codes: &[u8], k: usize) -> Vec<u64> {
+        let mut it = NtHashIterator::new(codes, k, true);
+        let mut out = vec![it.canonical_hash()];
+        for i in k..codes.len() {
+            it.roll_fwd(codes[i - k], codes[i]);
+            out.push(it.canonical_hash());
+        }
+        out
+    }
+
+    /// Rolling must land on exactly the hashes a fresh iterator computes for every window, and on
+    /// each strand separately: comparing only the canonical (minimum) hash would let a broken
+    /// reverse hash hide behind a smaller forward one.
     #[test]
     fn rolling_all_windows() {
-        // All rolling windows must equal fresh iterators on the same window
-        let seq = b"ACGTACGT";
-        let k = 4;
-        let mut it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
-        for i in 1..=(seq.len() - k) {
-            it.roll_fwd(encode_base(seq[i - 1]), encode_base(seq[i + k - 1]));
-            let fresh = NtHashIterator::new(&codes(&seq[i..i + k]), k, true).canonical_hash();
-            assert_eq!(it.canonical_hash(), fresh, "window {i} mismatch");
+        for (n, k) in KS.into_iter().enumerate() {
+            let codes = random_codes(k + 300, 0x9E37_79B9_7F4A_7C15 ^ n as u64);
+            let mut it = NtHashIterator::new(&codes, k, true);
+            for i in 1..=(codes.len() - k) {
+                it.roll_fwd(codes[i - 1], codes[i + k - 1]);
+                let fresh = NtHashIterator::new(&codes[i..i + k], k, true);
+                assert_eq!(it.fh, fresh.fh, "k={k}, window {i}: forward hash");
+                assert_eq!(it.rh, fresh.rh, "k={k}, window {i}: reverse hash");
+            }
         }
     }
 
+    /// A k-mer and its reverse complement are the same canonical k-mer, so they must hash alike:
+    /// window `i` of a sequence and the mirrored window of its reverse complement. The forward hash
+    /// of one is the reverse hash of the other.
     #[test]
-    fn canonical_hash_is_minimum() {
-        let seq = b"ACGTACGT";
-        let k = 4;
-        let it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
-        let (canonical, nc, _is_rc) = it.hashes_and_order();
-        assert!(canonical <= nc);
-        assert_eq!(it.canonical_hash(), canonical);
-    }
+    fn canonical_hash_is_strand_invariant() {
+        for (n, k) in KS.into_iter().enumerate() {
+            let codes = random_codes(k + 300, 0xD1B5_4A32_D192_ED03 ^ n as u64);
+            let rc = rc_codes(&codes);
+            let forward = rolled_canonical(&codes, k);
+            let reverse = rolled_canonical(&rc, k);
+            assert_eq!(forward.len(), reverse.len());
+            for (i, &hash) in forward.iter().enumerate() {
+                assert_eq!(hash, reverse[forward.len() - 1 - i], "k={k}, window {i}");
+            }
 
-    #[test]
-    fn is_rc_flag_consistent() {
-        let seq = b"ACGTACGT";
-        let k = 4;
-        let it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
-        let (canonical, _nc, is_rc) = it.hashes_and_order();
-        // is_rc == true means the rc hash is smaller (i.e. canonical == rc hash)
-        if is_rc {
-            assert_eq!(canonical, it.rh.unwrap());
-        } else {
-            assert_eq!(canonical, it.fh);
+            let window = NtHashIterator::new(&codes[..k], k, true);
+            let mirrored = NtHashIterator::new(&rc[rc.len() - k..], k, true);
+            assert_eq!(Some(window.fh), mirrored.rh, "k={k}");
+            assert_eq!(window.rh, Some(mirrored.fh), "k={k}");
         }
     }
 }

@@ -186,8 +186,12 @@ mod tests {
         }
     }
 
+    /// The whole ladder rule: the strict rung is the first bin at or above the default; the loose
+    /// rung is the highest bin above `MIN_LOOSE_FLOOR` and at least `MIN_RUNG_GAP` under the strict
+    /// one, merged into floor 0 when no call sits below it; one value, or none under the strict
+    /// rung, leaves floor 0 alone.
     #[test]
-    fn floors_from_caps_the_loose_floor() {
+    fn floors_from_builds_the_strict_loose_and_merged_rungs() {
         // Gaps of 14, 12 and 7 all clear MIN_RUNG_GAP, so each keeps its middle rung.
         assert_eq!(floors_from(&[2, 11, 25, 37], 20), vec![0, 11, 25]);
         assert_eq!(floors_from(&[2, 12, 24, 40], 20), vec![0, 12, 24]);

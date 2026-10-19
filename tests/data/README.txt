@@ -12,5 +12,5 @@ ecoli_window_1.fastq.gz, ecoli_window_2.fastq.gz
 
 Expected contigs
   sparrowhawk-asm ecoli_window_1.fastq.gz ecoli_window_2.fastq.gz --threads 2 --no-graphs
-  --no-histo (CLI defaults otherwise): FASTA at 80 bases per line, md5
-  6ec5c2b95ed2080067608ae058d12a77.
+  --no-histo (CLI defaults otherwise): a single 20,629 bp contig, as FASTA at 80 bases per line
+  with md5 6ec5c2b95ed2080067608ae058d12a77. The test checks both.

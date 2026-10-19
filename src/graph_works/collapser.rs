@@ -324,7 +324,8 @@ mod tests {
         let contigs = contigs_from_intermediate_vertex(&mut g, v);
 
         assert_eq!(contigs.len(), 1);
-        assert_eq!(contigs[0].len(), 2);
+        let walked: Vec<_> = contigs[0].iter().map(|n| n.abs_ind.clone()).collect();
+        assert_eq!(walked, vec![vec![0], vec![1]], "the walk runs from v to w");
         assert_eq!(g.node_count(), 0);
     }
 
@@ -341,50 +342,39 @@ mod tests {
         assert_eq!(g.node_count(), 0);
     }
 
-    /// External walks end at a branching junction and emit it as its own contig.
+    /// External and intermediate walks alike end at a branching junction and emit it as its own
+    /// contig, leaving the branches beyond it in the graph.
     #[test]
-    fn external_walk_keeps_a_branching_junction_as_its_own_contig() {
-        let mut g = DbgGraph::new(3);
-        let start = g.add_node(node(0));
-        let junction = g.add_node(node(1));
-        let branch_a = g.add_node(node(2));
-        let branch_b = g.add_node(node(3));
+    fn both_walks_keep_a_branching_junction_as_its_own_contig() {
+        type Walker = fn(&mut DbgGraph, NodeId) -> SerializedContigs;
+        let walkers: [(&str, Walker); 2] = [
+            ("external", contigs_from_vertex),
+            ("intermediate", contigs_from_intermediate_vertex),
+        ];
+        for (name, walk) in walkers {
+            let mut g = DbgGraph::new(3);
+            let start = g.add_node(node(0));
+            let junction = g.add_node(node(1));
+            let branch_a = g.add_node(node(2));
+            let branch_b = g.add_node(node(3));
 
-        g.add_bi_edge(start, junction, EdgeType::MinToMin);
-        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
-        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
+            g.add_bi_edge(start, junction, EdgeType::MinToMin);
+            g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
+            g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
 
-        let contigs = contigs_from_vertex(&mut g, start);
+            let contigs = walk(&mut g, start);
 
-        assert_eq!(contigs.len(), 2);
-        assert_eq!(contigs[0].len(), 1);
-        assert_eq!(contigs[0][0].abs_ind, vec![0]);
-        assert_eq!(contigs[1].len(), 1);
-        assert_eq!(contigs[1][0].abs_ind, vec![1]);
-        assert!(!g.contains_node(junction));
-    }
-
-    /// Intermediate walks apply the same junction rule as external walks.
-    #[test]
-    fn intermediate_walk_keeps_a_branching_junction_as_its_own_contig() {
-        let mut g = DbgGraph::new(3);
-        let start = g.add_node(node(0));
-        let junction = g.add_node(node(1));
-        let branch_a = g.add_node(node(2));
-        let branch_b = g.add_node(node(3));
-
-        g.add_bi_edge(start, junction, EdgeType::MinToMin);
-        g.add_bi_edge(junction, branch_a, EdgeType::MinToMin);
-        g.add_bi_edge(junction, branch_b, EdgeType::MinToMin);
-
-        let contigs = contigs_from_intermediate_vertex(&mut g, start);
-
-        assert_eq!(contigs.len(), 2);
-        assert_eq!(contigs[0].len(), 1);
-        assert_eq!(contigs[0][0].abs_ind, vec![0]);
-        assert_eq!(contigs[1].len(), 1);
-        assert_eq!(contigs[1][0].abs_ind, vec![1]);
-        assert!(!g.contains_node(junction));
+            assert_eq!(contigs.len(), 2, "{name} walk");
+            assert_eq!(contigs[0].len(), 1, "{name} walk");
+            assert_eq!(contigs[0][0].abs_ind, vec![0], "{name} walk");
+            assert_eq!(contigs[1].len(), 1, "{name} walk");
+            assert_eq!(contigs[1][0].abs_ind, vec![1], "{name} walk");
+            assert!(!g.contains_node(junction), "{name} walk");
+            assert!(
+                g.contains_node(branch_a) && g.contains_node(branch_b),
+                "{name} walk"
+            );
+        }
     }
 
     /// Pre-collapse junction erasure removes the junction and its incident edges only, and returns it.

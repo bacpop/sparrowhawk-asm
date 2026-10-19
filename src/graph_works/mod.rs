@@ -213,7 +213,12 @@ mod tests {
     use super::*;
     use crate::preprocessing::kmer::Kmer;
     use nohash_hasher::NoHashHasher;
-    use std::{borrow::Cow, collections::HashMap, hash::BuildHasherDefault};
+    use sparrowhawk_graph::{EdgeType, NodeStruct};
+    use std::{
+        borrow::Cow,
+        collections::{HashMap, HashSet},
+        hash::BuildHasherDefault,
+    };
 
     /// The packed k-mers of `seq`, and the `IndexedKmers` preprocessing would build from them.
     #[allow(clippy::type_complexity)]
@@ -303,11 +308,171 @@ mod tests {
         h
     }
 
-    /// Every edge in a real graph joins two k-mers that genuinely overlap by `k-1`.
+    /// The two-bit codes a node reads as when entered on `carry`. A lone k-mer's carry is its
+    /// strand outright: `Min` is the stored (canonical) k-mer and `Max` its reverse complement. A
+    /// shrunk node's carry picks the order of its k-mers, and that order fixes the strand it spells.
+    fn strand_codes(
+        g: &DbgGraph,
+        packed: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        n: sparrowhawk_graph::NodeId,
+        carry: sparrowhawk_graph::CarryType,
+        k: usize,
+    ) -> Vec<u8> {
+        let h = oriented(g, n, carry);
+        if h.len() == 1 {
+            let kmer = packed[&h[0]];
+            let kmer = match carry {
+                sparrowhawk_graph::CarryType::Min => kmer,
+                sparrowhawk_graph::CarryType::Max => kmer.rev_comp(k),
+            };
+            (0..k).map(|i| kmer.get_one_code(k - 1 - i)).collect()
+        } else {
+            crate::graph_works::spelling::spell_path(&h, |hash| packed.get(&hash).copied(), k)
+                .unwrap_or_else(|e| panic!("node {n:?} on {carry:?} is not a walk: {e}"))
+        }
+    }
+
+    /// Reproducible DNA without prescribing which canonical strand each k-mer uses.
+    fn round_trip_sequence(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[((state >> 33) & 3) as usize]
+            })
+            .collect()
+    }
+
+    fn reverse_complement(seq: &[u8]) -> Vec<u8> {
+        seq.iter()
+            .rev()
+            .map(|base| match base {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                b'T' => b'A',
+                _ => panic!("the fixture contains only ACGT"),
+            })
+            .collect()
+    }
+
+    /// Exercise the same three operations as assembly, keeping the walk as well as its bases
+    /// available to the independent sequence/order assertions below.
+    fn collapse_and_spell(
+        graph: DbgGraph,
+        packed: &HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>,
+        k: usize,
+    ) -> (Vec<u64>, Vec<u8>) {
+        let mut contigs = Contigs::new(graph.collapse());
+        assert_eq!(contigs.serialized_contigs.len(), 1, "one complete contig");
+        let before_shrink: Vec<_> = contigs.serialized_contigs[0]
+            .iter()
+            .flat_map(|node| node.abs_ind.iter().copied())
+            .collect();
+        contigs.shrink();
+        assert_eq!(contigs.serialized_contigs[0].len(), 1);
+        let walk = contigs.serialized_contigs[0][0].abs_ind.clone();
+        assert_eq!(
+            walk, before_shrink,
+            "shrinking preserves the collapsed walk"
+        );
+        let spelled = spelling::spell_contigs(&contigs, |hash| packed.get(&hash).copied(), k);
+        assert_eq!(spelled.len(), 1);
+        let bases = spelled.iter().next().unwrap().ascii();
+        (walk, bases)
+    }
+
+    /// A circle has neither an external start nor a preferred rotation or strand. Collapse must
+    /// still emit every k-mer once, with the closing k-1 overlap present in its spelled sequence.
+    #[test]
+    fn collapse_shrink_and_spell_round_trips_a_cycle() {
+        let k = 15;
+        let seq = round_trip_sequence(400);
+        let mut closed = seq.clone();
+        closed.extend_from_slice(&seq[..k - 1]);
+        let (packed, graph) = indexed_graph(&closed, k);
+        assert_eq!(packed.len(), seq.len(), "the circle has no repeated k-mers");
+        assert!(graph.externals_bi().is_empty(), "a true circle has no ends");
+
+        let (walk, spelled) = collapse_and_spell(graph, &packed, k);
+        assert_eq!(walk.len(), seq.len());
+        assert_eq!(
+            walk.into_iter().collect::<HashSet<_>>(),
+            packed.keys().copied().collect(),
+            "every circular k-mer appears exactly once"
+        );
+        assert_eq!(spelled.len(), seq.len() + k - 1);
+        assert_eq!(spelled[..k - 1], spelled[seq.len()..]);
+        let doubled = [seq.as_slice(), seq.as_slice()].concat();
+        let reverse = reverse_complement(&doubled);
+        let core = &spelled[..seq.len()];
+        assert!(
+            doubled.windows(seq.len()).any(|window| window == core)
+                || reverse.windows(seq.len()).any(|window| window == core),
+            "the circle's bases are preserved up to rotation and reverse complement"
+        );
+    }
+
+    /// The middle node is stored backwards. Following its Max carry must reverse its k-mer order
+    /// before it can be joined to its flanks; merely concatenating stored node payloads cannot pass.
+    #[test]
+    fn collapse_shrink_and_spell_handles_walks_against_innerdir() {
+        let k = 15;
+        let seq = round_trip_sequence(180);
+        let (packed, _) = build_indexed(&seq, k);
+        let mut kmers = Kmer::<u64>::new(Cow::Borrowed(&seq), seq.len(), None, k, 0, true).unwrap();
+        let mut walk = vec![kmers.get_hashes_and_bases_and_kmer().0];
+        while let Some((hash, _, _, _)) = kmers.get_next_kmer() {
+            walk.push(hash);
+        }
+        assert_eq!(packed.len(), walk.len(), "the fixture has unique k-mers");
+        let reverse_walk: Vec<_> = walk.iter().rev().copied().collect();
+        let split = walk.len() / 3;
+        let stored = [
+            walk[..split].to_vec(),
+            walk[split..2 * split].iter().rev().copied().collect(),
+            walk[2 * split..].to_vec(),
+        ];
+        let uncorrected: Vec<_> = stored.iter().flatten().copied().collect();
+        assert_ne!(uncorrected, walk);
+        assert_ne!(uncorrected, reverse_walk);
+
+        for order in [[0, 1, 2], [2, 1, 0]] {
+            let mut graph = DbgGraph::new(k);
+            let mut ids = [None; 3];
+            for i in order {
+                ids[i] = Some(graph.add_node(NodeStruct {
+                    counts: 10,
+                    abs_ind: stored[i].clone(),
+                    innerdir: Some(EdgeType::MinToMin),
+                }));
+            }
+            let [a, b, c] = ids.map(Option::unwrap);
+            graph.add_bi_edge(a, b, EdgeType::MinToMax);
+            graph.add_bi_edge(b, c, EdgeType::MaxToMin);
+
+            let (collapsed, spelled) = collapse_and_spell(graph, &packed, k);
+            assert!(
+                collapsed == walk || collapsed == reverse_walk,
+                "order {order:?}"
+            );
+            assert_eq!(spelled.len(), seq.len(), "both terminal k-mers survive");
+            assert!(
+                spelled == seq || spelled == reverse_complement(&seq),
+                "order {order:?}: spelling preserves the complete sequence"
+            );
+        }
+    }
+
+    /// Every edge in a real graph joins two k-mers that genuinely overlap by `k-1`, in the strands its
+    /// type names: the source read on its carry ends with the `k-1` bases the target, read on its
+    /// own, starts with. Letting `spell_path` choose a strand would also accept an edge whose type is
+    /// wrong.
     #[test]
     fn every_edge_is_a_valid_k_minus_one_junction() {
         use crate::graph_works::shrinker::Shrinkable;
-        use crate::graph_works::spelling::spell_path;
 
         let k = 15;
         let seq = seq_with_repeat(k);
@@ -317,55 +482,18 @@ mod tests {
 
         let mut checked = 0usize;
         for n in g.node_indices().collect::<Vec<_>>() {
-            // The node's own k-mers must be a walk.
-            for carry in [
-                sparrowhawk_graph::CarryType::Min,
-                sparrowhawk_graph::CarryType::Max,
-            ] {
-                let h = oriented(&g, n, carry);
-                if h.len() > 1 {
-                    spell_path(&h, |hash| packed.get(&hash).copied(), k)
-                        .unwrap_or_else(|e| panic!("node {n:?} on {carry:?} is not a walk: {e}"));
-                }
-            }
-            // And each outgoing edge must join two overlapping k-mers.
             for (m, et) in g.outgoing_edges(n) {
                 let (sc, tc) = et.get_from_and_to();
-                let from = *oriented(&g, n, sc).last().unwrap();
-                let to = oriented(&g, m, tc)[0];
-                spell_path(&[from, to], |hash| packed.get(&hash).copied(), k).unwrap_or_else(|e| {
-                    panic!("edge {n:?} -{et:?}-> {m:?} is not a k-1 junction: {e}")
-                });
+                let from = strand_codes(&g, &packed, n, sc, k);
+                let to = strand_codes(&g, &packed, m, tc, k);
+                assert_eq!(
+                    from[from.len() - (k - 1)..],
+                    to[..k - 1],
+                    "edge {n:?} -{et:?}-> {m:?} is not a k-1 junction in the strands it names"
+                );
                 checked += 1;
             }
         }
         assert!(checked > 0, "the test graph has no edges to check");
-    }
-
-    /// The companion to the above: a link that is *not* a valid junction is detected. Without this,
-    /// the test above could pass vacuously if `spell_path` accepted anything.
-    #[test]
-    fn a_fabricated_link_fails_the_junction_check() {
-        use crate::graph_works::spelling::{spell_path, SpellError};
-
-        let k = 15;
-        let seq = seq_with_repeat(k);
-        let (packed, g) = indexed_graph(&seq, k);
-
-        // Two k-mers from far-apart positions cannot overlap by k-1.
-        let all: Vec<u64> = g
-            .node_indices()
-            .map(|n| g.node_weight(n).unwrap().abs_ind[0])
-            .collect();
-        assert!(all.len() > 100);
-        assert_eq!(
-            spell_path(
-                &[all[0], all[all.len() - 1]],
-                |hash| packed.get(&hash).copied(),
-                k
-            ),
-            Err(SpellError::NotAWalk { index: 1 }),
-            "an invented junction must be rejected"
-        );
     }
 }

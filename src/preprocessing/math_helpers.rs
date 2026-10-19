@@ -194,15 +194,39 @@ mod tests {
     use super::*;
     use crate::preprocessing::models::*;
 
+    /// The negative binomial is a distribution with the mean it is given and `dispersion` times that
+    /// as its variance, both just past the Poisson switch and well above it. Just past the switch it
+    /// must also stay close to the Poisson, or the limit is discontinuous.
     #[test]
-    fn fit_matches_poisson_when_dispersion_is_one() {
-        for x in [0.0, 1.0, 5.0, 40.0] {
-            let nb = ln_dnbinom(x, 20.0, 1.0);
-            let po = ln_dpois(x, 20.0);
-            assert!((nb - po).abs() < 1e-9, "x={x}: {nb} vs {po}");
+    fn the_negative_binomial_has_its_moments_and_tends_to_the_poisson() {
+        let mean = 20.0;
+        for dispersion in [1.001, 3.0] {
+            let (mut total, mut first, mut second) = (0.0, 0.0, 0.0);
+            for x in 0..=1_000 {
+                let x = f64::from(x);
+                let p = ln_dnbinom(x, mean, dispersion).exp();
+                total += p;
+                first += x * p;
+                second += x * x * p;
+            }
+            let variance = second - first * first;
+            assert!(
+                (total - 1.0).abs() < 1e-9,
+                "dispersion {dispersion}: mass {total}"
+            );
+            assert!(
+                (first - mean).abs() < 1e-7,
+                "dispersion {dispersion}: mean {first}"
+            );
+            assert!(
+                (variance / (dispersion * mean) - 1.0).abs() < 1e-7,
+                "dispersion {dispersion}: variance {variance}"
+            );
         }
-        // Just past the switch the two must still be close, or the limit is discontinuous.
-        assert!((ln_dnbinom(5.0, 20.0, 1.001) - ln_dpois(5.0, 20.0)).abs() < 0.05);
+        for x in [0.0, 1.0, 5.0, 20.0, 40.0] {
+            let (nb, po) = (ln_dnbinom(x, 20.0, 1.001), ln_dpois(x, 20.0));
+            assert!((nb - po).abs() < 0.05, "x={x}: {nb} vs {po}");
+        }
     }
 
     /// A(1, 1) beta-binomial is uniform over its trials, and any beta-binomial sums to one.

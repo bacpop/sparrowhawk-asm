@@ -225,20 +225,30 @@ mod tests {
         assert_eq!(write_fasta(&packed, 501, &mut Vec::new()).unwrap(), 0);
     }
 
-    /// Headers are the contigs' indices, and sequences wrap every `FASTA_LINE_WIDTH` bases.
+    /// Headers are the contigs' indices, and sequences wrap every `FASTA_LINE_WIDTH` bases. Mixed
+    /// bases, with a period coprime to the width, so a line that was shifted, dropped or repeated
+    /// cannot look the same as the right one.
     #[test]
     fn fasta_wraps_sequences_at_the_line_width() {
-        let seqs = vec![
-            vec![b'A'; 2 * FASTA_LINE_WIDTH + 5],
-            vec![b'C'; FASTA_LINE_WIDTH],
-        ];
+        let mixed = |len: usize, offset: usize| -> String {
+            (0..len)
+                .map(|i| b"ACGTTGCAAGC"[(i + offset) % 11] as char)
+                .collect()
+        };
+        let first = mixed(2 * FASTA_LINE_WIDTH + 5, 0);
+        let second = mixed(FASTA_LINE_WIDTH, 3);
+        let seqs = vec![first.clone().into_bytes(), second.clone().into_bytes()];
         let mut out = Vec::new();
         write_fasta(&packed(&seqs), 0, &mut out).unwrap();
-        let a = "A".repeat(FASTA_LINE_WIDTH);
-        let c = "C".repeat(FASTA_LINE_WIDTH);
+        let w = FASTA_LINE_WIDTH;
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            format!(">0\n{a}\n{a}\nAAAAA\n>1\n{c}\n")
+            format!(
+                ">0\n{}\n{}\n{}\n>1\n{second}\n",
+                &first[..w],
+                &first[w..2 * w],
+                &first[2 * w..]
+            )
         );
     }
 }

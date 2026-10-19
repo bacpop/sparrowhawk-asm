@@ -272,18 +272,28 @@ mod tests {
         sketch.shrink();
         sketch.shrink();
         let sampled = &sketch.spectra(1)[0];
-        let (ft, st) = (
-            full[9..60].iter().sum::<u32>(),
-            sampled[9..60].iter().sum::<u32>(),
-        );
+        let (ft, st) = (full.iter().sum::<u32>(), sampled.iter().sum::<u32>());
         assert!(st > 0, "the sample is empty");
-        // The whole spectrum lives in counts 10..49 in both, and the valley/genomic peak structure is identical.
         assert_eq!(ft, 60_000);
         let rescaled = st as f64 / sketch.fraction();
         assert!(
             (rescaled / ft as f64 - 1.0).abs() < 0.1,
             "rescaled {rescaled:.0} against {ft}"
         );
+        // Bin by bin, the sample is the full spectrum scaled down: empty where it is empty, and each of
+        // the 1,500-k-mer bins at counts 10..=49 within 15 % (about five standard errors) of its share.
+        for (i, (&f, &s)) in full.iter().zip(sampled.iter()).enumerate() {
+            if f == 0 {
+                assert_eq!(s, 0, "count {} is empty in the full spectrum", i + 1);
+            } else {
+                let ratio = s as f64 / (f as f64 * sketch.fraction());
+                assert!(
+                    (ratio - 1.0).abs() < 0.15,
+                    "count {}: sampled {s} of {f}, ratio {ratio:.3}",
+                    i + 1
+                );
+            }
+        }
     }
 
     /// Rescaling moves bin heights, never the counts they sit at: the hole guard reads the heights,

@@ -644,21 +644,6 @@ mod tests {
     }
 
     #[test]
-    fn path_coverage_weights_nodes_and_partial_prefixes() {
-        let short = node(1, 10, 1);
-        let long = node(10, 100, 9);
-        let mut coverage = PathCoverage::default();
-        coverage.add_node(&short);
-        coverage.add_node(&long);
-        assert_eq!(coverage.mean(), 91.0);
-
-        let mut prefix = PathCoverage::default();
-        prefix.add_part(&long, 3);
-        assert_eq!(prefix.weighted_sum, 300);
-        assert_eq!(prefix.kmers, 3);
-    }
-
-    #[test]
     fn simple_bulge_is_removed_in_all_orientations() {
         for edge in [
             EdgeType::MinToMin,
@@ -684,27 +669,37 @@ mod tests {
         }
     }
 
+    /// Each bulge is found once from each strand, and the two finds collapse into one. The internal
+    /// nodes hold several k-mers, so the reverse strand reads them backwards and only
+    /// `canonical_signature` can tell the two finds are the same path.
     #[test]
     fn reverse_strand_candidates_are_deduplicated() {
         let mut graph = DbgGraph::new(31);
         let start = graph.add_node(node(1, 20, 1));
-        let weak = graph.add_node(node(10, 1, 1));
-        let strong = graph.add_node(node(20, 20, 1));
+        let weak = graph.add_node(node(10, 1, 3));
+        let strong = graph.add_node(node(20, 20, 3));
         let exit = graph.add_node(node(30, 20, 1));
         add_path(&mut graph, start, &[weak], exit, EdgeType::MinToMin);
         add_path(&mut graph, start, &[strong], exit, EdgeType::MinToMin);
 
         let max_length = bulge_max_kmers(graph.k());
+        let mut raw = HashSet::new();
         let mut unique = HashSet::new();
         let mut oriented = 0;
         for (entrance, first, edge, _) in candidate_order(&graph) {
             if let Some(candidate) = build_candidate(&graph, entrance, first, edge, max_length) {
                 oriented += 1;
+                raw.insert(candidate.signature);
                 unique.insert(candidate.canonical);
             }
         }
         assert_eq!(oriented, 4);
-        assert_eq!(unique.len(), 2);
+        assert_eq!(raw.len(), 4, "each strand reads the path differently");
+        assert_eq!(
+            unique,
+            HashSet::from([vec![10, 11, 12], vec![20, 21, 22]]),
+            "one canonical signature per bulge"
+        );
     }
 
     #[test]
@@ -785,79 +780,190 @@ mod tests {
         assert_paired(&graph);
     }
 
-    fn ordered_bulge(reverse: bool) -> DbgGraph {
+    /// Three routes from `start` (hash 1) to `exit` (60): `x` (hash 10, 1x, 1 k-mer), `y` (20, 3x, 4
+    /// k-mers) and `z` (40, 9x, 7 k-mers). Only `y` is near enough `x`'s length to be its
+    /// alternative, and `y`'s best is `z`, so popping `y` before `x` is judged leaves `x` with
+    /// nothing to be judged against: the outcome depends on the order candidates are taken in.
+    /// Nodes and edges go in forwards or backwards.
+    fn competing_bulges(reverse: bool) -> (DbgGraph, std::collections::HashMap<u64, NodeId>) {
         let mut graph = DbgGraph::new(31);
-        let specs = [(1, 20), (10, 1), (20, 20), (30, 20)];
-        let mut ids = std::collections::HashMap::new();
-        let iter: Box<dyn Iterator<Item = &(u64, u32)>> = if reverse {
-            Box::new(specs.iter().rev())
-        } else {
-            Box::new(specs.iter())
-        };
-        for &(hash, count) in iter {
-            ids.insert(hash, graph.add_node(node(hash, count, 1)));
+        let mut specs = vec![(1, 20, 1), (10, 1, 1), (20, 3, 4), (40, 9, 7), (60, 20, 1)];
+        let mut routes = vec![10, 20, 40];
+        if reverse {
+            specs.reverse();
+            routes.reverse();
         }
-        let paths = [[10], [20]];
-        let path_iter: Box<dyn Iterator<Item = &[u64; 1]>> = if reverse {
-            Box::new(paths.iter().rev())
-        } else {
-            Box::new(paths.iter())
-        };
-        for path in path_iter {
+        let mut ids = std::collections::HashMap::new();
+        for (hash, count, length) in specs {
+            ids.insert(hash, graph.add_node(node(hash, count, length)));
+        }
+        for route in routes {
             add_path(
                 &mut graph,
                 ids[&1],
-                &[ids[&path[0]]],
-                ids[&30],
+                &[ids[&route]],
+                ids[&60],
                 EdgeType::MinToMin,
             );
         }
-        graph
+        (graph, ids)
     }
 
+    /// Candidates are taken in an order fixed by their hashes, never by how the graph was built.
+    /// The fixture is one where the order matters: `x` goes only if it is judged while `y` stands.
     #[test]
     fn correction_is_independent_of_node_and_edge_insertion_order() {
-        let mut forward = ordered_bulge(false);
-        let mut reverse = ordered_bulge(true);
-        assert!(remove_bulges(&mut forward, 0.1, &CoverageRef::unknown()));
-        assert!(remove_bulges(&mut reverse, 0.1, &CoverageRef::unknown()));
-        assert_eq!(hashes(&forward), hashes(&reverse));
+        let (mut forward, _) = competing_bulges(false);
+        let (mut reverse, _) = competing_bulges(true);
+        assert!(remove_bulges(&mut forward, 0.5, &CoverageRef::unknown()));
+        assert!(remove_bulges(&mut reverse, 0.5, &CoverageRef::unknown()));
+        let survivors: Vec<u64> = [1].into_iter().chain(40..47).chain([60]).collect();
+        assert_eq!(hashes(&forward), survivors, "x, then y, are popped");
+        assert_eq!(hashes(&reverse), survivors, "whatever the insertion order");
         assert_paired(&forward);
         assert_paired(&reverse);
+
+        // The order does matter here: with `y` gone first, `x` has no alternative and stays.
+        let (mut y_first, ids) = competing_bulges(false);
+        y_first.remove_node(ids[&20]);
+        assert!(!remove_bulges(&mut y_first, 0.5, &CoverageRef::unknown()));
+        assert!(y_first.contains_node(ids[&10]));
     }
 
+    /// Whether the one-node path `entrance -> first -> exit` would be popped against its best
+    /// alternative at `pop_ratio`, were it accepted as a candidate at all.
+    fn would_pop(
+        graph: &DbgGraph,
+        entrance: OrientedNode,
+        first: OrientedNode,
+        exit: OrientedNode,
+        pop_ratio: f32,
+    ) -> bool {
+        let weight = graph.node_weight(first.node).unwrap();
+        let mut coverage = PathCoverage::default();
+        coverage.add_node(weight);
+        let signature = oriented_hashes(graph, first);
+        let candidate = Candidate {
+            entrance,
+            first,
+            first_edge: EdgeType::from_carrytypes(entrance.carry, first.carry),
+            internal: vec![first],
+            exit,
+            last_edge: EdgeType::from_carrytypes(first.carry, exit.carry),
+            coverage,
+            length: weight.abs_ind.len(),
+            canonical: canonical_signature(&signature),
+            signature,
+        };
+        match find_alternative(graph, &candidate) {
+            AlternativeSearch::Complete(Some(alternative))
+            | AlternativeSearch::Capped(Some(alternative)) => should_delete(
+                coverage.mean(),
+                alternative.coverage.mean(),
+                pop_ratio,
+                &CoverageRef::unknown(),
+            ),
+            _ => false,
+        }
+    }
+
+    fn on(node: NodeId, carry: CarryType) -> OrientedNode {
+        OrientedNode { node, carry }
+    }
+
+    /// A weak route that loops (through a self-loop, or back into its own entrance) is not a bulge,
+    /// though a strong parallel route is there that would pop it if it were.
     #[test]
-    fn cycles_foldbacks_and_overlong_bulges_are_rejected() {
-        let mut cycle = DbgGraph::new(3);
-        let start = cycle.add_node(node(1, 20, 1));
-        let a = cycle.add_node(node(10, 1, 1));
-        let strong = cycle.add_node(node(20, 20, 1));
-        let exit = cycle.add_node(node(30, 20, 1));
-        cycle.add_bi_edge(start, a, EdgeType::MinToMin);
-        cycle.add_bi_edge(a, a, EdgeType::MinToMin);
-        add_path(&mut cycle, start, &[strong], exit, EdgeType::MinToMin);
-        assert!(!remove_bulges(&mut cycle, 0.1, &CoverageRef::unknown()));
-        assert!(cycle.contains_node(a));
+    fn cycles_are_rejected() {
+        use CarryType::Min;
 
-        let mut foldback = DbgGraph::new(3);
-        let start = foldback.add_node(node(100, 20, 1));
-        let a = foldback.add_node(node(110, 1, 1));
-        let b = foldback.add_node(node(120, 1, 1));
-        foldback.add_bi_edge(start, a, EdgeType::MinToMin);
-        foldback.add_bi_edge(a, b, EdgeType::MinToMin);
-        foldback.add_bi_edge(b, a, EdgeType::MinToMin);
-        assert!(!remove_bulges(&mut foldback, 0.1, &CoverageRef::unknown()));
+        // The weak node carries a self-loop.
+        let mut graph = DbgGraph::new(3);
+        let start = graph.add_node(node(1, 20, 1));
+        let weak = graph.add_node(node(10, 1, 1));
+        let strong = graph.add_node(node(20, 20, 1));
+        let exit = graph.add_node(node(30, 20, 1));
+        add_path(&mut graph, start, &[weak], exit, EdgeType::MinToMin);
+        graph.add_bi_edge(weak, weak, EdgeType::MinToMin);
+        add_path(&mut graph, start, &[strong], exit, EdgeType::MinToMin);
+        assert!(would_pop(
+            &graph,
+            on(start, Min),
+            on(weak, Min),
+            on(exit, Min),
+            0.1
+        ));
+        assert!(!remove_bulges(&mut graph, 0.1, &CoverageRef::unknown()));
+        assert!(graph.contains_node(weak));
+        assert_paired(&graph);
 
-        let mut overlong = DbgGraph::new(3);
-        let start = overlong.add_node(node(200, 20, 1));
-        let weak = overlong.add_node(node(300, 1, 104));
-        let strong = overlong.add_node(node(500, 20, 104));
-        let exit = overlong.add_node(node(700, 20, 1));
-        add_path(&mut overlong, start, &[weak], exit, EdgeType::MinToMin);
-        add_path(&mut overlong, start, &[strong], exit, EdgeType::MinToMin);
-        assert!(!remove_bulges(&mut overlong, 0.1, &CoverageRef::unknown()));
-        assert!(overlong.contains_node(weak));
-        assert_paired(&overlong);
+        // Both routes leave a hub and come back into it on the same strand.
+        let mut graph = DbgGraph::new(3);
+        let hub = graph.add_node(node(1, 20, 1));
+        let weak = graph.add_node(node(10, 1, 1));
+        let strong = graph.add_node(node(20, 20, 1));
+        add_path(&mut graph, hub, &[weak], hub, EdgeType::MinToMin);
+        add_path(&mut graph, hub, &[strong], hub, EdgeType::MinToMin);
+        assert!(would_pop(
+            &graph,
+            on(hub, Min),
+            on(weak, Min),
+            on(hub, Min),
+            0.1
+        ));
+        assert!(!remove_bulges(&mut graph, 0.1, &CoverageRef::unknown()));
+        assert!(graph.contains_node(weak));
+        assert_paired(&graph);
+    }
+
+    /// A weak route that folds back into its own entrance on the other strand is not a bulge either,
+    /// though a strong route folding back the same way would pop it if it were.
+    #[test]
+    fn foldbacks_are_rejected() {
+        use CarryType::{Max, Min};
+
+        let mut graph = DbgGraph::new(3);
+        let hub = graph.add_node(node(1, 20, 1));
+        let weak = graph.add_node(node(10, 1, 1));
+        let strong = graph.add_node(node(20, 20, 1));
+        for route in [weak, strong] {
+            graph.add_bi_edge(hub, route, EdgeType::MinToMin);
+            graph.add_bi_edge(route, hub, EdgeType::MinToMax);
+        }
+        assert!(would_pop(
+            &graph,
+            on(hub, Min),
+            on(weak, Min),
+            on(hub, Max),
+            0.1
+        ));
+        assert!(!remove_bulges(&mut graph, 0.1, &CoverageRef::unknown()));
+        assert!(graph.contains_node(weak));
+        assert_paired(&graph);
+    }
+
+    /// A bulge longer than `bulge_max_kmers` is left alone however weak it is; one at the limit is
+    /// popped.
+    #[test]
+    fn overlong_bulges_are_rejected() {
+        let max = bulge_max_kmers(3);
+        for (length, popped) in [(max, true), (max + 1, false)] {
+            let mut graph = DbgGraph::new(3);
+            let start = graph.add_node(node(1, 20, 1));
+            let weak = graph.add_node(node(300, 1, length));
+            let strong = graph.add_node(node(500, 20, length));
+            let exit = graph.add_node(node(700, 20, 1));
+            add_path(&mut graph, start, &[weak], exit, EdgeType::MinToMin);
+            add_path(&mut graph, start, &[strong], exit, EdgeType::MinToMin);
+            assert_eq!(
+                remove_bulges(&mut graph, 0.1, &CoverageRef::unknown()),
+                popped,
+                "{length} k-mers against a limit of {max}"
+            );
+            assert_eq!(graph.contains_node(weak), !popped, "{length} k-mers");
+            assert!(graph.contains_node(strong));
+            assert_paired(&graph);
+        }
     }
 
     #[test]
@@ -899,24 +1005,79 @@ mod tests {
         assert_paired(&graph);
     }
 
+    /// `start` (hash 1) reaches `x` (30) by `p` (10, 1x) or `f` (20, 2x), and `x` goes on to `y`
+    /// (50), which `s` (40-41, 50x) also reaches from `start`. Popping `p` leaves `x` with one way
+    /// in, so `f`'s candidate no longer ends at `x` but runs on through it to `y`.
+    fn reshaped_by_a_pop() -> (DbgGraph, [NodeId; 6]) {
+        let mut graph = DbgGraph::new(31);
+        let start = graph.add_node(node(1, 20, 1));
+        let p = graph.add_node(node(10, 1, 1));
+        let f = graph.add_node(node(20, 2, 1));
+        let x = graph.add_node(node(30, 20, 1));
+        let s = graph.add_node(node(40, 50, 2));
+        let y = graph.add_node(node(50, 20, 1));
+        let z = graph.add_node(node(60, 20, 1));
+        add_path(&mut graph, start, &[p], x, EdgeType::MinToMin);
+        add_path(&mut graph, start, &[f], x, EdgeType::MinToMin);
+        add_path(&mut graph, x, &[], y, EdgeType::MinToMin);
+        add_path(&mut graph, start, &[s], y, EdgeType::MinToMin);
+        add_path(&mut graph, y, &[], z, EdgeType::MinToMin);
+        (graph, [start, p, f, x, s, y])
+    }
+
+    /// A candidate an earlier pop reshaped, with its own first node still there, is stale: it is
+    /// skipped for the rest of the pass rather than judged on a shape that no longer exists, and its
+    /// new shape is judged on the next pass. Judging the new shape at once would pop `f` and `x`
+    /// in the first pass.
     #[test]
     fn stale_candidate_is_not_deleted() {
-        let mut graph = ordered_bulge(false);
+        use CarryType::Min;
+
+        // How staleness is seen: the candidate rebuilt from its first node differs.
+        let (mut graph, [start, p, f, x, _, y]) = reshaped_by_a_pop();
         let max_length = bulge_max_kmers(graph.k());
-        let candidate = candidate_order(&graph)
-            .into_iter()
-            .find_map(|(entrance, first, edge, _)| {
-                build_candidate(&graph, entrance, first, edge, max_length)
-            })
-            .unwrap();
-        graph.remove_node(candidate.internal[0].node);
+        let candidate = build_candidate(
+            &graph,
+            on(start, Min),
+            on(f, Min),
+            EdgeType::MinToMin,
+            max_length,
+        )
+        .unwrap();
+        assert_eq!(candidate.exit, on(x, Min));
+        graph.remove_node(p);
+        assert!(graph.contains_node(f));
         assert!(!candidate_still_matches(&graph, &candidate, max_length));
+        let fresh = build_candidate(
+            &graph,
+            candidate.entrance,
+            candidate.first,
+            candidate.first_edge,
+            max_length,
+        )
+        .unwrap();
+        assert_eq!(fresh.exit, on(y, Min), "the path now runs through x");
+
+        // And through `remove_bulges`: `p` goes against `f`, which is then stale.
+        let (mut graph, [_, p, f, x, s, _]) = reshaped_by_a_pop();
+        assert!(remove_bulges(&mut graph, 0.6, &CoverageRef::unknown()));
+        assert!(!graph.contains_node(p));
+        assert!(graph.contains_node(f), "stale this pass, so not judged");
+        assert!(graph.contains_node(x));
+        assert_paired(&graph);
+
+        // Next pass, `f -> x` is a fresh candidate and goes against `s`: 11x is under 0.6 * 50x.
+        assert!(remove_bulges(&mut graph, 0.6, &CoverageRef::unknown()));
+        assert!(!graph.contains_node(f));
+        assert!(!graph.contains_node(x));
+        assert!(graph.contains_node(s));
         assert_paired(&graph);
     }
 
-    /// The ratio is strict: a flank at exactly 4x the connector (8 against 2) keeps it.
+    /// The ratio is strict: a flank at exactly 4x the connector (8 against 2) keeps it, even with
+    /// both flanks required and the other one far over.
     #[test]
-    fn ec_requires_strong_alternatives_at_both_ends() {
+    fn ec_ratio_is_strict_at_exactly_four_times_the_connector() {
         let make_graph = |right_count| {
             let mut graph = DbgGraph::new(3);
             let start = graph.add_node(node(1, 30, 1));

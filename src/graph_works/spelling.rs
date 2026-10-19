@@ -182,7 +182,22 @@ mod tests {
         (dict, walk)
     }
 
-    /// The core contract: spelling the k-mers of S gives back S, in full.
+    /// The reverse complement of an ASCII sequence.
+    fn reverse_complement(seq: &[u8]) -> Vec<u8> {
+        seq.iter()
+            .rev()
+            .map(|b| match b {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                _ => b'A',
+            })
+            .collect()
+    }
+
+    /// The core contract: spelling the k-mers of S gives back S, in full. A single k-mer (`len == k`)
+    /// has no successor to fix its strand and is spelled in its canonical orientation, so there
+    /// either strand is right.
     #[test]
     fn round_trips_the_original_sequence() {
         for k in [5, 15, 31] {
@@ -198,17 +213,23 @@ mod tests {
                     walk.len() + k - 1,
                     "k={k} len={len}: spelled length"
                 );
-                assert_eq!(
-                    String::from_utf8(
-                        spelled
-                            .into_iter()
-                            .map(crate::utils::bit_encoding::decode_base)
-                            .collect()
-                    )
-                    .unwrap(),
-                    String::from_utf8(seq).unwrap(),
-                    "k={k} len={len}: spelled sequence"
-                );
+                let spelled: Vec<u8> = spelled
+                    .into_iter()
+                    .map(crate::utils::bit_encoding::decode_base)
+                    .collect();
+                if len == k && spelled != seq {
+                    assert_eq!(
+                        spelled,
+                        reverse_complement(&seq),
+                        "k={k} len={len}: a lone k-mer spells one strand or the other"
+                    );
+                } else {
+                    assert_eq!(
+                        String::from_utf8(spelled).unwrap(),
+                        String::from_utf8(seq).unwrap(),
+                        "k={k} len={len}: spelled sequence"
+                    );
+                }
             }
         }
     }
@@ -238,16 +259,7 @@ mod tests {
         let spelled = spell_path(&walk, |hash| dict.get(&hash).copied(), k).unwrap();
         assert_eq!(spelled.len(), k);
         // Either strand is a legitimate answer here; the sequence itself is one of them.
-        let rc: Vec<u8> = seq
-            .iter()
-            .rev()
-            .map(|b| match b {
-                b'A' => b'T',
-                b'C' => b'G',
-                b'G' => b'C',
-                _ => b'A',
-            })
-            .collect();
+        let rc = reverse_complement(&seq);
         let spelled: Vec<_> = spelled
             .into_iter()
             .map(crate::utils::bit_encoding::decode_base)
@@ -317,39 +329,8 @@ mod tests {
         );
     }
 
-    /// A deterministic ACGT sequence. An LCG keeps it reproducible without pulling in a rng crate.
-    fn contig_sequence(len: usize) -> Vec<u8> {
-        const BASES: [u8; 4] = *b"ACGT";
-        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
-        (0..len)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                BASES[((state >> 33) & 3) as usize]
-            })
-            .collect()
-    }
-
-    /// Canonical hash -> packed k-mer, as preprocessing stores it.
-    type PackedDict = HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>>;
-
-    /// The (dict, abs_ind) pair preprocessing would produce: canonical hash -> packed k-mer, plus the
-    /// ordered hashes along the walk.
-    fn dict_and_path(seq: &[u8], k: usize) -> (PackedDict, Vec<u64>) {
-        let mut dict = PackedDict::default();
-        let mut path: Vec<u64> = Vec::new();
-
-        let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
-        let (hc, _, _, km) = it.get_hashes_and_bases_and_kmer();
-        dict.insert(hc, km);
-        path.push(hc);
-        while let Some((hc, _, _, km)) = it.get_next_kmer() {
-            dict.insert(hc, km);
-            path.push(hc);
-        }
-        (dict, path)
-    }
+    /// The seed of the sequences the contig tests spell.
+    const CONTIG_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 
     fn one_contig(path: Vec<u64>) -> Contigs {
         Contigs::new(vec![vec![NodeStruct {
@@ -359,33 +340,23 @@ mod tests {
         }]])
     }
 
-    /// A contig is the whole sequence its k-mer path spells, so it must come back as `S` itself.
+    /// A contig is the whole sequence its k-mer path spells, so it must come back as `S` itself, with
+    /// both terminal k-mers: that guards the end-symmetry the old trim had to be fixed for, where an
+    /// off-by-one at either end would clip exactly one of them.
     #[test]
     fn contig_preserves_the_full_spelled_path() {
         let k = 31;
-        let seq = contig_sequence(300);
+        let seq = pseudo_seq(300, CONTIG_SEED);
         let n = seq.len() - k + 1; // number of k-mers
-        let (dict, path) = dict_and_path(&seq, k);
+        let (dict, path) = dict_and_walk::<u64>(&seq, k);
         assert_eq!(path.len(), n);
 
         let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
         let got = sequences.iter().next().unwrap().ascii();
         assert_eq!(got.len(), seq.len(), "contig length");
-        assert_eq!(got, seq, "contig sequence");
-    }
-
-    /// Both terminal k-mers survive. Guards the end-symmetry the old trim had to be fixed for: an
-    /// off-by-one at either end would clip exactly one of these.
-    #[test]
-    fn contig_preserves_both_terminal_kmers() {
-        let k = 31;
-        let seq = contig_sequence(300);
-        let (dict, path) = dict_and_path(&seq, k);
-
-        let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
-        let got = sequences.iter().next().unwrap().ascii();
         assert_eq!(&got[..k], &seq[..k], "the first terminal k-mer");
         assert_eq!(&got[got.len() - k..], &seq[seq.len() - k..], "the last one");
+        assert_eq!(got, seq, "contig sequence");
     }
 
     /// A path of fewer than k k-mers used to be dropped whatever the minimum, by a `2*k-1` guard that
@@ -393,8 +364,8 @@ mod tests {
     #[test]
     fn a_path_shorter_than_k_kmers_is_still_written() {
         let k = 31;
-        let seq = contig_sequence(k + 4); // 5 k-mers, far fewer than k
-        let (dict, path) = dict_and_path(&seq, k);
+        let seq = pseudo_seq(k + 4, CONTIG_SEED); // 5 k-mers, far fewer than k
+        let (dict, path) = dict_and_walk::<u64>(&seq, k);
         assert!(path.len() < k, "fixture must have fewer than k k-mers");
 
         let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);

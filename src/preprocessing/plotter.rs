@@ -630,7 +630,6 @@ mod tests {
     use crate::preprocessing::models::{ErrorModel, ErrorParams, GenomeModel};
     use crate::preprocessing::MAXSIZEHISTO;
 
-    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn plot_paths_keep_dots_in_the_output_prefix() {
         let base = std::path::Path::new("out/s.v2_kmerspectrum_k21.png");
@@ -692,6 +691,16 @@ mod tests {
             "without an empirical peak the linear plot is unbounded"
         );
 
+        /// Removes its files when dropped, so a failed assertion leaves nothing behind either.
+        struct RemoveOnDrop([PathBuf; 4]);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+
         for (suffix, raw) in [("exact", None), ("bloom", Some(raw_bloom.as_slice()))] {
             let path = std::env::temp_dir().join(format!(
                 "sparrowhawk-spectrum-{suffix}-{}.png",
@@ -700,8 +709,14 @@ mod tests {
             let svg_path = path.with_extension("svg");
             let log_path = suffixed_path(&path, "_log", "png");
             let log_svg_path = log_path.with_extension("svg");
+            let written_files = RemoveOnDrop([
+                path.clone(),
+                svg_path.clone(),
+                log_path.clone(),
+                log_svg_path.clone(),
+            ]);
             plot_kmer_histogram(&decision, raw, &diagnostics, 12, &path);
-            for written in [&path, &svg_path, &log_path, &log_svg_path] {
+            for written in &written_files.0 {
                 assert!(std::fs::metadata(written).is_ok_and(|metadata| metadata.len() > 0));
             }
             let svg = std::fs::read_to_string(&svg_path).expect("read spectrum SVG");
@@ -713,9 +728,6 @@ mod tests {
             assert!(svg.contains("Minimum count used = 12"));
             let log_svg = std::fs::read_to_string(&log_svg_path).expect("read logarithmic SVG");
             assert!(log_svg.contains("k-mer spectrum (logarithmic Y)"));
-            for written in [path, svg_path, log_path, log_svg_path] {
-                std::fs::remove_file(written).expect("remove temporary spectrum plot");
-            }
         }
     }
 }

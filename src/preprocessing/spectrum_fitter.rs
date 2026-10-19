@@ -552,7 +552,6 @@ fn select_fit(attempts: &[FitAttempt]) -> Option<SpectrumFit> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argmin::core::CostFunction;
 
     fn synthetic_histogram(error: ErrorParams) -> Vec<u32> {
         let mut histogram = vec![0u32; 601];
@@ -591,9 +590,11 @@ mod tests {
             genome_model: GenomeModel::NegativeBinomial,
             sample_scale: 1.0,
         };
+        let starts = fit_starts(&problem, 4.0, 0.05).len() as u32;
+        assert!(starts > 1, "the fixture needs several starts");
         let attempt = fit_candidate(problem, 12, 50, 4.0, 0.05, 1);
-        assert_eq!(attempt.capped_starts, 8);
-        assert_eq!(attempt.total_iterations, 8);
+        assert_eq!(attempt.capped_starts, starts);
+        assert_eq!(attempt.total_iterations, u64::from(starts));
         assert!(attempt.candidate.is_none());
         assert_eq!(attempt.rejection, Some(FitRejection::OptimisationFailed));
     }
@@ -749,7 +750,13 @@ mod tests {
             50,
         );
         assert_eq!(attempt.rejection, None);
-        assert_eq!(attempt.candidate.unwrap().primary_mode(), 52);
+        let candidate = attempt.candidate.unwrap();
+        assert_eq!(candidate.primary_mode(), 52);
+        assert_eq!(
+            candidate.best_iterations, 12,
+            "the candidate is the valid, higher-cost start"
+        );
+        assert_eq!(attempt.total_iterations, 22);
 
         let all_rejected = attempt_from(
             &problem,
@@ -761,7 +768,7 @@ mod tests {
             12,
             50,
         );
-        assert!(all_rejected.candidate.is_some());
+        assert_eq!(all_rejected.candidate.unwrap().best_iterations, 10);
         assert_eq!(
             all_rejected.rejection,
             Some(FitRejection::ComponentMassExceeded)
@@ -835,33 +842,11 @@ mod tests {
         assert!((1.6..=1.8).contains(&selected.repeat_ratio), "{selected:?}");
     }
 
-    /// A simplex probe at an absurd dispersion (a mean near 1e13) returns promptly, as it did before
-    /// the table: no allocation proportional to the mean.
+    /// A simplex probe at an absurd dispersion puts the mean, and so the shelf's trials, near 1e13 or
+    /// beyond. The shelf table behind the cost stops at the fit window however large the mean, so it
+    /// never allocates in proportion to it; below the window it stops at the trials.
     #[test]
-    fn a_shelf_cost_at_an_extreme_dispersion_stays_bounded() {
-        let problem = shelf_problem();
-        for log_dispersion in [30.0, 60.0, 700.0] {
-            let theta = vec![
-                0.0,
-                -3.0,
-                0.0,
-                log_dispersion,
-                1.8f64.ln(),
-                1.7,
-                0.0,
-                -1.0,
-                0.0,
-                0.0,
-            ];
-            let started = std::time::Instant::now();
-            let cost = problem.cost(&theta).expect("the cost never errors");
-            assert!(cost.is_finite() || cost == f64::INFINITY);
-            assert!(
-                started.elapsed().as_secs() < 5,
-                "log dispersion {log_dispersion}"
-            );
-        }
-        // The table behind that cost stops at the fit window, however large the mean.
+    fn the_shelf_table_stops_at_the_fit_window_however_large_the_mean() {
         let shelf = Shelf {
             share: 0.1,
             alpha: 1.0,
@@ -870,6 +855,7 @@ mod tests {
         for mean in [1e6, 1e12, 1e19, 1e300] {
             assert_eq!(shelf_log_table(mean, shelf, 300).len(), 301, "mean {mean}");
         }
+        assert_eq!(shelf_log_table(99.6, shelf, 300).len(), 101);
     }
 
     /// A spectrum with a tenth of its single-copy k-mers in a uniform shelf selects the shelf model,
@@ -1071,7 +1057,11 @@ mod tests {
             "{result:?}"
         );
         assert!(selected.primary_mode().abs_diff(50) <= 3, "{result:?}");
-        assert!(selected.error_params.weibull_shape.is_some());
+        let shape = selected
+            .error_params
+            .weibull_shape
+            .expect("the Weibull tail has a shape");
+        assert!((shape - 0.8).abs() < 0.01, "shape {shape}: {result:?}");
     }
 
     #[test]
@@ -1130,31 +1120,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bad_srr_like_mode_is_rejected() {
-        let fit = SpectrumFit::for_test(
-            ErrorModel::SingletonPareto,
-            GenomeModel::NegativeBinomial,
-            [0.877, 0.123, 0.0],
-            417.5,
-            139.22,
-            ErrorParams {
-                singleton_probability: 0.85,
-                tail_exponent: 2.0,
-                weibull_shape: None,
-            },
-            18.0e6,
-            2478,
-        );
-        assert_eq!(fit.primary_mode(), 279);
-        assert_eq!(
-            validate_fit(&fit, 12, 413),
-            Some(FitRejection::PrimaryModeOutsideBand)
-        );
-    }
-
     /// The primary mode must lie within a ratio of the empirical peak, ramping from 1.25 (peak <= 100) to
-    /// 1.40 (peak >= 200), on both sides and inclusively.
+    /// 1.40 (peak >= 200), on both sides and inclusively. The SRR-like row, a mode of 279 under an
+    /// empirical peak of 413, is rejected.
     #[test]
     fn the_primary_mode_band_ramps_with_the_peak_and_is_inclusive() {
         for (peak, limit) in [
@@ -1196,6 +1164,7 @@ mod tests {
             (200, 143, true),
             (200, 142, false),
             (250, 280, true),
+            (413, 279, false),
             (0, 125, false),
         ] {
             let fit = make_fit(mode);
@@ -1252,24 +1221,39 @@ mod tests {
         );
     }
 
+    /// Neither cutoff search looks past the fit window: a hole budget whose answer lies at count 41
+    /// finds it in a wide window and nothing in a window ending at 20.
     #[test]
     fn cutoff_searches_stop_at_the_fit_window() {
-        let fit = SpectrumFit::for_test(
-            ErrorModel::SingletonPareto,
-            GenomeModel::NegativeBinomial,
-            [0.999_999_999, 0.000_000_001, 0.0],
-            100.0,
-            5.0,
-            ErrorParams {
-                singleton_probability: 0.85,
-                tail_exponent: 2.0,
-                weibull_shape: None,
-            },
-            1.0e6,
-            20,
-        );
-        assert_eq!(fit.crossover(), None);
-        assert_eq!(fit.hole_cutoff(f64::INFINITY), None);
+        let make_fit = |fit_window_end| {
+            SpectrumFit::for_test(
+                ErrorModel::SingletonPareto,
+                GenomeModel::NegativeBinomial,
+                [0.999_999_999, 0.000_000_001, 0.0],
+                100.0,
+                5.0,
+                ErrorParams {
+                    singleton_probability: 0.85,
+                    tail_exponent: 2.0,
+                    weibull_shape: None,
+                },
+                1.0e6,
+                fit_window_end,
+            )
+        };
+        let (narrow, wide) = (make_fit(20), make_fit(570));
+        assert_eq!(narrow.crossover(), None);
+
+        // The share of single-copy k-mers below 41 and below 42, from count 0; a budget between the two
+        // allows cutting at 41 but not at 42.
+        let below = |cutoff: usize| -> f64 {
+            (0..cutoff)
+                .map(|count| ln_single_copy(count as f64, 100.0, 5.0, None).exp())
+                .sum()
+        };
+        let allowed = 0.5 * (below(41) + below(42));
+        assert_eq!(wide.hole_cutoff(allowed * wide.genome_kmers), Some(41));
+        assert_eq!(narrow.hole_cutoff(allowed * narrow.genome_kmers), None);
     }
 
     #[test]
@@ -1328,13 +1312,16 @@ mod tests {
                 10.0e6,
                 570,
             );
-            let floor = fit.error_floor_cutoff();
-            if floor > 2 {
-                let reference = fit.component_heights(fit.primary_mode())[1];
-                assert!(fit.component_heights(usize::from(floor - 1))[0] >= reference);
-                if usize::from(floor) <= fit.fit_window_end {
-                    assert!(fit.component_heights(usize::from(floor))[0] < reference);
-                }
+            let floor = usize::from(fit.error_floor_cutoff());
+            assert!(floor > 2, "{model}: the fixture needs an active floor");
+            let reference = fit.component_heights(fit.primary_mode())[1];
+            assert!(fit.component_heights(floor - 1)[0] >= reference, "{model}");
+            // The last overlap: nothing from the floor to the end of the window reaches the reference.
+            for count in floor..=fit.fit_window_end {
+                assert!(
+                    fit.component_heights(count)[0] < reference,
+                    "{model}: count {count}"
+                );
             }
         }
     }

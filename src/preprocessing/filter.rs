@@ -753,13 +753,15 @@ mod tests {
     use crate::utils::reads::OwnedRecord;
     use std::{collections::HashMap, hash::BuildHasherDefault};
 
+    /// When the hole guard would cut below the fitted 100 % error floor, the floor wins: a resolved
+    /// cutoff is lowered to the hole cutoff and then raised back to the floor, never left under it.
     #[test]
     fn active_error_floor_remains_a_hard_minimum() {
         let fit = SpectrumFit::for_test(
             ErrorModel::SingletonPareto,
             GenomeModel::NegativeBinomial,
-            [0.9, 0.09, 0.01],
-            100.0,
+            [0.99, 0.0099, 0.0001],
+            50.0,
             6.0,
             ErrorParams {
                 singleton_probability: 0.85,
@@ -767,17 +769,26 @@ mod tests {
                 weibull_shape: None,
             },
             10.0e6,
-            570,
+            300,
+        );
+        let floor = fit.error_floor_cutoff();
+        let holes = fit
+            .hole_cutoff(MAX_GENOME_HOLES)
+            .expect("the lobe reaches low counts");
+        assert!(floor > 2, "the fixture needs an active floor, got {floor}");
+        assert!(
+            holes < floor,
+            "hole cutoff {holes} must conflict with floor {floor}"
         );
         let mut estimate = SpectrumEstimate {
-            min_count: 2,
-            verdict: Verdict::NoPeakAboveValley,
+            min_count: 20,
+            verdict: Verdict::Ok,
             ..SpectrumEstimate::default()
         };
+        assert_eq!(estimate.hole_guarded_min_count(&fit), holes);
         estimate.apply_hole_guard(&fit);
         assert_eq!(
-            estimate.min_count,
-            fit.error_floor_cutoff().max(2),
+            estimate.min_count, floor,
             "the full error floor is a hard minimum"
         );
     }
@@ -845,6 +856,9 @@ mod tests {
             .contains("requested base-quality floor 25"));
     }
 
+    /// An empty sketch is not proof that a floor has no k-mers. With fitting on, a spectrum that
+    /// resolves nowhere drops to the loosest floor exact counting saw k-mers at and asks for a recount
+    /// there, rather than failing, though the sketch sampled nothing at any floor.
     #[test]
     fn an_empty_sketch_does_not_override_exact_floor_presence() {
         let qual = QualOpts {
@@ -862,14 +876,14 @@ mod tests {
                 km: 23,
             },
         );
-        let (kmers, _, _, _, _) = choose_cutoff_and_filter::<u64>(
+        let (kmers, _, minc, chosen_min_qual, _) = choose_cutoff_and_filter::<u64>(
             vec![shard],
             31,
             &qual,
             Some(&floors),
             &[true; MAX_GROUPS],
             Some(SpectrumSketch::new()),
-            false,
+            true,
             false,
             None,
             &mut None,
@@ -877,7 +891,9 @@ mod tests {
             None,
         )
         .expect("the sketch sample being empty is not proof that the floor has no k-mers");
-        assert_eq!(kmers.len(), 1);
+        assert_eq!(chosen_min_qual, 0, "the loosest floor with k-mers");
+        assert_eq!(minc, UNRESOLVED_MINCOUNT);
+        assert_eq!(kmers.len(), 0, "a recount pass must not build the table");
     }
 
     #[test]
@@ -1107,8 +1123,8 @@ mod tests {
         assert_eq!(floor, 11, "a sub-10 peak steps down to a deeper floor");
     }
 
-    /// The tail is measured from the cutoff the floor would actually apply, so error k-mers that
-    /// cutoff removes anyway do not count against it.
+    /// The tail a floor is judged by is measured from the cutoff the floor would actually apply, so
+    /// error k-mers that cutoff removes anyway do not count against it.
     #[test]
     fn the_error_tail_starts_at_the_applied_cutoff() {
         let histogram = synthetic_spectrum(30.0);
@@ -1119,6 +1135,15 @@ mod tests {
         let applied = fit_error_tail_fraction(&histogram, &fit, cutoff).unwrap();
         let from_two = fit_error_tail_fraction(&histogram, &fit, 2).unwrap();
         assert!(applied < from_two, "{applied} should be below {from_two}");
+
+        let candidate = evaluate_floor(
+            25,
+            &histogram,
+            1.0,
+            &mut |_: &[u32], _: &SpectrumEstimate, _| Some(fit),
+        );
+        assert!(candidate.fit_attempted);
+        assert_eq!(candidate.error_tail_fraction, Some(applied));
     }
 
     #[test]

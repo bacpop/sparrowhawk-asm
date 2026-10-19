@@ -26,7 +26,7 @@ use self::read_store::PackedSeqs;
 
 /// Bins of the k-mer spectrum: bin `c - 1` holds the k-mers seen `c` times, and the last bin every
 /// count from `MAXSIZEHISTO` up. For the fitting, we'll use actually MAXSIZEHISTO - 1.
-const MAXSIZEHISTO: usize = 8000;
+pub(crate) const MAXSIZEHISTO: usize = 8000;
 
 /// Bins either side of a count in the smoothed spectrum.
 const SMOOTH: usize = 2;
@@ -1055,6 +1055,8 @@ mod tests {
         assert_eq!(find_raw_genomic_peak(&saturated, 10), Some(20));
     }
 
+    /// The area's denominator leaves out singletons, its 5 % threshold is inclusive, and its mirrored
+    /// shoulder may reach the last unsaturated count but not the saturating last bin.
     #[test]
     fn mirrored_peak_area_excludes_singletons_and_accepts_exactly_five_percent() {
         let mut histogram = vec![0u32; 12];
@@ -1073,15 +1075,15 @@ mod tests {
         assert_eq!(support.area_sum, 5);
         assert_eq!(support.denominator, 101);
         assert!(!support.passes(), "just below 5 % must fail");
-    }
 
-    #[test]
-    fn mirrored_peak_area_rejects_an_endpoint_in_the_saturated_bin() {
-        let histogram = vec![1, 4, 3, 2, 8, 9, 5, 2, 1];
+        assert!(
+            PeakAreaSupport::measure(&histogram, 3, 7).is_some(),
+            "the right endpoint is count 11, the last unsaturated count"
+        );
         assert_eq!(
-            PeakAreaSupport::measure(&histogram, 2, 6),
+            PeakAreaSupport::measure(&histogram, 4, 8),
             None,
-            "the right endpoint is count 10, beyond the last unsaturated count 8"
+            "the right endpoint is count 12, the saturating last bin"
         );
     }
 
@@ -1133,8 +1135,9 @@ mod tests {
         assert!(estimate.verdict.is_ok());
     }
 
-    /// At extreme depth the genome lobe is real but under 5 % of the non-singleton bins, so the area rule
-    /// refuses it: no pair is published, nothing is fitted, and the cutoff is the sentinel.
+    /// At extreme depth the genome lobe is real but under 5 % of the non-singleton bins. The primary pair
+    /// clears every separation check, so it is the area rule that refuses it: no pair is published,
+    /// nothing is fitted, and the cutoff is the sentinel.
     #[test]
     fn deep_error_dominated_spectra_are_refused_by_the_area_guard() {
         let deepest = synthetic_spectrum(500.0);
@@ -1147,6 +1150,23 @@ mod tests {
 
         for lam in [250.0, 500.0] {
             let h = synthetic_spectrum(lam);
+            let mut primary = SpectrumEstimate::default();
+            let (valley, peak, _) = primary
+                .find_primary_pair(&h)
+                .expect("the primary search finds the genome lobe");
+            primary.set_pair(&h, valley, peak);
+            assert_eq!(
+                primary.verdict,
+                Verdict::Ok,
+                "lambda {lam}: the separation checks alone accept the pair"
+            );
+            let area = PeakAreaSupport::measure(&h, valley, peak).expect("the area is measurable");
+            assert!(
+                !area.passes(),
+                "lambda {lam}: area {:.3} must fail the guard",
+                area.fraction()
+            );
+
             let e = SpectrumEstimate::by_valley(&h);
             assert_eq!(e.verdict, Verdict::NoLocalValley, "lambda {lam}");
             assert_eq!(
@@ -1208,19 +1228,26 @@ mod tests {
             let ripple = 1.0 + 0.01 * ((c % 7) as f64 - 3.0) / 3.0;
             h[c - 1] = (200_000_000.0 / (c as f64).powf(1.5) * ripple) as u32;
         }
-        // Either refusal is right here — the walk may stop on the crest it locked onto, making genomic peak and
-        // valley equal — but the depth is what rules it out either way.
+        // The primary pair is judged before a refusal clears it, so its verdict is read from a copy.
+        let mut primary = SpectrumEstimate::default();
+        let (valley, peak, _) = primary
+            .find_primary_pair(&h)
+            .expect("the walk locks onto a noise crest");
+        primary.set_pair(&h, valley, peak);
+        assert_eq!(
+            primary.verdict,
+            Verdict::PeakNotClearOfValley,
+            "valley {} ({}) genomic_peak {} ({}) gave gp_to_v_ratio {:.3}",
+            primary.valley,
+            primary.valley_n,
+            primary.genomic_peak,
+            primary.genomic_peak_n,
+            primary.gp_to_v_ratio
+        );
+        assert!(primary.gp_to_v_ratio < MIN_GP_TO_V_RATIO);
+        // The local fallback finds no lobe either, so nothing resolves.
         let e = SpectrumEstimate::by_valley(&h);
         assert_ne!(e.verdict, Verdict::Ok);
-        assert!(
-            e.gp_to_v_ratio < MIN_GP_TO_V_RATIO,
-            "valley {} ({}) genomic_peak {} ({}) gave gp_to_v_ratio {:.3}",
-            e.valley,
-            e.valley_n,
-            e.genomic_peak,
-            e.genomic_peak_n,
-            e.gp_to_v_ratio
-        );
         assert_eq!(e.min_count, UNRESOLVED_MINCOUNT);
     }
 
@@ -1247,23 +1274,39 @@ mod tests {
         );
     }
 
-    /// Through moderate depth the lobes separate inside the genome-loss budget, from raw candidates, and
-    /// the reported heights are the observed bins rather than their five-bin averages.
+    /// The smoothed view averages each bin with [`SMOOTH`] bins either side, so a lone spike spreads
+    /// evenly over five.
     #[test]
-    fn the_working_range_resolves_from_raw_bins_within_the_loss_budget() {
+    fn smoothing_spreads_a_spike_over_five_bins() {
         let mut spike = vec![0u32; 40];
         spike[19] = 100;
         let smooth = smooth_histogram(&spike);
-        assert_eq!(
-            (smooth[17], smooth[19], smooth[21]),
-            (20, 20, 20),
-            "a spike is averaged over five bins"
-        );
-        assert_eq!(
-            SpectrumEstimate::by_valley(&synthetic_spectrum(30.0)).peak_search,
-            PeakSearch::SmoothedRefinement
-        );
+        assert_eq!(&smooth[17..=21], &[20; 5]);
+        assert_eq!((smooth[16], smooth[22]), (0, 0));
+    }
 
+    /// Above the low-coverage bypass, the pair is found from the raw candidates and refined on the
+    /// smoothed spectrum, with the valley under the peak.
+    #[test]
+    fn moderate_depth_pairs_come_from_raw_candidates_and_smoothed_refinement() {
+        for lam in [20.0, 30.0, 60.0, 150.0] {
+            let e = SpectrumEstimate::by_valley(&synthetic_spectrum(lam));
+            assert!(
+                e.raw_valley.is_some() && e.raw_genomic_peak.is_some(),
+                "lambda {lam}"
+            );
+            assert_eq!(
+                e.peak_search,
+                PeakSearch::SmoothedRefinement,
+                "lambda {lam}"
+            );
+            assert!(e.valley < e.genomic_peak, "lambda {lam}");
+        }
+    }
+
+    /// Through moderate depth the lobes separate and the cutoff stays inside the genome-loss budget.
+    #[test]
+    fn the_working_range_resolves_within_the_loss_budget() {
         for lam in [10.0, 15.0, 20.0, 50.0, 100.0] {
             let e = SpectrumEstimate::by_valley(&synthetic_spectrum(lam));
             assert_eq!(e.verdict, Verdict::Ok, "lambda {lam}");
@@ -1273,38 +1316,29 @@ mod tests {
                 e.min_count
             );
         }
-        for lam in [20.0, 30.0, 60.0, 150.0] {
-            let h = synthetic_spectrum(lam);
-            let e = SpectrumEstimate::by_valley(&h);
-            assert!(
-                e.raw_valley.is_some() && e.raw_genomic_peak.is_some(),
-                "lambda {lam}"
-            );
-            assert!(e.valley < e.genomic_peak, "lambda {lam}");
-            if e.verdict.is_ok() {
-                assert_eq!(
-                    (e.valley_n, e.genomic_peak_n),
-                    (h[e.valley - 1], h[e.genomic_peak - 1]),
-                    "lambda {lam}: heights must be the observed bins"
-                );
-            }
-        }
     }
 
-    /// A peak beyond the old 500-bin ceiling is measurable when the histogram also extends far
-    /// enough to contain its full mirrored shoulder.
+    /// A peak beyond the old 500-bin ceiling is found inside its lobe when the histogram, at its full
+    /// size, extends far enough to contain the lobe's mirrored shoulder.
     #[test]
     fn valley_estimator_finds_a_peak_beyond_the_old_ceiling() {
-        let mut h = vec![0u32; 20_000];
+        let mut h = vec![0u32; MAXSIZEHISTO];
         for c in 1..40 {
             h[c - 1] = 1_000_000 / (c as u32 * c as u32); // a decaying error lobe
         }
-        for c in 5500..6500 {
-            h[c - 1] = 20_000; // a genome lobe far outside 500
+        let lobe = 1_000..=2_000;
+        for c in lobe.clone() {
+            // A genome lobe far outside 500, centred on 1,500.
+            let z = (c as f64 - 1_500.0) / 150.0;
+            h[c - 1] = (20_000.0 * (-0.5 * z * z).exp()) as u32;
         }
         let e = SpectrumEstimate::by_valley(&h);
         assert_eq!(e.verdict, Verdict::Ok);
-        assert!(e.genomic_peak >= 500, "genomic_peak was {}", e.genomic_peak);
+        assert!(
+            lobe.contains(&e.genomic_peak),
+            "genomic_peak was {}",
+            e.genomic_peak
+        );
     }
 
     /// The measured half of the guard must spend its whole budget and no more: one bin higher has to
@@ -1335,9 +1369,21 @@ mod tests {
     /// real ones (mean 200, sd 45) would let a Poisson tail cut near 168.
     #[test]
     fn the_loss_guard_takes_the_tighter_of_its_two_bounds() {
+        // The cutoff `set_pair` settles on: the valley, at least 2 and at most the tighter guard.
+        let clamped = |e: &SpectrumEstimate| {
+            (e.valley as u16).clamp(2, e.guard_measured.min(e.guard_poisson))
+        };
+
         let h = synthetic_spectrum(10.0);
         let e = SpectrumEstimate::by_valley(&h);
-        assert!(poisson_guard(e.genomic_peak) < measured_guard(&h, e.valley, e.genomic_peak));
+        assert_eq!(e.verdict, Verdict::Ok);
+        assert_eq!(e.guard_poisson, poisson_guard(e.genomic_peak));
+        assert_eq!(
+            e.guard_measured,
+            measured_guard(&h, e.valley, e.genomic_peak)
+        );
+        assert!(e.guard_poisson < e.guard_measured);
+        assert_eq!(e.min_count, clamped(&e));
 
         let mut wide = vec![0u32; MAXSIZEHISTO];
         for c in 1..MAXSIZEHISTO {
@@ -1352,6 +1398,14 @@ mod tests {
         );
         let cost = measured_loss(&wide, 60, usize::from(measured));
         assert!(cost <= MAX_GENOME_LOSS, "guard {measured} cost {cost:.4}");
+        let mut e = SpectrumEstimate::default();
+        e.set_pair(&wide, 60, 200);
+        assert_eq!(e.verdict, Verdict::Ok);
+        assert_eq!(
+            (e.guard_measured, e.guard_poisson),
+            (measured, poisson_guard(200))
+        );
+        assert_eq!(e.min_count, clamped(&e));
     }
 
     /// Dispersion is what tells us whether the mixture fit's Poisson genome component is defensible,
@@ -1377,22 +1431,44 @@ mod tests {
         );
     }
 
-    /// Doubling every bin doubles the distinct k-mers without moving the mode. `distinct_above` must see
-    /// that and `genomic_peak` must not — the difference a depth criterion is blind to.
+    /// The hole guard is a ceiling on a resolved cutoff: it lowers the valley to the fit's hole cutoff,
+    /// never raises it, never goes below 2, and leaves a refused spectrum alone. `guarded_min_count`
+    /// predicts what `apply_hole_guard` settles on. (The error floor's precedence over it is checked in
+    /// `filter::tests::active_error_floor_remains_a_hard_minimum`.)
     #[test]
-    fn distinct_above_sees_breadth_that_the_peak_does_not() {
-        let narrow = histo(&bimodal(30));
-        let wide: Vec<u32> = narrow.iter().map(|n| n * 2).collect();
-        let (a, b) = (
-            SpectrumEstimate::by_valley(&narrow),
-            SpectrumEstimate::by_valley(&wide),
+    fn the_hole_guard_only_lowers_a_resolved_cutoff_and_never_below_two() {
+        let fit = test_fit(40, 0.0);
+        let holes = fit
+            .hole_cutoff(MAX_GENOME_HOLES)
+            .expect("the lobe reaches low counts");
+        assert_eq!(fit.error_floor_cutoff(), 2, "no error floor to interfere");
+        assert!(
+            holes > 3,
+            "the fixture needs room below its hole cutoff, got {holes}"
         );
-        assert_eq!(a.genomic_peak, b.genomic_peak, "depth is unchanged");
-        assert_eq!(
-            distinct_above(&wide, b.valley),
-            2 * distinct_above(&narrow, a.valley),
-            "breadth is not"
-        );
+        // A fit whose single-copy lobe strands a k-mer already at count 1.
+        let shallow = test_fit(3, 0.0);
+        assert_eq!(shallow.hole_cutoff(MAX_GENOME_HOLES), Some(2));
+
+        // (fit, verdict, min_count before, min_count after)
+        for (fit, verdict, before, after) in [
+            (fit, Verdict::Ok, holes + 4, holes),
+            (fit, Verdict::Ok, holes - 1, holes - 1),
+            (fit, Verdict::Ok, holes, holes),
+            (fit, Verdict::Ok, 2, 2),
+            (shallow, Verdict::Ok, 9, 2),
+            (fit, Verdict::PeakNotClearOfValley, holes + 4, holes + 4),
+        ] {
+            let mut estimate = SpectrumEstimate {
+                min_count: before,
+                verdict,
+                ..SpectrumEstimate::default()
+            };
+            let predicted = estimate.guarded_min_count(&fit);
+            estimate.apply_hole_guard(&fit);
+            assert_eq!(estimate.min_count, after, "{verdict:?} from {before}");
+            assert_eq!(predicted, after, "{verdict:?} from {before}");
+        }
     }
 
     /// A clean deep library must report a *fitted* peak near the true coverage.

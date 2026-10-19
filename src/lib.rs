@@ -30,6 +30,8 @@ use wasm_bindgen::prelude::*;
 /// Display bins returned to the browser; fitting uses the full preprocessing histogram.
 #[cfg(target_family = "wasm")]
 const BROWSER_HISTOGRAM_BINS: usize = 500;
+#[cfg(target_family = "wasm")]
+const _: () = assert!(BROWSER_HISTOGRAM_BINS <= preprocessing::MAXSIZEHISTO);
 
 /// Quality filtering options for FASTQ files
 #[derive(Clone, Copy)]
@@ -63,13 +65,11 @@ fn write_graph_files(graph: &DbgGraph, base: &Path) {
         "Saving graph (post-shrink, pre-collapse, w/o one-node contigs) as DOT, GFAv1.1, and GFAv2 \
          files..."
     );
+    // Appended, not `with_extension`, which would replace whatever follows a dot in the prefix.
     let open = |extension: &str| {
-        set_ostream(&Some(
-            base.with_extension(extension)
-                .into_os_string()
-                .into_string()
-                .unwrap(),
-        ))
+        let mut path = base.as_os_str().to_owned();
+        path.push(format!(".{extension}"));
+        set_ostream(&Some(path.into_string().unwrap()))
     };
     graph.write_to_dot(&mut open("dot"));
     graph.write_to_gfa(&mut open("gfa"));
@@ -177,7 +177,7 @@ pub fn main() {
         );
     }
 
-    // No extension here: `write_graph_files` sets .dot/.gfa/.gfa2 on this base path.
+    // No extension here: `write_graph_files` appends .dot/.gfa/.gfa2 to this base path.
     let out_path_graph: Option<PathBuf> = if *no_graphs {
         None
     } else {

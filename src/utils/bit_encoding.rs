@@ -385,27 +385,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_rev_comp_u64() {
-        // ACG encoded: A=0 at pos0, C=1<<2=4, G=3<<4=48  → 52
-        // CGT encoded: C=1 at pos0, G=3<<2=12, T=2<<4=32 → 45
-        let acg: u64 = (1 << 2) | (3 << 4); // 52
-        let cgt: u64 = 1 | (3 << 2) | (2 << 4); // 45
-        assert_eq!(acg.rev_comp(3), cgt);
-        assert_eq!(cgt.rev_comp(3), acg);
-
-        // Roundtrip: rev_comp(rev_comp(x, k), k) == x
-        assert_eq!(acg.rev_comp(3).rev_comp(3), acg);
-
-        // ACGT is its own reverse complement (palindrome)
-        let acgt: u64 = (1 << 2) | (3 << 4) | (2 << 6); // 180
-        assert_eq!(acgt.rev_comp(4), acgt);
-    }
-
     /// Every width reverse-complements a k-mer as base-by-base complementing in reverse does, which
-    /// checks each width's masks against the others'.
+    /// checks each width's masks against the others'. A hand-worked pair and palindrome pin the
+    /// packing itself, so the generic check cannot agree with a wrong reference.
     #[test]
     fn rev_comp_agrees_across_widths() {
+        // Packing is most significant first: the first base sits in the highest two bits used.
+        // ACG = 00 01 11 = 7, and its reverse complement CGT = 01 11 10 = 30.
+        let acg: u64 = 0b00_01_11;
+        let cgt: u64 = 0b01_11_10;
+        assert_eq!(acg.rev_comp(3), cgt);
+        assert_eq!(cgt.rev_comp(3), acg);
+        // ACGT = 00 01 11 10 = 30 is its own reverse complement.
+        let acgt: u64 = 0b00_01_11_10;
+        assert_eq!(acgt.rev_comp(4), acgt);
+        assert_eq!((acgt as u128).rev_comp(4), acgt as u128);
+        assert_eq!(U256::from_digit(acgt).rev_comp(4), U256::from_digit(acgt));
+        assert_eq!(U512::from_digit(acgt).rev_comp(4), U512::from_digit(acgt));
+
         fn check<IntT: for<'a> UInt<'a>>(k: usize) {
             let codes: Vec<u8> = (0..k).map(|i| ((i * 7 + i / 3) % 4) as u8).collect();
             let pack = |codes: &mut dyn Iterator<Item = u8>| {

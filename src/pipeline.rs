@@ -729,12 +729,106 @@ impl Preprocessed {
 #[cfg(test)]
 mod multik_tests {
     use super::{
-        aun, lowered_floor_index, preprocess_step, quality_floors, read_store, run_ladder,
-        settle_ladder, BuildOpts, LadderState, QualOpts, Replay,
+        assemble_step, aun, lowered_floor_index, preprocess_step, quality_floors, read_store,
+        run_ladder, settle_ladder, BuildOpts, DbgGraph, LadderState, Preprocessed, QualOpts,
+        Replay,
     };
     use crate::cli::{DEFAULT_MINCOUNT, DEFAULT_MINQUAL};
     use crate::preprocessing::read_store::PackedSeqs;
     use crate::utils::clock::Instant;
+    use crate::utils::reads::{OwnedRecord, ReadSource};
+    use std::cell::Cell;
+
+    /// Reads held in memory, counting how many times the input is opened.
+    struct Reads {
+        records: Vec<OwnedRecord>,
+        opens: Cell<usize>,
+    }
+
+    impl ReadSource for Reads {
+        type Records<'a> = std::vec::IntoIter<OwnedRecord>;
+        fn records(&self) -> Self::Records<'_> {
+            self.opens.set(self.opens.get() + 1);
+            self.records.clone().into_iter()
+        }
+    }
+
+    /// A random 2 kb genome, and two copies of each 150 bp read starting every 5 bases, every seventh
+    /// base at Q35 and the rest at Q70: about 48x at k=31, and each k-mer seen 2 or 4 times at k=145.
+    fn simulated_reads() -> (Vec<u8>, Reads) {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let genome: Vec<_> = (0..2000)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[((seed >> 33) & 3) as usize]
+            })
+            .collect();
+        let records = (0..=1850)
+            .step_by(5)
+            .flat_map(|i| {
+                let seq = genome[i..i + 150].to_vec();
+                let qual = (0..150)
+                    .map(|j| if j % 7 == 0 { 35 } else { 70 })
+                    .collect::<Vec<_>>();
+                [(seq.clone(), Some(qual.clone())), (seq, Some(qual))]
+            })
+            .collect();
+        let reads = Reads {
+            records,
+            opens: Cell::new(0),
+        };
+        (genome, reads)
+    }
+
+    /// The CLI's defaults at a fixed floor of Q0, so no k recounts.
+    fn q0_opts() -> BuildOpts<'static> {
+        let mut opts = BuildOpts::with_defaults(
+            QualOpts {
+                min_count: 2,
+                min_qual: 0,
+            },
+            true,
+            true,
+        );
+        opts.fixed_min_qual = true;
+        opts
+    }
+
+    fn ascii(contigs: &PackedSeqs) -> Vec<Vec<u8>> {
+        contigs.iter().map(|s| s.ascii()).collect()
+    }
+
+    /// Whether one contig is an exact piece of the genome, on either strand, spanning at least 99% of
+    /// it: its first and last few bases lie under a single read and fall below the cutoff.
+    fn spells(contigs: &[Vec<u8>], genome: &[u8]) -> bool {
+        let reverse: Vec<u8> = genome
+            .iter()
+            .rev()
+            .map(|base| match base {
+                b'A' => b'T',
+                b'C' => b'G',
+                b'G' => b'C',
+                _ => b'A',
+            })
+            .collect();
+        // (length, start on the forward strand, start on the reverse one)
+        let pieces: Vec<_> = contigs
+            .iter()
+            .map(|c| {
+                let start = |s: &[u8]| s.windows(c.len()).position(|w| w == c);
+                (c.len(), start(genome), start(&reverse))
+            })
+            .collect();
+        let found = pieces.iter().any(|&(len, forward, reverse)| {
+            (forward.is_some() || reverse.is_some()) && len * 100 >= genome.len() * 99
+        });
+        if !found {
+            eprintln!("contigs (length, forward start, reverse start): {pieces:?}");
+        }
+        found
+    }
 
     #[test]
     fn aun_weights_lengths_over_the_output_filter() {
@@ -799,18 +893,29 @@ mod multik_tests {
         assert_eq!((state.floor_index, state.quality.min_qual), (1, 14));
     }
 
+    /// The default ladder stops ten bases under the longest read; a given one loses its k not below
+    /// it, except the first, which has already run.
     #[test]
-    fn default_ladder_stops_ten_bases_under_the_longest_read() {
-        assert_eq!(
-            settle_ladder(&[21], true, 143.6, 151),
-            vec![21, 31, 41, 55, 71, 91, 111, 131, 141]
-        );
-        assert_eq!(settle_ladder(&[21], true, 22.2, 22), vec![21]);
-    }
-
-    #[test]
-    fn explicit_ladder_keeps_its_existing_longest_read_filter() {
-        assert_eq!(settle_ladder(&[21, 31, 55], false, 0.0, 55), vec![21, 31]);
+    fn settle_ladder_cases() {
+        // (k values, default ladder, average read length, longest read, settled ladder)
+        for (ks, default_ladder, average, longest, want) in [
+            (
+                &[21][..],
+                true,
+                143.6,
+                151,
+                &[21, 31, 41, 55, 71, 91, 111, 131, 141][..],
+            ),
+            (&[21], true, 22.2, 22, &[21]),
+            (&[21, 31, 55], false, 0.0, 55, &[21, 31]),
+            (&[61, 71], false, 0.0, 55, &[61]),
+        ] {
+            assert_eq!(
+                settle_ladder(ks, default_ladder, average, longest),
+                want,
+                "{ks:?}, default {default_ladder}, longest read {longest}"
+            );
+        }
     }
 
     /// The browser reads its input again for every k, while native packs it once; both must assemble
@@ -834,34 +939,27 @@ mod multik_tests {
             true,
             true,
         );
-        let run = |opts: &BuildOpts, in_memory| {
+        let run = |opts: &BuildOpts, ks: Option<&[usize]>, in_memory| {
             let mut timevec = vec![Instant::now()];
-            let mut ladder = LadderState::new(opts, &reads, None, in_memory);
+            let mut ladder = LadderState::new(opts, &reads, ks, in_memory);
             let first = preprocess_step(opts, &reads, 0, &mut ladder, &mut timevec).unwrap();
-            run_ladder(opts, &reads, &mut ladder, first, &mut timevec, None).unwrap()
+            ascii(&run_ladder(opts, &reads, &mut ladder, first, &mut timevec, None).unwrap())
         };
-        // The automatic ladder, and a fixed floor, whose 4-bit store holds a single class.
-        for fixed in [None, Some(20)] {
+        // The default ladder at the automatic floors, and a short one at a fixed floor, whose 4-bit
+        // store holds a single class.
+        for (fixed, ks) in [(None, None), (Some(20), Some(&[21, 31, 41][..]))] {
             if let Some(floor) = fixed {
                 opts.quality.min_qual = floor;
                 opts.fixed_min_qual = true;
             }
-            assert_eq!(
-                run(&opts, false)
-                    .iter()
-                    .map(|s| s.ascii())
-                    .collect::<Vec<_>>(),
-                run(&opts, true)
-                    .iter()
-                    .map(|s| s.ascii())
-                    .collect::<Vec<_>>(),
-                "fixed floor {fixed:?}"
-            );
+            let stored = run(&opts, ks, true);
+            assert!(!stored.is_empty(), "fixed floor {fixed:?}: no contigs");
+            assert_eq!(run(&opts, ks, false), stored, "fixed floor {fixed:?}");
         }
     }
 
-    /// A given floor is the only one counted at, so it can never be loosened; without one, the
-    /// fixture's qualities give a ladder topped by the default.
+    /// A fixed floor is the only one counted at, so it can never be loosened; an automatic one gives
+    /// the ladder the fixture's qualities allow, topped by it.
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn a_fixed_floor_is_the_only_floor() {
@@ -882,7 +980,9 @@ mod multik_tests {
             true,
             true,
         );
-        assert!(quality_floors(&opts, &reads).len() > 1);
+        let floors = quality_floors(&opts, &reads);
+        assert!(floors.len() > 1, "{floors:?}");
+        assert_eq!(floors.last(), Some(&25), "{floors:?}");
         opts.fixed_min_qual = true;
         assert_eq!(quality_floors(&opts, &reads), vec![25]);
         let ladder = LadderState::new(&opts, &reads, Some(&[21, 31]), true);
@@ -892,53 +992,15 @@ mod multik_tests {
         assert!(!single.multik);
         assert!(matches!(single.replay, Replay::Reread(_)));
     }
+
+    /// Two-bit reads count at Q0 from the first k and are replayed from the store, assembling what a
+    /// fixed Q0 floor does. The last k sends its graph only if kept, so one graph shows k=31 was.
     #[test]
     fn two_bit_reads_use_q0_from_the_first_k_and_never_reread() {
-        use crate::utils::reads::{OwnedRecord, ReadSource};
-        use std::cell::Cell;
-        struct Reads {
-            records: Vec<OwnedRecord>,
-            opens: Cell<usize>,
-        }
-        impl ReadSource for Reads {
-            type Records<'a> = std::vec::IntoIter<OwnedRecord>;
-            fn records(&self) -> Self::Records<'_> {
-                self.opens.set(self.opens.get() + 1);
-                self.records.clone().into_iter()
-            }
-        }
-        let mut seed = 0x2545_F491_4F6C_DD1Du64;
-        let genome: Vec<_> = (0..2000)
-            .map(|_| {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                b"ACGT"[((seed >> 33) & 3) as usize]
-            })
-            .collect();
-        let records: Vec<_> = (0..=1850)
-            .step_by(5)
-            .flat_map(|i| {
-                let seq = genome[i..i + 150].to_vec();
-                let qual = (0..150)
-                    .map(|j| if j % 7 == 0 { 35 } else { 70 })
-                    .collect::<Vec<_>>();
-                [(seq.clone(), Some(qual.clone())), (seq, Some(qual))]
-            })
-            .collect();
+        let (genome, _) = simulated_reads();
         let run = |two_bit| {
-            let reads = Reads {
-                records: records.clone(),
-                opens: Cell::new(0),
-            };
-            let mut opts = BuildOpts::with_defaults(
-                QualOpts {
-                    min_count: 2,
-                    min_qual: 0,
-                },
-                true,
-                true,
-            );
+            let (_, reads) = simulated_reads();
+            let mut opts = q0_opts();
             opts.two_bit_reads = two_bit;
             opts.fixed_min_qual = !two_bit;
             assert_eq!(quality_floors(&opts, &reads), [0]);
@@ -948,10 +1010,21 @@ mod multik_tests {
             let mut times = vec![Instant::now()];
             let first = preprocess_step(&opts, &reads, 0, &mut state, &mut times).unwrap();
             match &first {
-                super::Preprocessed::W64(c) => assert_eq!(c.chosen_min_qual, 0),
+                Preprocessed::W64(c) => assert_eq!(c.chosen_min_qual, 0),
                 _ => panic!("k=21 must use u64"),
             }
-            let result = run_ladder(&opts, &reads, &mut state, first, &mut times, None).unwrap();
+            let mut graphs = 0;
+            let mut count_graph = |_: &DbgGraph| graphs += 1;
+            let result = run_ladder(
+                &opts,
+                &reads,
+                &mut state,
+                first,
+                &mut times,
+                Some(&mut count_graph),
+            )
+            .unwrap();
+            assert_eq!(graphs, 1, "two bits {two_bit}: k=31 must be kept");
             assert_eq!(
                 reads.opens.get(),
                 1,
@@ -960,10 +1033,105 @@ mod multik_tests {
             assert_eq!(state.floors, [0]);
             assert_eq!(state.floor_index, 0);
             assert_eq!(state.quality.min_qual, 0);
-            result.iter().map(|s| s.ascii()).collect::<Vec<_>>()
+            ascii(&result)
         };
         let expected = run(false);
-        assert!(!expected.is_empty());
+        assert!(spells(&expected, &genome), "no contig spells the genome");
         assert_eq!(run(true), expected);
+    }
+
+    /// A later k whose single-copy peak is below `MIN_LADDER_PEAK` is not assembled: the ladder ends on
+    /// the previous k's contigs and sends no graph. At k=145 the simulated reads see each k-mer at
+    /// most 4 times.
+    #[test]
+    fn a_later_k_with_too_low_a_peak_stops_the_ladder() {
+        let (genome, reads) = simulated_reads();
+        let opts = q0_opts();
+        let mut times = vec![Instant::now()];
+        let mut state = LadderState::new(&opts, &reads, Some(&[21, 145]), true);
+        let first = preprocess_step(&opts, &reads, 0, &mut state, &mut times).unwrap();
+        assemble_step(&opts, 0, &mut state, first, &mut times, &mut None).unwrap();
+        let k21 = ascii(&state.contigs);
+        assert!(spells(&k21, &genome), "no k=21 contig spells the genome");
+        let Err(error) = preprocess_step(&opts, &reads, 1, &mut state, &mut times) else {
+            panic!("k=145 must be refused");
+        };
+        assert!(error.to_string().contains("too low"), "{error}");
+
+        let mut state = LadderState::new(&opts, &reads, Some(&[21, 145]), true);
+        let first = preprocess_step(&opts, &reads, 0, &mut state, &mut times).unwrap();
+        let mut graphs = 0;
+        let mut count_graph = |_: &DbgGraph| graphs += 1;
+        let contigs = run_ladder(
+            &opts,
+            &reads,
+            &mut state,
+            first,
+            &mut times,
+            Some(&mut count_graph),
+        )
+        .unwrap();
+        assert_eq!(ascii(&contigs), k21);
+        assert_eq!(graphs, 0, "a stopped ladder sends no graph");
+    }
+
+    /// A later k whose cutoff is unresolved is kept only if it raises auN over the previous contigs,
+    /// which are restored otherwise; either way it sends no graph, since it might have been refused.
+    /// The flag is set by hand on a resolved k=31 count: the gate reads nothing else of it.
+    #[test]
+    fn an_unresolved_k_is_kept_only_if_it_raises_aun() {
+        let (genome, reads) = simulated_reads();
+        let opts = q0_opts();
+        let previous = |lengths: &[usize]| {
+            let mut contigs = PackedSeqs::new(true);
+            for &len in lengths {
+                contigs.push_contig(&vec![0; len]);
+            }
+            contigs.finish();
+            contigs
+        };
+        // (previous contig lengths, whether the k=31 contigs are kept)
+        for (lengths, kept) in [(&[600, 600][..], true), (&[10_000][..], false)] {
+            let mut times = vec![Instant::now()];
+            let mut state = LadderState::new(&opts, &reads, Some(&[21, 31]), false);
+            let Ok(mut counted) = preprocess_step(&opts, &reads, 1, &mut state, &mut times) else {
+                panic!("k=31 must count");
+            };
+            match &mut counted {
+                Preprocessed::W64(c) => {
+                    assert!(!c.min_count_unresolved, "k=31 must resolve");
+                    c.min_count_unresolved = true;
+                }
+                _ => panic!("k=31 must use u64"),
+            }
+            state.contigs = previous(lengths);
+            let old = ascii(&state.contigs);
+            let mut graphs = 0;
+            let mut count_graph = |_: &DbgGraph| graphs += 1;
+            let outcome = assemble_step(
+                &opts,
+                1,
+                &mut state,
+                counted,
+                &mut times,
+                &mut Some(&mut count_graph),
+            );
+            assert_eq!(graphs, 0, "{lengths:?}: an unresolved k sends no graph");
+            let new = ascii(&state.contigs);
+            if kept {
+                assert!(outcome.is_ok(), "{lengths:?}: {:?}", outcome.err());
+                assert!(
+                    spells(&new, &genome),
+                    "{lengths:?}: no contig spells the genome"
+                );
+            } else {
+                let error = outcome.expect_err("auN did not rise");
+                assert!(error.to_string().contains("auN"), "{error}");
+                assert_eq!(
+                    new, old,
+                    "{lengths:?}: the previous contigs must be restored"
+                );
+            }
+        }
     }
 }
