@@ -73,8 +73,8 @@ pub trait UInt<'a>:
     fn from_encoded_base(encoded_base: u8) -> Self;
     /// Number of bits in the representation
     fn n_bits(self) -> u32;
-    /// Get one nucleotide already with an UTF-8 encoding
-    fn get_one_nucleotide(self, i: usize) -> u8;
+    /// Get one two-bit base code, indexed from the least significant end
+    fn get_one_code(self, i: usize) -> u8;
 }
 
 impl<'a> UInt<'a> for u64 {
@@ -123,8 +123,8 @@ impl<'a> UInt<'a> for u64 {
     }
 
     #[inline(always)]
-    fn get_one_nucleotide(self, i: usize) -> u8 {
-        decode_base(((self >> (i * 2)) & 0x3) as u8)
+    fn get_one_code(self, i: usize) -> u8 {
+        ((self >> (i * 2)) & 0x3) as u8
     }
 }
 
@@ -183,8 +183,8 @@ impl<'a> UInt<'a> for u128 {
     }
 
     #[inline(always)]
-    fn get_one_nucleotide(self, i: usize) -> u8 {
-        decode_base(((self >> (i * 2)) & 0x3) as u8)
+    fn get_one_code(self, i: usize) -> u8 {
+        ((self >> (i * 2)) & 0x3) as u8
     }
 }
 
@@ -259,8 +259,8 @@ impl<'a> UInt<'a> for U256 {
     }
 
     #[inline(always)]
-    fn get_one_nucleotide(self, i: usize) -> u8 {
-        decode_base(((self >> (i * 2)) & U256::from_digit(0x3)).as_u8())
+    fn get_one_code(self, i: usize) -> u8 {
+        ((self >> (i * 2)) & U256::from_digit(0x3)).as_u8()
     }
 }
 
@@ -349,8 +349,8 @@ impl<'a> UInt<'a> for U512 {
     }
 
     #[inline(always)]
-    fn get_one_nucleotide(self, i: usize) -> u8 {
-        decode_base(((self >> (i * 2)) & U512::from_digit(0x3)).as_u8())
+    fn get_one_code(self, i: usize) -> u8 {
+        ((self >> (i * 2)) & U512::from_digit(0x3)).as_u8()
     }
 }
 

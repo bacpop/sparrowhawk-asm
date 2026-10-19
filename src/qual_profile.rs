@@ -97,6 +97,28 @@ pub fn window_groups(seq: &[u8], qual: &[u8], k: usize, floors: &[u8], out: &mut
     }
 }
 
+/// Stored four-bit equivalent of `window_groups`, using the active ladder's highest class.
+pub fn window_classes(seq: crate::read_store::PackedSeq<'_>, k: usize, top: u8, out: &mut Vec<u8>) {
+    out.clear();
+    out.resize(seq.len(), NONE);
+    let mut run = [0usize; MAX_GROUPS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let class = seq.nibble(i) >> 2;
+        let mut best = NONE;
+        for (g, count) in run.iter_mut().enumerate().take(usize::from(top) + 1) {
+            *count = if class != crate::read_store::UNUSABLE && usize::from(class) >= g {
+                *count + 1
+            } else {
+                0
+            };
+            if *count >= k {
+                best = g as u8;
+            }
+        }
+        *slot = best;
+    }
+}
+
 //
 //
 //

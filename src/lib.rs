@@ -52,6 +52,8 @@ pub mod spectrum_fitter;
 
 use crate::bit_encoding::UInt;
 use crate::graph_works::Assemble;
+use crate::preprocessing::PassInput;
+use crate::read_store::PackedSeqs;
 use crate::reads::ReadSource;
 use bit_encoding::{U256, U512};
 use sparrowhawk_graph::DbgGraph;
@@ -108,6 +110,8 @@ struct BuildOpts<'a> {
     quality: QualOpts,
     /// Count at `quality.min_qual` alone, rather than at the reads' ladder of floors topped by it.
     fixed_min_qual: bool,
+    /// Native multi-k: whole reads in two bits, with Q0 at every k.
+    two_bit_reads: bool,
     /// Enabled by default
     do_bloom: bool,
     /// Fit `min_count` from the k-mer spectrum rather than using `quality.min_count`.
@@ -181,6 +185,7 @@ impl BuildOpts<'static> {
         Self {
             quality,
             fixed_min_qual: false,
+            two_bit_reads: false,
             do_bloom,
             do_fit,
             do_bubble_collapse: true,
@@ -217,7 +222,9 @@ enum Preprocessed {
 /// The base-quality floors a k is counted at, ascending: the given floor alone when it is fixed, which
 /// can never be loosened, or else the ladder the reads' qualities allow, topped by it.
 fn quality_floors<S: ReadSource>(opts: &BuildOpts, reads: &S) -> Vec<u8> {
-    let floors = if opts.fixed_min_qual {
+    let floors = if opts.two_bit_reads {
+        vec![0]
+    } else if opts.fixed_min_qual {
         vec![opts.quality.min_qual]
     } else {
         // The alphabet only, from the head of the reads: a few thousand show all 4-5 bins, and no
@@ -240,8 +247,8 @@ fn preprocess_pass<IntT, I>(
     k: usize,
     quality: &QualOpts,
     floors: Option<&[u8]>,
-    records: I,
-    carried: Option<&[Vec<u8>]>,
+    input: PassInput<'_, I>,
+    carried: Option<&PackedSeqs>,
     prior: Option<(u16, preprocessing::PeakSource)>,
     timevec: &mut Vec<Instant>,
     out_path_histo: &mut Option<PathBuf>,
@@ -251,7 +258,7 @@ where
     I: Iterator<Item = reads::OwnedRecord> + reads::MaybeSend,
 {
     preprocessing::preprocessing::<IntT, _>(
-        &mut [records],
+        input,
         k,
         quality,
         floors,
@@ -337,7 +344,7 @@ where
                 k,
                 &quality,
                 floors,
-                read_store::Tee::new(reads.records(), &mut **store),
+                PassInput::Text(read_store::Tee::new(reads.records(), &mut **store)),
                 None,
                 None,
                 timevec,
@@ -348,7 +355,7 @@ where
                 k,
                 &quality,
                 floors,
-                read_store::Tee::new(reads.records(), stats),
+                PassInput::Text(read_store::Tee::new(reads.records(), stats)),
                 None,
                 None,
                 timevec,
@@ -423,31 +430,22 @@ where
     IntT: for<'a> UInt<'a>,
     S: ReadSource,
 {
-    let carried = (!state.contigs.is_empty()).then_some(state.contigs.as_slice());
-    match &state.replay {
-        Replay::Store(store) => preprocess_pass::<IntT, _>(
-            opts,
-            k,
-            quality,
-            floors,
-            store.records(),
-            carried,
-            prior,
-            timevec,
-            out_path_histo,
-        ),
-        Replay::Reread(_) => preprocess_pass::<IntT, _>(
-            opts,
-            k,
-            quality,
-            floors,
-            reads.records(),
-            carried,
-            prior,
-            timevec,
-            out_path_histo,
-        ),
-    }
+    let carried = (!state.contigs.is_empty()).then_some(&state.contigs);
+    let input = match &state.replay {
+        Replay::Store(store) => PassInput::Stored(store),
+        Replay::Reread(_) => PassInput::Text(reads.records()),
+    };
+    preprocess_pass::<IntT, _>(
+        opts,
+        k,
+        quality,
+        floors,
+        input,
+        carried,
+        prior,
+        timevec,
+        out_path_histo,
+    )
 }
 
 /// Record the floor this k's first count chose and, if it is below `strict_floor`, recount there,
@@ -537,8 +535,8 @@ fn assemble_step_at<IntT: for<'a> UInt<'a>>(
     // An unresolved cutoff must beat the previous contigs, so they are kept until it has; otherwise
     // they are carried into the count-map by now and dead weight.
     let unresolved = step > 0 && assembly.min_count_unresolved;
-    let previous = unresolved.then(|| std::mem::take(&mut state.contigs));
-    state.contigs = Vec::new();
+    let previous = unresolved.then(|| std::mem::replace(&mut state.contigs, PackedSeqs::new(true)));
+    state.contigs = PackedSeqs::new(true);
 
     let last = step + 1 == state.ks.len();
     // A k that may still be rejected sends no graph, as a stopped ladder never has.
@@ -563,7 +561,7 @@ fn assemble_step_at<IntT: for<'a> UInt<'a>>(
     log::info!(
         "k={k}: {} contigs, {} bases",
         state.contigs.len(),
-        state.contigs.iter().map(Vec::len).sum::<usize>()
+        state.contigs.iter().map(|s| s.len()).sum::<usize>()
     );
     if !last && opts.keep_intermediate_contigs {
         let path =
@@ -623,7 +621,7 @@ struct LadderState {
     /// Current quality/min-count settings. `min_qual` is the ceiling, `floors[floor_index]`.
     quality: QualOpts,
     /// The previous k's contigs, spelled.
-    contigs: Vec<Vec<u8>>,
+    contigs: PackedSeqs,
 }
 
 impl LadderState {
@@ -641,7 +639,10 @@ impl LadderState {
             post_ladder(ks);
         }
         let replay = if in_memory && multik {
-            Replay::Store(Box::new(read_store::ReadStore::new(&floors)))
+            Replay::Store(Box::new(read_store::ReadStore::new(
+                &floors,
+                opts.two_bit_reads,
+            )))
         } else {
             Replay::Reread(read_store::ReadStats::default())
         };
@@ -656,7 +657,7 @@ impl LadderState {
                 // The strict floor, as `record_floor_choice` keeps it: with `[0]`, no quality filtering.
                 min_qual: floors[floors.len() - 1],
             },
-            contigs: Vec::new(),
+            contigs: PackedSeqs::new(true),
             floors,
             replay,
         }
@@ -685,7 +686,7 @@ impl LadderState {
 }
 
 /// Length-weighted mean length of the contigs of at least `min_len` bases; 0 when there are none.
-fn aun(contigs: &[Vec<u8>], min_len: usize) -> f64 {
+fn aun(contigs: &PackedSeqs, min_len: usize) -> f64 {
     let (sum, sum_sq) = contigs
         .iter()
         .map(|c| c.len() as u64)
@@ -707,7 +708,7 @@ fn run_ladder<S: ReadSource>(
     first: Preprocessed,
     timevec: &mut Vec<Instant>,
     mut graph_sink: Option<&mut dyn FnMut(&DbgGraph)>,
-) -> Result<Vec<Vec<u8>>, preprocessing::PreprocessingError> {
+) -> Result<PackedSeqs, preprocessing::PreprocessingError> {
     let mut counted = Ok(first);
     let mut step = 0;
     loop {
@@ -733,7 +734,7 @@ fn run_ladder<S: ReadSource>(
         }
         counted = preprocess_step(opts, reads, step, state, timevec);
     }
-    Ok(std::mem::take(&mut state.contigs))
+    Ok(std::mem::replace(&mut state.contigs, PackedSeqs::new(true)))
 }
 
 /// The ceiling for later k: the higher of two consecutive choices once both are below the current
@@ -832,6 +833,7 @@ pub fn main() {
         k,
         min_count,
         min_qual,
+        two_bit_reads,
         threads,
         no_bloom,
         chunk_size,
@@ -890,7 +892,9 @@ pub fn main() {
     };
     // An explicit --min-qual is used as is, as an explicit --min-count is.
     let fixed_min_qual = min_qual.is_some();
-    if fixed_min_qual {
+    if *two_bit_reads {
+        log::info!("--two-bit-reads: Q0 at every k; no quality-floor selection or recounting");
+    } else if fixed_min_qual {
         log::info!("Base-quality floor fixed at {}", quality.min_qual);
     } else {
         log::info!(
@@ -930,6 +934,7 @@ pub fn main() {
     let opts = BuildOpts {
         quality,
         fixed_min_qual,
+        two_bit_reads: *two_bit_reads,
         do_bloom: !no_bloom,
         do_fit,
         do_bubble_collapse: !no_bubble_collapse,
@@ -1224,14 +1229,17 @@ impl AssemblyHelper {
             Some(&mut keep_graph),
         )?;
         post_state("assembly:saving");
-        let kept = save_functions::at_least(&contigs, opts.min_contig_length);
+        let mut written = 0;
+        self.fasta_gz = save_functions::gzipped(|out| {
+            written = save_functions::write_fasta(&contigs, opts.min_contig_length, out)?;
+            Ok(())
+        });
+        self.ncontigs = written;
         log::info!(
             "Omitted {} contigs shorter than {} nt from FASTA output",
-            contigs.len() - kept.len(),
+            contigs.len() - written,
             opts.min_contig_length
         );
-        self.ncontigs = kept.len();
-        self.fasta_gz = save_functions::gzipped(|out| save_functions::write_fasta(&kept, out));
         let (dot, gfa, gfa2) = graph_text.unwrap_or_default();
         self.dot_gz = save_functions::gzipped(|out| out.write_all(dot.as_bytes()));
         self.gfa_gz = save_functions::gzipped(|out| out.write_all(gfa.as_bytes()));
@@ -1331,10 +1339,15 @@ mod multik_tests {
     };
     use crate::cli::{DEFAULT_MINCOUNT, DEFAULT_MINQUAL};
     use crate::clock::Instant;
+    use crate::read_store::PackedSeqs;
 
     #[test]
     fn aun_weights_lengths_over_the_output_filter() {
-        let contigs = vec![vec![b'A'; 600], vec![b'A'; 400], vec![b'A'; 1000]];
+        let mut contigs = PackedSeqs::new(true);
+        for len in [600, 400, 1000] {
+            contigs.push_contig(&vec![0; len]);
+        }
+        contigs.finish();
         let want = (600.0 * 600.0 + 1000.0 * 1000.0) / 1600.0;
         assert!((aun(&contigs, 500) - want).abs() < 1e-9);
         assert_eq!(aun(&contigs, 2000), 0.0);
@@ -1353,7 +1366,7 @@ mod multik_tests {
                 min_count: 0,
                 min_qual: floors[floors.len() - 1],
             },
-            contigs: Vec::new(),
+            contigs: PackedSeqs::new(true),
         }
     }
 
@@ -1431,7 +1444,10 @@ mod multik_tests {
             let first = preprocess_step(&opts, &reads, 0, &mut ladder, &mut timevec).unwrap();
             run_ladder(&opts, &reads, &mut ladder, first, &mut timevec, None).unwrap()
         };
-        assert_eq!(run(false), run(true));
+        assert_eq!(
+            run(false).iter().map(|s| s.ascii()).collect::<Vec<_>>(),
+            run(true).iter().map(|s| s.ascii()).collect::<Vec<_>>()
+        );
     }
 
     /// A given floor is the only one counted at, so it can never be loosened; without one, the
@@ -1464,5 +1480,79 @@ mod multik_tests {
         let single = LadderState::new(&opts, &reads, Some(&[31]), true);
         assert!(!single.multik);
         assert!(matches!(single.replay, Replay::Reread(_)));
+    }
+    #[test]
+    fn two_bit_reads_use_q0_from_the_first_k_and_never_reread() {
+        use crate::reads::{OwnedRecord, ReadSource};
+        use std::cell::Cell;
+        struct Reads {
+            records: Vec<OwnedRecord>,
+            opens: Cell<usize>,
+        }
+        impl ReadSource for Reads {
+            type Records<'a> = std::vec::IntoIter<OwnedRecord>;
+            fn records(&self) -> Self::Records<'_> {
+                self.opens.set(self.opens.get() + 1);
+                self.records.clone().into_iter()
+            }
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let genome: Vec<_> = (0..2000)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                b"ACGT"[((seed >> 33) & 3) as usize]
+            })
+            .collect();
+        let records: Vec<_> = (0..=1850)
+            .step_by(5)
+            .flat_map(|i| {
+                let seq = genome[i..i + 150].to_vec();
+                let qual = (0..150)
+                    .map(|j| if j % 7 == 0 { 35 } else { 70 })
+                    .collect::<Vec<_>>();
+                [(seq.clone(), Some(qual.clone())), (seq, Some(qual))]
+            })
+            .collect();
+        let run = |two_bit| {
+            let reads = Reads {
+                records: records.clone(),
+                opens: Cell::new(0),
+            };
+            let mut opts = BuildOpts::with_defaults(
+                QualOpts {
+                    min_count: 2,
+                    min_qual: 0,
+                },
+                true,
+                true,
+            );
+            opts.two_bit_reads = two_bit;
+            opts.fixed_min_qual = !two_bit;
+            assert_eq!(quality_floors(&opts, &reads), [0]);
+            assert_eq!(reads.opens.get(), 0, "Q0 must not peek at input qualities");
+            let mut state = LadderState::new(&opts, &reads, Some(&[21, 31]), true);
+            assert_eq!(state.floors, [0]);
+            let mut times = vec![Instant::now()];
+            let first = preprocess_step(&opts, &reads, 0, &mut state, &mut times).unwrap();
+            match &first {
+                super::Preprocessed::W64(c) => assert_eq!(c.chosen_min_qual, 0),
+                _ => panic!("k=21 must use u64"),
+            }
+            let result = run_ladder(&opts, &reads, &mut state, first, &mut times, None).unwrap();
+            assert_eq!(
+                reads.opens.get(),
+                1,
+                "packed replay must not reopen input or recount"
+            );
+            assert_eq!(state.floors, [0]);
+            assert_eq!(state.floor_index, 0);
+            assert_eq!(state.quality.min_qual, 0);
+            result.iter().map(|s| s.ascii()).collect::<Vec<_>>()
+        };
+        let expected = run(false);
+        assert!(!expected.is_empty());
+        assert_eq!(run(true), expected);
     }
 }

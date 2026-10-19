@@ -182,6 +182,12 @@ pub struct Args {
     #[arg(long)]
     pub min_qual: Option<u8>,
 
+    /// Native multi-k only: store whole reads in two bits and use Q0 from the first k onwards,
+    /// without quality-floor recounts. Panics on non-ACGT bases, including N. Incompatible with a
+    /// positive --min-qual, --debug-quality-floors, or a single explicit k.
+    #[arg(long, default_value_t = false)]
+    pub two_bit_reads: bool,
+
     /// Number of CPU threads
     #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
     pub threads: usize,
@@ -282,6 +288,20 @@ pub struct Args {
 impl Args {
     /// Reject option values a run cannot use, before anything is created or logged.
     pub fn validate(&self) -> Result<(), String> {
+        if self.two_bit_reads {
+            if self.k.as_ref().is_some_and(|ks| ks.len() == 1) {
+                return Err("--two-bit-reads requires multi-k mode; omit -k or provide at least two k values".into());
+            }
+            if self.min_qual.is_some_and(|q| q > 0) {
+                return Err("--two-bit-reads requires Q0; remove --min-qual or set it to 0".into());
+            }
+            if self.debug_quality_floors {
+                return Err(
+                    "--two-bit-reads fixes Q0 and is incompatible with --debug-quality-floors"
+                        .into(),
+                );
+            }
+        }
         validate_bloom_min_count(!self.no_bloom, self.min_count)?;
         if self.debug_quality_floors && self.min_count.is_some() {
             return Err(
@@ -391,6 +411,29 @@ mod tests {
             ),
         ] {
             assert_eq!(default_kmer_ladder(ceiling), want, "ceiling {ceiling}");
+        }
+    }
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn two_bit_reads_require_multik_q0_without_quality_diagnostics() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            super::Args::try_parse_from(
+                ["sparrowhawk-asm", "reads.fastq", "--two-bit-reads"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .unwrap()
+        };
+        for extra in [&[][..], &["-k", "21,31"][..], &["--min-qual", "0"][..]] {
+            assert!(parse(extra).validate().is_ok());
+        }
+        for (extra, message) in [
+            (&["-k", "31"][..], "multi-k"),
+            (&["--min-qual", "20"][..], "Q0"),
+            (&["--debug-quality-floors"][..], "incompatible"),
+        ] {
+            assert!(parse(extra).validate().unwrap_err().contains(message));
         }
     }
 }

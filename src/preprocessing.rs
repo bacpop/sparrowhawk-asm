@@ -1,5 +1,9 @@
 //! Assembly preprocessing: this includes k-mer parsing, k-mer filtering, and k-mer counting. We also plot here k-mer spectra and fits to them.
 
+use crate::kmer::Bases;
+use crate::qual_profile::window_classes;
+use crate::read_store::{PackedSeq, PackedSeqs, ReadStore};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::{error::Error, fmt};
 
@@ -45,7 +49,7 @@ const _: () = assert!(LEGACY_HISTO_RANGE <= MAXSIZEHISTO);
 
 /// How many records go to the workers at a time: ~1M k-mers at 150 bp and k=31, small enough to stay
 /// cache-friendly and large enough to amortise the rayon fork/join.
-const BATCH_RECORDS: usize = 8192;
+const BATCH_RECORDS: usize = crate::read_store::BLOCK_READS;
 /// Never fewer shards than this: below it each map stops being a small fraction of the working set. Heuristically set.
 const MIN_COUNTMAP_SHARDS: usize = 64;
 /// Nor more than this, or the per-batch split pays for buckets that hold almost nothing.
@@ -2166,63 +2170,117 @@ fn plot_kmer_histogram(
 
 /// The constants of one counting pass: fixed for every record, so they travel together.
 #[derive(Clone, Copy)]
-struct KmerWalk<'a> {
+pub(crate) struct KmerWalk<'a> {
     k: usize,
     min_qual: u8,
+    min_class: u8,
     floors: Option<&'a [u8]>,
     /// Group index of the strict floor: a k-mer tagged below this does not enter the count-map.
     keep: u8,
 }
 
-/// Walk one record's k-mers, handing each to `emit` as `(hc, hnc, b, group, packed)`. `groups` is the
-/// caller's scratch, reused per record. `floors = Some(ladder)` tags each k-mer with the strictest
-/// floor it clears; `None` filters at the iterator and tags everything `keep`.
+/// What one counting pass reads.
+pub enum PassInput<'a, I> {
+    /// Reads parsed from the input, as now: the first k (packing them on the way), a native single k,
+    /// and every pass in the browser.
+    Text(I),
+    /// The reads the first k packed, parsed where they lie: every later k of a native ladder, and a
+    /// recount. No reader thread, no decoding.
+    Stored(&'a ReadStore),
+}
+
+/// A sequence the counter walks: a read parsed from the input, or a packed one.
+pub(crate) trait CountedRead: Sync {
+    /// Hand each of its k-mers to `emit` as `(hc, hnc, b, group, packed)`. `groups` is the caller's
+    /// scratch, reused per sequence.
+    fn walk<IntT, F>(&self, w: KmerWalk, groups: &mut Vec<u8>, emit: F)
+    where
+        IntT: for<'a> UInt<'a>,
+        F: FnMut(u64, u64, u8, u8, Option<IntT>);
+}
+
+impl CountedRead for OwnedRecord {
+    /// Classify ASCII windows and filter the iterator at the lowest active floor.
+    #[inline]
+    fn walk<IntT, F>(&self, w: KmerWalk, groups: &mut Vec<u8>, emit: F)
+    where
+        IntT: for<'a> UInt<'a>,
+        F: FnMut(u64, u64, u8, u8, Option<IntT>),
+    {
+        let (seq, qual) = (self.0.as_slice(), self.1.as_deref());
+        // The scratch is shared across records, so a FASTA record must not inherit the previous one's tags.
+        groups.clear();
+        if let (Some(floors), Some(qual)) = (w.floors, qual) {
+            window_groups(seq, qual, w.k, floors, groups);
+        }
+        // Under a ladder the iterator filters at its lowest floor (0 unless the floor was fixed), so every
+        // window it emits clears at least one rung.
+        let min_qual = match w.floors {
+            Some(floors) if !groups.is_empty() => floors[0],
+            _ => w.min_qual,
+        };
+        walk_kmers(
+            Kmer::<IntT>::new(Cow::Borrowed(seq), seq.len(), qual, w.k, min_qual, true),
+            groups,
+            w.keep,
+            emit,
+        );
+    }
+}
+
+impl CountedRead for PackedSeq<'_> {
+    #[inline]
+    fn walk<IntT, F>(&self, w: KmerWalk, groups: &mut Vec<u8>, emit: F)
+    where
+        IntT: for<'a> UInt<'a>,
+        F: FnMut(u64, u64, u8, u8, Option<IntT>),
+    {
+        groups.clear();
+        if self.is_two_bit() {
+            // Reads kept in 2 bits (one floor), or a contig: every stored base clears the floor, so every
+            // k-mer is `keep`.
+            walk_kmers(
+                Kmer::<IntT, _>::from_two_bit(*self, w.k, true),
+                groups,
+                w.keep,
+                emit,
+            );
+        } else {
+            if let Some(floors) = w.floors {
+                window_classes(*self, w.k, (floors.len() - 1) as u8, groups);
+            }
+            walk_kmers(
+                Kmer::<IntT, _>::from_four_bit(*self, w.k, w.min_class, true),
+                groups,
+                w.keep,
+                emit,
+            );
+        }
+    }
+}
+
+/// Emit each k-mer with its tag: from `groups` under a ladder, `keep` otherwise. The packed k-mer is the
+/// costly half at k>=51, so it is built only for what is kept.
 #[inline]
-fn for_each_kmer<IntT, F>(
-    seq: &[u8],
-    qual_bytes: Option<&[u8]>,
-    w: KmerWalk,
-    groups: &mut Vec<u8>,
-    mut emit: F,
-) where
+fn walk_kmers<IntT, B, F>(kmers: Option<Kmer<'_, IntT, B>>, groups: &[u8], keep: u8, mut emit: F)
+where
     IntT: for<'a> UInt<'a>,
+    B: Bases,
     F: FnMut(u64, u64, u8, u8, Option<IntT>),
 {
-    // The scratch is shared across records, so a FASTA record must not inherit the previous one's tags.
-    groups.clear();
-    if let (Some(floors), Some(qual)) = (w.floors, qual_bytes) {
-        window_groups(seq, qual, w.k, floors, groups);
-    }
-    // Every emitted window must clear at least one rung. Automatic ladders start at zero, while an
-    // explicit quality floor is a single rung that must already apply on this first pass.
-    let min_qual = match w.floors {
-        Some(floors) if !groups.is_empty() => floors[0],
-        _ => w.min_qual,
-    };
-    let kmer_opt = Kmer::<IntT>::new(
-        std::borrow::Cow::Borrowed(seq),
-        seq.len(),
-        qual_bytes,
-        w.k,
-        min_qual,
-        true,
-    );
-    if let Some(mut kmer_it) = kmer_opt {
-        let (mut hc, mut hnc, mut b) = kmer_it.get_hashes_and_bases();
-        loop {
-            // A record with no qualities (FASTA) has nothing to classify: keep every k-mer.
-            let g = if groups.is_empty() {
-                w.keep
-            } else {
-                groups[kmer_it.end_index()]
-            };
-            debug_assert_ne!(g, NONE, "the iterator emitted a window no floor clears");
-            // The packed k-mer is the costly half at k>=51, so build it only for what is kept.
-            emit(hc, hnc, b, g, (g >= w.keep).then(|| kmer_it.get_kmer()));
-            match kmer_it.get_next_hash_and_bases() {
-                Some(next) => (hc, hnc, b) = next,
-                None => break,
-            }
+    let Some(mut kmer_it) = kmers else { return };
+    let (mut hc, mut hnc, mut b) = kmer_it.get_hashes_and_bases();
+    loop {
+        let g = if groups.is_empty() {
+            keep
+        } else {
+            groups[kmer_it.end_index()]
+        };
+        debug_assert_ne!(g, NONE, "the iterator emitted a window no floor clears");
+        emit(hc, hnc, b, g, (g >= keep).then(|| kmer_it.get_kmer()));
+        match kmer_it.get_next_hash_and_bases() {
+            Some(next) => (hc, hnc, b) = next,
+            None => break,
         }
     }
 }
@@ -2313,12 +2371,9 @@ impl<IntT> TaskState<IntT> {
 /// Nothing is materialised in between: a k-mer is written once into a bucket and once into the map,
 /// where the flat-vector version wrote it four times. Shards partition the keys, so absorb needs no lock.
 #[allow(clippy::too_many_arguments)]
-fn count_batch<IntT>(
-    batch: &[OwnedRecord],
-    k: usize,
-    qual: &QualOpts,
-    floors: Option<&[u8]>,
-    keep: u8,
+fn count_batch<IntT, R: CountedRead>(
+    batch: &[R],
+    w: KmerWalk,
     sketch: Option<&mut SpectrumSketch>,
     states: &mut [TaskState<IntT>],
     shards: &mut [CountMap<IntT>],
@@ -2334,12 +2389,6 @@ fn count_batch<IntT>(
         2
     } else {
         1
-    };
-    let w = KmerWalk {
-        k,
-        min_qual: qual.min_qual,
-        floors,
-        keep,
     };
     // `observe` rejects anything at or above the threshold, and the threshold only ever falls, so
     // filtering against a snapshot taken now admits exactly what it would have accepted.
@@ -2358,31 +2407,25 @@ fn count_batch<IntT>(
                 cand,
                 floor_has_kmers,
             } = st;
-            for (seq, qual_bytes) in recs {
-                for_each_kmer::<IntT, _>(
-                    seq,
-                    qual_bytes.as_deref(),
-                    w,
-                    groups,
-                    |hc, hnc, b, g, km| {
-                        if g != NONE {
-                            for present in floor_has_kmers.iter_mut().take(usize::from(g) + 1) {
-                                *present = true;
-                            }
+            for read in recs {
+                read.walk::<IntT, _>(w, groups, |hc, hnc, b, g, km| {
+                    if g != NONE {
+                        for present in floor_has_kmers.iter_mut().take(usize::from(g) + 1) {
+                            *present = true;
                         }
-                        if hc < thr {
-                            cand.push((hc, g));
-                        }
-                        if g >= keep {
-                            buckets[shard_of(hc, n_shards)].push((
-                                hc,
-                                hnc,
-                                b,
-                                km.expect("a kept k-mer carries its bits"),
-                            ));
-                        }
-                    },
-                );
+                    }
+                    if hc < thr {
+                        cand.push((hc, g));
+                    }
+                    if g >= w.keep {
+                        buckets[shard_of(hc, n_shards)].push((
+                            hc,
+                            hnc,
+                            b,
+                            km.expect("a kept k-mer carries its bits"),
+                        ));
+                    }
+                });
             }
         });
     t.hash_ns += t0.elapsed().as_nanos();
@@ -2451,10 +2494,11 @@ fn count_batch<IntT>(
 /// One pass over the reads: every kept k-mer counted into the sharded count map, and every
 /// k-mer sampled into the per-floor sketch.
 fn count_kmers<IntT, I>(
-    input_iters: &mut [I],
+    input: PassInput<'_, I>,
     k: usize,
     qual: &QualOpts,
     floors: Option<&[u8]>,
+    min_class: u8,
     do_bloom: bool,
     do_fit: bool,
 ) -> (
@@ -2504,21 +2548,48 @@ where
 
     let mut t = CountTimings::default();
     crate::post_state("preprocess:bulk:loop:start");
-    let total = extract_kmers_from_files_batched(input_iters, BATCH_RECORDS, |batch| {
-        count_batch(
-            batch,
-            k,
-            qual,
-            floors,
-            keep,
-            sketch.as_mut(),
-            &mut states,
-            &mut shards,
-            &mut blooms,
-            &mut t,
-        );
-        t.batches += 1;
-    });
+    let w = KmerWalk {
+        k,
+        min_qual: qual.min_qual,
+        min_class,
+        floors,
+        keep,
+    };
+    let total = match input {
+        PassInput::Text(records) => {
+            extract_kmers_from_files_batched(&mut [records], BATCH_RECORDS, |batch| {
+                count_batch(
+                    batch,
+                    w,
+                    sketch.as_mut(),
+                    &mut states,
+                    &mut shards,
+                    &mut blooms,
+                    &mut t,
+                );
+                t.batches += 1;
+            })
+        }
+        PassInput::Stored(store) => {
+            let start = Instant::now();
+            let mut batch = Vec::new();
+            for sequences in store.seqs().batches() {
+                batch.clear();
+                batch.extend(sequences);
+                count_batch(
+                    &batch,
+                    w,
+                    sketch.as_mut(),
+                    &mut states,
+                    &mut shards,
+                    &mut blooms,
+                    &mut t,
+                );
+                t.batches += 1;
+            }
+            start.elapsed()
+        }
+    };
     crate::post_state("preprocess:bulk:loop:end");
     t.log(total);
 
@@ -2588,7 +2659,7 @@ where
 /// the reads never produced. Each chunk is hashed in parallel, then absorbed one writer per shard.
 fn carry_contig_kmers<IntT>(
     shards: &mut [CountMap<IntT>],
-    contigs: &[Vec<u8>],
+    contigs: &PackedSeqs,
     k: usize,
     minc: u16,
 ) -> usize
@@ -2601,10 +2672,12 @@ where
     let w = KmerWalk {
         k,
         min_qual: 0,
+        min_class: 0,
         floors: None,
         keep: 0,
     };
-    let mut rest = contigs;
+    let seqs: Vec<_> = contigs.iter().collect();
+    let mut rest = seqs.as_slice();
     while !rest.is_empty() {
         let mut take = 1;
         let mut bases = rest[0].len();
@@ -2620,7 +2693,7 @@ where
             .flat_map_iter(|seq| {
                 let mut local = Vec::new();
                 let mut groups = Vec::new();
-                for_each_kmer::<IntT, _>(seq, None, w, &mut groups, |hc, hnc, b, _, km| {
+                seq.walk::<IntT, _>(w, &mut groups, |hc, hnc, b, _, km| {
                     local.push((hc, hnc, b, km.expect("a kept k-mer carries its bits")));
                 });
                 local
@@ -2688,7 +2761,7 @@ fn choose_cutoff_and_filter<IntT>(
     sketch: Option<SpectrumSketch>,
     do_fit: bool,
     do_bloom: bool,
-    carried: Option<&[Vec<u8>]>,
+    carried: Option<&PackedSeqs>,
     out_path: &mut Option<PathBuf>,
     debug_quality_floors: bool,
     prior: Option<(u16, PeakSource)>,
@@ -2879,7 +2952,7 @@ where
 /// and plots every floor; `prior`: a recount's selection from the sketch, see [`keep_refit_or_prior`].
 #[allow(clippy::too_many_arguments)]
 pub fn preprocessing<IntT, I>(
-    input_iters: &mut [I],
+    input: PassInput<'_, I>,
     k: usize,
     qual: &QualOpts,
     floors: Option<&[u8]>,
@@ -2887,7 +2960,7 @@ pub fn preprocessing<IntT, I>(
     out_path: &mut Option<PathBuf>,
     do_bloom: bool,
     do_fit: bool,
-    carried: Option<&[Vec<u8>]>,
+    carried: Option<&PackedSeqs>,
     debug_quality_floors: bool,
     prior: Option<(u16, PeakSource)>,
 ) -> Result<PreprocessedK<IntT>, PreprocessingError>
@@ -2898,8 +2971,12 @@ where
     crate::post_state("preprocess:bulk:start");
     log::info!("Starting preprocessing with k = {k}");
     log::info!("Counting k-mers into a hash map, without sorting");
+    let min_class = match (&input, floors) {
+        (PassInput::Stored(store), None) => store.class_of_floor(qual.min_qual),
+        _ => 0,
+    };
     let (shards, sketch, floor_has_kmers) =
-        count_kmers::<IntT, _>(input_iters, k, qual, floors, do_bloom, do_fit);
+        count_kmers::<IntT, _>(input, k, qual, floors, min_class, do_bloom, do_fit);
     let (kmers, histovec, used_min_count, chosen_min_qual, genomic_peak) =
         choose_cutoff_and_filter::<IntT>(
             shards,
@@ -2953,6 +3030,47 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Text adapter for the existing counter fixtures, including multiple input iterators.
+    fn count_kmers<IntT, I>(
+        records: &mut [I],
+        k: usize,
+        qual: &QualOpts,
+        floors: Option<&[u8]>,
+        do_bloom: bool,
+        do_fit: bool,
+    ) -> (
+        Vec<CountMap<IntT>>,
+        Option<SpectrumSketch>,
+        [bool; MAX_GROUPS],
+    )
+    where
+        IntT: for<'a> UInt<'a>,
+        I: Iterator<Item = OwnedRecord> + MaybeSend,
+    {
+        super::count_kmers(
+            PassInput::Text(records.iter_mut().flatten()),
+            k,
+            qual,
+            floors,
+            0,
+            do_bloom,
+            do_fit,
+        )
+    }
+    fn packed_contigs(seqs: &[Vec<u8>]) -> PackedSeqs {
+        let mut packed = PackedSeqs::new(true);
+        for seq in seqs {
+            assert!(seq.iter().all(|&b| crate::bit_encoding::valid_base(b)));
+            packed.push_contig(
+                &seq.iter()
+                    .map(|&b| crate::bit_encoding::encode_base(b))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        packed.finish();
+        packed
+    }
+
     #[cfg(not(target_family = "wasm"))]
     use crate::spectrum_fitter::{ErrorModel, ErrorParams, GenomeModel};
     use std::{collections::HashMap, hash::BuildHasherDefault};
@@ -4079,7 +4197,16 @@ mod tests {
                 let seq: Vec<u8> = (0..k)
                     .map(|_| BASES[(xorshift(&mut st) % 4) as usize])
                     .collect();
-                lowest = lowest.min(NtHashIterator::new(&seq, k, true).canonical_hash());
+                lowest = lowest.min(
+                    NtHashIterator::new(
+                        &seq.iter()
+                            .map(|&b| crate::bit_encoding::encode_base(b))
+                            .collect::<Vec<_>>(),
+                        k,
+                        true,
+                    )
+                    .canonical_hash(),
+                );
             }
             assert!(
                 lowest >= HASH_FLOOR,
@@ -4744,40 +4871,64 @@ mod tests {
     #[test]
     fn counting_the_read_store_matches_counting_the_reads() {
         let reads = counter_test_reads();
-        let ladder = [0u8, 11, 25];
-        let mut store = crate::read_store::ReadStore::new(&ladder);
-        for (seq, qual) in &reads {
-            store.push(seq, qual.as_deref());
-        }
-        store.finish();
-        let counts = |shards: Vec<CountMap<u64>>| -> HashMap<u64, (u32, u64, u8)> {
+        let counts = |shards: Vec<CountMap<u64>>| -> HashMap<u64, (u32, u64, u8, u64)> {
             shards
                 .into_iter()
                 .flatten()
-                .map(|(hc, i)| (hc, (i.count, i.hnc, i.b)))
+                .map(|(h, i)| (h, (i.count, i.hnc, i.b, i.km)))
                 .collect()
         };
-        for (floors, min_qual) in [(Some(&ladder[..]), 25u8), (None, 11), (None, 25)] {
-            let qual = QualOpts {
-                min_count: 2,
-                min_qual,
-            };
-            let streamed = count_kmers::<u64, _>(
-                &mut [reads.clone().into_iter()],
-                11,
-                &qual,
-                floors,
-                false,
-                true,
-            )
-            .0;
-            let replayed =
-                count_kmers::<u64, _>(&mut [store.records()], 11, &qual, floors, false, true).0;
-            assert_eq!(
-                counts(streamed),
-                counts(replayed),
-                "floors={floors:?} min_qual={min_qual}"
-            );
+        for (ladder, two_bit) in [
+            (vec![0, 11, 25], false),
+            (vec![20], false),
+            (vec![0], false),
+            (vec![0], true),
+        ] {
+            let mut store = ReadStore::new(&ladder, two_bit);
+            for (seq, qual) in &reads {
+                store.push(seq, qual.as_deref());
+            }
+            store.finish();
+            for do_bloom in [false, true] {
+                for top in 0..ladder.len() {
+                    for classify in [false, true] {
+                        let floor = ladder[top];
+                        let floors = classify.then_some(&ladder[..=top]);
+                        let qual = QualOpts {
+                            min_count: 2,
+                            min_qual: floor,
+                        };
+                        let text = super::count_kmers::<u64, _>(
+                            PassInput::Text(reads.clone().into_iter()),
+                            11,
+                            &qual,
+                            floors,
+                            0,
+                            do_bloom,
+                            true,
+                        );
+                        let packed = super::count_kmers::<u64, std::iter::Empty<OwnedRecord>>(
+                            PassInput::Stored(&store),
+                            11,
+                            &qual,
+                            floors,
+                            if classify { 0 } else { top as u8 },
+                            do_bloom,
+                            true,
+                        );
+                        assert_eq!(
+                            counts(text.0),
+                            counts(packed.0),
+                            "ladder={ladder:?} top={top} two_bit={two_bit} bloom={do_bloom}"
+                        );
+                        assert_eq!(text.2, packed.2);
+                        assert_eq!(
+                            text.1.as_ref().map(|s| s.spectra(top + 1)),
+                            packed.1.as_ref().map(|s| s.spectra(top + 1))
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -4816,7 +4967,7 @@ mod tests {
             true,
         );
         let before = as_counts(&shards);
-        let absent = carry_contig_kmers(&mut shards, &contigs, k, minc);
+        let absent = carry_contig_kmers(&mut shards, &packed_contigs(&contigs), k, minc);
         let after = as_counts(&shards);
         let minc = u32::from(minc);
         assert_eq!(
@@ -4879,7 +5030,7 @@ mod tests {
             ec_ratio: 4.0,
             ec_require_both_flanks: false,
         };
-        let assemble = |k: usize, carried: Option<&[Vec<u8>]>| -> Vec<Vec<u8>> {
+        let assemble = |k: usize, carried: Option<&PackedSeqs>| -> PackedSeqs {
             let (shards, sketch, present) = count_kmers::<u128, _>(
                 &mut [reads.clone().into_iter()],
                 k,
@@ -4906,7 +5057,7 @@ mod tests {
         assert_eq!(assemble(41, None).len(), 2, "ten 41-mers are never read");
         let large = assemble(41, Some(&small));
         assert_eq!(large.len(), 1, "the carried contig bridges the seam");
-        assert_eq!(large[0].len(), genome.len());
+        assert_eq!(large.iter().next().unwrap().len(), genome.len());
     }
 
     /// The min-count, and the floor it was read at. Every candidate floor is evaluated and only then
@@ -4966,22 +5117,19 @@ mod tests {
     {
         batch
             .par_iter()
-            .flat_map_iter(|(seq, qual_bytes)| {
+            .flat_map_iter(|read| {
                 let mut local = Vec::new();
                 let mut groups: Vec<u8> = Vec::new();
                 let w = KmerWalk {
                     k,
                     min_qual,
+                    min_class: 0,
                     floors,
                     keep,
                 };
-                for_each_kmer::<IntT, _>(
-                    seq,
-                    qual_bytes.as_deref(),
-                    w,
-                    &mut groups,
-                    |hc, hnc, b, g, km| local.push((hc, hnc, b, g, km)),
-                );
+                read.walk::<IntT, _>(w, &mut groups, |hc, hnc, b, g, km| {
+                    local.push((hc, hnc, b, g, km))
+                });
                 local
             })
             .collect()

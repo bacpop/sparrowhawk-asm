@@ -7,9 +7,10 @@ use std::io::Write;
 
 use std::path::PathBuf;
 
-use crate::bit_encoding::UInt;
+use crate::bit_encoding::{decode_base, UInt};
 use crate::graph_works::{spell_path, Contigs};
 use crate::io_utils::set_ostream;
+use crate::read_store::PackedSeqs;
 
 /// Spells every contig, looking each packed k-mer up with `lookup`. A multi-k step carries all of them
 /// to the next k, so none is length-filtered.
@@ -17,43 +18,46 @@ pub(crate) fn spell_contigs<IntT>(
     contigs: &Contigs,
     lookup: impl Fn(u64) -> Option<IntT>,
     k: usize,
-) -> Vec<Vec<u8>>
+) -> PackedSeqs
 where
     IntT: for<'a> UInt<'a>,
 {
-    contigs
-        .serialized_contigs
-        .iter()
-        .enumerate()
-        .map(|(ipc, contig)| {
-            assert_eq!(contig.len(), 1, "contig {ipc} was not shrunk to one node");
-            spell_path(&contig[0].abs_ind, &lookup, k)
-                .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"))
-        })
-        .collect()
-}
-
-/// The contigs of at least `min_contig_length` bases (inclusive), the only ones written to FASTA.
-pub(crate) fn at_least(seqs: &[Vec<u8>], min_contig_length: usize) -> Vec<Vec<u8>> {
-    seqs.iter()
-        .filter(|s| s.len() >= min_contig_length)
-        .cloned()
-        .collect()
+    let mut spelled = PackedSeqs::new(true);
+    for (i, contig) in contigs.serialized_contigs.iter().enumerate() {
+        assert_eq!(contig.len(), 1, "contig {i} was not shrunk to one node");
+        let codes = spell_path(&contig[0].abs_ind, &lookup, k)
+            .unwrap_or_else(|e| panic!("contig {i} is not a valid walk: {e}"));
+        spelled.push_contig(&codes);
+    }
+    spelled.finish();
+    spelled
 }
 
 /// Bases per FASTA line.
 const FASTA_LINE_WIDTH: usize = 80;
 
-/// Writes `seqs` as FASTA, named by their index, `FASTA_LINE_WIDTH` bases per line.
-pub(crate) fn write_fasta<W: Write>(seqs: &[Vec<u8>], out: &mut W) -> std::io::Result<()> {
-    for (i, seq) in seqs.iter().enumerate() {
-        writeln!(out, ">{i}")?;
-        for line in seq.chunks(FASTA_LINE_WIDTH) {
-            out.write_all(line)?;
+/// Write sequences clearing the inclusive length filter, with consecutive names and 80-base lines.
+/// Returns the number written; decoding needs only one fixed-size line buffer.
+pub(crate) fn write_fasta<W: Write>(
+    seqs: &PackedSeqs,
+    min_contig_length: usize,
+    out: &mut W,
+) -> std::io::Result<usize> {
+    let mut written = 0;
+    let mut line = [0u8; FASTA_LINE_WIDTH];
+    for seq in seqs.iter().filter(|s| s.len() >= min_contig_length) {
+        writeln!(out, ">{written}")?;
+        for start in (0..seq.len()).step_by(FASTA_LINE_WIDTH) {
+            let len = (seq.len() - start).min(FASTA_LINE_WIDTH);
+            for (i, base) in line[..len].iter_mut().enumerate() {
+                *base = decode_base(seq.code(start + i));
+            }
+            out.write_all(&line[..len])?;
             out.write_all(b"\n")?;
         }
+        written += 1;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// What `write` produces, gzipped as one member: how the page keeps and offers its downloads.
@@ -69,17 +73,17 @@ pub(crate) fn gzipped(
 
 /// Writes spelled contigs of at least `min_contig_length` bases as FASTA to `outfile`.
 pub(crate) fn save_sequences_as_fasta(
-    seqs: &[Vec<u8>],
+    seqs: &PackedSeqs,
     min_contig_length: usize,
     outfile: PathBuf,
 ) {
-    let kept = at_least(seqs, min_contig_length);
+    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
+    let written =
+        write_fasta(seqs, min_contig_length, &mut wbuf).expect("cannot write the contigs");
     log::info!(
         "Omitted {} contigs shorter than {min_contig_length} nt from FASTA output",
-        seqs.len() - kept.len()
+        seqs.len() - written
     );
-    let mut wbuf = set_ostream(&Some(outfile.into_os_string().into_string().unwrap()));
-    write_fasta(&kept, &mut wbuf).expect("cannot write the contigs");
 }
 
 //
@@ -92,6 +96,19 @@ pub(crate) fn save_sequences_as_fasta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn packed(seqs: &[Vec<u8>]) -> PackedSeqs {
+        let mut result = PackedSeqs::new(true);
+        for seq in seqs {
+            result.push_contig(
+                &seq.iter()
+                    .map(|&b| crate::bit_encoding::encode_base(b))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        result.finish();
+        result
+    }
+
     use crate::graph_works::Contigs;
     use crate::kmer::Kmer;
     use nohash_hasher::NoHashHasher;
@@ -151,9 +168,9 @@ mod tests {
         assert_eq!(path.len(), n);
 
         let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
-        let got = &sequences[0];
+        let got = sequences.iter().next().unwrap().ascii();
         assert_eq!(got.len(), seq.len(), "contig length");
-        assert_eq!(got, &seq, "contig sequence");
+        assert_eq!(got, seq, "contig sequence");
     }
 
     /// Both terminal k-mers survive. Guards the end-symmetry the old trim had to be fixed for: an
@@ -165,7 +182,7 @@ mod tests {
         let (dict, path) = dict_and_path(&seq, k);
 
         let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
-        let got = &sequences[0];
+        let got = sequences.iter().next().unwrap().ascii();
         assert_eq!(&got[..k], &seq[..k], "the first terminal k-mer");
         assert_eq!(&got[got.len() - k..], &seq[seq.len() - k..], "the last one");
     }
@@ -181,15 +198,17 @@ mod tests {
 
         let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
         assert_eq!(sequences.len(), 1, "the short path must still be written");
-        assert_eq!(sequences[0], seq);
+        assert_eq!(sequences.iter().next().unwrap().ascii(), seq);
     }
 
     #[test]
     fn minimum_contig_length_is_inclusive_and_configurable() {
         // The threshold applies to the sequence written, not to a trimmed body, so it means what it says.
         let sequences = [pseudo_seq(500), pseudo_seq(499)];
-        assert_eq!(at_least(&sequences, 500), vec![sequences[0].clone()]);
-        assert_eq!(at_least(&sequences, 499).len(), 2);
+        let packed = packed(&sequences);
+        assert_eq!(write_fasta(&packed, 500, &mut Vec::new()).unwrap(), 1);
+        assert_eq!(write_fasta(&packed, 499, &mut Vec::new()).unwrap(), 2);
+        assert_eq!(write_fasta(&packed, 501, &mut Vec::new()).unwrap(), 0);
     }
 
     /// Headers are the contigs' indices, and sequences wrap every `FASTA_LINE_WIDTH` bases.
@@ -200,7 +219,7 @@ mod tests {
             vec![b'C'; FASTA_LINE_WIDTH],
         ];
         let mut out = Vec::new();
-        write_fasta(&seqs, &mut out).unwrap();
+        write_fasta(&packed(&seqs), 0, &mut out).unwrap();
         let a = "A".repeat(FASTA_LINE_WIDTH);
         let c = "C".repeat(FASTA_LINE_WIDTH);
         assert_eq!(

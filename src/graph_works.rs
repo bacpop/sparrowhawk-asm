@@ -220,7 +220,7 @@ impl fmt::Display for SpellError {
     }
 }
 
-/// Spell the nucleotides of a walk of canonical k-mer hashes, looking each packed k-mer up with `lookup`.
+/// Spell the two-bit base codes of a walk of canonical k-mer hashes, looking each packed k-mer up with `lookup`.
 pub fn spell_path<IntT>(
     hashes: &[u64],
     lookup: impl Fn(u64) -> Option<IntT>,
@@ -264,10 +264,10 @@ where
 
     let mut out: Vec<u8> = Vec::with_capacity(hashes.len() + k - 1);
 
-    // All k bases of the first k-mer. `get_one_nucleotide` indexes from the low end, and packing is
+    // All k bases of the first k-mer. `get_one_code` indexes from the low end, and packing is
     // MSB-first, so index k-1 is base 0 and index 0 is the last base.
     for inc in 0..k {
-        out.push(prev.get_one_nucleotide(k - 1 - inc));
+        out.push(prev.get_one_code(k - 1 - inc));
     }
 
     // Thereafter each k-mer contributes exactly one new base: its last.
@@ -285,7 +285,7 @@ where
             }
         }
 
-        out.push(curr.get_one_nucleotide(0));
+        out.push(curr.get_one_code(0));
         prev = curr;
     }
 
@@ -685,7 +685,13 @@ mod tests {
                     "k={k} len={len}: spelled length"
                 );
                 assert_eq!(
-                    String::from_utf8(spelled).unwrap(),
+                    String::from_utf8(
+                        spelled
+                            .into_iter()
+                            .map(crate::bit_encoding::decode_base)
+                            .collect()
+                    )
+                    .unwrap(),
                     String::from_utf8(seq).unwrap(),
                     "k={k} len={len}: spelled sequence"
                 );
@@ -727,6 +733,10 @@ mod tests {
                 b'G' => b'C',
                 _ => b'A',
             })
+            .collect();
+        let spelled: Vec<_> = spelled
+            .into_iter()
+            .map(crate::bit_encoding::decode_base)
             .collect();
         assert!(
             spelled == seq || spelled == rc,

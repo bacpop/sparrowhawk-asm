@@ -5,7 +5,7 @@
 //!
 //! This implementation is based on ntHash 2, but using more partitions than the two present in the paper for the hashes, to reduce collisions
 
-use super::bit_encoding::{encode_base, rc_base};
+use super::bit_encoding::rc_base;
 
 /// Values to look up and multiply for direct k-mers
 pub const HASH_LOOKUP: [u64; 4] = [
@@ -550,7 +550,7 @@ pub fn swapbits_18_31_42_51_58_63(v: u64) -> u64 {
 }
 
 impl NtHashIterator {
-    /// Creates a new iterator over a sequence with a given k-mer size
+    /// Hash the first k encoded two-bit base codes
     pub fn new(seq: &[u8], k: usize, rc: bool) -> NtHashIterator {
         let mut fh: u64 = 0;
         // for (_, v) in seq[0..k].iter().enumerate() {
@@ -558,7 +558,7 @@ impl NtHashIterator {
             // With the six-part swap below, this is the split rotation ("srol")
             fh = fh.rotate_left(1_u32);
             fh = swapbits_0_19_32_43_52_59(fh);
-            fh ^= HASH_LOOKUP[encode_base(*v) as usize];
+            fh ^= HASH_LOOKUP[*v as usize];
         }
 
         let rh = if rc {
@@ -567,7 +567,7 @@ impl NtHashIterator {
             for v in seq[0..k].iter().rev() {
                 h = h.rotate_left(1_u32);
                 h = swapbits_0_19_32_43_52_59(h);
-                h ^= RC_HASH_LOOKUP[encode_base(*v) as usize];
+                h ^= RC_HASH_LOOKUP[*v as usize];
             }
             Some(h)
         } else {
@@ -643,6 +643,11 @@ impl NtHashIterator {
 // ==================================================================
 #[cfg(test)]
 mod tests {
+    fn codes(seq: &[u8]) -> Vec<u8> {
+        seq.iter()
+            .map(|&b| crate::bit_encoding::encode_base(b))
+            .collect()
+    }
     use super::*;
     use crate::bit_encoding::encode_base;
 
@@ -680,11 +685,11 @@ mod tests {
         // Roll from seq[0..k] by one position; should equal fresh iterator on seq[1..k+1]
         let seq = b"ACGTACGT";
         let k = 4;
-        let mut it = NtHashIterator::new(&seq[0..k], k, true);
+        let mut it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
         // roll_fwd takes encoded bases, not ASCII
         it.roll_fwd(encode_base(seq[0]), encode_base(seq[k]));
         let rolled = it.canonical_hash();
-        let fresh = NtHashIterator::new(&seq[1..k + 1], k, true).canonical_hash();
+        let fresh = NtHashIterator::new(&codes(&seq[1..k + 1]), k, true).canonical_hash();
         assert_eq!(rolled, fresh);
     }
 
@@ -693,10 +698,10 @@ mod tests {
         // All rolling windows must equal fresh iterators on the same window
         let seq = b"ACGTACGT";
         let k = 4;
-        let mut it = NtHashIterator::new(&seq[0..k], k, true);
+        let mut it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
         for i in 1..=(seq.len() - k) {
             it.roll_fwd(encode_base(seq[i - 1]), encode_base(seq[i + k - 1]));
-            let fresh = NtHashIterator::new(&seq[i..i + k], k, true).canonical_hash();
+            let fresh = NtHashIterator::new(&codes(&seq[i..i + k]), k, true).canonical_hash();
             assert_eq!(it.canonical_hash(), fresh, "window {i} mismatch");
         }
     }
@@ -705,7 +710,7 @@ mod tests {
     fn canonical_hash_is_minimum() {
         let seq = b"ACGTACGT";
         let k = 4;
-        let it = NtHashIterator::new(&seq[0..k], k, true);
+        let it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
         let (canonical, nc, _is_rc) = it.hashes_and_order();
         assert!(canonical <= nc);
         assert_eq!(it.canonical_hash(), canonical);
@@ -715,7 +720,7 @@ mod tests {
     fn is_rc_flag_consistent() {
         let seq = b"ACGTACGT";
         let k = 4;
-        let it = NtHashIterator::new(&seq[0..k], k, true);
+        let it = NtHashIterator::new(&codes(&seq[0..k]), k, true);
         let (canonical, _nc, is_rc) = it.hashes_and_order();
         // is_rc == true means the rc hash is smaller (i.e. canonical == rc hash)
         if is_rc {

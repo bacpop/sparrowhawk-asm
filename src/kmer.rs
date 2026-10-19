@@ -1,134 +1,98 @@
-//! Some docs here, but I think the file name is already self-explicative enough
-//! Blatantly copied from ska.rust
-
-use std::borrow::Cow;
+//! K-mer iteration over ASCII reads, packed four-bit reads, or two-bit sequences.
 
 use super::bit_encoding::*;
 use super::nthash::NtHashIterator;
+use crate::{
+    cli::MAX_K,
+    read_store::{PackedSeq, UNUSABLE},
+};
+use std::{borrow::Cow, marker::PhantomData};
 
-/// Struct to generate all k-mers from an input sequence
-///
-/// Holds reference to input sequence, current encoded k-mer, and other
-/// information (k-mer size, masks etc.)
-#[derive(Debug)]
-pub struct Kmer<'a, IntT> {
-    /// K-mer size
-    k: usize,
-    /// Reference to input sequence
-    seq: Cow<'a, [u8]>,
-    /// Size of seq
-    seq_len: usize,
-    /// Reference to sequence quality scores
-    qual: Option<&'a [u8]>,
-    /// Minimum quality score to allow in a k-mer
-    min_qual: u8,
-    /// Current index in input sequence
-    index: usize,
-    /// Current k-mer
-    kmer: IntT,
-    /// Hash generator for reads
-    hash_gen: NtHashIterator,
-    /// rc or Not
-    rc: bool,
+/// Source of encoded bases; unusable bases break k-mer windows.
+pub trait Bases {
+    /// Length in bases.
+    fn len(&self) -> usize;
+    /// Whether there are no bases.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Two-bit code, or `None` when a window must restart after this position.
+    fn code(&self, i: usize) -> Option<u8>;
 }
 
-impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
-    /// Quality score is at least minimum. Inclusive, so `--min-qual 20` keeps Q20; saturating because a byte below b'!' = 33, where the ASCII encoding starts, would otherwise underflow.
+/// ASCII input and its optional PHRED+33 qualities, filtered at an inclusive quality floor.
+#[derive(Debug)]
+pub struct TextBases<'a> {
+    seq: Cow<'a, [u8]>,
+    len: usize,
+    qual: Option<&'a [u8]>,
+    min_qual: u8,
+}
+impl Bases for TextBases<'_> {
     #[inline(always)]
-    fn valid_qual(idx: usize, qual: Option<&'a [u8]>, min_qual: u8) -> bool {
-        match qual {
-            Some(qual_seq) => qual_seq[idx].saturating_sub(33) >= min_qual,
-            None => true,
-        }
+    fn len(&self) -> usize {
+        self.len
     }
-
-    /// Build a new k-mer at the given index.
-    ///
-    #[allow(clippy::too_many_arguments)]
-    fn build(
-        seq: &[u8],
-        seq_len: usize,
-        qual: Option<&'a [u8]>,
-        k: usize,
-        idx: &mut usize,
-        min_qual: u8,
-        rc: bool,
-    ) -> Option<(IntT, NtHashIterator)> {
-        // A k-mer starting at `idx` spans [idx, idx + k - 1], so it exists iff idx + k <= seq_len.
-        if *idx + k > seq_len {
-            return None;
-        }
-        let mut kmer = IntT::zero_init();
-        let mut i = 0;
-        while i < k {
-            if valid_base(seq[i + *idx]) && (Self::valid_qual(i + *idx, qual, min_qual)) {
-                // Checks for N or n
-                let next_base = encode_base(seq[i + *idx]);
-                kmer <<= 2;
-                kmer |= IntT::from_encoded_base(next_base);
-                i += 1;
-            } else {
-                // Start again, skipping over N
-                *idx += i + 1;
-                if *idx + k > seq_len {
-                    return None;
-                }
-                kmer = IntT::zero_init();
-                i = 0;
-            }
-        }
-        let hash_gen = NtHashIterator::new(&seq[*idx..(*idx + k)], k, rc);
-        *idx += k - 1;
-        Some((kmer, hash_gen))
+    #[inline(always)]
+    fn code(&self, i: usize) -> Option<u8> {
+        let base = self.seq[i];
+        (valid_base(base)
+            && self
+                .qual
+                .is_none_or(|q| q[i].saturating_sub(33) >= self.min_qual))
+        .then(|| encode_base(base))
     }
+}
 
-    /// Move forward to the next valid k-mer
-    ///
-    /// Usually the next base, but if an N skips over it.
-    /// If end of sequence encountered then returns `false`.
-    #[inline]
-    fn roll_fwd(&mut self) -> bool {
-        let mut success = false;
-        self.index += 1;
-        if self.index >= self.seq_len {
-            return success;
-        }
-        let base = self.seq[self.index];
-        if !valid_base(base) || !Self::valid_qual(self.index, self.qual, self.min_qual) {
-            let new_kmer = Self::build(
-                &self.seq,
-                self.seq_len,
-                self.qual,
-                self.k,
-                &mut self.index,
-                self.min_qual,
-                self.rc,
-            );
-            if let Some(kmer_tuple) = new_kmer {
-                (self.kmer, self.hash_gen) = kmer_tuple;
-                success = true;
-            }
-        } else {
-            let new_base = encode_base(base);
-            let old_base = (self.kmer >> ((self.k - 1) * 2)).as_u8() & 3;
-            self.hash_gen.roll_fwd(old_base, new_base);
-
-            // Update the k-mer
-            let cleanbits = self.kmer.n_bits() as usize - (self.k - 1) * 2;
-            self.kmer = (((self.kmer << cleanbits) >> cleanbits) << 2)
-                | (IntT::from_encoded_base(new_base));
-            success = true;
-        }
-        success
+/// Packed bases and quality classes, filtered at a stored floor's class index.
+#[derive(Debug)]
+pub struct FourBitBases<'a> {
+    seq: PackedSeq<'a>,
+    min_class: u8,
+}
+impl Bases for FourBitBases<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.seq.len()
     }
+    #[inline(always)]
+    fn code(&self, i: usize) -> Option<u8> {
+        let n = self.seq.nibble(i);
+        let class = n >> 2;
+        (class != UNUSABLE && class >= self.min_class).then_some(n & 3)
+    }
+}
 
-    /// Create a [`Kmer`] iterator given reference to sequence input.
-    ///
-    /// Sequence, length and quality come from [`needletail`].
-    ///
-    /// Returns [`None`] if no valid k-mers found in input (e.g. too short,
-    /// no sequence, too many Ns).
-    #[allow(clippy::too_many_arguments)]
+/// Two-bit Q0 reads or contigs; every base is usable.
+#[derive(Debug)]
+pub struct TwoBitBases<'a> {
+    seq: PackedSeq<'a>,
+}
+impl Bases for TwoBitBases<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.seq.len()
+    }
+    #[inline(always)]
+    fn code(&self, i: usize) -> Option<u8> {
+        Some(self.seq.code(i))
+    }
+}
+
+/// Rolling k-mers and hashes from one sequence, specialised for its source encoding.
+#[derive(Debug)]
+pub struct Kmer<'a, IntT, B = TextBases<'a>> {
+    k: usize,
+    bases: B,
+    index: usize,
+    kmer: IntT,
+    hash_gen: NtHashIterator,
+    rc: bool,
+    _source: PhantomData<&'a ()>,
+}
+
+impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT, TextBases<'a>> {
+    /// Iterate ASCII input, or return `None` when it contains no usable k-window.
     pub fn new(
         seq: Cow<'a, [u8]>,
         seq_len: usize,
@@ -137,23 +101,96 @@ impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT> {
         min_qual: u8,
         rc: bool,
     ) -> Option<Self> {
-        let mut index = 0;
-        let first_kmer = Self::build(&seq, seq_len, qual, k, &mut index, min_qual, rc);
-        if let Some((kmer, hash_gen)) = first_kmer {
-            let kmerobj = Self {
-                k,
+        Self::start(
+            TextBases {
                 seq,
-                seq_len,
+                len: seq_len,
                 qual,
                 min_qual,
-                index,
-                kmer,
-                hash_gen,
-                rc,
-            };
-            Some(kmerobj)
-        } else {
-            None
+            },
+            k,
+            rc,
+        )
+    }
+}
+impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT, FourBitBases<'a>> {
+    /// Iterate a four-bit read, accepting classes at or above `min_class`.
+    pub fn from_four_bit(seq: PackedSeq<'a>, k: usize, min_class: u8, rc: bool) -> Option<Self> {
+        debug_assert!(!seq.is_two_bit());
+        Self::start(FourBitBases { seq, min_class }, k, rc)
+    }
+}
+impl<'a, IntT: for<'b> UInt<'b>> Kmer<'a, IntT, TwoBitBases<'a>> {
+    /// Iterate a whole two-bit read or contig.
+    pub fn from_two_bit(seq: PackedSeq<'a>, k: usize, rc: bool) -> Option<Self> {
+        debug_assert!(seq.is_two_bit());
+        Self::start(TwoBitBases { seq }, k, rc)
+    }
+}
+impl<'a, IntT: for<'b> UInt<'b>, B: Bases> Kmer<'a, IntT, B> {
+    fn start(bases: B, k: usize, rc: bool) -> Option<Self> {
+        let mut index = 0;
+        let (kmer, hash_gen) = Self::build(&bases, k, &mut index, rc)?;
+        Some(Self {
+            k,
+            bases,
+            index,
+            kmer,
+            hash_gen,
+            rc,
+            _source: PhantomData,
+        })
+    }
+    fn build(bases: &B, k: usize, idx: &mut usize, rc: bool) -> Option<(IntT, NtHashIterator)> {
+        if *idx + k > bases.len() {
+            return None;
+        }
+        let mut codes = [0u8; MAX_K];
+        let mut kmer = IntT::zero_init();
+        let mut i = 0;
+        while i < k {
+            match bases.code(*idx + i) {
+                Some(code) => {
+                    codes[i] = code;
+                    kmer = (kmer << 2) | IntT::from_encoded_base(code);
+                    i += 1;
+                }
+                None => {
+                    *idx += i + 1;
+                    if *idx + k > bases.len() {
+                        return None;
+                    }
+                    kmer = IntT::zero_init();
+                    i = 0;
+                }
+            }
+        }
+        let hash_gen = NtHashIterator::new(&codes[..k], k, rc);
+        *idx += k - 1;
+        Some((kmer, hash_gen))
+    }
+    #[inline]
+    fn roll_fwd(&mut self) -> bool {
+        self.index += 1;
+        if self.index >= self.bases.len() {
+            return false;
+        }
+        match self.bases.code(self.index) {
+            None => match Self::build(&self.bases, self.k, &mut self.index, self.rc) {
+                Some((kmer, hash_gen)) => {
+                    (self.kmer, self.hash_gen) = (kmer, hash_gen);
+                    true
+                }
+                None => false,
+            },
+            Some(new_base) => {
+                let old_base = (self.kmer >> ((self.k - 1) * 2)).as_u8() & 3;
+                self.hash_gen.roll_fwd(old_base, new_base);
+                let cleanbits = self.kmer.n_bits() as usize - (self.k - 1) * 2;
+                self.kmer = (((self.kmer << cleanbits) >> cleanbits) << 2)
+                    | IntT::from_encoded_base(new_base);
+                true
+            }
         }
     }
 
