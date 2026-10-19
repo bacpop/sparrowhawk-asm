@@ -1,5 +1,7 @@
 //! The candidate base-quality floors for a library, and which of them each k-mer window clears.
 
+use crate::bit_encoding::valid_base;
+
 /// Reads peeked for the quality alphabet. Only distinct values are wanted, never a spectrum, so a
 /// library shows all 4-5 of its bins long before this.
 pub const PEEK_READS: usize = 5_000;
@@ -26,7 +28,7 @@ pub fn peek_alphabet<I: Iterator<Item = crate::reads::OwnedRecord>>(
             return Vec::new();
         };
         for (&base, &q) in seq.iter().zip(&qual) {
-            if !matches!(base, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't') {
+            if !valid_base(base) {
                 continue;
             }
             let phred = q.saturating_sub(33) as usize;
@@ -79,10 +81,7 @@ pub fn window_groups(seq: &[u8], qual: &[u8], k: usize, floors: &[u8], out: &mut
     let mut run = [0usize; MAX_GROUPS];
     for i in 0..seq.len().min(qual.len()) {
         let phred = qual[i].saturating_sub(33);
-        let valid = matches!(
-            seq[i],
-            b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'
-        );
+        let valid = valid_base(seq[i]);
         let mut best = NONE;
         for (g, floor) in floors.iter().enumerate() {
             run[g] = if valid && phred >= *floor {
@@ -129,7 +128,8 @@ mod tests {
     /// exactly a k-mer the iterator would emit at that floor. Catches an off-by-one in either.
     #[test]
     fn window_groups_agree_with_the_iterator() {
-        let seq = b"ACGTACGTAACGGTTACGATCGATTACGGCATCAGGTACAGGTTACAGGATCAGGTACA";
+        // The R must break windows for both, as an N does.
+        let seq = b"ACGTACGTAACGGTTACGATCGATTACGRCATCAGGTACAGGTTACAGGATCAGGTACA";
         // A quality string spanning all three bins, with a dip and a recovery.
         let qual: Vec<u8> = (0..seq.len())
             .map(|i| {

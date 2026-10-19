@@ -1,6 +1,6 @@
 //! Every read packed once in memory, so a multi-k run parses and decompresses its input a single time.
 
-use crate::bit_encoding::{decode_base, encode_base};
+use crate::bit_encoding::{decode_base, encode_base, valid_base};
 use crate::qual_profile::MAX_GROUPS;
 
 /// Reads per block. Splitting into blocks means a big buffer is never reallocated, which would briefly
@@ -75,17 +75,19 @@ impl RecordSink for ReadStats {
 }
 
 impl ReadStore {
-    /// An empty store for a ladder as `qual_profile::floors_from` builds it (`0` first, at most 3 rungs).
+    /// An empty store for a ladder as `qual_profile::floors_from` builds it, or a single fixed floor.
+    /// A base below the lowest floor clears none, so it is stored as unusable.
     pub fn new(floors: &[u8]) -> Self {
         assert!(
-            !floors.is_empty() && floors.len() <= MAX_GROUPS && floors[0] == 0,
+            !floors.is_empty() && floors.len() <= MAX_GROUPS,
             "not a quality ladder: {floors:?}"
         );
-        let mut class_of = [0u8; 256];
+        let mut class_of = [INVALID; 256];
         for (byte, class) in class_of.iter_mut().enumerate() {
             let phred = (byte as u8).saturating_sub(33);
-            // `floors[0]` is 0, so every valid base clears at least that one.
-            *class = floors.iter().rposition(|&f| phred >= f).unwrap_or(0) as u8;
+            if let Some(floor) = floors.iter().rposition(|&f| phred >= f) {
+                *class = floor as u8;
+            }
         }
         Self {
             floors: floors.to_vec(),
@@ -141,7 +143,7 @@ impl ReadStore {
             .expect("an open block was just ensured");
         let mut pos = block.ends.last().map_or(0, |&end| end as usize);
         for (i, &base) in seq.iter().enumerate() {
-            let class = if !matches!(base, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't') {
+            let class = if !valid_base(base) {
                 INVALID
             } else {
                 qual.map_or(strict, |q| {
@@ -291,7 +293,7 @@ mod tests {
         else {
             return Vec::new();
         };
-        let mut out = vec![it.get_curr_hash_and_bases().0];
+        let mut out = vec![it.get_hashes_and_bases().0];
         while let Some((hc, _, _)) = it.get_next_hash_and_bases() {
             out.push(hc);
         }
@@ -309,6 +311,27 @@ mod tests {
             (seq, None),
             (b"AC".to_vec(), Some(b"II".to_vec())),
         ]
+    }
+
+    /// A fixed floor need not start at zero: bases below it clear no floor, and replay must keep
+    /// exactly the windows the text iterator keeps at that floor.
+    #[test]
+    fn a_fixed_floor_replays_what_the_iterator_keeps() {
+        let reads = fixture();
+        let mut store = ReadStore::new(&[20]);
+        for (seq, qual) in &reads {
+            store.push(seq, qual.as_deref());
+        }
+        store.finish();
+        for ((seq, qual), (rseq, rqual)) in reads.iter().zip(store.records()) {
+            for k in [3usize, 5, 7] {
+                assert_eq!(
+                    kmers_at(seq, qual.as_deref(), k, 20),
+                    kmers_at(&rseq, rqual.as_deref(), k, 20),
+                    "k={k}"
+                );
+            }
+        }
     }
 
     /// The invariant the store rests on: every floor admits exactly the same windows after a replay.

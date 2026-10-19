@@ -2,20 +2,23 @@
 //!
 //! Erroneous-connection removal and bubble/bulge removal are both wired into the correction loop, and both
 //! judge a path with `corrector::CoverageRef` rather than a bare ratio. The old bubble collapser we had is
-//! part of the bulge removal, as they are special cases of them.
+//! part of the bulge removal, as bubbles are special cases of bulges.
 
 use crate::algorithms::corrector::{CoverageRef, PathCoverage};
 use sparrowhawk_graph::{CarryType, DbgGraph, EdgeType, NodeId};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-/// Multipliers and what to add for bulge removal
+/// The bulge rule considers paths up to the larger of this multiple of k...
 const BULGE_LEN_K_MULT: usize = 3;
+/// ...and k plus this many bases (converted to k-mers by `bulge_max_kmers`).
 const BULGE_LEN_K_ADD: usize = 100;
 
-/// Partial paths the alternative search expands before giving up, and thresholds/limits.
+/// Partial paths the alternative search expands before giving up.
 const BULGE_ALT_PATH_POPS: usize = 131;
+/// An alternative may differ in length from the candidate by this fraction of the candidate...
 const BULGE_RELATIVE_LEN_DELTA: f64 = 0.10;
+/// ...or by this many k-mers, whichever is larger.
 const BULGE_MIN_LEN_DELTA: usize = 3;
 
 /// Longest candidate the bulge rule considers, in k-mers.

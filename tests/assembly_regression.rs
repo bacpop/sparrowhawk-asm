@@ -46,7 +46,6 @@ fn a_simulated_window_assembles_into_exact_contigs() {
     let out = std::env::temp_dir().join(format!("sparrowhawk-regression-{}", std::process::id()));
 
     let run = Command::new(env!("CARGO_BIN_EXE_sparrowhawk-asm"))
-        .arg("build")
         .arg(data.join("ecoli_window_1.fastq.gz"))
         .arg(data.join("ecoli_window_2.fastq.gz"))
         .args(["--threads", "2", "--no-graphs", "--no-histo"])

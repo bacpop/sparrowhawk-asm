@@ -555,8 +555,8 @@ impl NtHashIterator {
         let mut fh: u64 = 0;
         // for (_, v) in seq[0..k].iter().enumerate() {
         for v in seq[0..k].iter() {
-            fh = fh.rotate_left(1_u32); // This, WITH swapbits033 (next line), is the "srol" function
-                                        // fh = swapbits033(fh);
+            // With the six-part swap below, this is the split rotation ("srol")
+            fh = fh.rotate_left(1_u32);
             fh = swapbits_0_19_32_43_52_59(fh);
             fh ^= HASH_LOOKUP[encode_base(*v) as usize];
         }
@@ -566,7 +566,6 @@ impl NtHashIterator {
             // for (_, v) in seq[0..k].iter().rev().enumerate() {
             for v in seq[0..k].iter().rev() {
                 h = h.rotate_left(1_u32);
-                // h =  swapbits033(h);
                 h = swapbits_0_19_32_43_52_59(h);
                 h ^= RC_HASH_LOOKUP[encode_base(*v) as usize];
             }
@@ -579,9 +578,9 @@ impl NtHashIterator {
     }
 
     /// Move to the next k-mer by adding a new base, removing a base from the end, efficiently updating the hash.
+    #[inline]
     pub fn roll_fwd(&mut self, old_base: u8, new_base: u8) {
         self.fh = self.fh.rotate_left(1);
-        // self.fh = swapbits033(self.fh);
         self.fh = swapbits_0_19_32_43_52_59(self.fh);
         self.fh ^= HASH_LOOKUP[new_base as usize];
         // self.fh ^=   MS_TAB_31L[(old_base as usize * 31) + (self.k % 31)]
@@ -605,14 +604,14 @@ impl NtHashIterator {
                    | MS_TAB_19RR[(rc_base(new_base) as usize * 19) + (self.k % 19)]);
             h ^= RC_HASH_LOOKUP[old_base as usize];
             h = h.rotate_right(1_u32);
-            // h = swapbits3263(h);
             h = swapbits_18_31_42_51_58_63(h);
             self.rh = Some(h);
         };
     }
 
-    /// Retrieve the current hash (minimum of forward and reverse complement hashes)
-    pub fn curr_hash(&self) -> u64 {
+    /// The smaller of the forward and reverse-complement hashes, or the forward one without `rc`.
+    #[inline]
+    pub fn canonical_hash(&self) -> u64 {
         if let Some(rev) = self.rh {
             u64::min(self.fh, rev)
         } else {
@@ -620,8 +619,10 @@ impl NtHashIterator {
         }
     }
 
-    /// Retrieve the current hash (minimum of forward and reverse complement hashes)
-    pub fn curr_hash_and_whether_it_is_the_inverse(&self) -> (u64, u64, bool) {
+    /// The canonical hash, the non-canonical one, and whether the canonical one is the reverse
+    /// complement's. Needs `rc`.
+    #[inline]
+    pub fn hashes_and_order(&self) -> (u64, u64, bool) {
         let rev = self
             .rh
             .expect("reverse-complement hash is required; construct the iterator with rc=true");
@@ -682,8 +683,8 @@ mod tests {
         let mut it = NtHashIterator::new(&seq[0..k], k, true);
         // roll_fwd takes encoded bases, not ASCII
         it.roll_fwd(encode_base(seq[0]), encode_base(seq[k]));
-        let rolled = it.curr_hash();
-        let fresh = NtHashIterator::new(&seq[1..k + 1], k, true).curr_hash();
+        let rolled = it.canonical_hash();
+        let fresh = NtHashIterator::new(&seq[1..k + 1], k, true).canonical_hash();
         assert_eq!(rolled, fresh);
     }
 
@@ -695,8 +696,8 @@ mod tests {
         let mut it = NtHashIterator::new(&seq[0..k], k, true);
         for i in 1..=(seq.len() - k) {
             it.roll_fwd(encode_base(seq[i - 1]), encode_base(seq[i + k - 1]));
-            let fresh = NtHashIterator::new(&seq[i..i + k], k, true).curr_hash();
-            assert_eq!(it.curr_hash(), fresh, "window {i} mismatch");
+            let fresh = NtHashIterator::new(&seq[i..i + k], k, true).canonical_hash();
+            assert_eq!(it.canonical_hash(), fresh, "window {i} mismatch");
         }
     }
 
@@ -705,9 +706,9 @@ mod tests {
         let seq = b"ACGTACGT";
         let k = 4;
         let it = NtHashIterator::new(&seq[0..k], k, true);
-        let (canonical, nc, _is_rc) = it.curr_hash_and_whether_it_is_the_inverse();
+        let (canonical, nc, _is_rc) = it.hashes_and_order();
         assert!(canonical <= nc);
-        assert_eq!(it.curr_hash(), canonical);
+        assert_eq!(it.canonical_hash(), canonical);
     }
 
     #[test]
@@ -715,7 +716,7 @@ mod tests {
         let seq = b"ACGTACGT";
         let k = 4;
         let it = NtHashIterator::new(&seq[0..k], k, true);
-        let (canonical, _nc, is_rc) = it.curr_hash_and_whether_it_is_the_inverse();
+        let (canonical, _nc, is_rc) = it.hashes_and_order();
         // is_rc == true means the rc hash is smaller (i.e. canonical == rc hash)
         if is_rc {
             assert_eq!(canonical, it.rh.unwrap());

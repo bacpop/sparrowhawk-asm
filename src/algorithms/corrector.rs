@@ -14,9 +14,9 @@ pub(crate) fn short_path_limit(minnts: usize, k: usize) -> usize {
     (minnts + 1).saturating_sub(k) // sat_sub is compulsory, becase as these are usize, going negative my change the path to an absurd value!!!
 }
 
-/// Tip-removal threshold in bases: the larger of a flat floor and a multiple of k, as Minia sizes it
+/// Dead-end removal threshold in bases: the larger of a flat floor and a multiple of k, as Minia sizes it
 /// (`-tip-len-topo-kmult`). A flat 100 nt is generous at k=31 and catches almost nothing at k=81.
-pub(crate) fn tip_length_nts(flat_nts: usize, kmult: f32, k: usize) -> usize {
+pub(crate) fn dead_end_length_nts(flat_nts: usize, kmult: f32, k: usize) -> usize {
     if kmult <= 0.0 {
         flat_nts
     } else {
@@ -154,11 +154,11 @@ pub struct CorrectionOpts {
     /// Fraction of the stronger branch's coverage below which the weaker branch is popped.
     pub pop_ratio: f32,
     /// Dead-end threshold in bases, already resolved against k.
-    pub tip_nts: usize,
-    /// Upper bound of the coverage-judged tip band, already resolved against k. Zero disables it.
-    pub tip_rctc_nts: usize,
-    /// How many times better covered a junction must be than the tip hanging off it.
-    pub tip_rctc_cutoff: f64,
+    pub dead_end_nts: usize,
+    /// Upper bound of dead-end removal by coverage, already resolved against k. Zero disables it.
+    pub dead_end_coverage_nts: usize,
+    /// How many times better covered a junction must be than the dead end hanging off it.
+    pub dead_end_coverage_ratio: f64,
     /// What is known about the library's single-copy coverage.
     pub coverage: CoverageRef,
     /// Remove erroneous connections at all.
@@ -183,9 +183,14 @@ pub trait Correctable {
     /// Remove edges that are self-loops, i.e. those whose source and destination nodes are the same.
     fn remove_self_loops(&mut self);
 
-    /// Remove dead paths shorter than `tip_nts` bases, and those up to `tip_rctc_nts` whose junction
-    /// is `rctc_cutoff` times better covered.
-    fn remove_dead_paths(&mut self, tip_nts: usize, tip_rctc_nts: usize, rctc_cutoff: f64) -> bool;
+    /// Remove dead paths shorter than `dead_end_nts` bases, and those up to `dead_end_coverage_nts` whose junction
+    /// is `coverage_ratio` times better covered.
+    fn remove_dead_paths(
+        &mut self,
+        dead_end_nts: usize,
+        dead_end_coverage_nts: usize,
+        coverage_ratio: f64,
+    ) -> bool;
 }
 
 impl Correctable for DbgGraph {
@@ -201,7 +206,12 @@ impl Correctable for DbgGraph {
         DbgGraph::remove_self_loops(self);
     }
 
-    fn remove_dead_paths(&mut self, tip_nts: usize, tip_rctc_nts: usize, rctc_cutoff: f64) -> bool {
+    fn remove_dead_paths(
+        &mut self,
+        dead_end_nts: usize,
+        dead_end_coverage_nts: usize,
+        coverage_ratio: f64,
+    ) -> bool {
         log::info!(
             "Before pruning: {} nodes and {} edges",
             self.node_count(),
@@ -209,11 +219,11 @@ impl Correctable for DbgGraph {
         );
 
         // Hoisted out of the walk: it only depends on k and the threshold, both fixed for this call.
-        let limit = short_path_limit(tip_nts, self.k());
+        let limit = short_path_limit(dead_end_nts, self.k());
         // An empty band disables tier two outright: the walk bound falls back to `limit` and not one
-        // comparison is made, so `--tip-length-rctc-kmult 0` reproduces today's output exactly.
-        let rctc_limit = short_path_limit(tip_rctc_nts, self.k()).max(limit);
-        let (mut topo_tips, mut rctc_tips) = (0usize, 0usize);
+        // comparison is made, so `--dead-end-coverage-kmult 0` reproduces today's output exactly.
+        let coverage_limit = short_path_limit(dead_end_coverage_nts, self.k()).max(limit);
+        let (mut by_length, mut by_coverage) = (0usize, 0usize);
         let mut dididoanything = false;
         log::info!("Starting graph pruning. Graph has {} externals, {} alone nodes, the remaining are internal.",
             self.externals_bi().len(),
@@ -237,21 +247,21 @@ impl Correctable for DbgGraph {
 
             for v in externals {
                 let carryedge = self.first_outgoing_edge_type(v).unwrap();
-                let by_rctc = check_dead_path(
+                let removed_by_coverage = check_dead_path(
                     self,
                     v,
                     &mut path_check_vec,
                     limit,
-                    rctc_limit,
-                    rctc_cutoff,
+                    coverage_limit,
+                    coverage_ratio,
                     carryedge,
                 );
                 if !path_check_vec.is_empty() {
                     dididoanything = true;
-                    if by_rctc {
-                        rctc_tips += 1;
+                    if removed_by_coverage {
+                        by_coverage += 1;
                     } else {
-                        topo_tips += 1;
+                        by_length += 1;
                     }
                     to_remove.append(&mut path_check_vec);
                 }
@@ -260,9 +270,9 @@ impl Correctable for DbgGraph {
             // if there are no dead paths left pruning is done
             if to_remove.is_empty() {
                 log::info!(
-                    "Graph is pruned: {topo_tips} tips by length (threshold {tip_nts} nt, \
-                     {limit} k-mers), {rctc_tips} by coverage (up to {tip_rctc_nts} nt, \
-                     {rctc_limit} k-mers, cutoff {rctc_cutoff})"
+                    "Graph is pruned: {by_length} dead ends by length (threshold {dead_end_nts} nt, \
+                     {limit} k-mers), {by_coverage} by coverage (up to {dead_end_coverage_nts} nt, \
+                     {coverage_limit} k-mers, cutoff {coverage_ratio})"
                 );
                 return dididoanything;
             }
@@ -366,13 +376,14 @@ fn remove_paths(ptgraph: &mut DbgGraph, to_remove: Drain<NodeId>) {
     }
 }
 
-/// Check if the main branch from which a dedad-end comes from has a much different coverage than the dead end-.
-fn neighbourhood_outcovers_tip(
+/// Whether the junction a dead end hangs off is much better covered than the dead end: its other
+/// neighbours average more than `cutoff` times the dead end's mean coverage.
+fn neighbourhood_outcovers_dead_end(
     ptgraph: &DbgGraph,
     junction: NodeId,
     junction_ty: CarryType,
-    tip_last: NodeId,
-    tip_mean: f64,
+    dead_end_last: NodeId,
+    dead_end_mean: f64,
     cutoff: f64,
 ) -> bool {
     // Minia walks each neighbour's simple path to average it (`getMeanAbundanceOfNeighbors`); ours are
@@ -384,18 +395,18 @@ fn neighbourhood_outcovers_tip(
         .into_iter()
         .chain(ptgraph.out_neighbours_bi(junction, junction_ty))
     {
-        if nb == tip_last || !seen.insert(nb) {
+        if nb == dead_end_last || !seen.insert(nb) {
             continue;
         }
         total += f64::from(ptgraph.node_weight(nb).unwrap().counts);
     }
     if seen.is_empty() {
-        return false; // nothing to compare against: an isolated tip is tier one's business
+        return false; // nothing to compare against: an isolated dead end is tier one's business
     }
     // Strict `>`, and `f64` throughout — the cutoff is declared `f64` from the CLI down, as
     // `--ec-coverage-ratio` is, so there is no `f32` hop to shift the boundary the way
     // `f64::from(0.1f32)` did in `should_delete`.
-    total / seen.len() as f64 > cutoff * tip_mean
+    total / seen.len() as f64 > cutoff * dead_end_mean
 }
 
 /// Check if vertex initializes a dead path.
@@ -405,8 +416,8 @@ fn check_dead_path(
     vertex: NodeId,
     output_vec: &mut Vec<NodeId>,
     limit: usize,
-    rctc_limit: usize,
-    rctc_cutoff: f64,
+    coverage_limit: usize,
+    coverage_ratio: f64,
     carryedge: EdgeType,
 ) -> bool {
     let mut current_vertex = vertex;
@@ -421,20 +432,20 @@ fn check_dead_path(
 
     let (mut ty, _) = carryedge.get_from_and_to();
 
-    // A dead end that fans out is its own junction, Minia's single-node tip: its successors are the
+    // A dead end that fans out is its own junction, Minia's single-node dead end: its successors are the
     // whole neighbourhood.
     if ptgraph.out_neighbours_bi(current_vertex, ty).len() > 1 {
         if cnt < limit {
             return false;
         }
-        if cnt < rctc_limit
-            && neighbourhood_outcovers_tip(
+        if cnt < coverage_limit
+            && neighbourhood_outcovers_dead_end(
                 ptgraph,
                 current_vertex,
                 ty,
                 current_vertex,
                 path_mean_coverage(ptgraph, output_vec),
-                rctc_cutoff,
+                coverage_ratio,
             )
         {
             return true;
@@ -444,7 +455,7 @@ fn check_dead_path(
     }
 
     loop {
-        if cnt >= rctc_limit {
+        if cnt >= coverage_limit {
             output_vec.clear();
             return false;
         }
@@ -505,13 +516,13 @@ fn check_dead_path(
             }
 
             // Tier two: past the topological threshold, so length alone will not do it.
-            if neighbourhood_outcovers_tip(
+            if neighbourhood_outcovers_dead_end(
                 ptgraph,
                 candidate_node,
                 candidate_ty,
                 *output_vec.last().unwrap(),
                 path_mean_coverage(ptgraph, output_vec),
-                rctc_cutoff,
+                coverage_ratio,
             ) {
                 return true;
             }
@@ -538,21 +549,21 @@ fn check_dead_path(
             output_vec.push(candidate_node);
             cnt += ptgraph.node_weight(candidate_node).unwrap().abs_ind.len();
 
-            // Keep the existing strict short-tip boundary and remove by topology alone below it.
+            // Keep the existing strict short-dead-end boundary and remove by topology alone below it.
             if cnt < limit {
                 return false;
             }
 
-            // Longer tips retain the existing relative-coverage rule, now measuring the complete
+            // Longer dead ends retain the existing relative-coverage rule, now measuring the complete
             // path through its fan-out endpoint.
-            if cnt < rctc_limit
-                && neighbourhood_outcovers_tip(
+            if cnt < coverage_limit
+                && neighbourhood_outcovers_dead_end(
                     ptgraph,
                     candidate_node,
                     candidate_ty,
                     before,
                     path_mean_coverage(ptgraph, output_vec),
-                    rctc_cutoff,
+                    coverage_ratio,
                 )
             {
                 return true;
@@ -614,7 +625,7 @@ fn check_backwards_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::DEFAULT_TIP_RCTC_CUTOFF;
+    use crate::cli::DEFAULT_DEAD_END_COVERAGE_RATIO;
     use sparrowhawk_graph::{DbgGraph, NodeStruct};
 
     fn make_node() -> NodeStruct {
@@ -647,7 +658,7 @@ mod tests {
     #[test]
     fn dead_path_arbitration_compares_kmer_totals() {
         let mut graph = DbgGraph::new(3);
-        let tip_a = graph.add_node(NodeStruct {
+        let dead_end_a = graph.add_node(NodeStruct {
             counts: 1,
             abs_ind: vec![0; 2],
             innerdir: None,
@@ -657,58 +668,58 @@ mod tests {
             abs_ind: vec![0; 2],
             innerdir: None,
         });
-        let tip_b = graph.add_node(NodeStruct {
+        let dead_end_b = graph.add_node(NodeStruct {
             counts: 1,
             abs_ind: vec![0; 3],
             innerdir: None,
         });
         let junction = graph.add_node(make_node());
 
-        graph.add_bi_edge(tip_a, middle_a, EdgeType::MinToMin);
+        graph.add_bi_edge(dead_end_a, middle_a, EdgeType::MinToMin);
         graph.add_bi_edge(middle_a, junction, EdgeType::MinToMin);
-        graph.add_bi_edge(tip_b, junction, EdgeType::MinToMin);
+        graph.add_bi_edge(dead_end_b, junction, EdgeType::MinToMin);
 
         let limit = 98;
         let mut from_a = Vec::new();
         check_dead_path(
             &graph,
-            tip_a,
+            dead_end_a,
             &mut from_a,
             limit,
-            limit, // tier two disabled: an empty band, as `--no-tip-rctc` produces
-            DEFAULT_TIP_RCTC_CUTOFF,
-            graph.first_outgoing_edge_type(tip_a).unwrap(),
+            limit, // tier two disabled: an empty band, as `--no-dead-end-coverage` produces
+            DEFAULT_DEAD_END_COVERAGE_RATIO,
+            graph.first_outgoing_edge_type(dead_end_a).unwrap(),
         );
-        assert_eq!(from_a, vec![tip_b]);
+        assert_eq!(from_a, vec![dead_end_b]);
 
         let mut from_b = Vec::new();
         check_dead_path(
             &graph,
-            tip_b,
+            dead_end_b,
             &mut from_b,
             limit,
-            limit, // tier two disabled: an empty band, as `--no-tip-rctc` produces
-            DEFAULT_TIP_RCTC_CUTOFF,
-            graph.first_outgoing_edge_type(tip_b).unwrap(),
+            limit, // tier two disabled: an empty band, as `--no-dead-end-coverage` produces
+            DEFAULT_DEAD_END_COVERAGE_RATIO,
+            graph.first_outgoing_edge_type(dead_end_b).unwrap(),
         );
-        assert_eq!(from_b, vec![tip_b]);
+        assert_eq!(from_b, vec![dead_end_b]);
     }
 
     // ── the coverage tier (Minia's RCTC) ─────────────────────────────────────
 
-    /// A tip hanging off a junction, with a genomic path running in and out through it.
+    /// A dead end hanging off a junction, with a genomic path running in and out through it.
     ///
-    /// `tip_kmers` sets the tip's length so a test can place it either side of the topological
-    /// threshold; `tip_counts` against `flank_counts` sets what the coverage tier sees.
-    fn tip_at_junction(
-        tip_kmers: usize,
-        tip_counts: u32,
+    /// `dead_end_kmers` sets the dead end's length so a test can place it either side of the topological
+    /// threshold; `dead_end_counts` against `flank_counts` sets what the coverage tier sees.
+    fn dead_end_at_junction(
+        dead_end_kmers: usize,
+        dead_end_counts: u32,
         flank_counts: u32,
     ) -> (DbgGraph, NodeId, NodeId) {
         let mut graph = DbgGraph::new(3);
-        let tip = graph.add_node(NodeStruct {
-            counts: tip_counts,
-            abs_ind: vec![0; tip_kmers],
+        let dead_end = graph.add_node(NodeStruct {
+            counts: dead_end_counts,
+            abs_ind: vec![0; dead_end_kmers],
             innerdir: None,
         });
         // Single-k-mer by construction, as every junction is once the graph is shrunk.
@@ -729,40 +740,40 @@ mod tests {
         });
 
         graph.add_bi_edge(upstream, junction, EdgeType::MinToMin);
-        graph.add_bi_edge(tip, junction, EdgeType::MinToMin);
+        graph.add_bi_edge(dead_end, junction, EdgeType::MinToMin);
         graph.add_bi_edge(junction, downstream, EdgeType::MinToMin);
-        (graph, tip, junction)
+        (graph, dead_end, junction)
     }
 
-    /// Walks from `tip` with the tier-one threshold at 10 k-mers and tier two at 100.
-    fn walk_tip(graph: &DbgGraph, tip: NodeId, cutoff: f64) -> (Vec<NodeId>, bool) {
+    /// Walks from `dead_end` with the tier-one threshold at 10 k-mers and tier two at 100.
+    fn walk_dead_end(graph: &DbgGraph, dead_end: NodeId, cutoff: f64) -> (Vec<NodeId>, bool) {
         let mut out = Vec::new();
-        let by_rctc = check_dead_path(
+        let removed_by_coverage = check_dead_path(
             graph,
-            tip,
+            dead_end,
             &mut out,
             10,
             100,
             cutoff,
-            graph.first_outgoing_edge_type(tip).unwrap(),
+            graph.first_outgoing_edge_type(dead_end).unwrap(),
         );
-        (out, by_rctc)
+        (out, removed_by_coverage)
     }
 
-    /// Build a tip ending at a two-way fan-out. The outgoing branches occupy opposite carry
+    /// Build a dead end ending at a two-way fan-out. The outgoing branches occupy opposite carry
     /// orientations, so the helper exercises both sides of the bidirected endpoint.
-    fn tip_at_fanout(
+    fn dead_end_at_fanout(
         edge: EdgeType,
-        tip_kmers: usize,
-        tip_counts: u32,
+        dead_end_kmers: usize,
+        dead_end_counts: u32,
         fanout_kmers: usize,
         fanout_counts: u32,
         branch_counts: [u32; 2],
     ) -> (DbgGraph, NodeId, NodeId, [NodeId; 2]) {
         let mut graph = DbgGraph::new(3);
-        let tip = graph.add_node(NodeStruct {
-            counts: tip_counts,
-            abs_ind: vec![0; tip_kmers],
+        let dead_end = graph.add_node(NodeStruct {
+            counts: dead_end_counts,
+            abs_ind: vec![0; dead_end_kmers],
             innerdir: None,
         });
         let fanout = graph.add_node(NodeStruct {
@@ -778,7 +789,7 @@ mod tests {
             })
         });
 
-        graph.add_bi_edge(tip, fanout, edge);
+        graph.add_bi_edge(dead_end, fanout, edge);
         let fanout_carry = edge.get_from_and_to().1;
         for (branch, branch_carry) in branches.iter().zip([CarryType::Min, CarryType::Max]) {
             graph.add_bi_edge(
@@ -787,84 +798,91 @@ mod tests {
                 EdgeType::from_carrytypes(fanout_carry, branch_carry),
             );
         }
-        (graph, tip, fanout, branches)
+        (graph, dead_end, fanout, branches)
     }
 
     #[test]
-    fn a_short_tip_at_a_fanout_includes_and_removes_the_endpoint() {
-        let (mut graph, tip, fanout, _) = tip_at_fanout(EdgeType::MinToMin, 2, 2, 1, 2, [20, 20]);
+    fn a_short_dead_end_at_a_fanout_includes_and_removes_the_endpoint() {
+        let (mut graph, dead_end, fanout, _) =
+            dead_end_at_fanout(EdgeType::MinToMin, 2, 2, 1, 2, [20, 20]);
         let mut removal_path = Vec::new();
-        let by_rctc = check_dead_path(
+        let removed_by_coverage = check_dead_path(
             &graph,
-            tip,
+            dead_end,
             &mut removal_path,
             4,
             100,
             2.0,
-            graph.first_outgoing_edge_type(tip).unwrap(),
+            graph.first_outgoing_edge_type(dead_end).unwrap(),
         );
 
-        assert!(!by_rctc, "a short fan-out tip is removed by length");
-        assert_eq!(removal_path, vec![tip, fanout]);
+        assert!(
+            !removed_by_coverage,
+            "a short fan-out dead end is removed by length"
+        );
+        assert_eq!(removal_path, vec![dead_end, fanout]);
         assert_eq!(removal_path.iter().filter(|&&n| n == fanout).count(), 1);
 
         remove_paths(&mut graph, removal_path.drain(..));
-        assert!(graph.node_weight(tip).is_none());
+        assert!(graph.node_weight(dead_end).is_none());
         assert!(graph.node_weight(fanout).is_none());
         assert_eq!(graph.validate(), Ok(()));
     }
 
     #[test]
-    fn a_fanout_tip_at_the_short_length_limit_is_not_removed_by_length_alone() {
-        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 3, 2, 1, 2, [40, 40]);
+    fn a_fanout_dead_end_at_the_short_length_limit_is_not_removed_by_length_alone() {
+        let (graph, dead_end, _, _) = dead_end_at_fanout(EdgeType::MinToMin, 3, 2, 1, 2, [40, 40]);
         let mut removal_path = Vec::new();
-        let by_rctc = check_dead_path(
+        let removed_by_coverage = check_dead_path(
             &graph,
-            tip,
+            dead_end,
             &mut removal_path,
             4,
             4, // disable tier two at the strict boundary
             2.0,
-            graph.first_outgoing_edge_type(tip).unwrap(),
+            graph.first_outgoing_edge_type(dead_end).unwrap(),
         );
 
         assert!(
             removal_path.is_empty(),
             "represented length equal to limit is retained"
         );
-        assert!(!by_rctc);
+        assert!(!removed_by_coverage);
     }
 
     #[test]
-    fn a_long_low_coverage_tip_at_a_fanout_is_removed_with_its_endpoint() {
-        let (graph, tip, fanout, _) = tip_at_fanout(EdgeType::MinToMin, 12, 2, 1, 2, [40, 40]);
-        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+    fn a_long_low_coverage_dead_end_at_a_fanout_is_removed_with_its_endpoint() {
+        let (graph, dead_end, fanout, _) =
+            dead_end_at_fanout(EdgeType::MinToMin, 12, 2, 1, 2, [40, 40]);
+        let (removal_path, removed_by_coverage) = walk_dead_end(&graph, dead_end, 2.0);
 
-        assert!(by_rctc);
-        assert_eq!(removal_path, vec![tip, fanout]);
+        assert!(removed_by_coverage);
+        assert_eq!(removal_path, vec![dead_end, fanout]);
     }
 
     #[test]
-    fn fanout_tip_coverage_must_be_strictly_above_the_cutoff() {
-        // Equal path-node coverage makes the tip mean exactly 10; its two successors average 20.
-        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 12, 10, 1, 10, [20, 20]);
-        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+    fn fanout_dead_end_coverage_must_be_strictly_above_the_cutoff() {
+        // Equal path-node coverage makes the dead end's mean exactly 10; its two successors average 20.
+        let (graph, dead_end, _, _) =
+            dead_end_at_fanout(EdgeType::MinToMin, 12, 10, 1, 10, [20, 20]);
+        let (removal_path, removed_by_coverage) = walk_dead_end(&graph, dead_end, 2.0);
         assert!(removal_path.is_empty());
-        assert!(!by_rctc);
+        assert!(!removed_by_coverage);
 
-        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 12, 10, 1, 10, [19, 19]);
-        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+        let (graph, dead_end, _, _) =
+            dead_end_at_fanout(EdgeType::MinToMin, 12, 10, 1, 10, [19, 19]);
+        let (removal_path, removed_by_coverage) = walk_dead_end(&graph, dead_end, 2.0);
         assert!(removal_path.is_empty());
-        assert!(!by_rctc);
+        assert!(!removed_by_coverage);
     }
 
     #[test]
-    fn fanout_endpoint_counts_towards_the_rctc_length_limit() {
-        // The tip alone is below 100 k-mers, but including the one-k-mer fan-out endpoint reaches it.
-        let (graph, tip, _, _) = tip_at_fanout(EdgeType::MinToMin, 99, 2, 1, 2, [40, 40]);
-        let (removal_path, by_rctc) = walk_tip(&graph, tip, 2.0);
+    fn fanout_endpoint_counts_towards_the_coverage_length_limit() {
+        // The dead end alone is below 100 k-mers, but including the one-k-mer fan-out endpoint reaches it.
+        let (graph, dead_end, _, _) = dead_end_at_fanout(EdgeType::MinToMin, 99, 2, 1, 2, [40, 40]);
+        let (removal_path, removed_by_coverage) = walk_dead_end(&graph, dead_end, 2.0);
         assert!(removal_path.is_empty());
-        assert!(!by_rctc);
+        assert!(!removed_by_coverage);
     }
 
     #[test]
@@ -875,20 +893,27 @@ mod tests {
             EdgeType::MaxToMin,
             EdgeType::MaxToMax,
         ] {
-            let (mut graph, tip, fanout, _) = tip_at_fanout(edge, 2, 2, 1, 2, [20, 20]);
+            let (mut graph, dead_end, fanout, _) = dead_end_at_fanout(edge, 2, 2, 1, 2, [20, 20]);
             let mut removal_path = Vec::new();
-            let by_rctc = check_dead_path(
+            let removed_by_coverage = check_dead_path(
                 &graph,
-                tip,
+                dead_end,
                 &mut removal_path,
                 4,
                 100,
                 2.0,
-                graph.first_outgoing_edge_type(tip).unwrap(),
+                graph.first_outgoing_edge_type(dead_end).unwrap(),
             );
 
-            assert!(!by_rctc, "{edge:?} short tip should be removed by length");
-            assert_eq!(removal_path, vec![tip, fanout], "edge orientation {edge:?}");
+            assert!(
+                !removed_by_coverage,
+                "{edge:?} short dead end should be removed by length"
+            );
+            assert_eq!(
+                removal_path,
+                vec![dead_end, fanout],
+                "edge orientation {edge:?}"
+            );
             remove_paths(&mut graph, removal_path.drain(..));
             assert!(
                 graph.node_weight(fanout).is_none(),
@@ -898,33 +923,37 @@ mod tests {
         }
     }
 
-    /// A dead end that itself fans out: `tip_at_fanout` with its tip removed.
+    /// A dead end that itself fans out: `dead_end_at_fanout` with its leading dead end removed.
     fn fanning_dead_end(kmers: usize, counts: u32, branch_counts: [u32; 2]) -> (DbgGraph, NodeId) {
-        let (mut graph, tip, fanout, _) =
-            tip_at_fanout(EdgeType::MinToMin, 1, 1, kmers, counts, branch_counts);
-        graph.remove_node(tip);
+        let (mut graph, dead_end, fanout, _) =
+            dead_end_at_fanout(EdgeType::MinToMin, 1, 1, kmers, counts, branch_counts);
+        graph.remove_node(dead_end);
         (graph, fanout)
     }
 
     #[test]
     fn a_short_dead_end_that_fans_out_is_removed_by_length() {
         let (graph, dead_end) = fanning_dead_end(2, 999, [1, 1]);
-        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![dead_end], false));
+        assert_eq!(
+            walk_dead_end(&graph, dead_end, 2.0),
+            (vec![dead_end], false)
+        );
     }
 
     #[test]
     fn a_long_dead_end_that_fans_out_goes_only_when_its_successors_outcover_it() {
         let (graph, dead_end) = fanning_dead_end(12, 2, [40, 40]);
-        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![dead_end], true));
+        assert_eq!(walk_dead_end(&graph, dead_end, 2.0), (vec![dead_end], true));
         let (graph, dead_end) = fanning_dead_end(12, 10, [20, 20]);
-        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![], false));
+        assert_eq!(walk_dead_end(&graph, dead_end, 2.0), (vec![], false));
         let (graph, dead_end) = fanning_dead_end(100, 2, [40, 40]);
-        assert_eq!(walk_tip(&graph, dead_end, 2.0), (vec![], false));
+        assert_eq!(walk_dead_end(&graph, dead_end, 2.0), (vec![], false));
     }
 
     #[test]
     fn convergence_handling_keeps_precedence_over_fanout_handling() {
-        let (mut graph, tip, fanout, _) = tip_at_fanout(EdgeType::MinToMin, 12, 2, 1, 2, [40, 40]);
+        let (mut graph, dead_end, fanout, _) =
+            dead_end_at_fanout(EdgeType::MinToMin, 12, 2, 1, 2, [40, 40]);
         let other_incoming = graph.add_node(NodeStruct {
             counts: 40,
             abs_ind: vec![0],
@@ -933,79 +962,88 @@ mod tests {
         graph.add_bi_edge(other_incoming, fanout, EdgeType::MinToMin);
 
         let mut removal_path = Vec::new();
-        let by_rctc = check_dead_path(
+        let removed_by_coverage = check_dead_path(
             &graph,
-            tip,
+            dead_end,
             &mut removal_path,
             10,
             100,
             2.0,
-            graph.first_outgoing_edge_type(tip).unwrap(),
+            graph.first_outgoing_edge_type(dead_end).unwrap(),
         );
 
-        assert!(by_rctc);
-        assert_eq!(removal_path, vec![tip]);
+        assert!(removed_by_coverage);
+        assert_eq!(removal_path, vec![dead_end]);
         assert!(!removal_path.contains(&fanout));
     }
 
-    /// The point of the tier: a tip too long for the length rule still goes when the junction it
+    /// The point of the tier: a dead end too long for the length rule still goes when the junction it
     /// hangs off is far better covered. Taken from Minia!
     #[test]
-    fn a_long_tip_goes_when_its_junction_is_far_better_covered() {
-        let (graph, tip, _) = tip_at_junction(20, 2, 40);
-        let (removed, by_rctc) = walk_tip(&graph, tip, DEFAULT_TIP_RCTC_CUTOFF);
-        assert_eq!(removed, vec![tip]);
-        assert!(by_rctc, "removal must be attributed to the coverage tier");
+    fn a_long_dead_end_goes_when_its_junction_is_far_better_covered() {
+        let (graph, dead_end, _) = dead_end_at_junction(20, 2, 40);
+        let (removed, removed_by_coverage) =
+            walk_dead_end(&graph, dead_end, DEFAULT_DEAD_END_COVERAGE_RATIO);
+        assert_eq!(removed, vec![dead_end]);
+        assert!(
+            removed_by_coverage,
+            "removal must be attributed to the coverage tier"
+        );
     }
 
-    /// The other half: a comparably covered neighbourhood is evidence the tip is real sequence.
+    /// The other half: a comparably covered neighbourhood is evidence the dead end is real sequence.
     #[test]
-    fn a_long_tip_survives_a_comparably_covered_junction() {
-        let (graph, tip, _) = tip_at_junction(20, 20, 30);
-        let (removed, by_rctc) = walk_tip(&graph, tip, DEFAULT_TIP_RCTC_CUTOFF);
+    fn a_long_dead_end_survives_a_comparably_covered_junction() {
+        let (graph, dead_end, _) = dead_end_at_junction(20, 20, 30);
+        let (removed, removed_by_coverage) =
+            walk_dead_end(&graph, dead_end, DEFAULT_DEAD_END_COVERAGE_RATIO);
         assert!(removed.is_empty(), "1.5x is under the 2x cutoff");
-        assert!(!by_rctc);
+        assert!(!removed_by_coverage);
     }
 
     /// Strict `>`, matching every other coverage rule in the tree: a neighbourhood sitting exactly on
-    /// `cutoff * tip` is not *more* than it, so the tip stays.
+    /// `cutoff * dead end mean` is not *more* than it, so the dead end stays.
     #[test]
-    fn the_rctc_cutoff_is_strict_at_the_boundary() {
-        let (graph, tip, _) = tip_at_junction(20, 10, 20);
-        let (removed, _) = walk_tip(&graph, tip, 2.0);
+    fn the_coverage_ratio_is_strict_at_the_boundary() {
+        let (graph, dead_end, _) = dead_end_at_junction(20, 10, 20);
+        let (removed, _) = walk_dead_end(&graph, dead_end, 2.0);
         assert!(removed.is_empty(), "20 is not > 2.0 * 10");
     }
 
     /// Below the topological threshold the coverage tier is never consulted, so the change is
-    /// strictly additive: a short tip goes on length alone however poor the neighbourhood.
+    /// strictly additive: a short dead end goes on length alone however poor the neighbourhood.
     #[test]
-    fn a_short_tip_ignores_coverage_entirely() {
-        let (graph, tip, _) = tip_at_junction(2, 999, 1);
-        let (removed, by_rctc) = walk_tip(&graph, tip, DEFAULT_TIP_RCTC_CUTOFF);
-        assert_eq!(removed, vec![tip]);
-        assert!(!by_rctc, "tier one decided this, not the coverage rule");
+    fn a_short_dead_end_ignores_coverage_entirely() {
+        let (graph, dead_end, _) = dead_end_at_junction(2, 999, 1);
+        let (removed, removed_by_coverage) =
+            walk_dead_end(&graph, dead_end, DEFAULT_DEAD_END_COVERAGE_RATIO);
+        assert_eq!(removed, vec![dead_end]);
+        assert!(
+            !removed_by_coverage,
+            "tier one decided this, not the coverage rule"
+        );
     }
 
-    /// An empty band must reproduce the length rule exactly — this is what `--no-tip-rctc` and
-    /// `--tip-length-rctc-kmult 0` rely on.
+    /// An empty band must reproduce the length rule exactly — this is what `--no-dead-end-coverage` and
+    /// `--dead-end-coverage-kmult 0` rely on.
     #[test]
-    fn an_empty_rctc_band_reproduces_the_length_rule() {
-        let (graph, tip, _) = tip_at_junction(20, 2, 40);
+    fn an_empty_coverage_band_reproduces_the_length_rule() {
+        let (graph, dead_end, _) = dead_end_at_junction(20, 2, 40);
         let mut out = Vec::new();
-        let by_rctc = check_dead_path(
+        let removed_by_coverage = check_dead_path(
             &graph,
-            tip,
+            dead_end,
             &mut out,
             10,
-            10, // `rctc_limit.max(limit)` collapses the band to nothing
-            DEFAULT_TIP_RCTC_CUTOFF,
-            graph.first_outgoing_edge_type(tip).unwrap(),
+            10, // `coverage_limit.max(limit)` collapses the band to nothing
+            DEFAULT_DEAD_END_COVERAGE_RATIO,
+            graph.first_outgoing_edge_type(dead_end).unwrap(),
         );
         assert!(
             out.is_empty(),
             "over the length threshold and the coverage tier is off, so nothing is removed"
         );
-        assert!(!by_rctc);
+        assert!(!removed_by_coverage);
     }
 
     /// A whole isolated component has no junction to be compared against, so it stays tier one's
@@ -1025,20 +1063,21 @@ mod tests {
         });
         graph.add_bi_edge(head, tail, EdgeType::MinToMin);
 
-        let (removed, by_rctc) = walk_tip(&graph, head, DEFAULT_TIP_RCTC_CUTOFF);
+        let (removed, removed_by_coverage) =
+            walk_dead_end(&graph, head, DEFAULT_DEAD_END_COVERAGE_RATIO);
         assert!(
             removed.is_empty(),
             "40 k-mers is over the tier-one limit of 10"
         );
-        assert!(!by_rctc);
+        assert!(!removed_by_coverage);
     }
 
-    // ── tip_length_nts ───────────────────────────────────────────────────────
+    // ── dead_end_length_nts ───────────────────────────────────────────────────────
 
-    /// The tip threshold is the larger of the flat floor and the k multiple; a multiple of zero or below
+    /// The dead-end threshold is the larger of the flat floor and the k multiple; a multiple of zero or below
     /// keeps the flat floor.
     #[test]
-    fn tip_length_nts_cases() {
+    fn dead_end_length_nts_cases() {
         // (flat bases, k multiple, k, threshold)
         for (flat, kmult, k, want) in [
             (100, 0.0, 81, 100),
@@ -1048,7 +1087,7 @@ mod tests {
             (100, 10.0, 81, 810),
         ] {
             assert_eq!(
-                tip_length_nts(flat, kmult, k),
+                dead_end_length_nts(flat, kmult, k),
                 want,
                 "flat {flat}, kmult {kmult}, k {k}"
             );

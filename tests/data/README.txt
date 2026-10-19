@@ -11,6 +11,6 @@ ecoli_window_1.fastq.gz, ecoli_window_2.fastq.gz
   Reads, qualities and order are unchanged from the simulation.
 
 Expected contigs
-  sparrowhawk-asm build ecoli_window_1.fastq.gz ecoli_window_2.fastq.gz --threads 2 --no-graphs
+  sparrowhawk-asm ecoli_window_1.fastq.gz ecoli_window_2.fastq.gz --threads 2 --no-graphs
   --no-histo (CLI defaults otherwise): FASTA at 80 bases per line, md5
   6ec5c2b95ed2080067608ae058d12a77.

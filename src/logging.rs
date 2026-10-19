@@ -64,7 +64,6 @@ impl Logger {
     }
 }
 
-
 /// Log natively at `level`, to stdout and appended to `log_file`. A log file that cannot be opened
 /// costs only that copy, with a warning on stderr.
 #[cfg(not(target_family = "wasm"))]

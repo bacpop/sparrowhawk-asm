@@ -1,18 +1,21 @@
 //! Spelling contigs back to nucleotides, and writing them as FASTA.
 
 use core::panic;
+#[cfg(target_family = "wasm")]
+use flate2::{write::GzEncoder, Compression};
 use std::io::Write;
 
 use std::path::PathBuf;
 
 use crate::bit_encoding::UInt;
-use crate::graph_works::{spell_path, Contigs, KmerLookup};
+use crate::graph_works::{spell_path, Contigs};
 use crate::io_utils::set_ostream;
 
-/// Spells every contig. A multi-k step carries all of them to the next k, so none is length-filtered.
+/// Spells every contig, looking each packed k-mer up with `lookup`. A multi-k step carries all of them
+/// to the next k, so none is length-filtered.
 pub(crate) fn spell_contigs<IntT>(
     contigs: &Contigs,
-    dict: &impl KmerLookup<IntT>,
+    lookup: impl Fn(u64) -> Option<IntT>,
     k: usize,
 ) -> Vec<Vec<u8>>
 where
@@ -24,7 +27,7 @@ where
         .enumerate()
         .map(|(ipc, contig)| {
             assert_eq!(contig.len(), 1, "contig {ipc} was not shrunk to one node");
-            spell_path(&contig[0].abs_ind, dict, k)
+            spell_path(&contig[0].abs_ind, &lookup, k)
                 .unwrap_or_else(|e| panic!("contig {ipc} is not a valid walk: {e}"))
         })
         .collect()
@@ -53,12 +56,15 @@ pub(crate) fn write_fasta<W: Write>(seqs: &[Vec<u8>], out: &mut W) -> std::io::R
     Ok(())
 }
 
-/// The same FASTA as text, for the page to offer as a download.
+/// What `write` produces, gzipped as one member: how the page keeps and offers its downloads.
 #[cfg(target_family = "wasm")]
-pub(crate) fn fasta_string(seqs: &[Vec<u8>]) -> String {
-    let mut out = Vec::new();
-    write_fasta(seqs, &mut out).expect("writing to memory cannot fail");
-    String::from_utf8(out).expect("contigs are ASCII")
+pub(crate) fn gzipped(
+    write: impl FnOnce(&mut GzEncoder<Vec<u8>>) -> std::io::Result<()>,
+) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    write(&mut encoder)
+        .and_then(|()| encoder.finish())
+        .expect("writing to memory cannot fail")
 }
 
 /// Writes spelled contigs of at least `min_contig_length` bases as FASTA to `outfile`.
@@ -117,10 +123,10 @@ mod tests {
         let mut path: Vec<u64> = Vec::new();
 
         let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
-        let (hc, _, _, km) = it.get_curr_kmerhash_and_bases_and_kmer();
+        let (hc, _, _, km) = it.get_hashes_and_bases_and_kmer();
         dict.insert(hc, km);
         path.push(hc);
-        while let Some((hc, _, _, km)) = it.get_next_kmer_and_give_us_things() {
+        while let Some((hc, _, _, km)) = it.get_next_kmer() {
             dict.insert(hc, km);
             path.push(hc);
         }
@@ -144,7 +150,7 @@ mod tests {
         let (dict, path) = dict_and_path(&seq, k);
         assert_eq!(path.len(), n);
 
-        let sequences = spell_contigs(&one_contig(path), &dict, k);
+        let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
         let got = &sequences[0];
         assert_eq!(got.len(), seq.len(), "contig length");
         assert_eq!(got, &seq, "contig sequence");
@@ -158,7 +164,7 @@ mod tests {
         let seq = pseudo_seq(300);
         let (dict, path) = dict_and_path(&seq, k);
 
-        let sequences = spell_contigs(&one_contig(path), &dict, k);
+        let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
         let got = &sequences[0];
         assert_eq!(&got[..k], &seq[..k], "the first terminal k-mer");
         assert_eq!(&got[got.len() - k..], &seq[seq.len() - k..], "the last one");
@@ -173,7 +179,7 @@ mod tests {
         let (dict, path) = dict_and_path(&seq, k);
         assert!(path.len() < k, "fixture must have fewer than k k-mers");
 
-        let sequences = spell_contigs(&one_contig(path), &dict, k);
+        let sequences = spell_contigs(&one_contig(path), |hash| dict.get(&hash).copied(), k);
         assert_eq!(sequences.len(), 1, "the short path must still be written");
         assert_eq!(sequences[0], seq);
     }

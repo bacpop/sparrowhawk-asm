@@ -84,22 +84,16 @@ If using the `--release` flag, this should place your compiled binary inside `ta
 # Usage
 Here we will only consider the binary compiled for x86_64, refer to [sparrowhawk](https://github.com/bacpop/sparrowhawk) for an example of usage of the `wasm32-unknown-unknown` compilation target.
 
-sparrowhawk can be called later to see the basic options and arguments with
+Run `./sparrowhawk-asm --help` to see its options:
 
 ```
-./sparrowhawk-asm
-```
-
-Currently, only the `build` option is present (apart from `help`), that allows assemblying the genomes. You can check its arguments running
-
-```
-./sparrowhawk-asm build --help
+./sparrowhawk-asm --help
 ```
 
 An example execution could be the following:
 
 ```
-./sparrowhawk-asm build -f ./reads.tsv -k 31 --threads 1 -v --min-count 5 --output-dir ./ --output-prefix prefix
+./sparrowhawk-asm -f ./reads.tsv -k 31 --threads 1 -v --min-count 5 --output-dir ./ --output-prefix prefix
 ```
 
 This will assemble your reads, with k=31 and using only one thread. The minimum repeats of one particular k-mer to be considered are 5 (which is also the default). The output contigs will be written in the current directory as a fasta file called `prefix_contigs.fasta`, given that we have indicated, using the `--output-prefix` argument the word "prefix" as prefix. The input files in this case are provided through a `reads.tsv` tab-separated file, that contains an identifier for your reads and the two file paths separated by a space, i.e. a file that contains this line
@@ -113,7 +107,7 @@ IDENTIFIER     /path/to/the/read_1.fastq /path/to/the/read_2.fastq
 Alternatively, you could have run:
 
 ```
-./sparrowhawk-asm build /path/to/the/read_1.fastq /path/to/the/read_2.fastq -k 31 --threads 1 -v --min-count 5 --output-dir ./ --output-prefix prefix
+./sparrowhawk-asm /path/to/the/read_1.fastq /path/to/the/read_2.fastq -k 31 --threads 1 -v --min-count 5 --output-dir ./ --output-prefix prefix
 ```
 
 The native CLI uses Bloom counting by default to reduce memory use, with possible false-positive k-mer counts.
@@ -121,4 +115,4 @@ Pass `--no-bloom` to use exact counts instead. Bloom counting requires an explic
 explicit values 0 or 1 require `--no-bloom`. The old `--do-bloom` flag has been removed: omit it to use the new
 default, or add `--no-bloom` to preserve the former non-Bloom default.
 
-In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. A native diagnostic plot of the k-mer frequency spectrum will be saved in the same directory as `prefix_kmerspectrum.png`. Runs using automatic count selection overlay the fitted error, single-copy, and repeat components, the total mixture, the empirical valley and peak, the fitted single-copy mean and mode, and the error/genome crossover. With Bloom counting, the plot shows both the rescaled sketch used for fitting and the raw Bloom count map. These optional files can be avoided with the corresponding arguments.
+In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. Two native diagnostic plots of the k-mer frequency spectrum are saved beside them: `prefix_kmerspectrum.png`, linear and capped at three times the empirical peak's height (unbounded without a peak), and `prefix_kmerspectrum_log.png`, with a logarithmic Y axis. Each is also written as SVG. These optional files can be avoided with the corresponding arguments.

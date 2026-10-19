@@ -1,11 +1,8 @@
 //! Command line interface, built using [`crate::clap` with `Derive`](https://docs.rs/clap/latest/clap/_derive/_tutorial/index.html)
 //!
-//! The browser shares only the defaults and checks; the parser and its types are native-only.
+//! The browser shares only the defaults and checks; the parser is native-only.
 #[cfg(not(target_family = "wasm"))]
-use std::fmt;
-
-#[cfg(not(target_family = "wasm"))]
-use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser};
 
 /// Default k-mer size
 pub const DEFAULT_KMER: usize = 31;
@@ -13,14 +10,17 @@ pub const DEFAULT_KMER: usize = 31;
 pub const DEFAULT_MINCOUNT: u16 = 5;
 /// Default minimum base quality (PHRED score) for FASTQ files
 pub const DEFAULT_MINQUAL: u8 = 20;
-/// Default flat deadend-removal threshold, in bases
-pub const DEFAULT_TIP_LEN_NTS: usize = 100;
-/// Default deadend-removal k multiplier, taken from Minia/SPAdes
-pub const DEFAULT_TIP_LEN_KMULT: f32 = 2.5;
-/// Default value for the multiplier of coverage needed to clean dead-ends when the coverage is very different
-pub const DEFAULT_TIP_RCTC_KMULT: f32 = 10.0;
-/// Default value for the coverage rule threshold, SPAdes/Minia-derived
-pub const DEFAULT_TIP_RCTC_CUTOFF: f64 = 2.0;
+/// Default dead-end removal by length: dead ends shorter than this many bases are pruned
+pub const DEFAULT_DEAD_END_LEN_NTS: usize = 100;
+/// Default dead-end removal by length: the threshold also scales with k by this multiplier, taken from
+/// Minia/SPAdes
+pub const DEFAULT_DEAD_END_LEN_KMULT: f32 = 2.5;
+/// Default dead-end removal by coverage: dead ends up to this many times k bases are also pruned when
+/// the junction they hang off is much better covered
+pub const DEFAULT_DEAD_END_COVERAGE_KMULT: f32 = 10.0;
+/// Default dead-end removal by coverage: how many times a dead end's coverage its junction's other
+/// neighbours must average, SPAdes/Minia-derived
+pub const DEFAULT_DEAD_END_COVERAGE_RATIO: f64 = 2.0;
 /// Default minimum contig sequence length written to FASTA, in nucleotides
 pub const DEFAULT_MIN_CONTIG_LENGTH_NTS: usize = 500;
 /// Default output directory
@@ -70,16 +70,6 @@ pub fn default_kmer_ladder(max_k: usize) -> Vec<usize> {
         ladder.push(top);
     }
     ladder
-}
-
-/// How a multi-k run counts the k-mers carried over from the previous k's contigs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(target_family = "wasm"), derive(ValueEnum))]
-pub enum ContigCountRule {
-    /// Raise each to the fitted minimum count; counts the reads already clear stay untouched.
-    Floor,
-    /// Add the minimum count + 1 per occurrence, as GATB-Minia adds its contigs to the reads.
-    Gatb,
 }
 
 /// An odd k within 3..=MAX_K.
@@ -151,196 +141,208 @@ pub fn check_threads(threads: usize) {
     }
 }
 
-/// Possible output file types
-#[cfg(not(target_family = "wasm"))]
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum FileType {
-    /// Variant call format
-    Vcf,
-    /// FASTA alignment
-    Aln,
-}
-
-/// Possible variant filters
-#[cfg(not(target_family = "wasm"))]
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-pub enum FilterType {
-    /// Output all variants
-    NoFilter,
-    /// Filter constant bases
-    NoConst,
-    /// Filter any site with an ambiguous base
-    NoAmbig,
-    /// Filter constant bases, and any ambiguous bases
-    NoAmbigOrConst,
-}
-
-/// As text, for use in logging messages
-#[cfg(not(target_family = "wasm"))]
-impl fmt::Display for FilterType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Self::NoFilter => write!(f, "No filtering"),
-            Self::NoConst => write!(f, "No constant sites"),
-            Self::NoAmbig => write!(f, "No ambiguous sites"),
-            Self::NoAmbigOrConst => write!(f, "No constant sites or ambiguous bases"),
-        }
-    }
-}
-
-/// Options that apply to all subcommands
+/// Command-line options
 #[cfg(not(target_family = "wasm"))]
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
-#[command(propagate_version = true)]
+#[command(group(
+    ArgGroup::new("input")
+        .required(true)
+        .args(["seq_files", "file_list"]),
+))]
 pub struct Args {
-    #[doc(hidden)]
-    #[command(subcommand)]
-    pub command: Commands,
+    /// List of input FASTQ files
+    #[arg(group = "input")]
+    pub seq_files: Option<Vec<String>>,
+
+    /// File listing input file (tab separated name TAB fastq1,fastq2)
+    #[arg(short, group = "input")]
+    pub file_list: Option<String>,
+
+    /// Output directory
+    #[arg(long, default_value_t = DEFAULT_OUTPUT_DIR.to_string())]
+    pub output_dir: String,
+
+    /// Output prefix
+    #[arg(long, default_value_t = DEFAULT_OUTPUT_PREFIX.to_string())]
+    pub output_prefix: String,
+
+    /// K-mer size(s), comma-separated and strictly ascending: `-k 31`, or `-k 21,31,55,91` for an
+    /// iterative multi-k assembly. If omitted, use 21,31,41,55,71, then add 20 at a time up to 10 bases
+    /// under the longest read (at most 255), plus a last k clamped to that ceiling.
+    #[arg(short, value_parser = valid_kmer, value_delimiter = ',')]
+    pub k: Option<Vec<usize>>,
+
+    /// Minimum k-mer count. If omitted, it is FITTED from the k-mer spectrum, separately for each k.
+    #[arg(long)]
+    pub min_count: Option<u16>,
+
+    /// Minimum k-mer base quality, inclusive (with reads). If omitted, it is chosen automatically
+    /// at each k from the reads' quality ladder, topped at 20; if given, it is used as is at every k.
+    #[arg(long)]
+    pub min_qual: Option<u8>,
+
+    /// Number of CPU threads
+    #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
+    pub threads: usize,
+
+    /// Disable the default Bloom counting and use exact k-mer counts. Bloom counting uses less memory
+    /// and may be faster, but can add false-positive matches. Required for explicit --min-count 0 or 1.
+    #[arg(long, default_value_t = false)]
+    pub no_bloom: bool,
+
+    /// DEPRECATED: now ignored, with warning.
+    #[arg(long, default_value_t = 0)]
+    pub chunk_size: usize,
+
+    /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
+    /// treated as an error and popped.
+    #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
+    pub bubble_pop_ratio: f32,
+
+    /// Fraction of the fitted single-copy coverage below which a bubble branch is treated as an
+    /// error, whatever its sibling carries. Ignored when no coverage could be established.
+    #[arg(long)]
+    pub bubble_peak_ratio: Option<f32>,
+
+    /// Do not remove erroneous connections: short weakly-covered paths joining two branch points.
+    #[arg(long, default_value_t = false)]
+    pub no_ec_removal: bool,
+
+    /// Erroneous-connection removal: a connector goes when both its flanking branches carry this
+    /// many times its coverage.
+    #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_EC_COVERAGE_RATIO)]
+    pub ec_coverage_ratio: f64,
+
+    /// Erroneous-connection removal: require both flanks over the ratio rather than either.
+    #[arg(long, default_value_t = false)]
+    pub ec_require_both_flanks: bool,
+
+    /// Dead-end removal by length: dead ends shorter than this many bases are pruned. The threshold
+    /// actually used is `max(--dead-end-length, --dead-end-length-kmult * k)`.
+    #[arg(long, default_value_t = DEFAULT_DEAD_END_LEN_NTS)]
+    pub dead_end_length: usize,
+
+    /// Dead-end removal by length: scale that threshold with k. Zero disables the scaling.
+    #[arg(long, default_value_t = DEFAULT_DEAD_END_LEN_KMULT)]
+    pub dead_end_length_kmult: f32,
+
+    /// Dead-end removal by coverage: also prune dead ends up to `--dead-end-coverage-kmult * k` bases
+    /// when the junction they hang off is much better covered. Zero disables it.
+    #[arg(long, default_value_t = DEFAULT_DEAD_END_COVERAGE_KMULT)]
+    pub dead_end_coverage_kmult: f32,
+
+    /// Dead-end removal by coverage: a longer dead end goes when its junction's other neighbours
+    /// average this many times its coverage.
+    #[arg(long, default_value_t = DEFAULT_DEAD_END_COVERAGE_RATIO)]
+    pub dead_end_coverage_ratio: f64,
+
+    /// Disable dead-end removal by coverage: only remove dead ends by length.
+    #[arg(long, default_value_t = false)]
+    pub no_dead_end_coverage: bool,
+
+    /// Minimum contig sequence length written to FASTA, in nucleotides. Contigs with exactly
+    /// this length are retained.
+    #[arg(long, default_value_t = DEFAULT_MIN_CONTIG_LENGTH_NTS)]
+    pub min_contig_length: usize,
+
+    /// Multi-k: also write each intermediate k's contigs as `<prefix>_k<k>_contigs.fasta`.
+    #[arg(long, default_value_t = false)]
+    pub keep_intermediate_contigs: bool,
+
+    /// By default, Sparrowhawk draws the k-mer spectrum twice, linear and logarithmic (_log), each as
+    /// PNG and SVG, beside the contigs. Use this argument to disable it.
+    #[arg(long, default_value_t = false)]
+    pub no_histo: bool,
+
+    /// Evaluate and plot every quality floor for diagnosis. This does not alter floor selection;
+    /// it overrides --no-histo and writes per-floor plots and spectrum TSVs.
+    #[arg(long, default_value_t = false)]
+    pub debug_quality_floors: bool,
+
+    /// By default, Sparrowhawk will extract the graph just before collapse and save it in your output folder
+    /// in the DOT, GFAv1.1 and GFAv2 formats. Use this argument if you want it to not do this
+    #[arg(long, default_value_t = false)]
+    pub no_graphs: bool,
+
+    /// Do not solve bubbles in the graph
+    #[arg(long, default_value_t = false)]
+    pub no_bubble_collapse: bool,
+
+    /// Do not remove dead ends in the graph
+    #[arg(long, default_value_t = false)]
+    pub no_dead_end_removal: bool,
 
     /// Show progress messages
-    #[arg(short, long, global = true)]
+    #[arg(short, long)]
     pub verbose: bool,
 }
 
-/// Subcommands and their specific options
 #[cfg(not(target_family = "wasm"))]
-#[derive(Subcommand)]
-pub enum Commands {
-    #[command(group(
-        ArgGroup::new("input")
-            .required(true)
-            .args(["seq_files", "file_list"]),
-    ))]
-    /// Assemble these input fastq files
-    Build {
-        /// List of input FASTQ files
-        #[arg(group = "input")]
-        seq_files: Option<Vec<String>>,
-
-        /// File listing input file (tab separated name TAB fastq1,fastq2)
-        #[arg(short, group = "input")]
-        file_list: Option<String>,
-
-        /// Output directory
-        #[arg(long, default_value_t = DEFAULT_OUTPUT_DIR.to_string())]
-        output_dir: String,
-
-        /// Output prefix
-        #[arg(long, default_value_t = DEFAULT_OUTPUT_PREFIX.to_string())]
-        output_prefix: String,
-
-        /// K-mer size(s), comma-separated and strictly ascending: `-k 31`, or `-k 21,31,55,91` for an
-        /// iterative multi-k assembly. If omitted, use 21,31,41,55,71, then add 20 at a time up to 10 bases
-        /// under the longest read (at most 255), plus a last k clamped to that ceiling.
-        #[arg(short, value_parser = valid_kmer, value_delimiter = ',')]
-        k: Option<Vec<usize>>,
-
-        /// Minimum k-mer count. If omitted, it is FITTED from the k-mer spectrum, separately for each k.
-        #[arg(long)]
-        min_count: Option<u16>,
-
-        /// Minimum k-mer base quality, inclusive (with reads). If omitted, it is chosen automatically
-        /// at each k from the reads' quality ladder, topped at 20; if given, it is used as is at every k.
-        #[arg(long)]
-        min_qual: Option<u8>,
-
-        /// Number of CPU threads
-        #[arg(long, value_parser = valid_cpus, default_value_t = 1)]
-        threads: usize,
-
-        /// Disable the default Bloom counting and use exact k-mer counts. Bloom counting uses less memory
-        /// and may be faster, but can add false-positive matches. Required for explicit --min-count 0 or 1.
-        #[arg(long, default_value_t = false)]
-        no_bloom: bool,
-
-        /// DEPRECATED: now ignored, with warning.
-        #[arg(long, default_value_t = 0)]
-        chunk_size: usize,
-
-        /// Fraction of the stronger branch's coverage below which the weaker branch of a bubble is
-        /// treated as an error and popped.
-        #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_POP_RATIO)]
-        bubble_pop_ratio: f32,
-
-        /// Fraction of the fitted single-copy coverage below which a bubble branch is treated as an
-        /// error, whatever its sibling carries. Ignored when no coverage could be established.
-        #[arg(long)]
-        bubble_peak_ratio: Option<f32>,
-
-        /// Do not remove erroneous connections: short weakly-covered paths joining two branch points.
-        #[arg(long, default_value_t = false)]
-        no_ec_removal: bool,
-
-        /// Erroneous-connection removal: a connector goes when both its flanking branches carry this
-        /// many times its coverage.
-        #[arg(long, default_value_t = crate::algorithms::corrector::DEFAULT_EC_COVERAGE_RATIO)]
-        ec_coverage_ratio: f64,
-
-        /// Erroneous-connection removal: require both flanks over the ratio rather than either.
-        #[arg(long, default_value_t = false)]
-        ec_require_both_flanks: bool,
-
-        /// Dead-end removal by length: paths shorter than this many bases are pruned. The threshold actually
-        /// used is `max(--tip-length, --tip-length-kmult * k)`.
-        #[arg(long, default_value_t = DEFAULT_TIP_LEN_NTS)]
-        tip_length: usize,
-
-        /// Dead-end removal by length, length scale: scale its threshold with k. Zero disables scaling with k.
-        #[arg(long, default_value_t = DEFAULT_TIP_LEN_KMULT)]
-        tip_length_kmult: f32,
-
-        /// Dead-end removal by coverage, length threshold: prune dead ends up to `--tip-length-rctc-kmult * k` bases when the
-        /// junction they hang off is much better covered. Zero disables it.
-        #[arg(long, default_value_t = DEFAULT_TIP_RCTC_KMULT)]
-        tip_length_rctc_kmult: f32,
-
-        /// Dead-end removal by coverage, coverage threshold: a dead-end that might be a bit longth is removed when its junction's other neighbours average this many
-        /// times its coverage
-        #[arg(long, default_value_t = DEFAULT_TIP_RCTC_CUTOFF)]
-        tip_rctc_cutoff: f64,
-
-        /// Disable dead-end removal by coverage: only remove dead-ends by length.
-        #[arg(long, default_value_t = false)]
-        no_tip_rctc: bool,
-
-        /// Minimum contig sequence length written to FASTA, in nucleotides. Contigs with exactly
-        /// this length are retained.
-        #[arg(long, default_value_t = DEFAULT_MIN_CONTIG_LENGTH_NTS)]
-        min_contig_length: usize,
-
-        /// Multi-k: how k-mers of the previous k's contigs are counted at the next k. `floor` raises
-        /// each to the fitted minimum count; `gatb` adds minimum count + 1, as GATB-Minia does.
-        #[arg(long, value_enum, default_value_t = ContigCountRule::Floor)]
-        multik_contig_counts: ContigCountRule,
-
-        /// Multi-k: also write each intermediate k's contigs as `<prefix>_k<k>_contigs.fasta`.
-        #[arg(long, default_value_t = false)]
-        keep_intermediate_contigs: bool,
-
-        /// By default, Sparrowhawk will draw your k-mer spectrum histogram and save it as PNG and
-        /// SVG in the same folder where the contigs output will be. Use this argument to disable it.
-        #[arg(long, default_value_t = false)]
-        no_histo: bool,
-
-        /// Evaluate and plot every quality floor for diagnosis. This does not alter floor selection;
-        /// it overrides --no-histo and writes per-floor plots and spectrum TSVs.
-        #[arg(long, default_value_t = false)]
-        debug_quality_floors: bool,
-
-        /// By default, Sparrowhawk will extract the graph just before collapse and save it in your output folder
-        /// in the DOT, GFAv1.1 and GFAv2 formats. Use this argument if you want it to not do this
-        #[arg(long, default_value_t = false)]
-        no_graphs: bool,
-
-        /// Do not solve bubbles in the graph
-        #[arg(long, default_value_t = false)]
-        no_bubble_collapse: bool,
-
-        /// Do not remove dead ends in the graph
-        #[arg(long, default_value_t = false)]
-        no_dead_end_removal: bool,
-    },
+impl Args {
+    /// Reject option values a run cannot use, before anything is created or logged.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_bloom_min_count(!self.no_bloom, self.min_count)?;
+        if self.debug_quality_floors && self.min_count.is_some() {
+            return Err(
+                "--debug-quality-floors requires automatic min-count selection; remove --min-count"
+                    .into(),
+            );
+        }
+        if self.debug_quality_floors && self.min_qual.is_some() {
+            return Err(
+                "--debug-quality-floors requires automatic base-quality floors; remove --min-qual"
+                    .into(),
+            );
+        }
+        if !(self.bubble_pop_ratio > 0.0 && self.bubble_pop_ratio < 1.0) {
+            return Err(format!(
+                "--bubble-pop-ratio must be strictly between 0 and 1 (got {}). It is the fraction of \
+                 the stronger branch's coverage below which the weaker branch counts as an error; 1.0 \
+                 or more pops every bubble, 0.0 or less pops none.",
+                self.bubble_pop_ratio
+            ));
+        }
+        if let Some(ratio) = self.bubble_peak_ratio.filter(|r| !(*r > 0.0 && *r < 1.0)) {
+            return Err(format!(
+                "--bubble-peak-ratio must be strictly between 0 and 1 (got {ratio}). It is the \
+                 fraction of single-copy coverage below which a branch counts as an error."
+            ));
+        }
+        if !(self.ec_coverage_ratio.is_finite() && self.ec_coverage_ratio > 1.0) {
+            return Err(format!(
+                "--ec-coverage-ratio must be finite and greater than 1 (got {}). It is how many times \
+                 a connector's flanks must out-cover it before the connector is treated as erroneous.",
+                self.ec_coverage_ratio
+            ));
+        }
+        if self.dead_end_length_kmult < 0.0 {
+            return Err(format!(
+                "--dead-end-length-kmult must be >= 0 (got {}). Zero keeps the flat \
+                 --dead-end-length.",
+                self.dead_end_length_kmult
+            ));
+        }
+        if self.dead_end_coverage_kmult < 0.0 {
+            return Err(format!(
+                "--dead-end-coverage-kmult must be >= 0 (got {}). Zero drops dead-end removal by \
+                 coverage, leaving only the length rule.",
+                self.dead_end_coverage_kmult
+            ));
+        }
+        if !self.dead_end_coverage_ratio.is_finite() || self.dead_end_coverage_ratio <= 0.0 {
+            return Err(format!(
+                "--dead-end-coverage-ratio must be finite and > 0 (got {}). It is how many times \
+                 better covered a junction must be than the dead end hanging off it.",
+                self.dead_end_coverage_ratio
+            ));
+        }
+        // Each k is seeded with the contigs of the k before it, so the ladder must climb.
+        if let Some(ks) = &self.k {
+            check_ladder(ks)?;
+        }
+        Ok(())
+    }
 }
 
 /// Function to parse command line args into [`Args`] struct

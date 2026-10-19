@@ -83,7 +83,7 @@ impl ReadSource for BrowserFiles {
     }
 }
 
-// This is quite magic, but it is interesting: this is a way of having a shared variable that lies in the current thread, given that we have the two-buffer system. Those generate, IIUC, scopes that do not speak to each other in any way. This thread_local! macro creates essentially a, thanks to the "static", global variable for all the thread. Because it's static for globalness, we need std:cell:Cell for having mutability in its interior, as static mut is unsafe and forbidden in recent Rust versions. All a bit quite magic, but I did something similar when I didn't know in Python how to pass info to shared threads, now that I remember. We use this for showing progress on the web.
+// This is quite magic, but it is interesting: this is a way of having a shared variable that lies in the current thread, given that we have the two-buffer system. Those generate, IIUC, scopes that do not speak to each other in any way. This thread_local! macro creates essentially a, thanks to the "static", global variable for all the thread. Because it's static for globalness, we need std::cell::Cell for having mutability in its interior, as static mut is unsafe and forbidden in recent Rust versions. All a bit quite magic, but I did something similar when I didn't know in Python how to pass info to shared threads, now that I remember. We use this for showing progress on the web.
 
 #[cfg(target_family = "wasm")]
 thread_local! {

@@ -1,6 +1,4 @@
-use nohash_hasher::NoHashHasher;
 use rayon::prelude::*;
-use std::{collections::HashMap, hash::BuildHasherDefault};
 
 use crate::algorithms::collapser::Collapsable;
 use crate::algorithms::corrector::Correctable;
@@ -9,25 +7,13 @@ use crate::algorithms::path_correction::{remove_bulges, remove_erroneous_connect
 use crate::algorithms::shrinker::Shrinkable;
 use crate::bit_encoding::UInt;
 use crate::clock::Instant;
-use crate::indexed_kmers::{IndexedKmers, OrientedKmerIndex};
+use crate::indexed_kmers::{IndexMap, IndexedKmers};
 use crate::nthash;
 use std::fmt;
 
 use crate::bit_encoding::rc_base;
 
 use sparrowhawk_graph::{DbgGraph, EdgeType, IndexedEdge, SerializedContigs};
-
-/// Retrieves a packed canonical k-mer by its hash.
-pub trait KmerLookup<IntT> {
-    /// Return the packed k-mer associated with `hash`.
-    fn get_kmer(&self, hash: u64) -> Option<IntT>;
-}
-
-impl<IntT: Copy> KmerLookup<IntT> for IndexedKmers<IntT> {
-    fn get_kmer(&self, hash: u64) -> Option<IntT> {
-        self.get_packed(hash).copied()
-    }
-}
 
 /// ntHash's split-rotate tables for `base` at `k`, ORed: the term that drops or adds the far base.
 #[inline]
@@ -79,11 +65,9 @@ fn fwd_candidates(hc: u64, hnc: u64, k: usize, bases: u8) -> [(u64, EdgeType, Ed
     out
 }
 
-type OrientedLookup = HashMap<u64, OrientedKmerIndex, BuildHasherDefault<NoHashHasher<u64>>>;
-
 fn indexed_edge(
     hash: u64,
-    lookup: &OrientedLookup,
+    lookup: &IndexMap,
     canonical_type: EdgeType,
     reverse_type: EdgeType,
 ) -> Option<IndexedEdge> {
@@ -102,7 +86,7 @@ fn check_bkg_indexed(
     hnc: u64,
     k: usize,
     bases: u8,
-    lookup: &OrientedLookup,
+    lookup: &IndexMap,
 ) -> Vec<IndexedEdge> {
     bkg_candidates(hc, hnc, k, bases)
         .into_iter()
@@ -115,7 +99,7 @@ fn check_fwd_indexed(
     hnc: u64,
     k: usize,
     bases: u8,
-    lookup: &OrientedLookup,
+    lookup: &IndexMap,
 ) -> Vec<IndexedEdge> {
     fwd_candidates(hc, hnc, k, bases)
         .into_iter()
@@ -236,10 +220,10 @@ impl fmt::Display for SpellError {
     }
 }
 
-/// Spell the nucleotides of a walk of canonical k-mer hashes.
+/// Spell the nucleotides of a walk of canonical k-mer hashes, looking each packed k-mer up with `lookup`.
 pub fn spell_path<IntT>(
     hashes: &[u64],
-    dict: &impl KmerLookup<IntT>,
+    lookup: impl Fn(u64) -> Option<IntT>,
     k: usize,
 ) -> Result<Vec<u8>, SpellError>
 where
@@ -250,7 +234,7 @@ where
     }
 
     let get = |i: usize| -> Result<IntT, SpellError> {
-        dict.get_kmer(hashes[i]).ok_or(SpellError::UnknownKmer {
+        lookup(hashes[i]).ok_or(SpellError::UnknownKmer {
             index: i,
             hash: hashes[i],
         })
@@ -347,9 +331,9 @@ impl Assemble for BasicAsm {
             do_bubble_collapse,
             do_dead_end_removal,
             pop_ratio,
-            tip_nts,
-            tip_rctc_nts,
-            tip_rctc_cutoff,
+            dead_end_nts,
+            dead_end_coverage_nts,
+            dead_end_coverage_ratio,
             coverage,
             do_ec_removal,
             ec_ratio,
@@ -392,7 +376,11 @@ impl Assemble for BasicAsm {
         loop {
             let shrink_changed_graph = ptgraph.shrink();
             let pruned = if do_dead_end_removal {
-                ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff)
+                ptgraph.remove_dead_paths(
+                    dead_end_nts,
+                    dead_end_coverage_nts,
+                    dead_end_coverage_ratio,
+                )
             } else {
                 false
             };
@@ -417,7 +405,11 @@ impl Assemble for BasicAsm {
             }
             changed |= ptgraph.shrink();
             if do_dead_end_removal {
-                changed |= ptgraph.remove_dead_paths(tip_nts, tip_rctc_nts, tip_rctc_cutoff);
+                changed |= ptgraph.remove_dead_paths(
+                    dead_end_nts,
+                    dead_end_coverage_nts,
+                    dead_end_coverage_ratio,
+                );
             }
             if !changed {
                 break;
@@ -474,13 +466,6 @@ mod tests {
     use nohash_hasher::NoHashHasher;
     use std::{borrow::Cow, collections::HashMap, hash::BuildHasherDefault};
 
-    /// The spelling tests look k-mers up in a plain map.
-    impl<IntT: Copy> KmerLookup<IntT> for HashMap<u64, IntT, BuildHasherDefault<NoHashHasher<u64>>> {
-        fn get_kmer(&self, hash: u64) -> Option<IntT> {
-            self.get(&hash).copied()
-        }
-    }
-
     /// The packed k-mers of `seq`, and the `IndexedKmers` preprocessing would build from them.
     #[allow(clippy::type_complexity)]
     fn build_indexed(
@@ -494,14 +479,14 @@ mod tests {
         let mut counted: HashMap<u64, (u64, u8, u32), BuildHasherDefault<NoHashHasher<u64>>> =
             HashMap::with_hasher(BuildHasherDefault::default());
         let mut it = Kmer::<u64>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
-        let mut cur = Some(it.get_curr_kmerhash_and_bases_and_kmer());
+        let mut cur = Some(it.get_hashes_and_bases_and_kmer());
         while let Some((hc, hnc, b, km)) = cur {
             packed.insert(hc, km);
             counted
                 .entry(hc)
                 .and_modify(|e| e.2 += 1)
                 .or_insert((hnc, b, 1));
-            cur = it.get_next_kmer_and_give_us_things();
+            cur = it.get_next_kmer();
         }
         let mut indexed = IndexedKmers::with_capacity(counted.len());
         for (&hash, &(hnc, b, counts)) in &counted {
@@ -597,7 +582,7 @@ mod tests {
             ] {
                 let h = oriented(&g, n, carry);
                 if h.len() > 1 {
-                    spell_path(&h, &packed, k)
+                    spell_path(&h, |hash| packed.get(&hash).copied(), k)
                         .unwrap_or_else(|e| panic!("node {n:?} on {carry:?} is not a walk: {e}"));
                 }
             }
@@ -606,7 +591,7 @@ mod tests {
                 let (sc, tc) = et.get_from_and_to();
                 let from = *oriented(&g, n, sc).last().unwrap();
                 let to = oriented(&g, m, tc)[0];
-                spell_path(&[from, to], &packed, k).unwrap_or_else(|e| {
+                spell_path(&[from, to], |hash| packed.get(&hash).copied(), k).unwrap_or_else(|e| {
                     panic!("edge {n:?} -{et:?}-> {m:?} is not a k-1 junction: {e}")
                 });
                 checked += 1;
@@ -632,7 +617,11 @@ mod tests {
             .collect();
         assert!(all.len() > 100);
         assert_eq!(
-            spell_path(&[all[0], all[all.len() - 1]], &packed, k),
+            spell_path(
+                &[all[0], all[all.len() - 1]],
+                |hash| packed.get(&hash).copied(),
+                k
+            ),
             Err(SpellError::NotAWalk { index: 1 }),
             "an invented junction must be rejected"
         );
@@ -669,10 +658,10 @@ mod tests {
         let mut dict = HashMap::with_hasher(BuildHasherDefault::default());
         let mut walk = Vec::new();
         let mut it = Kmer::<IntT>::new(Cow::Borrowed(seq), seq.len(), None, k, 0, true).unwrap();
-        let (hc, _, _, km) = it.get_curr_kmerhash_and_bases_and_kmer();
+        let (hc, _, _, km) = it.get_hashes_and_bases_and_kmer();
         dict.insert(hc, km);
         walk.push(hc);
-        while let Some((hc, _, _, km)) = it.get_next_kmer_and_give_us_things() {
+        while let Some((hc, _, _, km)) = it.get_next_kmer() {
             dict.insert(hc, km);
             walk.push(hc);
         }
@@ -688,7 +677,8 @@ mod tests {
                 let (dict, walk) = dict_and_walk::<u64>(&seq, k);
                 assert_eq!(walk.len(), len - k + 1, "k={k} len={len}: k-mer count");
 
-                let spelled = spell_path(&walk, &dict, k).expect("valid walk");
+                let spelled =
+                    spell_path(&walk, |hash| dict.get(&hash).copied(), k).expect("valid walk");
                 assert_eq!(
                     spelled.len(),
                     walk.len() + k - 1,
@@ -713,8 +703,8 @@ mod tests {
         let (d128, w128) = dict_and_walk::<u128>(&seq, k);
         assert_eq!(w64, w128, "hashes are independent of the packing width");
         assert_eq!(
-            spell_path(&w64, &d64, k).unwrap(),
-            spell_path(&w128, &d128, k).unwrap()
+            spell_path(&w64, |hash| d64.get(&hash).copied(), k).unwrap(),
+            spell_path(&w128, |hash| d128.get(&hash).copied(), k).unwrap()
         );
     }
 
@@ -725,7 +715,7 @@ mod tests {
         let seq = pseudo_seq(k, 7);
         let (dict, walk) = dict_and_walk::<u64>(&seq, k);
         assert_eq!(walk.len(), 1);
-        let spelled = spell_path(&walk, &dict, k).unwrap();
+        let spelled = spell_path(&walk, |hash| dict.get(&hash).copied(), k).unwrap();
         assert_eq!(spelled.len(), k);
         // Either strand is a legitimate answer here; the sequence itself is one of them.
         let rc: Vec<u8> = seq
@@ -747,7 +737,10 @@ mod tests {
     #[test]
     fn empty_walk_is_an_error() {
         let dict: HashMap<u64, u64, BuildHasherDefault<NoHashHasher<u64>>> = HashMap::default();
-        assert_eq!(spell_path(&[], &dict, 31), Err(SpellError::Empty));
+        assert_eq!(
+            spell_path(&[], |hash| dict.get(&hash).copied(), 31),
+            Err(SpellError::Empty)
+        );
     }
 
     #[test]
@@ -757,7 +750,7 @@ mod tests {
         let (mut dict, walk) = dict_and_walk::<u64>(&seq, k);
         dict.remove(&walk[5]);
         assert_eq!(
-            spell_path(&walk, &dict, k),
+            spell_path(&walk, |hash| dict.get(&hash).copied(), k),
             Err(SpellError::UnknownKmer {
                 index: 5,
                 hash: walk[5]
@@ -778,7 +771,7 @@ mod tests {
 
         let walk = vec![wa[0], wb[0]];
         assert_eq!(
-            spell_path(&walk, &dict, k),
+            spell_path(&walk, |hash| dict.get(&hash).copied(), k),
             Err(SpellError::NotAWalk { index: 1 })
         );
     }
@@ -795,7 +788,7 @@ mod tests {
 
         walk[10] = wother[0];
         assert_eq!(
-            spell_path(&walk, &dict, k),
+            spell_path(&walk, |hash| dict.get(&hash).copied(), k),
             Err(SpellError::NotAWalk { index: 10 })
         );
     }

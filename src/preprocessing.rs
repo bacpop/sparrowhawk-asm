@@ -1,4 +1,4 @@
-//! Assembly preprocessing: this includes, k-mer parsing, k-mer filtering, and k-mer counting. We also plot here k-mer spectrums and fits to them.
+//! Assembly preprocessing: this includes k-mer parsing, k-mer filtering, and k-mer counting. We also plot here k-mer spectra and fits to them.
 
 use std::path::PathBuf;
 use std::{error::Error, fmt};
@@ -22,12 +22,99 @@ use super::QualOpts;
 
 use crate::bit_encoding::UInt;
 use crate::bloom_filter::BloomBits;
-use crate::cli::ContigCountRule;
 use crate::indexed_kmers::IndexedKmers;
 use crate::kmer::Kmer;
 use crate::qual_profile::{window_groups, MAX_GROUPS, NONE};
 use crate::reads::{MaybeSend, OwnedRecord};
-use crate::spectrum_fitter::{fit_spectrum, FitAttempt, GenomeModel, SpectrumFit};
+use crate::spectrum_fitter::{fit_spectrum, FitAttempt, SpectrumFit};
+
+// Constants
+
+// The histogram
+
+/// Bins of the k-mer spectrum: bin `c - 1` holds the k-mers seen `c` times, and the last bin every
+/// count from `MAXSIZEHISTO` up. For the fitting, we'll use actually MAXSIZEHISTO - 1.
+const MAXSIZEHISTO: usize = 8000;
+/// Window of the k-mer spectrum returned through the WASM preprocessing JSON. It does not limit
+/// the current valley or mixture fit.
+pub(crate) const LEGACY_HISTO_RANGE: usize = 500;
+/// The pinned window has to fit inside the histogram, or the legacy readers would index out of bounds.
+const _: () = assert!(LEGACY_HISTO_RANGE <= MAXSIZEHISTO);
+
+// Counting
+
+/// How many records go to the workers at a time: ~1M k-mers at 150 bp and k=31, small enough to stay
+/// cache-friendly and large enough to amortise the rayon fork/join.
+const BATCH_RECORDS: usize = 8192;
+/// Never fewer shards than this: below it each map stops being a small fraction of the working set. Heuristically set.
+const MIN_COUNTMAP_SHARDS: usize = 64;
+/// Nor more than this, or the per-batch split pays for buckets that hold almost nothing.
+const MAX_COUNTMAP_SHARDS: usize = 256;
+/// Shards per thread. One, not more: oversubscribing to give rayon work to steal was measured and is a
+/// bad trade, since every extra shard is another half-empty table. At k=81 on 12 threads, 64 shards
+/// cost 17% peak RSS to save 4% wall against 16.
+const SHARDS_PER_THREAD: usize = 1;
+/// Bloom filter occupancy (%) from which a warning is shown.
+const BLOOM_WARN_OCCUPANCY_PCT: f64 = 25.0;
+/// Contig bases hashed per round when carrying contigs in; bounds the transient k-mer buffer.
+const CARRY_CHUNK_BASES: usize = 1 << 20;
+
+// The sketch
+
+/// Sampled hashes held before the threshold halves
+const SKETCH_BUDGET: usize = 500_000;
+/// The canonical k-mer hash never returns a value below this, so the sample is taken from the interval
+/// above it: halving from zero would put the threshold in a range the hash cannot reach, and the whole
+/// table would be retained away. Measured over 8M k-mers at k = 21, 31, 41 and 71.
+const HASH_FLOOR: u64 = 1 << 52;
+
+// The valley estimator
+
+/// Bins either side of a count in the smoothed spectrum.
+const SMOOTH: usize = 2;
+/// The run of occupied raw bins that confirms we have left the error lobe rather than hit noise.
+const RISE_RUN: usize = 3;
+/// How far the genome lobe must stand above the valley. Spectra with a textbook valley and a broad lobe
+/// were being rejected at a ratio near 2.4, so a threshold of 3 cut into good data.
+const MIN_GP_TO_V_RATIO: f64 = 1.75;
+/// Share of k-mer *instances* the lobe above the valley must hold. A handful of noise bins clears 1 %
+/// on repeats and adapters alone; a genuine lobe holds 0.75-0.95 of the sequence.
+const MIN_CAND_KMER_FRAC: f64 = 0.20;
+/// A selected peak's mirrored valley-to-shoulder interval must carry at least this share of all non-singleton bins.
+const MIN_PEAK_AREA_FRACTION: f64 = 0.05;
+/// Used when the lobes cannot be separated. Not 1: at a genomic peak of 3-4 every singleton error survives and
+/// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
+const UNRESOLVED_MINCOUNT: u16 = 2;
+
+// The cutoff's guards
+
+/// Genome k-mers the cutoff may delete: this share of those above the valley for the measured guard,
+/// and of a Poisson genome for the Poisson one.
+const MAX_GENOME_LOSS: f64 = 0.01;
+/// Expected single-copy k-mers the cutoff may strand below itself.
+const MAX_GENOME_HOLES: f64 = 1.0;
+
+// The floor choice
+
+/// A fit whose error component explains more than this share of observed counts above the applied
+/// cutoff is considered too error-heavy when comparing multiple usable quality floors. Provisional;
+/// cluster results should be used to recalibrate it.
+const MAX_FIT_ERROR_TAIL_FRACTION: f64 = 0.05;
+/// A very shallow empirical peak is a reason to inspect the lower floors, not a reason to refuse a fit.
+const LOW_COVERAGE_FLOOR_REVIEW: usize = 10;
+/// Peak gain a lower floor needs over a starved one (peak below [`LOW_COVERAGE_FLOOR_REVIEW`]) to be
+/// stepped down to. Well-covered floors never step down: that cost Neisseria 6-8% auN locally.
+const STEP_DOWN_GAIN: f64 = 1.10;
+
+// The plots, native-only
+
+/// Smallest useful horizontal range for a diagnostic plot with no empirical genomic peak.
+#[cfg(not(target_family = "wasm"))]
+const MIN_PLOT_RANGE: usize = 10;
+/// The linear plot's Y axis stops at this multiple of the empirical peak's bar, so the error lobe does
+/// not flatten the genome lobe.
+#[cfg(not(target_family = "wasm"))]
+const PEAK_Y_CAP_MULT: f64 = 3.0;
 
 /// Tuple for name and list of input files
 pub type InputFastx = (String, Vec<String>);
@@ -80,20 +167,6 @@ impl fmt::Display for PreprocessingError {
 
 impl Error for PreprocessingError {}
 
-// For the fitting, we'll use actually MAXSIZEHISTO - 1
-const MAXSIZEHISTO: usize = 8000;
-
-/// Window of the k-mer spectrum returned through the WASM preprocessing JSON. It does not limit
-/// the current valley or mixture fit.
-pub(crate) const LEGACY_HISTO_RANGE: usize = 500;
-
-/// Smallest useful horizontal range for a native diagnostic with no empirical genomic peak.
-#[cfg(not(target_family = "wasm"))]
-const MIN_NATIVE_PLOT_RANGE: usize = 10;
-
-/// The pinned window has to fit inside the histogram, or the legacy readers would index out of bounds.
-const _: () = assert!(LEGACY_HISTO_RANGE <= MAXSIZEHISTO);
-
 #[inline]
 fn add_to_histogram(histovec: &mut [u32], count: u32) {
     let idx = if (count as usize) >= MAXSIZEHISTO {
@@ -103,14 +176,6 @@ fn add_to_histogram(histovec: &mut [u32], count: u32) {
     };
     histovec[idx] = histovec[idx].saturating_add(1);
 }
-
-/// Sampled hashes held before the threshold halves
-const SKETCH_BUDGET: usize = 500_000;
-
-/// The canonical k-mer hash never returns a value below this, so the sample is taken from the interval
-/// above it: halving from zero would put the threshold in a range the hash cannot reach, and the whole
-/// table would be retained away. Measured over 8M k-mers at k = 21, 31, 41 and 71.
-const HASH_FLOOR: u64 = 1 << 52;
 
 /// Per-floor k-mer spectra from a fixed-size sample of hash space. Subsampling hash space does not move
 /// lambda, as a k-mer's hash does not depend on how often it occurs.
@@ -211,124 +276,106 @@ impl SpectrumSketch {
 // the smoothed spectrum without allowing the refinement to escape the raw peak's neighbourhood.
 // =====================================================================================================
 
-/// Bins either side of a count in the smoothed spectrum, and the run of occupied raw bins that
-/// confirms we have left the error lobe rather than hit noise.
-const SMOOTH: usize = 2;
-const RISE_RUN: usize = 3;
-/// Genome k-mers the cutoff may delete, and how far the genome lobe must stand above the valley.
-const MAX_GENOME_LOSS: f64 = 0.01;
-/// Spectra with a textbook valley and a broad lobe were being rejected at a ratio near 2.4, so a
-/// threshold of 3 cut into good data.
-const MIN_GP_TO_V_RATIO: f64 = 1.75;
-/// Share of k-mer *instances* the lobe above the valley must hold. A handful of noise bins clears 1 %
-/// on repeats and adapters alone; a genuine lobe holds 0.75-0.95 of the sequence.
-const MIN_CAND_KMER_FRAC: f64 = 0.20;
-/// A selected peak's mirrored valley-to-shoulder interval must carry at least this share of all non-singleton bins.
-const MIN_PEAK_AREA_FRACTION: f64 = 0.05;
-/// Bloom filter occupancy (%) from which a warning is shown.
-const BLOOM_WARN_OCCUPANCY_PCT: f64 = 25.0;
-/// Used when the lobes cannot be separated. Not 1: at a genomic peak of 3-4 every singleton error survives and
-/// we exhaust memory, which is worse than the ~20 % genome loss cutting at 2 costs there.
-const UNRESOLVED_MINCOUNT: u16 = 2;
-
-fn min_count_decision_unresolved(
-    automatic: bool,
-    min_count: u16,
-    genomic_peak: PeakSource,
-) -> bool {
-    automatic && min_count == UNRESOLVED_MINCOUNT && !matches!(genomic_peak, PeakSource::Fitted(_))
-}
-
 /// How the raw candidates were turned into the selected empirical valley and peak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum PeakSearch {
+    /// No pair was accepted.
     #[default]
     Unresolved,
+    /// The raw pair, low and close: both under 15, and under 10 apart.
     RawLowCoverage,
+    /// The raw pair refined on the smoothed spectrum.
     SmoothedRefinement,
+    /// The raw pair, when the refinement found none.
     RawFallback,
+    /// The first raw local valley and the tallest bin after it.
     RawLocalFallback,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PeakRetryReason {
-    NoSeed,
-    NoPrimaryPair,
-    AreaNotMeasurable,
-    AreaBelowThreshold,
-    SeparationGuardFailed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PeakAreaFailure {
-    InvalidPair,
-    SaturatedEndpoint,
-    EmptyDenominator,
-}
-
+/// How much of the spectrum a valley-peak pair's lobe holds: the k-mers from the valley to the peak's
+/// mirror on its far side, against every non-singleton k-mer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PeakAreaSupport {
+    /// Distinct k-mers from the valley to the mirrored shoulder.
     area_sum: u64,
+    /// Distinct k-mers of every count from 2, the saturating last bin included.
     denominator: u64,
 }
 
 impl PeakAreaSupport {
+    /// Sum the valley-to-mirrored-shoulder interval and all non-singleton bins. The overflow bin is
+    /// retained in the denominator but cannot be used as the interval's right endpoint. `None` when the
+    /// pair is not valley-then-peak, the mirrored shoulder reaches the saturating last bin, or no k-mer
+    /// is seen twice.
+    fn measure(histovec: &[u32], valley: usize, peak: usize) -> Option<Self> {
+        if valley < 2 || peak <= valley || peak >= histovec.len() {
+            return None;
+        }
+        let mirrored_end = peak.checked_mul(2)?.checked_sub(valley)?;
+        let last_unsaturated_count = histovec.len().checked_sub(1)?;
+        if mirrored_end > last_unsaturated_count {
+            return None;
+        }
+        let denominator: u64 = histovec[1..].iter().map(|&height| u64::from(height)).sum();
+        if denominator == 0 {
+            return None;
+        }
+        let area_sum: u64 = (valley..=mirrored_end)
+            .map(|count| u64::from(histovec[count - 1]))
+            .sum();
+        Some(Self {
+            area_sum,
+            denominator,
+        })
+    }
+
+    /// The lobe's share of the non-singleton k-mers.
     fn fraction(self) -> f64 {
         self.area_sum as f64 / self.denominator as f64
     }
 
+    /// Whether that share reaches [`MIN_PEAK_AREA_FRACTION`].
     fn passes(self) -> bool {
         self.fraction() >= MIN_PEAK_AREA_FRACTION
     }
 }
 
-/// What the valley estimator concluded, and every intermediate it passed through. The extra fields are
-/// carried so the native diagnostics can reproduce the decision.
+/// What the valley estimator concluded about one spectrum, and the figures behind it.
 #[derive(Clone, Copy, Default)]
 struct SpectrumEstimate {
-    /// Where the raw-histogram walk stopped, before finding the raw valley and peak.
+    /// Where the raw walk left the error lobe: the first raw minimum followed by [`RISE_RUN`] occupied
+    /// bins not below it, as a count; 0 when none was found. Plotted.
     valley_seed: usize,
+    /// Lowest raw bin from count 2 to the raw genomic peak, as a count. Plotted.
     raw_valley: Option<usize>,
+    /// Highest raw bin at or above the seed, as a count. Plotted.
     raw_genomic_peak: Option<usize>,
-    refined_valley: Option<usize>,
-    refined_peak: Option<usize>,
+    /// How the selected pair was found; `Unresolved` when none was accepted.
     peak_search: PeakSearch,
-    primary_search: PeakSearch,
-    primary_valley: Option<usize>,
-    primary_peak: Option<usize>,
-    primary_area_sum: Option<u64>,
-    primary_area_fraction: Option<f64>,
-    primary_area_failure: Option<PeakAreaFailure>,
-    fallback_area_sum: Option<u64>,
-    fallback_area_fraction: Option<f64>,
-    fallback_area_failure: Option<PeakAreaFailure>,
-    area_denominator: u64,
-    fallback_valley: Option<usize>,
-    fallback_peak: Option<usize>,
-    fallback_tail_confirmed: Option<bool>,
-    fallback_attempted: bool,
-    retry_reason: Option<PeakRetryReason>,
+    /// The selected valley, as a count; 0 when unresolved.
     valley: usize,
+    /// The selected single-copy peak, as a count; 0 when unresolved.
     genomic_peak: usize,
-    /// Heights at those two counts, so the ratio below can be checked rather than trusted.
+    /// Distinct k-mers in the valley's bin.
     valley_n: u32,
+    /// Distinct k-mers in the peak's bin.
     genomic_peak_n: u32,
     /// `genomic_peak_n / valley_n`, the quantity [`MIN_GP_TO_V_RATIO`] guards.
     gp_to_v_ratio: f64,
-    /// `valley / genomic_peak` as counts. Logged, never gated on: near 1.0 usually means the valley search found
-    /// nothing and stopped under the genomic peak, but a tight clean separation reads the same way.
-    valley_to_peak_xratio: f64,
     /// Share of k-mer instances at or above the valley, the quantity [`MIN_CAND_KMER_FRAC`] guards.
     cand_kmer_frac: f64,
-    /// Distinct k-mers at or above the valley: the lobe's breadth, where `genomic_peak` is its depth.
-    /// Logged only for now; a floor's real cost is in breadth, and nothing yet reads it.
-    distinct_above: u64,
-    /// The two cutoff ceilings, kept apart so that which one binds can be read off a run.
+    /// Largest cutoff whose measured cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the
+    /// valley; binds at depth.
     guard_measured: u16,
+    /// Largest cutoff deleting at most [`MAX_GENOME_LOSS`] of a Poisson(`genomic_peak`) genome; binds
+    /// at low coverage.
     guard_poisson: u16,
+    /// The cutoff: the valley, clamped to 2 and to both guards; [`UNRESOLVED_MINCOUNT`] when unresolved.
     min_count: u16,
-    /// Variance-to-mean ratio of the genome lobe, or NaN when there is no usable lobe.
+    /// Variance-to-mean ratio of the genome lobe, from the valley to twice the peak, seeding the fit's
+    /// dispersion; NaN without a lobe.
     dispersion: f64,
+    /// Whether the lobes separated, and if not, why.
     verdict: Verdict,
 }
 
@@ -370,7 +417,7 @@ impl SpectrumPlotDiagnostics {
 }
 
 /// Why the estimator accepted or refused a spectrum. The default is a *refusal* on purpose: every path
-/// through [`estimate_by_valley`] sets it, so the default is unreachable, and if one ever stops setting
+/// through [`SpectrumEstimate::by_valley`] sets it, so the default is unreachable, and if one ever stops setting
 /// it the run should fail closed rather than silently report a resolved spectrum.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum Verdict {
@@ -440,18 +487,6 @@ impl PeakSource {
     }
 }
 
-/// The fitted peak when the lobes separated, else the occurrence-weighted median.
-///
-/// `genomic_peak` is an argmax *above a valley*, so on a merged spectrum it names the error lobe.
-/// Refusing it there is what lets every consumer treat `Fitted` as trustworthy.
-fn peak_of(estimate: &SpectrumEstimate, histovec: &[u32]) -> PeakSource {
-    if estimate.verdict.is_ok() {
-        PeakSource::Fitted(estimate.genomic_peak as u32)
-    } else {
-        occurrence_weighted_median(histovec).map_or(PeakSource::Unknown, PeakSource::Fallback)
-    }
-}
-
 /// Single-copy coverage without needing a valley: the smallest count at which k-mers of that count
 /// or less hold half of all k-mer *occurrences*. Error k-mers are many but each occurs a few times,
 /// so they carry little occurrence mass, and the median lands in the genomic lobe regardless.
@@ -474,17 +509,15 @@ fn occurrence_weighted_median(histovec: &[u32]) -> Option<u32> {
     None
 }
 
-/// Smoothed spectrum height at `count` (a count, not an index).
-fn smoothed(histovec: &[u32], count: usize) -> u64 {
-    let lo = count.saturating_sub(SMOOTH).max(1);
-    let hi = (count + SMOOTH).min(histovec.len() - 1);
-    (lo..=hi).map(|c| histovec[c - 1] as u64).sum::<u64>() / (hi - lo + 1) as u64
-}
-
-/// Smooth each histogram bin once so valley and peak searches use the same five-bin view.
+/// Smooth each histogram bin once so valley and peak searches use the same five-bin view: at each
+/// count, the mean of the bins up to [`SMOOTH`] either side, the saturating last bin excluded.
 fn smooth_histogram(histovec: &[u32]) -> Vec<u64> {
     (1..=histovec.len())
-        .map(|count| smoothed(histovec, count))
+        .map(|count| {
+            let lo = count.saturating_sub(SMOOTH).max(1);
+            let hi = (count + SMOOTH).min(histovec.len() - 1);
+            (lo..=hi).map(|c| histovec[c - 1] as u64).sum::<u64>() / (hi - lo + 1) as u64
+        })
         .collect()
 }
 
@@ -528,16 +561,6 @@ fn find_raw_genomic_peak(histovec: &[u32], seed: usize) -> Option<usize> {
         .min_by_key(|&count| (std::cmp::Reverse(histovec[count - 1]), count))
 }
 
-/// Lowest raw bin in `2..=raw_peak`, as a **count**.
-fn find_raw_valley(histovec: &[u32], raw_peak: usize) -> Option<usize> {
-    let last_unsaturated_count = histovec.len().checked_sub(1)?;
-    let hi = raw_peak.min(last_unsaturated_count);
-    if hi < 2 {
-        return None;
-    }
-    (2..=hi).min_by_key(|&count| (histovec[count - 1], count))
-}
-
 /// Largest cutoff whose *measured* cost is at most [`MAX_GENOME_LOSS`] of the k-mers above the valley. This binds/protects at large coverage.
 fn measured_guard(histovec: &[u32], valley: usize, genomic_peak: usize) -> u16 {
     let total: u128 = (valley..histovec.len())
@@ -578,7 +601,7 @@ fn poisson_guard(genomic_peak: usize) -> u16 {
     (m as u16).max(2)
 }
 
-/// Variance-to-mean ratio of the single-copy lobe; 1.0 is Poisson. 
+/// Variance-to-mean ratio of the single-copy lobe; 1.0 is Poisson.
 /// Stops at twice the genomic peak: beyond that lie the repeat copies and the saturating bin, and including
 /// them measures the spread of the whole spectrum rather than of the lobe the fit tries to model.
 fn dispersion_above(histovec: &[u32], valley: usize, genomic_peak: usize) -> f64 {
@@ -686,313 +709,279 @@ fn confirms_two_bin_right_tail(histovec: &[u32], peak: usize) -> bool {
     first > second && second > third
 }
 
-/// Sum the valley-to-mirrored-shoulder interval and all non-singleton bins. The overflow bin is
-/// retained in the denominator but cannot be used as the interval's right endpoint.
-fn peak_area_support(
-    histovec: &[u32],
-    valley: usize,
-    peak: usize,
-) -> Result<PeakAreaSupport, PeakAreaFailure> {
-    if valley < 2 || peak <= valley || peak >= histovec.len() {
-        return Err(PeakAreaFailure::InvalidPair);
-    }
-    let mirrored_end = peak
-        .checked_mul(2)
-        .and_then(|twice_peak| twice_peak.checked_sub(valley))
-        .ok_or(PeakAreaFailure::InvalidPair)?;
-    let last_unsaturated_count = histovec
-        .len()
-        .checked_sub(1)
-        .ok_or(PeakAreaFailure::InvalidPair)?;
-    if mirrored_end > last_unsaturated_count {
-        return Err(PeakAreaFailure::SaturatedEndpoint);
-    }
-    let denominator: u64 = histovec[1..].iter().map(|&height| u64::from(height)).sum();
-    if denominator == 0 {
-        return Err(PeakAreaFailure::EmptyDenominator);
-    }
-    let area_sum: u64 = (valley..=mirrored_end)
-        .map(|count| u64::from(histovec[count - 1]))
-        .sum();
-    Ok(PeakAreaSupport {
-        area_sum,
-        denominator,
-    })
-}
-
-/// Populate the metrics and existing separation verdict for a proposed pair.
-fn populate_peak_pair(
-    histovec: &[u32],
-    estimate: &mut SpectrumEstimate,
-    valley: usize,
-    genomic_peak: usize,
-) {
-    estimate.valley = valley;
-    estimate.genomic_peak = genomic_peak;
-    estimate.valley_n = histovec[valley - 1];
-    estimate.genomic_peak_n = histovec[genomic_peak - 1];
-    estimate.gp_to_v_ratio = estimate.genomic_peak_n as f64 / estimate.valley_n.max(1) as f64;
-    estimate.valley_to_peak_xratio = valley as f64 / genomic_peak as f64;
-
-    let instances_from = |from: usize| -> u128 {
-        (from..=histovec.len())
-            .map(|count| count as u128 * histovec[count - 1] as u128)
-            .sum()
-    };
-    let total_instances = instances_from(1);
-    estimate.cand_kmer_frac = if total_instances == 0 {
-        0.0
-    } else {
-        instances_from(valley) as f64 / total_instances as f64
-    };
-    estimate.guard_measured = measured_guard(histovec, valley, genomic_peak);
-    estimate.guard_poisson = poisson_guard(genomic_peak);
-    estimate.dispersion = dispersion_above(histovec, valley, genomic_peak);
-    estimate.distinct_above = distinct_above(histovec, valley);
-
-    estimate.verdict = if genomic_peak <= valley {
-        Verdict::NoPeakAboveValley
-    } else if estimate.cand_kmer_frac < MIN_CAND_KMER_FRAC {
-        Verdict::TooFewCandidateKmers
-    } else if estimate.gp_to_v_ratio < MIN_GP_TO_V_RATIO {
-        Verdict::PeakNotClearOfValley
-    } else {
-        Verdict::Ok
-    };
-    if estimate.verdict.is_ok() {
-        estimate.min_count =
-            (valley as u16).clamp(2, estimate.guard_measured.min(estimate.guard_poisson));
-    } else {
-        estimate.min_count = UNRESOLVED_MINCOUNT;
-    }
-}
-
-/// A rejected pair remains available in the primary/fallback diagnostics, but must not escape as
-/// an empirical valley or genomic peak to floor arbitration, fitting, or plots.
-fn clear_selected_peak_pair(estimate: &mut SpectrumEstimate) {
-    estimate.valley = 0;
-    estimate.genomic_peak = 0;
-    estimate.valley_n = 0;
-    estimate.genomic_peak_n = 0;
-    estimate.gp_to_v_ratio = 0.0;
-    estimate.valley_to_peak_xratio = 0.0;
-    estimate.cand_kmer_frac = 0.0;
-    estimate.distinct_above = 0;
-    estimate.guard_measured = 0;
-    estimate.guard_poisson = 0;
-    estimate.min_count = UNRESOLVED_MINCOUNT;
-    estimate.dispersion = f64::NAN;
-}
-
-/// The valley estimate for this spectrum. Falls back to [`UNRESOLVED_MINCOUNT`] with a stated verdict
-/// wherever the lobes are not separated — at 3-5x, trusting it blindly deleted 98-99 % of the genome.
-fn primary_empirical_pair(
-    histovec: &[u32],
-    estimate: &mut SpectrumEstimate,
-) -> Result<(usize, usize, PeakSearch), PeakRetryReason> {
-    let valley_seed = find_raw_valley_seed(histovec).ok_or(PeakRetryReason::NoSeed)?;
-    estimate.valley_seed = valley_seed;
-    let genomic_peak_seed =
-        find_raw_genomic_peak(histovec, valley_seed).ok_or(PeakRetryReason::NoPrimaryPair)?;
-    let raw_valley =
-        find_raw_valley(histovec, genomic_peak_seed).ok_or(PeakRetryReason::NoPrimaryPair)?;
-    estimate.raw_valley = Some(raw_valley);
-    estimate.raw_genomic_peak = Some(genomic_peak_seed);
-    if genomic_peak_seed <= raw_valley || histovec[genomic_peak_seed - 1] == 0 {
-        return Err(PeakRetryReason::NoPrimaryPair);
-    }
-
-    let (valley, genomic_peak, method) = if genomic_peak_seed - raw_valley < 10
-        && genomic_peak_seed < 15
-        && raw_valley < 15
-    {
-        (raw_valley, genomic_peak_seed, PeakSearch::RawLowCoverage)
-    } else {
-        let smooth = smooth_histogram(histovec);
-        match refine_smoothed_valley(&smooth, raw_valley, genomic_peak_seed).and_then(|valley| {
-            refine_smoothed_peak(histovec, &smooth, raw_valley, genomic_peak_seed, valley)
-                .filter(|&peak| peak > valley)
-                .map(|peak| (valley, peak))
-        }) {
-            Some((valley, peak)) => {
-                estimate.refined_valley = Some(valley);
-                estimate.refined_peak = Some(peak);
-                (valley, peak, PeakSearch::SmoothedRefinement)
-            }
-            None => (raw_valley, genomic_peak_seed, PeakSearch::RawFallback),
-        }
-    };
-    estimate.primary_valley = Some(valley);
-    estimate.primary_peak = Some(genomic_peak);
-    estimate.primary_search = method;
-    Ok((valley, genomic_peak, method))
-}
-
-fn record_primary_area(
-    estimate: &mut SpectrumEstimate,
-    result: Result<PeakAreaSupport, PeakAreaFailure>,
-) {
-    match result {
-        Ok(support) => {
-            estimate.area_denominator = support.denominator;
-            estimate.primary_area_sum = Some(support.area_sum);
-            estimate.primary_area_fraction = Some(support.fraction());
-        }
-        Err(failure) => estimate.primary_area_failure = Some(failure),
-    }
-}
-
-fn record_fallback_area(
-    estimate: &mut SpectrumEstimate,
-    result: Result<PeakAreaSupport, PeakAreaFailure>,
-) {
-    match result {
-        Ok(support) => {
-            estimate.area_denominator = support.denominator;
-            estimate.fallback_area_sum = Some(support.area_sum);
-            estimate.fallback_area_fraction = Some(support.fraction());
-        }
-        Err(failure) => estimate.fallback_area_failure = Some(failure),
-    }
-}
-
-fn estimate_by_valley(histovec: &[u32]) -> SpectrumEstimate {
-    let mut estimate = SpectrumEstimate {
-        min_count: UNRESOLVED_MINCOUNT,
-        dispersion: f64::NAN,
-        area_denominator: histovec
-            .iter()
-            .skip(1)
-            .map(|&height| u64::from(height))
-            .sum(),
-        ..Default::default()
-    };
-
-    match primary_empirical_pair(histovec, &mut estimate) {
-        Ok((valley, peak, method)) => {
-            let area = peak_area_support(histovec, valley, peak);
-            record_primary_area(&mut estimate, area);
-            let mut primary = estimate;
-            populate_peak_pair(histovec, &mut primary, valley, peak);
-            primary.peak_search = method;
-
-            if matches!(area, Ok(support) if support.passes()) && primary.verdict.is_ok() {
-                return primary;
-            }
-            estimate.retry_reason = Some(match area {
-                Err(_) => PeakRetryReason::AreaNotMeasurable,
-                Ok(support) if !support.passes() => PeakRetryReason::AreaBelowThreshold,
-                Ok(_) => PeakRetryReason::SeparationGuardFailed,
-            });
-        }
-        Err(reason) => {
-            estimate.retry_reason = Some(reason);
-        }
-    }
-
-    estimate.fallback_attempted = true;
-    let Some(valley) = find_first_raw_local_valley(histovec) else {
-        estimate.verdict = Verdict::NoLocalValley;
-        estimate.peak_search = PeakSearch::Unresolved;
-        return estimate;
-    };
-    estimate.fallback_valley = Some(valley);
-    let Some(peak) = find_raw_peak_after_valley(histovec, valley) else {
-        estimate.verdict = Verdict::NoPeakAboveValley;
-        estimate.peak_search = PeakSearch::Unresolved;
-        return estimate;
-    };
-    estimate.fallback_peak = Some(peak);
-    let tail_confirmed = confirms_two_bin_right_tail(histovec, peak);
-    estimate.fallback_tail_confirmed = Some(tail_confirmed);
-    let area = peak_area_support(histovec, valley, peak);
-    record_fallback_area(&mut estimate, area);
-
-    let mut fallback = estimate;
-    populate_peak_pair(histovec, &mut fallback, valley, peak);
-    if !tail_confirmed {
-        fallback.verdict = Verdict::PeakTailNotDecreasing;
-        fallback.min_count = UNRESOLVED_MINCOUNT;
-    } else if area.is_err() {
-        fallback.verdict = Verdict::PeakAreaNotMeasurable;
-        fallback.min_count = UNRESOLVED_MINCOUNT;
-    } else if matches!(area, Ok(support) if !support.passes()) {
-        fallback.verdict = Verdict::PeakAreaTooSmall;
-        fallback.min_count = UNRESOLVED_MINCOUNT;
-    } else if fallback.verdict.is_ok() {
-        fallback.peak_search = PeakSearch::RawLocalFallback;
-        return fallback;
-    }
-    fallback.peak_search = PeakSearch::Unresolved;
-    clear_selected_peak_pair(&mut fallback);
-    fallback
-}
-
-/// The whole derivation, as `key=value` pairs so a directory of logs parses into a table. The prose a
-/// user reads is the warning in [`choose_min_count`], not this.
-fn log_spectrum(histovec: &[u32], estimate: &SpectrumEstimate) {
-    log::info!(
-        "K-mer spectrum: seed={} valley={} genomic_peak={} valley_n={} genomic_peak_n={} \
-             gp_to_v_ratio={:.2} valley_to_peak_xratio={:.3} cand_kmer_frac={:.4} \
-             guard_measured={} guard_poisson={} dispersion={:.1} min_count={} distinct_above={} \
-             saturates={} verdict={:?}",
-        estimate.valley_seed,
-        estimate.valley,
-        estimate.genomic_peak,
-        estimate.valley_n,
-        estimate.genomic_peak_n,
-        estimate.gp_to_v_ratio,
-        estimate.valley_to_peak_xratio,
-        estimate.cand_kmer_frac,
-        estimate.guard_measured,
-        estimate.guard_poisson,
-        estimate.dispersion,
-        estimate.min_count,
-        estimate.distinct_above,
-        histovec[histovec.len() - 1] > 0,
-        estimate.verdict
-    );
-    {
-        let height = |count: Option<usize>| {
-            count
-                .and_then(|count| count.checked_sub(1))
-                .and_then(|index| histovec.get(index))
-                .copied()
+impl SpectrumEstimate {
+    /// The valley estimate for this spectrum. Falls back to [`UNRESOLVED_MINCOUNT`] with a stated verdict
+    /// wherever the lobes are not separated — at 3-5x, trusting it blindly deleted 98-99 % of the genome.
+    /// The primary pair comes first; when it is refused, the first raw local valley and the tallest bin
+    /// after it. Each attempt is logged where it is decided.
+    fn by_valley(histovec: &[u32]) -> Self {
+        let mut estimate = Self {
+            min_count: UNRESOLVED_MINCOUNT,
+            dispersion: f64::NAN,
+            ..Self::default()
         };
-        log::info!("Spectrum peak search: raw_valley={:?} raw_valley_n={:?} genomic_peak_seed={:?} genomic_peak_seed_n={:?} \
-                 refined_valley={:?} refined_valley_n={:?} refined_peak={:?} refined_peak_n={:?} \
-                 primary_valley={:?} primary_peak={:?} primary_method={:?} \
-                 area_denominator={} primary_area_sum={:?} primary_area_pct={:?} primary_area_failure={:?} \
-                 fallback_attempted={} fallback_valley={:?} fallback_peak={:?} \
-                 fallback_tail_confirmed={:?} fallback_area_sum={:?} fallback_area_pct={:?} \
-                 fallback_area_failure={:?} retry_reason={:?} \
-                 selected_valley={} selected_peak={} method={:?}",
-                estimate.raw_valley,
-                height(estimate.raw_valley),
-                estimate.raw_genomic_peak,
-                height(estimate.raw_genomic_peak),
-                estimate.refined_valley,
-                height(estimate.refined_valley),
-                estimate.refined_peak,
-                height(estimate.refined_peak),
-                estimate.primary_valley,
-                estimate.primary_peak,
-                estimate.primary_search,
-                estimate.area_denominator,
-                estimate.primary_area_sum,
-                estimate.primary_area_fraction.map(|fraction| fraction * 100.0),
-                estimate.primary_area_failure,
-                estimate.fallback_attempted,
-                estimate.fallback_valley,
-                estimate.fallback_peak,
-                estimate.fallback_tail_confirmed,
-                estimate.fallback_area_sum,
-                estimate.fallback_area_fraction.map(|fraction| fraction * 100.0),
-                estimate.fallback_area_failure,
-                estimate.retry_reason,
-                estimate.valley,
-                estimate.genomic_peak,
-                estimate.peak_search);
+        match estimate.find_primary_pair(histovec) {
+            Ok((valley, peak, method)) => {
+                let area = PeakAreaSupport::measure(histovec, valley, peak);
+                let mut primary = estimate;
+                primary.set_pair(histovec, valley, peak);
+                primary.peak_search = method;
+                let refusal = match area {
+                    None => Some("mirrored area not measurable"),
+                    Some(support) if !support.passes() => Some("mirrored area below 5%"),
+                    Some(_) => (!primary.verdict.is_ok()).then(|| primary.verdict.reason()),
+                };
+                log::info!(
+                    "Valley search, primary pair: seed={} raw_valley={:?} raw_peak={:?} valley={valley} \
+                     peak={peak} method={method:?} area_pct={:?} outcome={}",
+                    primary.valley_seed,
+                    primary.raw_valley,
+                    primary.raw_genomic_peak,
+                    area.map(|support| 100.0 * support.fraction()),
+                    refusal.unwrap_or("accepted")
+                );
+                if refusal.is_none() {
+                    return primary;
+                }
+            }
+            Err(reason) => log::info!("Valley search, primary pair: none, {reason}"),
+        }
+
+        let Some(valley) = find_first_raw_local_valley(histovec) else {
+            estimate.verdict = Verdict::NoLocalValley;
+            log::info!(
+                "Valley search, local fallback: none, {}",
+                estimate.verdict.reason()
+            );
+            return estimate;
+        };
+        let Some(peak) = find_raw_peak_after_valley(histovec, valley) else {
+            estimate.verdict = Verdict::NoPeakAboveValley;
+            log::info!(
+                "Valley search, local fallback: valley={valley}, {}",
+                estimate.verdict.reason()
+            );
+            return estimate;
+        };
+        let tail_confirmed = confirms_two_bin_right_tail(histovec, peak);
+        let area = PeakAreaSupport::measure(histovec, valley, peak);
+        let mut fallback = estimate;
+        fallback.set_pair(histovec, valley, peak);
+        if !tail_confirmed {
+            fallback.verdict = Verdict::PeakTailNotDecreasing;
+        } else if area.is_none() {
+            fallback.verdict = Verdict::PeakAreaNotMeasurable;
+        } else if area.is_some_and(|support| !support.passes()) {
+            fallback.verdict = Verdict::PeakAreaTooSmall;
+        }
+        log::info!(
+            "Valley search, local fallback: valley={valley} peak={peak} tail_confirmed={tail_confirmed} \
+             area_pct={:?} verdict={:?}",
+            area.map(|support| 100.0 * support.fraction()),
+            fallback.verdict
+        );
+        if fallback.verdict.is_ok() {
+            fallback.peak_search = PeakSearch::RawLocalFallback;
+            return fallback;
+        }
+        // A refused pair must not escape as an empirical valley or genomic peak to floor arbitration,
+        // fitting, or plots.
+        fallback.clear_pair();
+        fallback
+    }
+
+    /// The primary pair, from the raw spectrum: the valley seed, the tallest bin above it, and the
+    /// lowest bin from count 2 up to that peak. A low and close pair stands as it is; others are refined
+    /// on the smoothed spectrum. Records the seed and the raw pair; the error says where the search
+    /// stopped.
+    fn find_primary_pair(
+        &mut self,
+        histovec: &[u32],
+    ) -> Result<(usize, usize, PeakSearch), &'static str> {
+        let valley_seed = find_raw_valley_seed(histovec).ok_or("no valley seed")?;
+        self.valley_seed = valley_seed;
+        let genomic_peak_seed =
+            find_raw_genomic_peak(histovec, valley_seed).ok_or("no raw peak above the seed")?;
+        // The lowest raw bin in `2..=genomic_peak_seed`, as a count; the saturating last bin is excluded.
+        let raw_valley = (2..=genomic_peak_seed.min(histovec.len() - 1))
+            .min_by_key(|&count| (histovec[count - 1], count))
+            .ok_or("no raw valley under the peak")?;
+        self.raw_valley = Some(raw_valley);
+        self.raw_genomic_peak = Some(genomic_peak_seed);
+        if genomic_peak_seed <= raw_valley || histovec[genomic_peak_seed - 1] == 0 {
+            return Err("the raw peak does not rise above the raw valley");
+        }
+
+        if genomic_peak_seed - raw_valley < 10 && genomic_peak_seed < 15 && raw_valley < 15 {
+            return Ok((raw_valley, genomic_peak_seed, PeakSearch::RawLowCoverage));
+        }
+        let smooth = smooth_histogram(histovec);
+        let refined =
+            refine_smoothed_valley(&smooth, raw_valley, genomic_peak_seed).and_then(|valley| {
+                refine_smoothed_peak(histovec, &smooth, raw_valley, genomic_peak_seed, valley)
+                    .filter(|&peak| peak > valley)
+                    .map(|peak| (valley, peak))
+            });
+        Ok(match refined {
+            Some((valley, peak)) => (valley, peak, PeakSearch::SmoothedRefinement),
+            None => (raw_valley, genomic_peak_seed, PeakSearch::RawFallback),
+        })
+    }
+
+    /// Populate the metrics and existing separation verdict for a proposed pair.
+    fn set_pair(&mut self, histovec: &[u32], valley: usize, genomic_peak: usize) {
+        self.valley = valley;
+        self.genomic_peak = genomic_peak;
+        self.valley_n = histovec[valley - 1];
+        self.genomic_peak_n = histovec[genomic_peak - 1];
+        self.gp_to_v_ratio = self.genomic_peak_n as f64 / self.valley_n.max(1) as f64;
+
+        let instances_from = |from: usize| -> u128 {
+            (from..=histovec.len())
+                .map(|count| count as u128 * histovec[count - 1] as u128)
+                .sum()
+        };
+        let total_instances = instances_from(1);
+        self.cand_kmer_frac = if total_instances == 0 {
+            0.0
+        } else {
+            instances_from(valley) as f64 / total_instances as f64
+        };
+        self.guard_measured = measured_guard(histovec, valley, genomic_peak);
+        self.guard_poisson = poisson_guard(genomic_peak);
+        self.dispersion = dispersion_above(histovec, valley, genomic_peak);
+
+        self.verdict = if genomic_peak <= valley {
+            Verdict::NoPeakAboveValley
+        } else if self.cand_kmer_frac < MIN_CAND_KMER_FRAC {
+            Verdict::TooFewCandidateKmers
+        } else if self.gp_to_v_ratio < MIN_GP_TO_V_RATIO {
+            Verdict::PeakNotClearOfValley
+        } else {
+            Verdict::Ok
+        };
+        if self.verdict.is_ok() {
+            self.min_count = (valley as u16).clamp(2, self.guard_measured.min(self.guard_poisson));
+        } else {
+            self.min_count = UNRESOLVED_MINCOUNT;
+        }
+    }
+
+    /// Forget a refused pair, keeping the verdict that refused it.
+    fn clear_pair(&mut self) {
+        self.valley = 0;
+        self.genomic_peak = 0;
+        self.valley_n = 0;
+        self.genomic_peak_n = 0;
+        self.gp_to_v_ratio = 0.0;
+        self.cand_kmer_frac = 0.0;
+        self.guard_measured = 0;
+        self.guard_poisson = 0;
+        self.min_count = UNRESOLVED_MINCOUNT;
+        self.dispersion = f64::NAN;
+    }
+
+    /// The whole derivation, as `key=value` pairs so a directory of logs parses into a table. The prose a
+    /// user reads is the warning in [`Self::warn_if_unresolved`], not this.
+    fn log_spectrum(&self, histovec: &[u32]) {
+        // `valley_to_peak_xratio` is logged, never gated on: near 1.0 usually means the valley search
+        // found nothing and stopped under the genomic peak, but a tight clean separation reads the same
+        // way. `distinct_above` is the lobe's breadth, where `genomic_peak` is its depth. Both are 0
+        // without a pair.
+        let (valley_to_peak_xratio, breadth) = if self.genomic_peak > 0 {
+            (
+                self.valley as f64 / self.genomic_peak as f64,
+                distinct_above(histovec, self.valley),
+            )
+        } else {
+            (0.0, 0)
+        };
+        log::info!(
+            "K-mer spectrum: seed={} valley={} genomic_peak={} valley_n={} genomic_peak_n={} \
+                 gp_to_v_ratio={:.2} valley_to_peak_xratio={:.3} cand_kmer_frac={:.4} \
+                 guard_measured={} guard_poisson={} dispersion={:.1} min_count={} distinct_above={} \
+                 saturates={} method={:?} verdict={:?}",
+            self.valley_seed,
+            self.valley,
+            self.genomic_peak,
+            self.valley_n,
+            self.genomic_peak_n,
+            self.gp_to_v_ratio,
+            valley_to_peak_xratio,
+            self.cand_kmer_frac,
+            self.guard_measured,
+            self.guard_poisson,
+            self.dispersion,
+            self.min_count,
+            breadth,
+            histovec[histovec.len() - 1] > 0,
+            self.peak_search,
+            self.verdict
+        );
+    }
+
+    /// The fitted peak when the lobes separated, else the occurrence-weighted median.
+    ///
+    /// `genomic_peak` is an argmax *above a valley*, so on a merged spectrum it names the error lobe.
+    /// Refusing it there is what lets every consumer treat `Fitted` as trustworthy.
+    fn peak_source(&self, histovec: &[u32]) -> PeakSource {
+        if self.verdict.is_ok() {
+            PeakSource::Fitted(self.genomic_peak as u32)
+        } else {
+            occurrence_weighted_median(histovec).map_or(PeakSource::Unknown, PeakSource::Fallback)
+        }
+    }
+
+    /// The cutoff [`Self::apply_hole_guard`] settles on: the valley capped by the hole guard, then raised
+    /// to the 100% error floor.
+    fn guarded_min_count(&self, fit: &SpectrumFit) -> u16 {
+        self.hole_guarded_min_count(fit)
+            .max(fit.error_floor_cutoff())
+    }
+
+    /// The valley lowered to what strands at most [`MAX_GENOME_HOLES`] single-copy k-mers, never below 2,
+    /// and only for a resolved spectrum.
+    fn hole_guarded_min_count(&self, fit: &SpectrumFit) -> u16 {
+        match fit.hole_cutoff(MAX_GENOME_HOLES) {
+            Some(cutoff) if self.verdict.is_ok() && cutoff < self.min_count => cutoff.max(2),
+            _ => self.min_count,
+        }
+    }
+
+    /// Lower the cutoff to whatever strands at most [`MAX_GENOME_HOLES`] single-copy k-mers.
+    ///
+    /// A **ceiling** on the valley, never a raise: the valley already removes the errors, and the only
+    /// failure measured was cutting too deep. Floored at 2, and skipped by callers when the fit did not
+    /// converge, so the worst case is exactly the behaviour without a fit.
+    fn apply_hole_guard(&mut self, fit: &SpectrumFit) {
+        let hole_guarded = self.hole_guarded_min_count(fit);
+        if hole_guarded < self.min_count {
+            log::info!(
+                "Cutting at {} would strand more than {MAX_GENOME_HOLES} single-copy k-mers; using \
+                     {hole_guarded} instead.",
+                self.min_count
+            );
+        }
+        let error_floor = fit.error_floor_cutoff();
+        self.min_count = hole_guarded.max(error_floor);
+        let hole_cutoff = fit.hole_cutoff(MAX_GENOME_HOLES);
+        log::info!("Spectrum 100% error floor enforced: floor={error_floor} previous_min_count={hole_guarded} \
+                 final_min_count={} hole_cutoff={hole_cutoff:?} conflict={}",
+                self.min_count,
+                hole_cutoff.is_some_and(|cutoff| error_floor > cutoff));
+    }
+
+    /// The warning for a spectrum that yielded no usable cutoff.
+    fn warn_if_unresolved(&self) {
+        // Keyed on the outcome, not only the verdict: a spectrum can be called `ok` and still have the loss
+        // guard collapse the cutoff to `UNRESOLVED_MINCOUNT`, which is the same thin-spectrum situation.
+        if !self.verdict.is_ok() || self.min_count == UNRESOLVED_MINCOUNT {
+            log::warn!("The k-mer spectrum's error and genome lobes are not separated ({}), so no reliable \
+                     minimum count exists and {} will be used — k-mers seen once are discarded and nothing \
+                     else is. Expect a fragmented assembly if this is a deep library. This usually means \
+                     the spectrum is thin: low coverage, or a large k. Check the k-mer spectrum histogram.",
+                    self.verdict.reason(), self.min_count);
+        }
     }
 }
 
@@ -1081,9 +1070,8 @@ fn shelf_summary(fit: &SpectrumFit) -> String {
 }
 
 fn log_fit_attempt(attempt: &FitAttempt) {
-    let selection_eligible = attempt.genome_model != GenomeModel::Normal;
     if let Some(fit) = attempt.candidate {
-        let log_window_masses = fit.component_log_window_masses();
+        let log_window_masses = fit.component_log_window_masses;
         let status = attempt.rejection.map_or_else(
             || "accepted".to_string(),
             |reason| format!("rejected:{reason}"),
@@ -1093,7 +1081,7 @@ fn log_fit_attempt(attempt: &FitAttempt) {
                  singleton_probability={:.6} tail_exponent={:.6} weibull_shape={} shelf={} \
                  component_kmers=({:.3e}/{:.3e}/{:.3e}) component_mass_ratio={:.6e} \
                  log_window_mass=({:.6e}/{:.6e}/{:.6e}) mode_roundtrip_error={:.6e} \
-                 total_iterations={} capped_starts={} best_iterations={} selection_eligible={}",
+                 total_iterations={} capped_starts={} best_iterations={}",
                 attempt.error_model,
                 attempt.genome_model,
                 status,
@@ -1120,27 +1108,22 @@ fn log_fit_attempt(attempt: &FitAttempt) {
                 fit.mode_roundtrip_error(),
                 attempt.total_iterations,
                 attempt.capped_starts,
-                fit.best_iterations,
-                selection_eligible);
+                fit.best_iterations);
     } else {
-        log::info!("Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={} capped_starts={} selection_eligible={}",
+        log::info!("Spectrum fit candidate: error_model={} genome_model={} status=rejected:{} total_iterations={} capped_starts={}",
                 attempt.error_model,
                 attempt.genome_model,
                 attempt
                     .rejection
                     .expect("an absent candidate always has a rejection reason"),
                 attempt.total_iterations,
-                attempt.capped_starts,
-                selection_eligible);
+                attempt.capped_starts);
     }
 }
 
 // =====================================================================================================
 // =====================================================================================================
 // =====================================================================================================
-
-/// Expected single-copy k-mers the cutoff may strand below itself.
-const MAX_GENOME_HOLES: f64 = 1.0;
 
 /// As [`choose_min_count`], and also the single-copy coverage the same estimate found.
 ///
@@ -1151,83 +1134,22 @@ fn choose_min_count_and_peak(
     histovec: &[u32],
     sample_scale: f64,
 ) -> (u16, PeakSource, SpectrumPlotDiagnostics) {
-    let mut estimate = estimate_by_valley(histovec);
-    log_spectrum(histovec, &estimate);
+    let mut estimate = SpectrumEstimate::by_valley(histovec);
+    estimate.log_spectrum(histovec);
     let fit_attempted = estimate.verdict.is_ok();
     let fit = fit_attempted
         .then(|| fit_and_log(histovec, &estimate, sample_scale))
         .flatten();
-    apply_hole_guard(&mut estimate, fit.as_ref());
-    warn_unresolved(&estimate);
+    if let Some(fit) = &fit {
+        estimate.apply_hole_guard(fit);
+    }
+    estimate.warn_if_unresolved();
     (
         estimate.min_count,
-        peak_of(&estimate, histovec),
+        estimate.peak_source(histovec),
         SpectrumPlotDiagnostics::new(&estimate, fit, fit_attempted),
     )
 }
-
-/// The cutoff [`apply_hole_guard`] settles on: the valley capped by the hole guard, then raised to
-/// the 100% error floor.
-fn guarded_min_count(estimate: &SpectrumEstimate, fit: &SpectrumFit) -> u16 {
-    hole_guarded_min_count(estimate, fit).max(fit.error_floor_cutoff())
-}
-
-/// The valley lowered to what strands at most [`MAX_GENOME_HOLES`] single-copy k-mers, never below 2,
-/// and only for a resolved spectrum.
-fn hole_guarded_min_count(estimate: &SpectrumEstimate, fit: &SpectrumFit) -> u16 {
-    match fit.hole_cutoff(MAX_GENOME_HOLES) {
-        Some(cutoff) if estimate.verdict.is_ok() && cutoff < estimate.min_count => cutoff.max(2),
-        _ => estimate.min_count,
-    }
-}
-
-/// Lower the cutoff to whatever strands at most [`MAX_GENOME_HOLES`] single-copy k-mers.
-///
-/// A **ceiling** on the valley, never a raise: the valley already removes the errors, and the only
-/// failure measured was cutting too deep. Floored at 2, and a no-op when the fit did not converge, so
-/// the worst case is exactly the behaviour without a fit.
-fn apply_hole_guard(estimate: &mut SpectrumEstimate, fit: Option<&SpectrumFit>) {
-    let Some(fit) = fit else { return };
-    let hole_guarded = hole_guarded_min_count(estimate, fit);
-    if hole_guarded < estimate.min_count {
-        log::info!(
-            "Cutting at {} would strand more than {MAX_GENOME_HOLES} single-copy k-mers; using \
-                 {hole_guarded} instead.",
-            estimate.min_count
-        );
-    }
-    let error_floor = fit.error_floor_cutoff();
-    estimate.min_count = hole_guarded.max(error_floor);
-    let hole_cutoff = fit.hole_cutoff(MAX_GENOME_HOLES);
-    log::info!("Spectrum 100% error floor enforced: floor={error_floor} previous_min_count={hole_guarded} \
-             final_min_count={} hole_cutoff={hole_cutoff:?} conflict={}",
-            estimate.min_count,
-            hole_cutoff.is_some_and(|cutoff| error_floor > cutoff));
-}
-
-/// The warning for a spectrum that yielded no usable cutoff. Shared, so the one-pass and the sketch
-/// paths cannot drift apart in what they tell the user.
-fn warn_unresolved(estimate: &SpectrumEstimate) {
-    // Keyed on the outcome, not only the verdict: a spectrum can be called `ok` and still have the loss
-    // guard collapse the cutoff to `UNRESOLVED_MINCOUNT`, which is the same thin-spectrum situation.
-    if !estimate.verdict.is_ok() || estimate.min_count == UNRESOLVED_MINCOUNT {
-        log::warn!("The k-mer spectrum's error and genome lobes are not separated ({}), so no reliable \
-                 minimum count exists and {} will be used — k-mers seen once are discarded and nothing \
-                 else is. Expect a fragmented assembly if this is a deep library. This usually means \
-                 the spectrum is thin: low coverage, or a large k. Check the k-mer spectrum histogram.",
-                estimate.verdict.reason(), estimate.min_count);
-    }
-}
-
-/// A fit whose error component explains more than this share of observed counts above the applied
-/// cutoff is considered too error-heavy when comparing multiple usable quality floors. Provisional;
-/// cluster results should be used to recalibrate it.
-const MAX_FIT_ERROR_TAIL_FRACTION: f64 = 0.05;
-/// A very shallow empirical peak is a reason to inspect the lower floors, not a reason to refuse a fit.
-const LOW_COVERAGE_FLOOR_REVIEW: usize = 10;
-/// Peak gain a lower floor needs over a starved one (peak below [`LOW_COVERAGE_FLOOR_REVIEW`]) to be
-/// stepped down to. Well-covered floors never step down: that cost Neisseria 6-8% auN locally.
-const STEP_DOWN_GAIN: f64 = 1.10;
 
 #[derive(Clone, Copy)]
 struct FloorCandidate {
@@ -1275,14 +1197,13 @@ fn evaluate_floor<F>(floor: u8, histovec: &[u32], sample_scale: f64, fit: &mut F
 where
     F: FnMut(&[u32], &SpectrumEstimate, f64) -> Option<SpectrumFit>,
 {
-    let estimate = estimate_by_valley(histovec);
+    let estimate = SpectrumEstimate::by_valley(histovec);
     let fit_attempted = estimate.verdict.is_ok();
     let fitted = fit_attempted
         .then(|| fit(histovec, &estimate, sample_scale))
         .flatten();
-    let error_tail_fraction = fitted.and_then(|fit| {
-        fit_error_tail_fraction(histovec, &fit, guarded_min_count(&estimate, &fit))
-    });
+    let error_tail_fraction = fitted
+        .and_then(|fit| fit_error_tail_fraction(histovec, &fit, estimate.guarded_min_count(&fit)));
     log::info!(
         "Quality-floor fit assessment: floor={floor} empirical_peak={} empirical_verdict={:?} fit_usable={} error_tail_fraction={:?}",
         estimate.genomic_peak,
@@ -1334,8 +1255,7 @@ fn select_usable_fit(candidates: &[FloorCandidate]) -> Option<usize> {
     }
 }
 
-
-/// MAIN METHOD FOR SETTING MIN_COUNT AND FOLOOR
+/// MAIN METHOD FOR SETTING MIN_COUNT AND FLOOR
 fn choose_min_count_and_floor_with_debug<F>(
     histovec: &[u32],
     strict_scale: f64,
@@ -1358,7 +1278,7 @@ where
     let strict_floor = floors[strict_index];
     let strict_present = floor_has_kmers[strict_index];
     let strict = evaluate_floor(strict_floor, histovec, strict_scale, &mut fit);
-    log_spectrum(histovec, &strict.estimate);
+    strict.estimate.log_spectrum(histovec);
     let strict_needs_review = !strict_present
         || strict.fit.is_none()
         || strict
@@ -1404,23 +1324,15 @@ where
             evaluated[index] = Some(candidate);
             let estimate = &candidate.estimate;
             log::info!("Sketch at a base-quality floor of {}: valley={} genomic_peak={} gp_to_v_ratio={:.2} \
-                     min_count={} distinct_above={} verdict={:?} primary_method={:?} \
-                     primary_area_pct={:?} fallback_attempted={} fallback_valley={:?} \
-                     fallback_peak={:?} fallback_area_pct={:?} retry_reason={:?}",
+                     min_count={} distinct_above={} method={:?} verdict={:?}",
                     candidate.floor,
                     estimate.valley,
                     estimate.genomic_peak,
                     estimate.gp_to_v_ratio,
                     estimate.min_count,
-                    estimate.distinct_above,
-                    estimate.verdict,
-                    estimate.primary_search,
-                    estimate.primary_area_fraction.map(|fraction| fraction * 100.0),
-                    estimate.fallback_attempted,
-                    estimate.fallback_valley,
-                    estimate.fallback_peak,
-                    estimate.fallback_area_fraction.map(|fraction| fraction * 100.0),
-                    estimate.retry_reason);
+                    if estimate.genomic_peak > 0 { distinct_above(&spectra[index], estimate.valley) } else { 0 },
+                    estimate.peak_search,
+                    estimate.verdict);
             if debug_all_floors {
                 diagnostic_floors.push(FloorDiagnostic {
                     floor: candidate.floor,
@@ -1481,7 +1393,7 @@ where
         {
             let lower = index - 1;
             let peak = evaluated[lower].map_or_else(
-                || estimate_by_valley(&spectra[lower]),
+                || SpectrumEstimate::by_valley(&spectra[lower]),
                 |candidate| candidate.estimate,
             );
             if !peak.verdict.is_ok()
@@ -1509,10 +1421,10 @@ where
         }
     }
     if let Some(selected_fit) = selected.fit {
-        apply_hole_guard(&mut selected.estimate, Some(&selected_fit));
+        selected.estimate.apply_hole_guard(&selected_fit);
     }
     let peak = selected.fit.map_or_else(
-        || peak_of(&selected.estimate, histovec),
+        || selected.estimate.peak_source(histovec),
         |selected_fit| PeakSource::Fitted(selected_fit.primary_mode() as u32),
     );
     let diagnostics = (selected.floor == strict_floor).then(|| {
@@ -1593,10 +1505,6 @@ fn rescaled_strict_spectrum(sketch: &SpectrumSketch, keep: u8) -> Vec<u32> {
         .pop()
         .unwrap_or_default()
 }
-
-/// How many records go to the workers at a time: ~1M k-mers at 150 bp and k=31, small enough to stay
-/// cache-friendly and large enough to amortise the rayon fork/join.
-const BATCH_RECORDS: usize = 8192;
 
 /// Parse `files` into owned batches of records, handing each to `on_batch`, and return how long the
 /// whole walk took. A scoped producer fills the next batch while `on_batch` works on the previous one,
@@ -1711,10 +1619,6 @@ fn write_kmer_spectrum_tsv(histovec: &[u32], out_path: &std::path::Path) {
     }
 }
 
-fn quality_floor_path(path: &std::path::Path, floor: u8) -> PathBuf {
-    suffixed_path(path, &format!("_q{floor}"), "png")
-}
-
 /// `path` with `suffix` appended to its file stem and `extension` set; dots already in the stem stay.
 fn suffixed_path(path: &std::path::Path, suffix: &str, extension: &str) -> PathBuf {
     let mut name = path.file_stem().unwrap_or_default().to_os_string();
@@ -1732,9 +1636,11 @@ enum MarkerLineStyle {
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlotYAxis {
-    CappedLinear,
-    UnboundedLinear,
-    UnboundedLog,
+    /// Linear, topped at [`PEAK_Y_CAP_MULT`] times the empirical peak's bar, or at the tallest bar or
+    /// curve without a peak.
+    PeakCapped,
+    /// Logarithmic, up to the tallest bar or curve.
+    Log,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1840,7 +1746,7 @@ fn plot_markers(diagnostics: &SpectrumPlotDiagnostics, used_min_count: u16) -> V
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn native_plot_end(
+fn plot_x_end(
     spectrum_len: usize,
     diagnostics: &SpectrumPlotDiagnostics,
     used_min_count: u16,
@@ -1856,7 +1762,7 @@ fn native_plot_end(
             },
             |fit| Some(fit.fit_window_end),
         )
-        .unwrap_or(MIN_NATIVE_PLOT_RANGE);
+        .unwrap_or(MIN_PLOT_RANGE);
     let marker_end = plot_markers(diagnostics, used_min_count)
         .iter()
         .map(|marker| marker.x.ceil() as usize)
@@ -1864,12 +1770,12 @@ fn native_plot_end(
         .unwrap_or(0);
     fit_end
         .max(marker_end)
-        .max(MIN_NATIVE_PLOT_RANGE)
+        .max(MIN_PLOT_RANGE)
         .min(histogram_end)
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn native_plot_y_max(
+fn plot_y_max(
     decision_spectrum: &[u32],
     raw_bloom_spectrum: Option<&[u32]>,
     diagnostics: &SpectrumPlotDiagnostics,
@@ -1899,18 +1805,18 @@ fn native_plot_y_max(
 #[cfg(not(target_family = "wasm"))]
 fn transform_plot_y(value: f64, y_axis: PlotYAxis) -> f64 {
     match y_axis {
-        PlotYAxis::CappedLinear | PlotYAxis::UnboundedLinear => value,
+        PlotYAxis::PeakCapped => value,
         // A half-count baseline keeps count-1 bins visible. Zero-height bars remain invisible at
         // that baseline, and zero-valued line points are omitted from logarithmic series.
-        PlotYAxis::UnboundedLog => value.max(0.5).log10(),
+        PlotYAxis::Log => value.max(0.5).log10(),
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
 fn plot_axis_y_min(y_axis: PlotYAxis) -> f64 {
     match y_axis {
-        PlotYAxis::CappedLinear | PlotYAxis::UnboundedLinear => 0.0,
-        PlotYAxis::UnboundedLog => 0.5f64.log10(),
+        PlotYAxis::PeakCapped => 0.0,
+        PlotYAxis::Log => 0.5f64.log10(),
     }
 }
 
@@ -1922,19 +1828,16 @@ fn plot_axis_y_max(
     diagnostics: &SpectrumPlotDiagnostics,
     plot_end: usize,
 ) -> f64 {
-    const CAPPED_Y_MAX: f64 = 200_000.0;
+    let tallest = plot_y_max(decision_spectrum, raw_bloom_spectrum, diagnostics, plot_end) * 1.05;
     match y_axis {
-        PlotYAxis::CappedLinear => CAPPED_Y_MAX,
-        PlotYAxis::UnboundedLinear => {
-            (native_plot_y_max(decision_spectrum, raw_bloom_spectrum, diagnostics, plot_end) * 1.05)
-                .max(1.0)
-        }
-        PlotYAxis::UnboundedLog => transform_plot_y(
-            (native_plot_y_max(decision_spectrum, raw_bloom_spectrum, diagnostics, plot_end)
-                * 1.05)
-                .max(10.0),
-            y_axis,
-        ),
+        PlotYAxis::PeakCapped => diagnostics
+            .empirical_peak
+            .and_then(|peak| decision_spectrum.get(peak - 1))
+            .map_or(tallest, |&height| {
+                tallest.min(PEAK_Y_CAP_MULT * f64::from(height))
+            })
+            .max(1.0),
+        PlotYAxis::Log => transform_plot_y(tallest.max(10.0), y_axis),
     }
 }
 
@@ -1953,7 +1856,7 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
     DB::ErrorType: 'static,
 {
     let markers = plot_markers(diagnostics, used_min_count);
-    let plot_end = native_plot_end(decision_spectrum.len(), diagnostics, used_min_count);
+    let plot_end = plot_x_end(decision_spectrum.len(), diagnostics, used_min_count);
     let y_max = plot_axis_y_max(
         y_axis,
         decision_spectrum,
@@ -1970,9 +1873,8 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
         notes.push("mixture fit unavailable".to_string());
     }
     let plot_kind = match y_axis {
-        PlotYAxis::CappedLinear => "k-mer spectrum",
-        PlotYAxis::UnboundedLinear => "k-mer spectrum (unbounded Y)",
-        PlotYAxis::UnboundedLog => "k-mer spectrum (logarithmic Y)",
+        PlotYAxis::PeakCapped => "k-mer spectrum",
+        PlotYAxis::Log => "k-mer spectrum (logarithmic Y)",
     };
     let caption = if notes.is_empty() {
         plot_kind.to_string()
@@ -1997,8 +1899,8 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
         .light_line_style(RGBColor(220, 220, 220).mix(0.35))
         .bold_line_style(RGBColor(180, 180, 180).mix(0.4))
         .y_label_formatter(&|y| match y_axis {
-            PlotYAxis::CappedLinear | PlotYAxis::UnboundedLinear => format!("{y:.0}"),
-            PlotYAxis::UnboundedLog => {
+            PlotYAxis::PeakCapped => format!("{y:.0}"),
+            PlotYAxis::Log => {
                 let count = 10.0f64.powf(*y);
                 if count < 1.0 {
                     "0.5".to_string()
@@ -2136,7 +2038,10 @@ fn draw_kmer_histogram<DB: DrawingBackend>(
                 RGBColor(100, 100, 100).stroke_width(1),
             ))
             .unwrap()
-            .label(format!("Two-copy ({})", fit.genome_model.lobe()))
+            .label(format!(
+                "Two-copy ({})",
+                crate::spectrum_fitter::GenomeModel::NegativeBinomial
+            ))
             .legend(|(x, y)| {
                 PathElement::new(
                     vec![(x, y), (x + 16, y)],
@@ -2207,7 +2112,6 @@ fn plot_kmer_histogram(
     _diagnostics: &SpectrumPlotDiagnostics,
     _used_min_count: u16,
     _out_path: &std::path::Path,
-    _all_variants: bool,
 ) {
 }
 
@@ -2218,7 +2122,6 @@ fn plot_kmer_histogram(
     diagnostics: &SpectrumPlotDiagnostics,
     used_min_count: u16,
     out_path: &std::path::Path,
-    all_variants: bool,
 ) {
     // Register before constructing any text style; with Plotters' `ttf` feature disabled,
     // `ab_glyph` reads this bundled font instead of querying system fonts.
@@ -2235,69 +2138,28 @@ fn plot_kmer_histogram(
         );
     });
 
-    if all_variants {
+    // `out_path` is the linear plot; the logarithmic one takes a `_log` suffix. Each is written as PNG
+    // and as SVG.
+    for (y_axis, png_path) in [
+        (PlotYAxis::PeakCapped, out_path.to_path_buf()),
+        (PlotYAxis::Log, suffixed_path(out_path, "_log", "png")),
+    ] {
         draw_kmer_histogram(
-            BitMapBackend::new(out_path, (1280, 960)).into_drawing_area(),
+            BitMapBackend::new(&png_path, (1280, 960)).into_drawing_area(),
             decision_spectrum,
             raw_bloom_spectrum,
             diagnostics,
             used_min_count,
-            PlotYAxis::CappedLinear,
+            y_axis,
         );
-        let svg_path = out_path.with_extension("svg");
+        let svg_path = png_path.with_extension("svg");
         draw_kmer_histogram(
             SVGBackend::new(&svg_path, (1280, 960)).into_drawing_area(),
             decision_spectrum,
             raw_bloom_spectrum,
             diagnostics,
             used_min_count,
-            PlotYAxis::CappedLinear,
-        );
-
-        for (suffix, y_axis) in [
-            ("_unbounded", PlotYAxis::UnboundedLinear),
-            ("_log", PlotYAxis::UnboundedLog),
-        ] {
-            let png_path = suffixed_path(out_path, suffix, "png");
-            draw_kmer_histogram(
-                BitMapBackend::new(&png_path, (1280, 960)).into_drawing_area(),
-                decision_spectrum,
-                raw_bloom_spectrum,
-                diagnostics,
-                used_min_count,
-                y_axis,
-            );
-
-            let mut svg_path = png_path.clone();
-            svg_path.set_extension("svg");
-            draw_kmer_histogram(
-                SVGBackend::new(&svg_path, (1280, 960)).into_drawing_area(),
-                decision_spectrum,
-                raw_bloom_spectrum,
-                diagnostics,
-                used_min_count,
-                y_axis,
-            );
-        }
-    } else {
-        // The default histogram keeps every count bin visible; capped and logarithmic views are
-        // additional diagnostics, generated only when the user asks for all-floor debugging.
-        draw_kmer_histogram(
-            BitMapBackend::new(out_path, (1280, 960)).into_drawing_area(),
-            decision_spectrum,
-            raw_bloom_spectrum,
-            diagnostics,
-            used_min_count,
-            PlotYAxis::UnboundedLinear,
-        );
-        let svg_path = out_path.with_extension("svg");
-        draw_kmer_histogram(
-            SVGBackend::new(&svg_path, (1280, 960)).into_drawing_area(),
-            decision_spectrum,
-            raw_bloom_spectrum,
-            diagnostics,
-            used_min_count,
-            PlotYAxis::UnboundedLinear,
+            y_axis,
         );
     }
 }
@@ -2331,17 +2193,22 @@ fn for_each_kmer<IntT, F>(
     if let (Some(floors), Some(qual)) = (w.floors, qual_bytes) {
         window_groups(seq, qual, w.k, floors, groups);
     }
+    // Every emitted window must clear at least one rung. Automatic ladders start at zero, while an
+    // explicit quality floor is a single rung that must already apply on this first pass.
+    let min_qual = match w.floors {
+        Some(floors) if !groups.is_empty() => floors[0],
+        _ => w.min_qual,
+    };
     let kmer_opt = Kmer::<IntT>::new(
         std::borrow::Cow::Borrowed(seq),
         seq.len(),
         qual_bytes,
         w.k,
-        // Filtering nothing at the iterator is what "never stop because of qualities" means.
-        if groups.is_empty() { w.min_qual } else { 0 },
+        min_qual,
         true,
     );
     if let Some(mut kmer_it) = kmer_opt {
-        let (mut hc, mut hnc, mut b) = kmer_it.get_curr_hash_and_bases();
+        let (mut hc, mut hnc, mut b) = kmer_it.get_hashes_and_bases();
         loop {
             // A record with no qualities (FASTA) has nothing to classify: keep every k-mer.
             let g = if groups.is_empty() {
@@ -2403,22 +2270,6 @@ impl CountTimings {
             pct(self.absorb_ns),
         );
     }
-}
-
-/// Never fewer shards than this: below it each map stops being a small fraction of the working set. Heuristically set.
-const MIN_COUNTMAP_SHARDS: usize = 64;
-/// Nor more than this, or the per-batch split pays for buckets that hold almost nothing.
-const MAX_COUNTMAP_SHARDS: usize = 256;
-/// Shards per thread. One, not more: oversubscribing to give rayon work to steal was measured and is a
-/// bad trade, since every extra shard is another half-empty table. At k=81 on 12 threads, 64 shards
-/// cost 17% peak RSS to save 4% wall against 16.
-const SHARDS_PER_THREAD: usize = 1;
-
-/// How many shards to split the count-map into.
-fn countmap_shards() -> usize {
-    (rayon::current_num_threads() * SHARDS_PER_THREAD)
-        .next_power_of_two()
-        .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS)
 }
 
 /// Pick a shard for a canonical hash, mixing first. `shards` must be a power of two.
@@ -2597,9 +2448,9 @@ fn count_batch<IntT>(
     t.absorb_ns += t3.elapsed().as_nanos();
 }
 
-/// Main function for preprocessing
-/// Count every k-mer straight into a [`CountMap`], with the per-floor sketch.
-fn bulk_preprocessing_standalone_cpu<IntT, I>(
+/// One pass over the reads: every kept k-mer counted into the sharded count map, and every
+/// k-mer sampled into the per-floor sketch.
+fn count_kmers<IntT, I>(
     input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
@@ -2619,7 +2470,9 @@ where
     let keep = floors.map_or(0u8, |f| (f.len() - 1) as u8);
     // The sketch only feeds the fit, except under Bloom counting, whose spectrum must come from it.
     let mut sketch = ((floors.is_some() && do_fit) || do_bloom).then(SpectrumSketch::new);
-    let n_shards = countmap_shards();
+    let n_shards = (rayon::current_num_threads() * SHARDS_PER_THREAD)
+        .next_power_of_two()
+        .clamp(MIN_COUNTMAP_SHARDS, MAX_COUNTMAP_SHARDS);
     log::info!(
         "Counting k-mers into {n_shards} shards on {} thread(s){}",
         rayon::current_num_threads(),
@@ -2730,23 +2583,12 @@ where
     indexed
 }
 
-/// Contig bases hashed per round when carrying contigs in; bounds the transient k-mer buffer.
-const CARRY_CHUNK_BASES: usize = 1 << 20;
-
-/// A multi-k step's previous contigs, and how their k-mers are counted when carried in.
-#[derive(Clone, Copy)]
-pub struct CarriedContigs<'a> {
-    /// The previous k's contigs, spelled.
-    pub seqs: &'a [Vec<u8>],
-    /// How each carried k-mer's count is set.
-    pub rule: ContigCountRule,
-}
-
-/// Put every k-mer of `carried` into the count-map so the `minc` filter keeps it, and return how many
+/// Put every k-mer of the previous k's `contigs` into the count-map so the `minc` filter keeps it:
+/// each count is raised to `minc`, and counts the reads already clear stay untouched. Returns how many
 /// the reads never produced. Each chunk is hashed in parallel, then absorbed one writer per shard.
 fn carry_contig_kmers<IntT>(
     shards: &mut [CountMap<IntT>],
-    carried: CarriedContigs,
+    contigs: &[Vec<u8>],
     k: usize,
     minc: u16,
 ) -> usize
@@ -2762,7 +2604,7 @@ where
         floors: None,
         keep: 0,
     };
-    let mut rest = carried.seqs;
+    let mut rest = contigs;
     while !rest.is_empty() {
         let mut take = 1;
         let mut bases = rest[0].len();
@@ -2794,34 +2636,19 @@ where
         }
         shards.par_iter_mut().zip(runs).for_each(|(map, run)| {
             for &(hc, hnc, b, km) in run {
-                match carried.rule {
-                    ContigCountRule::Floor => {
-                        map.entry(hc)
-                            .and_modify(|e| e.count = e.count.max(minc))
-                            .or_insert(KmerInfo {
-                                count: minc,
-                                hnc,
-                                b,
-                                km,
-                            });
-                    }
-                    ContigCountRule::Gatb => {
-                        map.entry(hc)
-                            .and_modify(|e| e.count = e.count.saturating_add(minc + 1))
-                            .or_insert(KmerInfo {
-                                count: minc + 1,
-                                hnc,
-                                b,
-                                km,
-                            });
-                    }
-                }
+                map.entry(hc)
+                    .and_modify(|e| e.count = e.count.max(minc))
+                    .or_insert(KmerInfo {
+                        count: minc,
+                        hnc,
+                        b,
+                        km,
+                    });
             }
         });
     }
     shards.iter().map(HashMap::len).sum::<usize>() - before
 }
-
 
 /// A recount refits the whole spectrum at the floor the sketch chose. The refit wins unless the
 /// sketch's lobes separated there and the refit's did not, so a recount never loses a resolved cutoff.
@@ -2852,7 +2679,7 @@ fn keep_refit_or_prior(
 
 /// Choose, filter and plot from a finished sharded count-map.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn finish_map_counter<IntT>(
+fn choose_cutoff_and_filter<IntT>(
     mut shards: Vec<CountMap<IntT>>,
     k: usize,
     qual: &QualOpts,
@@ -2861,7 +2688,7 @@ fn finish_map_counter<IntT>(
     sketch: Option<SpectrumSketch>,
     do_fit: bool,
     do_bloom: bool,
-    carried: Option<CarriedContigs>,
+    carried: Option<&[Vec<u8>]>,
     out_path: &mut Option<PathBuf>,
     debug_quality_floors: bool,
     prior: Option<(u16, PeakSource)>,
@@ -2975,21 +2802,20 @@ where
             for diagnostic in &debug_floor_diagnostics {
                 let mut estimate = diagnostic.estimate;
                 if let Some(fit) = diagnostic.fit {
-                    apply_hole_guard(&mut estimate, Some(&fit));
+                    estimate.apply_hole_guard(&fit);
                 }
                 let diagnostics = SpectrumPlotDiagnostics::new(
                     &estimate,
                     diagnostic.fit,
                     diagnostic.fit_attempted,
                 );
-                let path = quality_floor_path(base_path, diagnostic.floor);
+                let path = suffixed_path(base_path, &format!("_q{}", diagnostic.floor), "png");
                 plot_kmer_histogram(
                     &diagnostic.spectrum,
                     do_bloom.then_some(histovec.as_slice()),
                     &diagnostics,
                     estimate.min_count,
                     &path,
-                    true,
                 );
                 write_kmer_spectrum_tsv(&diagnostic.spectrum, &path);
             }
@@ -3011,8 +2837,8 @@ where
         minc = qual.min_count;
         // `--min-count` fixes the cutoff, not the coverage. The spectrum above spans every distinct
         // k-mer including singletons, so it is the same one the fitting path reads.
-        let estimate = estimate_by_valley(spectrum);
-        genomic_peak = peak_of(&estimate, spectrum);
+        let estimate = SpectrumEstimate::by_valley(spectrum);
+        genomic_peak = estimate.peak_source(spectrum);
         plot_diagnostics = Some(SpectrumPlotDiagnostics::new(&estimate, None, false));
     }
     log::info!("Single-copy coverage read from the spectrum: {genomic_peak:?}");
@@ -3021,10 +2847,8 @@ where
     if let Some(carried) = carried {
         let absent = carry_contig_kmers(&mut shards, carried, k, minc);
         log::info!(
-            "Carried {} contig(s) into k={k} by the {:?} rule; {absent} of their k-mers were not in \
-             the reads",
-            carried.seqs.len(),
-            carried.rule
+            "Carried {} contig(s) into k={k}; {absent} of their k-mers were not in the reads",
+            carried.len()
         );
     }
     crate::post_state("preprocess:bulk:filtering");
@@ -3038,7 +2862,6 @@ where
             &diagnostics,
             minc,
             p.as_path(),
-            debug_quality_floors,
         );
         write_kmer_spectrum_tsv(&histovec, p.as_path());
     }
@@ -3051,12 +2874,11 @@ where
     Ok((kmers, histovec, minc, chosen_min_qual, genomic_peak))
 }
 
-
 /// Read the records, count their k-mers, choose the cutoff and filter by it. `carried`: a multi-k
 /// step's previous contigs, put in once the cutoff is chosen. `debug_quality_floors` also evaluates
 /// and plots every floor; `prior`: a recount's selection from the sketch, see [`keep_refit_or_prior`].
 #[allow(clippy::too_many_arguments)]
-pub fn preprocessing_standalone<IntT, I>(
+pub fn preprocessing<IntT, I>(
     input_iters: &mut [I],
     k: usize,
     qual: &QualOpts,
@@ -3065,7 +2887,7 @@ pub fn preprocessing_standalone<IntT, I>(
     out_path: &mut Option<PathBuf>,
     do_bloom: bool,
     do_fit: bool,
-    carried: Option<CarriedContigs>,
+    carried: Option<&[Vec<u8>]>,
     debug_quality_floors: bool,
     prior: Option<(u16, PeakSource)>,
 ) -> Result<PreprocessedK<IntT>, PreprocessingError>
@@ -3074,18 +2896,12 @@ where
     I: Iterator<Item = OwnedRecord> + MaybeSend,
 {
     crate::post_state("preprocess:bulk:start");
-    log::info!("Starting preprocessing_standalone with k = {k}");
+    log::info!("Starting preprocessing with k = {k}");
     log::info!("Counting k-mers into a hash map, without sorting");
-    let (shards, sketch, floor_has_kmers) = bulk_preprocessing_standalone_cpu::<IntT, _>(
-        input_iters,
-        k,
-        qual,
-        floors,
-        do_bloom,
-        do_fit,
-    );
+    let (shards, sketch, floor_has_kmers) =
+        count_kmers::<IntT, _>(input_iters, k, qual, floors, do_bloom, do_fit);
     let (kmers, histovec, used_min_count, chosen_min_qual, genomic_peak) =
-        finish_map_counter::<IntT>(
+        choose_cutoff_and_filter::<IntT>(
             shards,
             k,
             qual,
@@ -3113,7 +2929,9 @@ where
     }
     log::info!("Minimum count per k-mer used: {used_min_count}");
 
-    let min_count_unresolved = min_count_decision_unresolved(do_fit, used_min_count, genomic_peak);
+    let min_count_unresolved = do_fit
+        && used_min_count == UNRESOLVED_MINCOUNT
+        && !matches!(genomic_peak, PeakSource::Fitted(_));
     Ok(PreprocessedK {
         k,
         kmers,
@@ -3144,7 +2962,7 @@ mod tests {
     fn plot_paths_keep_dots_in_the_output_prefix() {
         let base = std::path::Path::new("out/s.v2_kmerspectrum_k21.png");
         assert_eq!(
-            quality_floor_path(base, 20),
+            suffixed_path(base, "_q20", "png"),
             std::path::Path::new("out/s.v2_kmerspectrum_k21_q20.png")
         );
         assert_eq!(
@@ -3189,23 +3007,42 @@ mod tests {
         );
         let diagnostics = SpectrumPlotDiagnostics::new(&estimate, Some(fit), true);
 
+        assert_eq!(
+            plot_axis_y_max(PlotYAxis::PeakCapped, &decision, None, &diagnostics, 570),
+            PEAK_Y_CAP_MULT * f64::from(decision[94]),
+            "the linear plot is capped at three times the empirical peak's bar"
+        );
+        let no_peak = SpectrumPlotDiagnostics::default();
+        assert_eq!(
+            plot_axis_y_max(PlotYAxis::PeakCapped, &decision, None, &no_peak, 570),
+            plot_y_max(&decision, None, &no_peak, 570) * 1.05,
+            "without an empirical peak the linear plot is unbounded"
+        );
+
         for (suffix, raw) in [("exact", None), ("bloom", Some(raw_bloom.as_slice()))] {
             let path = std::env::temp_dir().join(format!(
                 "sparrowhawk-spectrum-{suffix}-{}.png",
                 std::process::id()
             ));
             let svg_path = path.with_extension("svg");
-            plot_kmer_histogram(&decision, raw, &diagnostics, 12, &path, false);
-            assert!(std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() > 0));
-            assert!(std::fs::metadata(&svg_path).is_ok_and(|metadata| metadata.len() > 0));
+            let log_path = suffixed_path(&path, "_log", "png");
+            let log_svg_path = log_path.with_extension("svg");
+            plot_kmer_histogram(&decision, raw, &diagnostics, 12, &path);
+            for written in [&path, &svg_path, &log_path, &log_svg_path] {
+                assert!(std::fs::metadata(written).is_ok_and(|metadata| metadata.len() > 0));
+            }
             let svg = std::fs::read_to_string(&svg_path).expect("read spectrum SVG");
             assert!(svg.contains("<svg"));
             assert!(svg.contains("Counts"));
             assert!(svg.contains("k-mer frequency"));
-            assert!(svg.contains("k-mer spectrum (unbounded Y)"));
+            assert!(svg.contains("k-mer spectrum"));
+            assert!(!svg.contains("logarithmic"));
             assert!(svg.contains("Minimum count used = 12"));
-            std::fs::remove_file(path).expect("remove temporary spectrum plot");
-            std::fs::remove_file(svg_path).expect("remove temporary vector spectrum plot");
+            let log_svg = std::fs::read_to_string(&log_svg_path).expect("read logarithmic SVG");
+            assert!(log_svg.contains("k-mer spectrum (logarithmic Y)"));
+            for written in [path, svg_path, log_path, log_svg_path] {
+                std::fs::remove_file(written).expect("remove temporary spectrum plot");
+            }
         }
     }
 
@@ -3231,7 +3068,7 @@ mod tests {
             verdict: Verdict::NoPeakAboveValley,
             ..SpectrumEstimate::default()
         };
-        apply_hole_guard(&mut estimate, Some(&fit));
+        estimate.apply_hole_guard(&fit);
         assert_eq!(
             estimate.min_count,
             fit.error_floor_cutoff().max(2),
@@ -3248,15 +3085,9 @@ mod tests {
         };
         let floors = [0u8, 11, 25];
         let mut iters = [Vec::<OwnedRecord>::new().into_iter()];
-        let (shards, sketch, floor_has_kmers) = bulk_preprocessing_standalone_cpu::<u64, _>(
-            &mut iters,
-            31,
-            &qual,
-            Some(&floors),
-            false,
-            true,
-        );
-        let error = finish_map_counter::<u64>(
+        let (shards, sketch, floor_has_kmers) =
+            count_kmers::<u64, _>(&mut iters, 31, &qual, Some(&floors), false, true);
+        let error = choose_cutoff_and_filter::<u64>(
             shards,
             31,
             &qual,
@@ -3285,17 +3116,11 @@ mod tests {
         let floors = [0u8, 11, 25];
         let reads = deep_library(2, 20);
         let mut iters = [reads.into_iter()];
-        let (shards, sketch, floor_has_kmers) = bulk_preprocessing_standalone_cpu::<u64, _>(
-            &mut iters,
-            31,
-            &qual,
-            Some(&floors),
-            false,
-            true,
-        );
+        let (shards, sketch, floor_has_kmers) =
+            count_kmers::<u64, _>(&mut iters, 31, &qual, Some(&floors), false, true);
         assert!(!floor_has_kmers[2]);
         assert!(floor_has_kmers[1]);
-        let error = finish_map_counter::<u64>(
+        let error = choose_cutoff_and_filter::<u64>(
             shards,
             31,
             &qual,
@@ -3334,7 +3159,7 @@ mod tests {
                 km: 23,
             },
         );
-        let (kmers, _, _, _, _) = finish_map_counter::<u64>(
+        let (kmers, _, _, _, _) = choose_cutoff_and_filter::<u64>(
             vec![shard],
             31,
             &qual,
@@ -3369,7 +3194,7 @@ mod tests {
                 km: 23,
             },
         );
-        let error = finish_map_counter::<u64>(
+        let error = choose_cutoff_and_filter::<u64>(
             vec![shard],
             31,
             &qual,
@@ -3451,6 +3276,34 @@ mod tests {
             .collect()
     }
 
+    /// A fixed floor is a ladder of one rung: counting under it keeps exactly what filtering at that
+    /// floor keeps, and no emitted window is tagged NONE.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn a_fixed_floor_counts_only_what_clears_it() {
+        let reads = counter_test_reads();
+        let qual = QualOpts {
+            min_count: 2,
+            min_qual: 20,
+        };
+        let counts = |floors: Option<&[u8]>| -> HashMap<u64, u32> {
+            count_kmers::<u64, _>(
+                &mut [reads.clone().into_iter()],
+                11,
+                &qual,
+                floors,
+                false,
+                true,
+            )
+            .0
+            .into_iter()
+            .flatten()
+            .map(|(hc, info)| (hc, info.count))
+            .collect()
+        };
+        assert_eq!(counts(Some(&[20])), counts(None));
+    }
+
     /// The sharded, threaded counter must agree with the obvious serial one, and every k-mer must sit
     /// in the shard `shard_of` claims. Both sides consume the same `hash_batch` output, so this tests
     /// the sharding and the floor filtering, not the hashing.
@@ -3466,14 +3319,8 @@ mod tests {
         };
 
         let mut iters = [reads.clone().into_iter()];
-        let (shards, _, _) = bulk_preprocessing_standalone_cpu::<u64, _>(
-            &mut iters,
-            k,
-            &qual,
-            Some(&ladder[..]),
-            false,
-            true,
-        );
+        let (shards, _, _) =
+            count_kmers::<u64, _>(&mut iters, k, &qual, Some(&ladder[..]), false, true);
 
         let n_shards = shards.len();
         let mut got: HashMap<u64, (u32, u64, u8)> = HashMap::default();
@@ -3531,14 +3378,7 @@ mod tests {
         ladder: &[u8],
     ) -> HashMap<u64, u32> {
         let mut iters = [reads.into_iter()];
-        let (shards, _, _) = bulk_preprocessing_standalone_cpu::<u64, _>(
-            &mut iters,
-            k,
-            qual,
-            Some(ladder),
-            true,
-            true,
-        );
+        let (shards, _, _) = count_kmers::<u64, _>(&mut iters, k, qual, Some(ladder), true, true);
         let mut got: HashMap<u64, u32> = HashMap::default();
         for shard in &shards {
             for (hc, info) in shard {
@@ -3659,7 +3499,7 @@ mod tests {
             histogram[count - 1] = (200.0 * (-0.5 * distance * distance / 25.0).exp()) as u32;
         }
 
-        let estimate = estimate_by_valley(&histogram);
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         assert_eq!(estimate.valley_seed, 10);
         assert_eq!(estimate.raw_valley, Some(10));
         assert_eq!(estimate.raw_genomic_peak, Some(40));
@@ -3705,7 +3545,7 @@ mod tests {
             "fixture should fool a global smooth search"
         );
 
-        let estimate = estimate_by_valley(&histogram);
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         assert_eq!(estimate.raw_genomic_peak, Some(40));
         assert!(
             estimate.genomic_peak <= 52,
@@ -3728,19 +3568,16 @@ mod tests {
         let mut histogram = vec![0u32; MAXSIZEHISTO];
         histogram[..observed.len()].copy_from_slice(&observed);
 
-        let estimate = estimate_by_valley(&histogram);
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         assert_eq!(estimate.raw_valley, Some(31));
         assert_eq!(estimate.raw_genomic_peak, Some(32));
-        assert_eq!(estimate.primary_valley, Some(32));
-        assert_eq!(estimate.primary_peak, Some(33));
-        assert!(estimate.fallback_attempted);
         assert_eq!(
-            estimate.retry_reason,
-            Some(PeakRetryReason::AreaBelowThreshold)
+            SpectrumEstimate::default().find_primary_pair(&histogram),
+            Ok((32, 33, PeakSearch::SmoothedRefinement))
         );
-        assert!(estimate
-            .primary_area_fraction
-            .is_some_and(|fraction| fraction < MIN_PEAK_AREA_FRACTION));
+        assert!(
+            PeakAreaSupport::measure(&histogram, 32, 33).is_some_and(|support| !support.passes())
+        );
         assert_ne!(estimate.verdict, Verdict::Ok);
         assert_eq!((estimate.valley, estimate.genomic_peak), (0, 0));
         assert_eq!(estimate.min_count, UNRESOLVED_MINCOUNT);
@@ -3766,7 +3603,7 @@ mod tests {
     #[test]
     fn raw_low_coverage_bypass_has_strict_boundaries() {
         let nine_count_gap = spectrum_with_valley_and_peak(5, 14, 64);
-        let estimate = estimate_by_valley(&nine_count_gap);
+        let estimate = SpectrumEstimate::by_valley(&nine_count_gap);
         assert_eq!(estimate.raw_valley, Some(5));
         assert_eq!(estimate.raw_genomic_peak, Some(14));
         assert_eq!(estimate.peak_search, PeakSearch::RawLowCoverage);
@@ -3774,19 +3611,19 @@ mod tests {
 
         // Exactly ten counts apart does not bypass smoothing.
         let ten_count_gap = spectrum_with_valley_and_peak(5, 15, 64);
-        let estimate = estimate_by_valley(&ten_count_gap);
+        let estimate = SpectrumEstimate::by_valley(&ten_count_gap);
         assert_eq!(estimate.raw_genomic_peak, Some(15));
         assert_eq!(estimate.peak_search, PeakSearch::SmoothedRefinement);
 
         // Both positions must be below 15; equality at either boundary takes the refinement path.
         let peak_at_15 = spectrum_with_valley_and_peak(5, 15, 64);
         assert_eq!(
-            estimate_by_valley(&peak_at_15).peak_search,
+            SpectrumEstimate::by_valley(&peak_at_15).peak_search,
             PeakSearch::SmoothedRefinement
         );
         let valley_at_15 = spectrum_with_valley_and_peak(15, 24, 64);
         assert_eq!(
-            estimate_by_valley(&valley_at_15).peak_search,
+            SpectrumEstimate::by_valley(&valley_at_15).peak_search,
             PeakSearch::SmoothedRefinement
         );
     }
@@ -3826,13 +3663,10 @@ mod tests {
         histogram[16] = 2;
         histogram[17] = 100; // raw peak at 18; bin 19 is the saturated bin
 
-        let estimate = estimate_by_valley(&histogram);
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         assert_eq!(estimate.raw_valley, Some(7));
         assert_eq!(estimate.raw_genomic_peak, Some(18));
-        assert_eq!(
-            estimate.primary_area_failure,
-            Some(PeakAreaFailure::SaturatedEndpoint)
-        );
+        assert_eq!(PeakAreaSupport::measure(&histogram, 7, 18), None);
         assert_eq!(estimate.peak_search, PeakSearch::Unresolved);
         assert_eq!(estimate.min_count, UNRESOLVED_MINCOUNT);
     }
@@ -3844,7 +3678,7 @@ mod tests {
             monotone[count - 1] = (64 - count) as u32;
         }
         assert_eq!(find_raw_valley_seed(&monotone), None);
-        let estimate = estimate_by_valley(&monotone);
+        let estimate = SpectrumEstimate::by_valley(&monotone);
         assert_eq!(estimate.peak_search, PeakSearch::Unresolved);
         assert_eq!(estimate.min_count, UNRESOLVED_MINCOUNT);
 
@@ -3860,14 +3694,14 @@ mod tests {
         histogram[1] = 95; // count 2, outside the valley-to-mirrored-shoulder area
         histogram[2..7].fill(1); // counts 3..=7: exactly 5 of 100 non-singleton bins
 
-        let support = peak_area_support(&histogram, 3, 5).unwrap();
+        let support = PeakAreaSupport::measure(&histogram, 3, 5).unwrap();
         assert_eq!(support.area_sum, 5);
         assert_eq!(support.denominator, 100);
         assert_eq!(support.fraction(), MIN_PEAK_AREA_FRACTION);
         assert!(support.passes(), "the boundary is inclusive");
 
         histogram[1] += 1;
-        let support = peak_area_support(&histogram, 3, 5).unwrap();
+        let support = PeakAreaSupport::measure(&histogram, 3, 5).unwrap();
         assert_eq!(support.area_sum, 5);
         assert_eq!(support.denominator, 101);
         assert!(!support.passes(), "just below 5 % must fail");
@@ -3877,8 +3711,8 @@ mod tests {
     fn mirrored_peak_area_rejects_an_endpoint_in_the_saturated_bin() {
         let histogram = vec![1, 4, 3, 2, 8, 9, 5, 2, 1];
         assert_eq!(
-            peak_area_support(&histogram, 2, 6),
-            Err(PeakAreaFailure::SaturatedEndpoint),
+            PeakAreaSupport::measure(&histogram, 2, 6),
+            None,
             "the right endpoint is count 10, beyond the last unsaturated count 8"
         );
     }
@@ -3890,7 +3724,9 @@ mod tests {
         let peak = find_raw_peak_after_valley(&histogram, 2).unwrap();
         assert_eq!(peak, 5);
         assert!(confirms_two_bin_right_tail(&histogram, peak));
-        assert!(peak_area_support(&histogram, 2, peak).unwrap().passes());
+        assert!(PeakAreaSupport::measure(&histogram, 2, peak)
+            .unwrap()
+            .passes());
 
         let mut non_decreasing_tail = histogram;
         non_decreasing_tail[7] = 10; // makes the final overlapping average equal to the previous
@@ -3903,11 +3739,11 @@ mod tests {
         histogram[..4].copy_from_slice(&[10, 2, 3, 20]);
         histogram[5] = 1; // count 6 makes the last two-bin average stop decreasing
 
-        let estimate = estimate_by_valley(&histogram);
-        assert_eq!(estimate.retry_reason, Some(PeakRetryReason::NoSeed));
-        assert_eq!(estimate.fallback_valley, Some(2));
-        assert_eq!(estimate.fallback_peak, Some(4));
-        assert_eq!(estimate.fallback_tail_confirmed, Some(false));
+        assert_eq!(find_raw_valley_seed(&histogram), None);
+        assert_eq!(find_first_raw_local_valley(&histogram), Some(2));
+        assert_eq!(find_raw_peak_after_valley(&histogram, 2), Some(4));
+        assert!(!confirms_two_bin_right_tail(&histogram, 4));
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         assert_eq!(estimate.verdict, Verdict::PeakTailNotDecreasing);
         assert_eq!((estimate.valley, estimate.genomic_peak), (0, 0));
         assert_eq!(estimate.min_count, UNRESOLVED_MINCOUNT);
@@ -3919,14 +3755,11 @@ mod tests {
         histogram[..5].copy_from_slice(&[10, 2, 3, 20, 1]);
 
         assert_eq!(find_raw_valley_seed(&histogram), None);
-        let estimate = estimate_by_valley(&histogram);
-        assert_eq!(estimate.retry_reason, Some(PeakRetryReason::NoSeed));
-        assert_eq!(estimate.fallback_valley, Some(2));
-        assert_eq!(estimate.fallback_peak, Some(4));
-        assert_eq!(estimate.fallback_tail_confirmed, Some(true));
-        assert!(estimate
-            .fallback_area_fraction
-            .is_some_and(|fraction| fraction >= MIN_PEAK_AREA_FRACTION));
+        assert_eq!(find_first_raw_local_valley(&histogram), Some(2));
+        assert_eq!(find_raw_peak_after_valley(&histogram, 2), Some(4));
+        assert!(confirms_two_bin_right_tail(&histogram, 4));
+        assert!(PeakAreaSupport::measure(&histogram, 2, 4).is_some_and(PeakAreaSupport::passes));
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         assert_eq!(estimate.peak_search, PeakSearch::RawLocalFallback);
         assert_eq!((estimate.valley, estimate.genomic_peak), (2, 4));
         assert!(estimate.verdict.is_ok());
@@ -3952,18 +3785,7 @@ mod tests {
 
         for lam in [250.0, 500.0] {
             let h = synthetic_spectrum(lam);
-            let e = estimate_by_valley(&h);
-            assert!(
-                e.primary_area_fraction
-                    .is_some_and(|f| f < MIN_PEAK_AREA_FRACTION),
-                "lambda {lam}"
-            );
-            assert_eq!(
-                e.retry_reason,
-                Some(PeakRetryReason::AreaBelowThreshold),
-                "lambda {lam}"
-            );
-            assert!(e.fallback_attempted, "lambda {lam}");
+            let e = SpectrumEstimate::by_valley(&h);
             assert_eq!(e.verdict, Verdict::NoLocalValley, "lambda {lam}");
             assert_eq!(
                 (e.valley, e.genomic_peak, e.min_count),
@@ -3986,12 +3808,12 @@ mod tests {
     #[test]
     fn low_coverage_spectra_resolve_only_once_the_lobes_separate() {
         for lam in [3.0, 4.0, 5.0] {
-            let e = estimate_by_valley(&synthetic_spectrum(lam));
+            let e = SpectrumEstimate::by_valley(&synthetic_spectrum(lam));
             assert_ne!(e.verdict, Verdict::Ok, "lambda {lam}");
             assert_eq!(e.min_count, UNRESOLVED_MINCOUNT, "lambda {lam}");
         }
         for lam in [6.0, 7.0] {
-            let e = estimate_by_valley(&synthetic_spectrum(lam));
+            let e = SpectrumEstimate::by_valley(&synthetic_spectrum(lam));
             assert_eq!(e.verdict, Verdict::Ok, "lambda {lam}");
             assert!(
                 e.genomic_peak.abs_diff(lam as usize) <= 1,
@@ -4000,10 +3822,10 @@ mod tests {
             );
         }
         assert_eq!(
-            estimate_by_valley(&synthetic_spectrum(8.0)).min_count,
+            SpectrumEstimate::by_valley(&synthetic_spectrum(8.0)).min_count,
             UNRESOLVED_MINCOUNT
         );
-        let e = estimate_by_valley(&synthetic_spectrum(9.0));
+        let e = SpectrumEstimate::by_valley(&synthetic_spectrum(9.0));
         assert_eq!(
             e.verdict,
             Verdict::Ok,
@@ -4026,7 +3848,7 @@ mod tests {
         }
         // Either refusal is right here — the walk may stop on the crest it locked onto, making genomic peak and
         // valley equal — but the depth is what rules it out either way.
-        let e = estimate_by_valley(&h);
+        let e = SpectrumEstimate::by_valley(&h);
         assert_ne!(e.verdict, Verdict::Ok);
         assert!(
             e.gp_to_v_ratio < MIN_GP_TO_V_RATIO,
@@ -4047,7 +3869,7 @@ mod tests {
         let mut h = vec![0u32; MAXSIZEHISTO];
         h[0] = 100_000; // error spike at count 1
         h[5..10].fill(50_000); // a narrow but smoothed genome lobe, with a clear empty valley
-        let e = estimate_by_valley(&h);
+        let e = SpectrumEstimate::by_valley(&h);
         assert_eq!(
             e.verdict,
             Verdict::Ok,
@@ -4055,10 +3877,10 @@ mod tests {
             e.valley,
             e.genomic_peak,
             e.gp_to_v_ratio,
-            e.valley_to_peak_xratio
+            e.valley as f64 / e.genomic_peak as f64
         );
         assert!(
-            e.valley_to_peak_xratio > 0.3,
+            e.valley as f64 / e.genomic_peak as f64 > 0.3,
             "the point of the case is that it is crowded"
         );
     }
@@ -4076,12 +3898,12 @@ mod tests {
             "a spike is averaged over five bins"
         );
         assert_eq!(
-            estimate_by_valley(&synthetic_spectrum(30.0)).peak_search,
+            SpectrumEstimate::by_valley(&synthetic_spectrum(30.0)).peak_search,
             PeakSearch::SmoothedRefinement
         );
 
         for lam in [10.0, 15.0, 20.0, 50.0, 100.0] {
-            let e = estimate_by_valley(&synthetic_spectrum(lam));
+            let e = SpectrumEstimate::by_valley(&synthetic_spectrum(lam));
             assert_eq!(e.verdict, Verdict::Ok, "lambda {lam}");
             assert!(
                 e.min_count >= 2 && genome_loss(lam, e.min_count) < MAX_GENOME_LOSS,
@@ -4091,7 +3913,7 @@ mod tests {
         }
         for lam in [20.0, 30.0, 60.0, 150.0] {
             let h = synthetic_spectrum(lam);
-            let e = estimate_by_valley(&h);
+            let e = SpectrumEstimate::by_valley(&h);
             assert!(
                 e.raw_valley.is_some() && e.raw_genomic_peak.is_some(),
                 "lambda {lam}"
@@ -4118,7 +3940,7 @@ mod tests {
         for c in 5500..6500 {
             h[c - 1] = 20_000; // a genome lobe far outside LEGACY_HISTO_RANGE
         }
-        let e = estimate_by_valley(&h);
+        let e = SpectrumEstimate::by_valley(&h);
         assert_eq!(e.verdict, Verdict::Ok);
         assert!(
             e.genomic_peak >= LEGACY_HISTO_RANGE,
@@ -4147,7 +3969,7 @@ mod tests {
     fn measured_guard_spends_its_budget_and_stops() {
         for lam in [20.0, 50.0, 100.0] {
             let h = synthetic_spectrum(lam);
-            let estimate = estimate_by_valley(&h);
+            let estimate = SpectrumEstimate::by_valley(&h);
             let valley = estimate.valley;
             let genomic_peak = estimate.genomic_peak;
             let m = measured_guard(&h, valley, genomic_peak) as usize;
@@ -4170,7 +3992,7 @@ mod tests {
     #[test]
     fn the_loss_guard_takes_the_tighter_of_its_two_bounds() {
         let h = synthetic_spectrum(10.0);
-        let e = estimate_by_valley(&h);
+        let e = SpectrumEstimate::by_valley(&h);
         assert!(poisson_guard(e.genomic_peak) < measured_guard(&h, e.valley, e.genomic_peak));
 
         let mut wide = vec![0u32; MAXSIZEHISTO];
@@ -4257,7 +4079,7 @@ mod tests {
                 let seq: Vec<u8> = (0..k)
                     .map(|_| BASES[(xorshift(&mut st) % 4) as usize])
                     .collect();
-                lowest = lowest.min(NtHashIterator::new(&seq, k, true).curr_hash());
+                lowest = lowest.min(NtHashIterator::new(&seq, k, true).canonical_hash());
             }
             assert!(
                 lowest >= HASH_FLOOR,
@@ -4363,7 +4185,10 @@ mod tests {
         let raw = sketch.spectra(1).pop().unwrap();
         let scaled = rescaled_strict_spectrum(&sketch, 0);
 
-        let (r, s) = (estimate_by_valley(&raw), estimate_by_valley(&scaled));
+        let (r, s) = (
+            SpectrumEstimate::by_valley(&raw),
+            SpectrumEstimate::by_valley(&scaled),
+        );
         assert_eq!(r.genomic_peak, s.genomic_peak, "the peak moved");
         assert_eq!(r.valley, s.valley, "the valley moved");
         assert_eq!(r.min_count, s.min_count, "the cutoff moved");
@@ -4459,15 +4284,9 @@ mod tests {
         do_bloom: bool,
     ) -> (IndexedKmers<u64>, Vec<u32>, u16, u8, PeakSource) {
         let mut iters = [reads.into_iter()];
-        let (shards, sketch, floor_has_kmers) = bulk_preprocessing_standalone_cpu::<u64, _>(
-            &mut iters,
-            k,
-            qual,
-            Some(ladder),
-            do_bloom,
-            true,
-        );
-        finish_map_counter::<u64>(
+        let (shards, sketch, floor_has_kmers) =
+            count_kmers::<u64, _>(&mut iters, k, qual, Some(ladder), do_bloom, true);
+        choose_cutoff_and_filter::<u64>(
             shards,
             k,
             qual,
@@ -4605,9 +4424,16 @@ mod tests {
     fn distinct_above_sees_breadth_that_the_peak_does_not() {
         let narrow = histo(&bimodal(30));
         let wide: Vec<u32> = narrow.iter().map(|n| n * 2).collect();
-        let (a, b) = (estimate_by_valley(&narrow), estimate_by_valley(&wide));
+        let (a, b) = (
+            SpectrumEstimate::by_valley(&narrow),
+            SpectrumEstimate::by_valley(&wide),
+        );
         assert_eq!(a.genomic_peak, b.genomic_peak, "depth is unchanged");
-        assert_eq!(b.distinct_above, 2 * a.distinct_above, "breadth is not");
+        assert_eq!(
+            distinct_above(&wide, b.valley),
+            2 * distinct_above(&narrow, a.valley),
+            "breadth is not"
+        );
     }
 
     /// Floors only step down below [`LOW_COVERAGE_FLOOR_REVIEW`]: a resolved strict floor at 14 or 40 stays,
@@ -4615,12 +4441,15 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn a_resolved_strict_floor_at_or_above_the_review_peak_does_not_step_down() {
-        assert_eq!(estimate_by_valley(&histo(&bimodal(14))).genomic_peak, 14);
+        assert_eq!(
+            SpectrumEstimate::by_valley(&histo(&bimodal(14))).genomic_peak,
+            14
+        );
         // (strict floor's peak, lower floor's peak)
         for (strict_peak, lower_peak) in [(14, 40), (40, 60), (40, 120)] {
             let strict = histo(&bimodal(strict_peak));
             assert!(
-                estimate_by_valley(&strict).verdict.is_ok(),
+                SpectrumEstimate::by_valley(&strict).verdict.is_ok(),
                 "strict peak {strict_peak}"
             );
             let calls = std::cell::Cell::new(0);
@@ -4646,7 +4475,7 @@ mod tests {
     #[test]
     fn a_failed_strict_floor_fit_checks_lower_quality_floors() {
         let strict_histogram = histo(&bimodal(30));
-        let strict = estimate_by_valley(&strict_histogram);
+        let strict = SpectrumEstimate::by_valley(&strict_histogram);
         assert!(strict.verdict.is_ok());
 
         let sketch = sketch_with(1, &bimodal(40));
@@ -4676,7 +4505,7 @@ mod tests {
     #[test]
     fn peak_below_ten_checks_other_floors_even_if_its_fit_converges() {
         let histogram = synthetic_spectrum(9.0);
-        let estimate = estimate_by_valley(&histogram);
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         assert!(
             estimate.verdict.is_ok(),
             "fixture must yield an accepted pair"
@@ -4704,9 +4533,9 @@ mod tests {
     #[test]
     fn the_error_tail_starts_at_the_applied_cutoff() {
         let histogram = synthetic_spectrum(30.0);
-        let estimate = estimate_by_valley(&histogram);
+        let estimate = SpectrumEstimate::by_valley(&histogram);
         let fit = fit_and_log(&histogram, &estimate, 1.0).expect("the fixture fits");
-        let cutoff = guarded_min_count(&estimate, &fit);
+        let cutoff = estimate.guarded_min_count(&fit);
         assert!(cutoff > 2, "the fixture must cut above 2, got {cutoff}");
         let applied = fit_error_tail_fraction(&histogram, &fit, cutoff).unwrap();
         let from_two = fit_error_tail_fraction(&histogram, &fit, 2).unwrap();
@@ -4797,7 +4626,7 @@ mod tests {
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn multiple_fit_selection_applies_the_error_area_and_fallback_rules() {
-        let estimate = estimate_by_valley(&histo(&bimodal(30)));
+        let estimate = SpectrumEstimate::by_valley(&histo(&bimodal(30)));
         let candidate = |floor, mean, fraction| FloorCandidate {
             floor,
             estimate,
@@ -4872,7 +4701,7 @@ mod tests {
     #[test]
     fn a_deep_library_reports_a_fitted_peak() {
         let h = synthetic_spectrum(120.0);
-        match peak_of(&estimate_by_valley(&h), &h) {
+        match SpectrumEstimate::by_valley(&h).peak_source(&h) {
             PeakSource::Fitted(p) => assert!(
                 (100..=140).contains(&p),
                 "fitted peak {p} should sit near the true 120x"
@@ -4896,14 +4725,17 @@ mod tests {
             assert_eq!(occurrence_weighted_median(h), want);
         }
         assert_eq!(
-            peak_of(&estimate_by_valley(&empty), &empty),
+            SpectrumEstimate::by_valley(&empty).peak_source(&empty),
             PeakSource::Unknown
         );
 
         let flat = vec![1000u32; MAXSIZEHISTO];
-        let estimate = estimate_by_valley(&flat);
+        let estimate = SpectrumEstimate::by_valley(&flat);
         assert!(!estimate.verdict.is_ok(), "fixture must not resolve");
-        assert!(matches!(peak_of(&estimate, &flat), PeakSource::Fallback(_)));
+        assert!(matches!(
+            estimate.peak_source(&flat),
+            PeakSource::Fallback(_)
+        ));
     }
 
     /// The store replays the reads exactly: at the ladder, as the first k counts, and at one floor, as
@@ -4930,7 +4762,7 @@ mod tests {
                 min_count: 2,
                 min_qual,
             };
-            let streamed = bulk_preprocessing_standalone_cpu::<u64, _>(
+            let streamed = count_kmers::<u64, _>(
                 &mut [reads.clone().into_iter()],
                 11,
                 &qual,
@@ -4939,15 +4771,8 @@ mod tests {
                 true,
             )
             .0;
-            let replayed = bulk_preprocessing_standalone_cpu::<u64, _>(
-                &mut [store.records()],
-                11,
-                &qual,
-                floors,
-                false,
-                true,
-            )
-            .0;
+            let replayed =
+                count_kmers::<u64, _>(&mut [store.records()], 11, &qual, floors, false, true).0;
             assert_eq!(
                 counts(streamed),
                 counts(replayed),
@@ -4956,11 +4781,11 @@ mod tests {
         }
     }
 
-    /// Both rules keep every carried k-mer past the cutoff. `Floor` never touches a count the reads
-    /// already clear and is idempotent; `Gatb` adds minc + 1 per occurrence, as GATB-Minia does.
+    /// Every carried k-mer passes the cutoff. A count the reads already clear is never touched, and
+    /// carrying a contig twice changes nothing.
     #[cfg(not(target_family = "wasm"))]
     #[test]
-    fn carried_contig_kmers_survive_the_cutoff_under_either_rule() {
+    fn carried_contig_kmers_survive_the_cutoff() {
         let (k, minc) = (11usize, 3u16);
         let reads = counter_test_reads();
         let ladder = [0u8, 11, 25];
@@ -4982,43 +4807,29 @@ mod tests {
                 .map(|(h, i)| (*h, i.count))
                 .collect()
         };
-        for rule in [ContigCountRule::Floor, ContigCountRule::Gatb] {
-            let (mut shards, _, _) = bulk_preprocessing_standalone_cpu::<u64, _>(
-                &mut [reads.clone().into_iter()],
-                k,
-                &qual,
-                Some(&ladder[..]),
-                false,
-                true,
-            );
-            let before = as_counts(&shards);
-            let absent = carry_contig_kmers(
-                &mut shards,
-                CarriedContigs {
-                    seqs: &contigs,
-                    rule,
-                },
-                k,
-                minc,
-            );
-            let after = as_counts(&shards);
-            let minc = u32::from(minc);
-            assert_eq!(
-                absent,
-                occurrences
-                    .keys()
-                    .filter(|&h| !before.contains_key(h))
-                    .count()
-            );
-            for (h, &count) in &after {
-                let read = before.get(h).copied().unwrap_or(0);
-                let want = match (occurrences.get(h), rule) {
-                    (None, _) => read,
-                    (Some(_), ContigCountRule::Floor) => read.max(minc),
-                    (Some(&n), ContigCountRule::Gatb) => read + n * (minc + 1),
-                };
-                assert_eq!(count, want, "{rule:?}");
-            }
+        let (mut shards, _, _) = count_kmers::<u64, _>(
+            &mut [reads.clone().into_iter()],
+            k,
+            &qual,
+            Some(&ladder[..]),
+            false,
+            true,
+        );
+        let before = as_counts(&shards);
+        let absent = carry_contig_kmers(&mut shards, &contigs, k, minc);
+        let after = as_counts(&shards);
+        let minc = u32::from(minc);
+        assert_eq!(
+            absent,
+            occurrences
+                .keys()
+                .filter(|&h| !before.contains_key(h))
+                .count()
+        );
+        for (h, &count) in &after {
+            let read = before.get(h).copied().unwrap_or(0);
+            let want = occurrences.get(h).map_or(read, |_| read.max(minc));
+            assert_eq!(count, want);
         }
     }
 
@@ -5060,16 +4871,16 @@ mod tests {
             do_bubble_collapse: false,
             do_dead_end_removal: false,
             pop_ratio: 0.1,
-            tip_nts: 0,
-            tip_rctc_nts: 0,
-            tip_rctc_cutoff: 2.0,
+            dead_end_nts: 0,
+            dead_end_coverage_nts: 0,
+            dead_end_coverage_ratio: 2.0,
             coverage: CoverageRef::unknown(),
             do_ec_removal: false,
             ec_ratio: 4.0,
             ec_require_both_flanks: false,
         };
-        let assemble = |k: usize, carried: Option<CarriedContigs>| -> Vec<Vec<u8>> {
-            let (shards, sketch, present) = bulk_preprocessing_standalone_cpu::<u128, _>(
+        let assemble = |k: usize, carried: Option<&[Vec<u8>]>| -> Vec<Vec<u8>> {
+            let (shards, sketch, present) = count_kmers::<u128, _>(
                 &mut [reads.clone().into_iter()],
                 k,
                 &qual,
@@ -5077,27 +4888,25 @@ mod tests {
                 false,
                 true,
             );
-            let (mut kmers, ..) = finish_map_counter::<u128>(
+            let (mut kmers, ..) = choose_cutoff_and_filter::<u128>(
                 shards, k, &qual, None, &present, sketch, false, false, carried, &mut None, false,
                 None,
             )
             .expect("the fixture leaves k-mers after filtering");
             let contigs = BasicAsm::assemble::<u128>(k, &mut kmers, &mut None, None, correction);
-            crate::save_functions::spell_contigs::<u128>(&contigs, &kmers, k)
+            crate::save_functions::spell_contigs::<u128>(
+                &contigs,
+                |hash| kmers.get_packed(hash).copied(),
+                k,
+            )
         };
 
         let small = assemble(21, None);
         assert_eq!(small.len(), 1, "every 21-mer is read");
         assert_eq!(assemble(41, None).len(), 2, "ten 41-mers are never read");
-        for rule in [ContigCountRule::Floor, ContigCountRule::Gatb] {
-            let large = assemble(41, Some(CarriedContigs { seqs: &small, rule }));
-            assert_eq!(
-                large.len(),
-                1,
-                "{rule:?}: the carried contig bridges the seam"
-            );
-            assert_eq!(large[0].len(), genome.len());
-        }
+        let large = assemble(41, Some(&small));
+        assert_eq!(large.len(), 1, "the carried contig bridges the seam");
+        assert_eq!(large[0].len(), genome.len());
     }
 
     /// The min-count, and the floor it was read at. Every candidate floor is evaluated and only then

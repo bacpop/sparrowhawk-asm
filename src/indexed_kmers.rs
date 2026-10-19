@@ -7,10 +7,9 @@ use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
 /// Simple type: just a hashmap that we'll use for the correspondence between hashes and the vector index associated to it.
-type IndexMap = HashMap<u64, OrientedKmerIndex, BuildHasherDefault<NoHashHasher<u64>>>;
+pub(crate) type IndexMap = HashMap<u64, OrientedKmerIndex, BuildHasherDefault<NoHashHasher<u64>>>;
 
-
-/// OrientedKmerIndex is just an usize, i.e. for our cases just an u32 or u64. It is "oriented" because it includes the information in its first bit of whether the hash is canonical or not.
+/// OrientedKmerIndex is just a usize, i.e. for our cases just a u32 or u64. It is "oriented" because it includes the information in its lowest bit of whether the hash is canonical or not.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OrientedKmerIndex(usize);
@@ -41,7 +40,7 @@ impl OrientedKmerIndex {
     }
 }
 
-/// K-mer attributes stored once in vectors sharing a stable index. Essentially, aligned vectors that allow us later to parallelise in CPU operations without atomics. This also replaces our old minmaxdict, a hashmap that I added for having the correspondance between canonical and non-canonical hashes.
+/// K-mer attributes stored once in vectors sharing a stable index. Essentially, aligned vectors that allow us later to parallelise in CPU operations without atomics. This also replaces our old minmaxdict, a hashmap that I added for having the correspondence between canonical and non-canonical hashes.
 #[derive(Clone)]
 pub struct IndexedKmers<IntT> {
     pub(crate) canonical_hashes: Vec<u64>,
@@ -55,7 +54,8 @@ pub struct IndexedKmers<IntT> {
 }
 
 impl<IntT> IndexedKmers<IntT> {
-    pub(crate) fn with_capacity(kmers: usize) -> Self { // ONE ALLOCATION!
+    pub(crate) fn with_capacity(kmers: usize) -> Self {
+        // ONE ALLOCATION!
         let lookup_capacity = kmers
             .checked_mul(2) // We store direct and reverse!
             .expect("too many indexed k-mers to allocate their hash lookup");

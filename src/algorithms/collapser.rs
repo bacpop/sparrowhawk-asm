@@ -48,7 +48,8 @@ impl Collapsable for DbgGraph {
                             contigs.push(vec![self.node_weight(n).unwrap().clone()]);
                             self.remove_node(n);
                         } else {
-                            stacker::maybe_grow(32 * 1024, 1024 * 1024, || { // remember the stack overflow!!!! (RIP btw)
+                            stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                                // remember the stack overflow!!!! (RIP btw)
                                 let contigs_ = contigs_from_vertex(&mut self, n);
                                 contigs.extend(contigs_.into_iter().filter(|c| !c.is_empty()));
                             });
@@ -101,7 +102,7 @@ impl Collapsable for DbgGraph {
 }
 
 /// Remove branching junction nodes before collapse walks begin, returning each as its own contig.
-/// This is important for performance, speeds up a lot things
+/// This is important for performance, speeds things up a lot
 #[inline]
 fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> SerializedContigs {
     let junctions: Vec<NodeId> = ptgraph
