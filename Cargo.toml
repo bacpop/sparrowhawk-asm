@@ -22,7 +22,6 @@ num-traits = { version = "0.2.19" }
 log = { version = "0.4.27" }
 rayon = { version = "1.10.0" }
 nohash-hasher = { version = "0.2.0" }
-stacker = { version = "0.1.20" }
 sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", rev = "93d19ae2138640752796415a9f76db437fbc9179" }
 bnum = { version = "0.13.0", features = ["numtraits"] }
 libm = { version = "0.2" }

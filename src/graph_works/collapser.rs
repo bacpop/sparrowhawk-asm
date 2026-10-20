@@ -30,6 +30,8 @@ impl Collapsable for DbgGraph {
 
         log::info!("Starting collapse loop.");
 
+        // Nodes walked from each cycle left after the path walks.
+        let mut cycles: Vec<usize> = Vec::new();
         loop {
             loop {
                 // get all starting nodes, i.e. nodes with in_degree == 0
@@ -48,47 +50,36 @@ impl Collapsable for DbgGraph {
                             contigs.push(vec![self.node_weight(n).unwrap().clone()]);
                             self.remove_node(n);
                         } else {
-                            stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-                                // remember the stack overflow!!!! (RIP btw)
-                                let contigs_ = contigs_from_vertex(&mut self, n);
-                                contigs.extend(contigs_.into_iter().filter(|c| !c.is_empty()));
-                            });
+                            let contigs_ = contigs_from_vertex(&mut self, n);
+                            contigs.extend(contigs_.into_iter().filter(|c| !c.is_empty()));
                         }
                     }
                 }
             }
             log::debug!("\t- Loops over external nodes finished.");
 
-            let tmpc = self.node_count();
-            if tmpc != 0 {
-                // we guarantee that there's at least one node to unwrap here
-                log::debug!(
-                    "\t\t# {} nodes remain. Starting to build from middle node.",
-                    tmpc
-                );
-
-                // This call to stacker::grow here is needed because of the algorithm that is run to obtain the
-                // strongly-connected components. It is recursive, so in very entangled graphs (and/or when k is
-                // low, i.e. k ~< 15), it might lead to a stack overflow.
-                stacker::grow(100 * 1024 * 1024, || {
-                    let sccvec: Vec<Vec<NodeId>> = self.strongly_connected_components();
-                    let node_in_cycle = sccvec[0].last().unwrap();
-
-                    log::debug!(
-                        "\t\t# Remaining nodes {}, remaining SCCs {}, starting with {} neighbours",
-                        tmpc,
-                        sccvec.len(),
-                        self.get_good_connections_degree(*node_in_cycle)
-                    );
-
-                    let thecontigs = contigs_from_intermediate_vertex(&mut self, *node_in_cycle);
-
-                    contigs.extend(thecontigs.into_iter().filter(|c| !c.is_empty()));
-                });
-                log::debug!("\t\t# Finished creating one contig from starting circle.");
-            } else {
+            // The walks from path ends consume every path, as the junctions are already gone, so only
+            // cycles without a junction remain; any node on one is a valid start, and the walk goes
+            // all the way round. No strongly-connected-components search: petgraph's is recursive,
+            // and a plasmid the shrinker never reached is a cycle of one node per k-mer.
+            let Some(start) = self.node_indices().next() else {
                 break;
-            }
+            };
+            let before = self.node_count();
+            contigs.extend(
+                contigs_from_intermediate_vertex(&mut self, start)
+                    .into_iter()
+                    .filter(|c| !c.is_empty()),
+            );
+            cycles.push(before - self.node_count());
+        }
+
+        if !cycles.is_empty() {
+            log::info!(
+                "Walked {} cycle(s) without a junction; the largest had {} nodes",
+                cycles.len(),
+                cycles.iter().max().unwrap()
+            );
         }
 
         log::trace!(
@@ -118,8 +109,8 @@ fn erase_junction_nodes(ptgraph: &mut DbgGraph) -> SerializedContigs {
         .collect()
 }
 
-/// Main collapse function/method
-/// Now, almost not used... The previous function takes care of simplifying most of this.
+/// Walk a path from its end `v`, emitting it as one contig. With the junctions already erased, this
+/// turns every remaining path into a contig.
 #[inline]
 fn contigs_from_vertex(ptgraph: &mut DbgGraph, v: NodeId) -> SerializedContigs {
     let mut contigs: SerializedContigs = vec![];
@@ -398,5 +389,64 @@ mod tests {
         assert_eq!(g.in_degree(branch_a), 0);
         assert_eq!(g.out_degree(branch_b), 0);
         assert_eq!(g.in_degree(branch_b), 0);
+    }
+
+    /// Adds `len` nodes chained by straight edges, closing them into a cycle when asked, and
+    /// returns their hashes, which start at `first`.
+    fn add_chain(g: &mut DbgGraph, first: u64, len: u64, circular: bool) -> Vec<u64> {
+        let ids: Vec<NodeId> = (first..first + len).map(|h| g.add_node(node(h))).collect();
+        for pair in ids.windows(2) {
+            g.add_bi_edge(pair[0], pair[1], EdgeType::MinToMin);
+        }
+        if circular {
+            g.add_bi_edge(ids[ids.len() - 1], ids[0], EdgeType::MinToMin);
+        }
+        (first..first + len).collect()
+    }
+
+    /// A long cycle without junctions, as a plasmid the shrinker never reaches leaves it, is walked
+    /// whole without any stack-depth-dependent step.
+    #[test]
+    fn a_long_cycle_without_junctions_collapses_on_a_small_stack() {
+        const LEN: u64 = 100_000;
+        let mut g = DbgGraph::new(3);
+        add_chain(&mut g, 0, LEN, true);
+        assert!(g.ambiguous_nodes().is_empty(), "every node is straight");
+
+        let contigs = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || g.collapse())
+            .unwrap()
+            .join()
+            .expect("collapse overflowed a small stack");
+
+        assert_eq!(contigs.len(), 1);
+        assert_eq!(contigs[0].len(), LEN as usize);
+    }
+
+    /// Paths and junction-free cycles together collapse into one contig each, with every node
+    /// appearing exactly once.
+    #[test]
+    fn paths_and_cycles_collapse_together() {
+        let mut g = DbgGraph::new(3);
+        let mut expected = Vec::new();
+        expected.extend(add_chain(&mut g, 0, 5, false));
+        expected.extend(add_chain(&mut g, 100, 7, true));
+        expected.extend(add_chain(&mut g, 200, 3, false));
+        expected.extend(add_chain(&mut g, 300, 4, true));
+
+        let contigs = g.collapse();
+
+        let mut sizes: Vec<usize> = contigs.iter().map(Vec::len).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![3, 4, 5, 7]);
+        let mut seen: Vec<u64> = contigs
+            .iter()
+            .flatten()
+            .flat_map(|n| n.abs_ind.clone())
+            .collect();
+        seen.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(seen, expected);
     }
 }
