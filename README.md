@@ -111,7 +111,7 @@ explicit values 0 or 1 require `--no-bloom`. The old `--do-bloom` flag has been 
 default, or add `--no-bloom` to preserve the former non-Bloom default.
 
 A multi-k run keeps its reads in memory after the first k, whole, at four bits a base (a base code and a quality
-class), and counts every later k from there.
+class), and counts every later k from there. If you prefer to do a faster, single-k execution, you might use a method like [KmerGenie](http://kmergenie.bx.psu.edu/) to select k.
 
 In the same folder as the output FASTA file, the graph before collapsing will be exported in [DOT](https://en.wikipedia.org/wiki/DOT_%28graph_description_language%29), and [GFA](https://gfa-spec.github.io/GFA-spec/) versions 1.1 and 2 as `prefix_graph.dot`, `prefix_graph.gfa`, and `prefix_graph.gfa2` respectively. Two native diagnostic plots of the k-mer frequency spectrum are saved beside them: `prefix_kmerspectrum.png`, linear and capped at three times the empirical peak's height (unbounded without a peak), and `prefix_kmerspectrum_log.png`, with a logarithmic Y axis. Each is also written as SVG. Runs using automatic count selection overlay the fitted error, single-copy, and repeat components, the total mixture, the empirical valley and peak, the fitted single-copy mean and mode, and the error/genome crossover. With Bloom counting, the plots show both the rescaled sketch used for fitting and the raw Bloom count map. These optional files can be avoided with the corresponding arguments.
 
