@@ -1,0 +1,17 @@
+coverage:
+  paths:
+    - lcov.info
+  # Fails the test job below 60%, or on a drop of more than 0.5 points against master.
+  acceptable: current >= 60% && diff >= -0.5%
+comment:
+  if: is_pull_request
+  updatePrevious: true
+summary:
+  if: true
+diff:
+  datastores:
+    - artifact://${GITHUB_REPOSITORY}
+report:
+  if: is_default_branch
+  datastores:
+    - artifact://${GITHUB_REPOSITORY}

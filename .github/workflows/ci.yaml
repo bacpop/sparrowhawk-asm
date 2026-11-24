@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # missing_docs (src/lib.rs:32) is a warning too, so undocumented public items fail this job.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Native (library, CLI, examples, and tests)
+        run: cargo build --locked --all-targets
+      - name: wasm32
+        run: cargo check --locked --lib --target wasm32-unknown-unknown
+
+  build-wasm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      # The build sparrowhawk's scripts/build_wasm64.py runs for this crate (no simd128).
+      - name: wasm64
+        run: >-
+          cargo +nightly build --locked --lib --release
+          --target wasm64-unknown-unknown
+          -Z build-std=std,panic_abort
+          --config 'target.wasm64-unknown-unknown.rustflags=["-C", "link-arg=--max-memory=17179869184"]'
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # octocov's PR comment
+      actions: read          # octocov reads the default branch's report
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Release: the CLI tests run the full multi-k assembly on the fixture.
+      - name: Tests, with coverage
+        run: cargo llvm-cov --locked --release --all-targets --lcov --output-path lcov.info
+      - name: Doc tests
+        run: cargo test --locked --release --doc
+      - name: Coverage report
+        uses: k1LoW/octocov-action@v1

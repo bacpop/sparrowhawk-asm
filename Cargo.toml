@@ -22,7 +22,7 @@ num-traits = { version = "0.2.19" }
 log = { version = "0.4.27" }
 rayon = { version = "1.10.0" }
 nohash-hasher = { version = "0.2.0" }
-sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", rev = "93d19ae2138640752796415a9f76db437fbc9179" }
+sparrowhawk-graph = { git = "https://github.com/bacpop/sparrowhawk-graph.git", rev = "20083f024e2212c6a6778fb07edcbd287fe15093" }
 bnum = { version = "0.13.0", features = ["numtraits"] }
 libm = { version = "0.2" }
 # The spectrum fit runs on both targets. `wasm-bindgen` is added per-target below: on native it would
