@@ -45,6 +45,25 @@ Current **main features**:
 - Partial GPU acceleration.
 - Improved error correction and graph collapse logics.
 
+# Citation
+
+The algorithm of this repository is depicted currently in Sparrohawk's preprint on [bioRxiv (2026.11.18.767565)](https://www.biorxiv.org/content/10.64898/2026.11.18.767565). You may use the following bibtex entry:
+
+```bibtex
+@article{rodriguez-bouza2026sparrowhawk,
+	author    = {Rodr{\'\i}guez-Bouza, V{\'\i}ctor and von Wachsmann, Johanna H. and Constantinides, Bede and Andr{\'e}oletti, Antoine and Odih, Erkison E. and Nesterenko, Luca and Gupta, Vikas and Lees, John A.},
+	title     = {{Sparrowhawk}: harnessing {WebAssembly} for private microbial genomics, and beyond},
+	journal   = {bioRxiv},
+	year      = {2026},
+	month     = nov,
+	eid       = {2026.11.18.767565},
+	doi       = {10.64898/2026.11.18.767565},
+	url       = {https://www.biorxiv.org/content/10.64898/2026.11.18.767565v1},
+	publisher = {Cold Spring Harbor Laboratory},
+	note      = {Preprint}
+}
+```
+
 
 # Installation
 
