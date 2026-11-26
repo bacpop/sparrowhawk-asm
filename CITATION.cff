@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use sparrowhawk-asm, please cite the preprint below."
+title: sparrowhawk-asm
+type: software
+repository-code: "https://github.com/bacpop/sparrowhawk-asm"
+authors:
+  - family-names: Rodríguez-Bouza
+    given-names: Víctor
+  - family-names: Lees
+    given-names: John A.
+preferred-citation:
+  type: article
+  title: "Sparrowhawk: harnessing WebAssembly for private microbial genomics, and beyond"
+  journal: bioRxiv
+  year: 2026
+  month: 11
+  doi: 10.64898/2026.11.18.767565
+  url: "https://www.biorxiv.org/content/10.64898/2026.11.18.767565"
+  notes: Preprint
+  authors:
+    - family-names: Rodríguez-Bouza
+      given-names: Víctor
+    - name-particle: von
+      family-names: Wachsmann
+      given-names: Johanna H.
+    - family-names: Constantinides
+      given-names: Bede
+    - family-names: Andréoletti
+      given-names: Antoine
+    - family-names: Odih
+      given-names: Erkison E.
+    - family-names: Nesterenko
+      given-names: Luca
+    - family-names: Gupta
+      given-names: Vikas
+    - family-names: Lees
+      given-names: John A.
