@@ -575,6 +575,25 @@ pub(super) fn plot_kmer_histogram(
 ) {
 }
 
+/// Registers the bundled font as Plotters' `sans-serif`. With Plotters' `ttf` feature disabled,
+/// `ab_glyph` draws with it instead of querying system fonts, a lookup that stalled cluster runs.
+/// Roboto 2.138, Apache-2.0: assets/fonts/LICENSE.txt.
+#[cfg(not(target_family = "wasm"))]
+fn register_bundled_font() {
+    static REGISTER_FONT: std::sync::Once = std::sync::Once::new();
+    REGISTER_FONT.call_once(|| {
+        assert!(
+            plotters::style::register_font(
+                "sans-serif",
+                FontStyle::Normal,
+                include_bytes!("../../assets/fonts/Roboto-Regular.ttf"),
+            )
+            .is_ok(),
+            "Bundled Roboto font is invalid"
+        );
+    });
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub(super) fn plot_kmer_histogram(
     decision_spectrum: &[u32],
@@ -583,20 +602,8 @@ pub(super) fn plot_kmer_histogram(
     used_min_count: u16,
     out_path: &std::path::Path,
 ) {
-    // Register before constructing any text style; with Plotters' `ttf` feature disabled,
-    // `ab_glyph` reads this bundled font instead of querying system fonts.
-    static REGISTER_FONT: std::sync::Once = std::sync::Once::new();
-    REGISTER_FONT.call_once(|| {
-        assert!(
-            plotters::style::register_font(
-                "sans-serif",
-                FontStyle::Normal,
-                include_bytes!("../../assets/fonts/IBMPlexSans-Regular.ttf"),
-            )
-            .is_ok(),
-            "Bundled IBM Plex Sans font is invalid"
-        );
-    });
+    // Register before constructing any text style.
+    register_bundled_font();
 
     // `out_path` is the linear plot; the logarithmic one takes a `_log` suffix. Each is written as PNG
     // and as SVG.
@@ -729,5 +736,47 @@ mod tests {
             let log_svg = std::fs::read_to_string(&log_svg_path).expect("read logarithmic SVG");
             assert!(log_svg.contains("k-mer spectrum (logarithmic Y)"));
         }
+    }
+
+    /// The bundled font is valid and measures text, so no plot text needs system fonts.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn bundled_font_measures_text() {
+        register_bundled_font();
+        let (width, height) = ("sans-serif", 24.0)
+            .into_font()
+            .box_size("k-mer spectrum")
+            .expect("the bundled font measures text");
+        assert!(width > 0 && height > 0);
+    }
+
+    /// The PNG's caption is drawn with the bundled font: its rows are not blank.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_plot_rasterises_its_caption() {
+        const WIDTH: u32 = 1280;
+        const HEIGHT: u32 = 960;
+        register_bundled_font();
+        let mut spectrum = vec![0u32; MAXSIZEHISTO];
+        for (i, bar) in spectrum.iter_mut().take(200).enumerate() {
+            let distance = (i as f64 - 60.0).abs();
+            *bar = (5_000.0 * (-distance * distance / 200.0).exp()) as u32 + 1;
+        }
+        let mut buffer = vec![0u8; (WIDTH * HEIGHT * 3) as usize];
+        draw_kmer_histogram(
+            BitMapBackend::with_buffer(&mut buffer, (WIDTH, HEIGHT)).into_drawing_area(),
+            &spectrum,
+            None,
+            &SpectrumPlotDiagnostics::default(),
+            2,
+            PlotYAxis::PeakCapped,
+        );
+        // Only the caption is drawn in the top 30 rows (5 px margin, 24 px caption); the canvas
+        // is white, so a dark pixel there is a glyph.
+        let caption_rows = &buffer[..(WIDTH * 30 * 3) as usize];
+        assert!(
+            caption_rows.iter().any(|&channel| channel < 128),
+            "the caption has no visible text"
+        );
     }
 }

@@ -47,7 +47,18 @@ Current **main features**:
 
 
 # Installation
-Currently the only option is to compile from source.
+
+## Pre-compiled binaries
+Each [release](https://github.com/bacpop/sparrowhawk-asm/releases) has binaries for GNU/Linux on x86_64 (glibc 2.28 or newer: e.g. RHEL 8, Ubuntu 20.04, Debian 10, or later) and for macOS on Apple silicon. Download the archive for your system, then:
+
+```
+tar -xzf sparrowhawk-asm-vX.Y.Z-<target>.tar.gz
+./sparrowhawk-asm-vX.Y.Z-<target>/sparrowhawk-asm --help
+```
+
+The macOS binary is not signed by Apple, so if you downloaded it with a browser, macOS will block it the first time. Remove the quarantine flag with `xattr -d com.apple.quarantine sparrowhawk-asm`, or allow it in System Settings → Privacy & Security.
+
+For any other system, compile from source as follows.
 
 ## Compilation from source
 Development has been done only on x86_64 GNU/Linux-based systems, and most surely will probably stay that way (i.e. no other systems have been tested). To compile our project from source as we did, you will need the [rust toolchain](https://www.rust-lang.org/tools/install) installed in your system. To get an in principle working version (up to some degree), always clone a versioned tag. E.g. to get version vX.Y.Z, you could use:

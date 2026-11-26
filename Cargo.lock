@@ -903,7 +903,8 @@ dependencies = [
 [[package]]
 name = "sparrowhawk-graph"
 version = "0.1.0"
-source = "git+https://github.com/bacpop/sparrowhawk-graph.git?rev=20083f024e2212c6a6778fb07edcbd287fe15093#20083f024e2212c6a6778fb07edcbd287fe15093"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f085d5a211530791fac268aa5dd7e4e7fdf83880a37c7ee304b00f69fdddac96"
 dependencies = [
  "log",
  "nohash-hasher",

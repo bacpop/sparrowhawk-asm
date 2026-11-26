@@ -1,0 +1,102 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:   # test builds: archives are kept as run artifacts only
+
+permissions:
+  contents: read
+
+# Never cancel a release build half-way.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # manylinux_2_28 (AlmaLinux 8, glibc 2.28): the binary then runs on RHEL 8+, Ubuntu
+          # 20.04+, and Debian 10+, not only on systems as new as the runner.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, container: "quay.io/pypa/manylinux_2_28_x86_64" }
+          - { os: macos-15,      target: aarch64-apple-darwin,     container: "" }
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}   # empty: run on the runner itself
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable   # installs rustup inside the container too
+
+      # A release tag v0.2.0 must match version = "0.2.0", which --version prints.
+      - name: Version
+        shell: bash
+        run: |
+          crate_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            if [ "$GITHUB_REF_NAME" != "v$crate_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml's version $crate_version"
+              exit 1
+            fi
+            echo "LABEL=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+          else
+            echo "LABEL=dev-$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Check the glibc requirement
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          needed=$(objdump -T target/release/sparrowhawk-asm | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          echo "Newest glibc symbol needed: $needed"
+          if [ "$(printf '%s\n' "$needed" 2.28 | sort -V | tail -n 1)" != 2.28 ]; then
+            echo "::error::the binary needs glibc $needed, newer than 2.28"
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          name="sparrowhawk-asm-${LABEL}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/sparrowhawk-asm LICENSE README.md "$name/"
+          cp assets/fonts/LICENSE.txt "$name/LICENSE-Roboto.txt"   # the font embedded in the binary
+          tar -czf "$name.tar.gz" "$name"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach files to the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum ./*.tar.gz > SHA256SUMS.txt
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"

@@ -1,0 +1,49 @@
+name: Publish to crates.io
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Never cancel a publish half-way.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    # A crates.io version is permanent (it can only be yanked), so pre-releases never publish.
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    environment: crates-io   # crates.io's trusted publisher is tied to this environment name
+    permissions:
+      contents: read
+      id-token: write   # trusted publishing: GitHub's OIDC token buys a short-lived crates.io token
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A release tag v0.2.0 must match version = "0.2.0" in Cargo.toml.
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml's version $version"
+            exit 1
+          fi
+
+      # Packages and builds the crate as crates.io would, before any token exists.
+      - run: cargo publish --dry-run
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
