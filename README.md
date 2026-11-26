@@ -1,13 +1,6 @@
 # sparrowhawk-asm 
 Short-read assembler for bacterial genomics based on a de Bruijn graph written in Rust.
 
-
-<br>
-<br>
-<br>
-<br>
-
-
 ---
 ## Disclaimer :warning: :construction:
 This is a **work in progress** project. This in particular implies:
@@ -19,9 +12,7 @@ This is a **work in progress** project. This in particular implies:
 - Some features might be partially hardcoded.
 
 These (and potentially other) items will be progressively fixed before version 1.0.
-
 ---
-
 
 ## sparrowhawk?
 Sparrowhawk was at one time the Archmage of [Earthsea](https://en.wikipedia.org/wiki/Earthsea).
